@@ -17,30 +17,64 @@ parent-child `accept()` lifecycle methods. 91 tests pass across
 the workspace.
 
 ```
-$ lotus run examples/hello-world/main.lt        # interpreter path
-hello, world
+$ lotus run examples/02-parent-child/main.lt    # interpreter path
+greeting from child: hello
+greeting from child: hi
+greeting from child: yo
 
-$ lotus build examples/hello-world/main.lt      # codegen path
-built: examples/hello-world/main
-$ ./examples/hello-world/main
-hello, world
+$ lotus build examples/02-parent-child/main.lt  # codegen path
+built: examples/02-parent-child/main
+$ ./examples/02-parent-child/main
+greeting from child: hello
+greeting from child: hi
+greeting from child: yo
 ```
 
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 8 of 9 example projects
-  execute end-to-end
-- **Phase 3 milestone 9** (codegen subset) — complete; everything
-  through milestone 8 plus `time::monotonic()` (clock_gettime on
-  CLOCK_MONOTONIC) and Duration arithmetic / comparisons on both
-  paths. Elapsed-time patterns like `let dt = t1 - t0; if dt > 20ms`
-  work end-to-end.
+- **Phase 2 v0** (interpreter + bus router) — 14 of 15 example
+  projects execute end-to-end via `lotus run` (only multi-binary
+  trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 9** (codegen subset) — complete. 8 of 15
+  example projects build to native ELF via `lotus build`:
+  hello-world, 01-locus-with-run, 02-parent-child, 06-mutable-
+  counter, 07-control-flow, 08-monotonic-sleep, 09-functions,
+  10-stateful-locus. Latest: `time::monotonic()` (`clock_gettime`
+  on CLOCK_MONOTONIC) + Duration arithmetic / comparisons on both
+  paths.
 - **Phase 3 next** — `drain()` / `dissolve()` lifecycle (tear
   down long-lived loci cleanly per F.4 cascade), then bus router
   lowering for `05-bus`. Modes (bulk / harmonic / resolution),
   closures, and decimal arithmetic are the remaining big pieces
   before `trellis-demo` is a build target.
+
+## Codegen milestone arc (Phase 3 progress)
+
+Each milestone below is one focused commit + a CHECKPOINT/README
+refresh. The arc moved fast in 2026-05-08 — nine milestones
+landed in one session — but each load-bearing piece was
+intentionally narrow:
+
+```
+m0  Phase 3 milestone 0: lotus build → native ELF via LLVM      (77b977f)
+m1  Codegen milestone 1: Int / Float / Bool params + println    (5c9b6f7)
+m2  Codegen milestone 2: let + Int/Float arithmetic + cmp       (5224d53)
+m3  Codegen milestone 3: let mut + assignment                   (03c2f55)
+m4  Codegen milestone 4: if / while / break / continue          (cae8c9a)
+m5  Codegen milestone 5: time::sleep on CLOCK_MONOTONIC         (929efa2)
+m6  Codegen milestone 6: multi-fn programs                      (9955bea)
+m7  Codegen milestone 7: locus runtime ABI    ← load-bearing    (206fbd0)
+m8  Codegen milestone 8: accept() + parent-child wiring         (d5afffd)
+m9  Codegen milestone 9: time::monotonic() + Duration arith     (cdd7353)
+```
+
+The architectural pivots are **m7** (locus → LLVM struct,
+lifecycle methods take `self_ptr`, `self.X` via GEP) and **m8**
+(accept's child param as `LotusType::LocusRef(String)`,
+parent-aware child instantiation, F.7 dispatch ordering).
+Everything before m7 was scalar-only fn-bodies; everything after
+m7 builds on the struct ABI.
 
 ## What runs vs. what builds
 
@@ -101,23 +135,38 @@ Spec source: `spec/design-rationale.md`. Summary:
 
 In order:
 
-1. `README.md` — overview, status, F-table, examples, toolchain.
+1. `README.md` — overview, status, F-table, example list, toolchain.
 2. `spec/design-rationale.md` — why each construct is shaped the way
    it is. Source of truth for F.1–F.18.
 3. `spec/grammar.ebnf` — formal grammar.
 4. `spec/tokens.md` — lexical structure.
 5. `spec/precedence.md` — operator precedence table.
-6. `examples/hello-world/main.lt` through `examples/trellis-demo/main.lt` —
-   the example ladder. trellis-demo exercises the full pipeline.
-7. `crates/lotus-syntax/src/lib.rs` — public API of the parser/AST.
-8. `crates/lotus-types/src/lib.rs` — typechecker entry + unit tests
-   that lock the F.x rules.
-9. `crates/lotus-runtime/src/lib.rs` + `eval.rs` + `bus.rs` —
-   interpreter, dissolve cascade, bus router.
-10. `crates/lotus-codegen/src/codegen.rs` — current LLVM lowering.
-11. `crates/lotus-cli/src/main.rs` — CLI dispatch.
-12. `~/.claude/plans/witty-foraging-lightning.md` — the original
+6. `spec/memory.md` — memory model + the "Codegen ABI (v0)" section
+   documenting the locus struct lowering, F.7 dispatch ordering,
+   and ephemeral-only constraint (added in m7, extended in m8).
+7. `spec/runtime.md` — runtime semantics + the "Time" section
+   documenting the monotonic-only-scheduling discipline (m5, m9).
+8. `examples/hello-world/main.lt` → `examples/10-stateful-locus/`
+   → `examples/trellis-demo/main.lt` — the example ladder.
+   06-10 are the codegen-arc demos; trellis-demo exercises the
+   full interpreter pipeline.
+9. `crates/lotus-syntax/src/lib.rs` — public API of the parser/AST.
+10. `crates/lotus-types/src/lib.rs` — typechecker entry + unit
+    tests that lock the F.x rules.
+11. `crates/lotus-runtime/src/lib.rs` + `eval.rs` + `bus.rs` +
+    `builtins.rs` — interpreter, dissolve cascade, bus router,
+    `time::sleep` / `time::monotonic` via libc::clock_*.
+12. `crates/lotus-codegen/src/codegen.rs` — current LLVM lowering.
+    The biggest single file in the workspace; the locus runtime
+    ABI is what makes it interesting. Worth a careful read if
+    extending codegen.
+13. `crates/lotus-cli/src/main.rs` — CLI dispatch (lex / parse /
+    check / run / build).
+14. `~/.claude/plans/witty-foraging-lightning.md` — the original
     delivery plan to team-wide internal v1.0 (~18–30 months total).
+15. `notes/open-questions.md` — tracked deferrals, including the
+    spec-vs-impl gap on immutable-binding compile-time
+    enforcement (§23).
 
 For broader program context:
 
