@@ -82,7 +82,7 @@ m12 Codegen milestone 12: bus router (subscribe + <- + deferral)(5645eaa)
 m13 Codegen milestone 13: self.method() calls                   (b036c7f)
 m14 Codegen milestone 14: Decimal + return-from-main exit code  (b036c7f)
 m15 Codegen milestone 15: closures (collapse-only path)         (9bf21c1)
-m16 Codegen milestone 16: Time + composite defaults + heap lits (this commit)
+m16 Codegen milestone 16: Time + composite defaults + heap lits (e33e8ee)
                           ⇒ trellis-demo builds to native ELF
 ```
 
