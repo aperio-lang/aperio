@@ -45,6 +45,12 @@ enum LotusType {
     /// fixed-point or arbitrary-precision representation lands
     /// later when Decimal precision actually matters.
     Decimal,
+    /// Wall-clock instant. v0 codegen stores this as a pointer to
+    /// the literal's source-spelling string (same hack the
+    /// interpreter uses). Real `time_t` / `i64`-since-epoch
+    /// lowering lands later. Distinct from `String` at the type
+    /// level so the typechecker keeps `Time` and `String` apart.
+    Time,
     /// Pointer to a locus's struct. The string carries the locus
     /// name; the layout + field map live in `Cx.user_loci`. Used
     /// for the child param of `accept(g: ChildLocus)`.
@@ -248,10 +254,14 @@ struct LocusInfo<'ctx> {
     /// Field name → (index in struct, field type).
     fields: BTreeMap<String, (u32, LotusType)>,
     /// Field initializers in declaration order. Each entry is
-    /// (name, default_value) where default_value is the locus's
-    /// declared default. Overrides at instantiation sites replace
-    /// the default for that field.
-    defaults: Vec<(String, ParamValue)>,
+    /// (name, default_init). Overrides at instantiation sites
+    /// replace the default for that field. Default-init can be a
+    /// pre-resolved literal (so simple defaults stay cheap) OR a
+    /// deferred AST expression evaluated at the instantiation
+    /// site (for composite literals like
+    /// `current_kernel: TradeKernel = TradeKernel { ... }` where
+    /// the default isn't a scalar literal).
+    defaults: Vec<(String, DefaultInit)>,
     /// Lifecycle method LLVM functions, keyed by lifecycle name
     /// ("birth", "accept", "run"). drain / dissolve wait on the
     /// scheduler + recovery work.
@@ -287,6 +297,17 @@ struct LocusInfo<'ctx> {
     /// to check. Called between drain() and dissolve() per F.4 +
     /// F.9.
     closures_fn: Option<FunctionValue<'ctx>>,
+}
+
+/// One locus param's default-initializer. Either pre-resolved
+/// (the common case — scalar literal) or deferred to the
+/// instantiation site (composite literal like
+/// `TradeKernel { ... }` whose evaluation needs the codegen
+/// builder).
+#[derive(Debug, Clone)]
+enum DefaultInit {
+    Const(ParamValue),
+    Expr(Expr),
 }
 
 /// Compiled user `type` (a plain data record). No methods, no
@@ -376,6 +397,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // No `noreturn` attr in inkwell stable; the unreachable we
         // emit after the call is enough for LLVM to optimize.
         let _ = exit_fn;
+
+        // declare ptr @malloc(i64)
+        //
+        // Used by user-type struct literals (e.g. bus payloads,
+        // composite locus param defaults) so the heap-allocated
+        // record outlives the publisher's stack frame. v0 codegen
+        // never frees — all type-literal allocations leak. Trellis-
+        // grade lifetime management lands with the region allocator.
+        let i64_t = self.context.i64_type();
+        let malloc_ty = ptr_t.fn_type(&[i64_t.into()], false);
+        self.module.add_function("malloc", malloc_ty, None);
     }
 
     /// LLVM struct type for one entry in the bus subscription
@@ -905,6 +937,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 PrimType::String => Ok(LotusType::String),
                 PrimType::Duration => Ok(LotusType::Duration),
                 PrimType::Decimal => Ok(LotusType::Decimal),
+                PrimType::Time => Ok(LotusType::Time),
                 other => Err(CodegenError::Unsupported(format!(
                     "type primitive `{:?}` in signature",
                     other
@@ -1004,52 +1037,84 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // not ABI — fine to ignore for codegen.
         }
 
-        // v0 codegen requires every locus param to have a literal
-        // default (so instantiation sites can omit it). Type
-        // ascription is optional; if present, we type-check it
-        // against the inferred type, else we infer from the default.
+        // Each locus param must have either a literal default or
+        // a typed default expression evaluable at instantiation
+        // time. Scalar literals lock in `DefaultInit::Const` so
+        // const_param can build them directly; non-literal defaults
+        // (like `current_kernel: TradeKernel = TradeKernel { ... }`)
+        // get `DefaultInit::Expr` and are evaluated at the
+        // instantiation site through lower_expr. Type ascription is
+        // REQUIRED for non-literal defaults (we don't infer a type
+        // from an arbitrary expression here — the AST resolver
+        // doesn't run in codegen v0).
         let mut fields: BTreeMap<String, (u32, LotusType)> = BTreeMap::new();
-        let mut defaults: Vec<(String, ParamValue)> = Vec::new();
+        let mut defaults: Vec<(String, DefaultInit)> = Vec::new();
         let mut llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
             Vec::new();
         let mut idx: u32 = 0;
         for member in &l.members {
             if let LocusMember::Params(pb) = member {
                 for p in &pb.params {
-                    let default = match &p.init {
-                        ParamInit::Value(e) => param_value(e)?,
+                    let default_expr = match &p.init {
+                        ParamInit::Value(e) => e,
                         ParamInit::Inferred => {
                             return Err(CodegenError::Unsupported(format!(
                                 "locus `{}` param `{}`: codegen requires a \
-                                 literal default",
+                                 default value (literal or typed expression)",
                                 l.name.name, p.name.name
                             )));
                         }
                     };
-                    let inferred_ty = match &default {
-                        ParamValue::Int(_) => LotusType::Int,
-                        ParamValue::Float(_) => LotusType::Float,
-                        ParamValue::Bool(_) => LotusType::Bool,
-                        ParamValue::String(_) => LotusType::String,
-                        ParamValue::Duration(_) => LotusType::Duration,
-                        ParamValue::Decimal(_) => LotusType::Decimal,
-                    };
+                    // Try to lock in as a literal Const first; fall
+                    // back to deferred Expr if that fails.
+                    let (default, default_ty): (DefaultInit, LotusType) =
+                        match param_value(default_expr) {
+                            Ok(pv) => {
+                                let ty = match &pv {
+                                    ParamValue::Int(_) => LotusType::Int,
+                                    ParamValue::Float(_) => LotusType::Float,
+                                    ParamValue::Bool(_) => LotusType::Bool,
+                                    ParamValue::String(_) => LotusType::String,
+                                    ParamValue::Duration(_) => {
+                                        LotusType::Duration
+                                    }
+                                    ParamValue::Decimal(_) => LotusType::Decimal,
+                                    ParamValue::Time(_) => LotusType::Time,
+                                };
+                                (DefaultInit::Const(pv), ty)
+                            }
+                            Err(_) => {
+                                // Non-literal default → require an
+                                // explicit type ascription so we
+                                // know the field's LLVM shape
+                                // without evaluating the default.
+                                let ascribed = p.ty.as_ref().ok_or_else(|| {
+                                    CodegenError::Unsupported(format!(
+                                        "locus `{}` param `{}`: non-literal \
+                                         default requires a type ascription",
+                                        l.name.name, p.name.name
+                                    ))
+                                })?;
+                                let ty = self.type_expr_to_lotus(ascribed)?;
+                                (DefaultInit::Expr(default_expr.clone()), ty)
+                            }
+                        };
                     if let Some(ascribed) = &p.ty {
                         let asc_ty = self.type_expr_to_lotus(ascribed)?;
-                        if asc_ty != inferred_ty {
+                        if asc_ty != default_ty {
                             return Err(CodegenError::Unsupported(format!(
                                 "locus `{}` param `{}`: declared {:?}, \
                                  default {:?}",
-                                l.name.name, p.name.name, asc_ty, inferred_ty
+                                l.name.name, p.name.name, asc_ty, default_ty
                             )));
                         }
                     }
                     fields.insert(
                         p.name.name.clone(),
-                        (idx, inferred_ty.clone()),
+                        (idx, default_ty.clone()),
                     );
                     defaults.push((p.name.name.clone(), default));
-                    llvm_field_tys.push(self.llvm_basic_type(&inferred_ty));
+                    llvm_field_tys.push(self.llvm_basic_type(&default_ty));
                     idx += 1;
                 }
             }
@@ -1243,6 +1308,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     .bool_type()
                                     .fn_type(&llvm_param_tys, false),
                                 LotusType::String
+                                | LotusType::Time
                                 | LotusType::LocusRef(_)
                                 | LotusType::TypeRef(_) => self
                                     .context
@@ -1582,6 +1648,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.context.bool_type().fn_type(&llvm_param_tys, false)
             }
             Some(LotusType::String)
+            | Some(LotusType::Time)
             | Some(LotusType::LocusRef(_))
             | Some(LotusType::TypeRef(_)) => self
                 .context
@@ -2161,6 +2228,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .build_alloca(self.context.bool_type(), name)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
             LotusType::String
+            | LotusType::Time
             | LotusType::LocusRef(_)
             | LotusType::TypeRef(_) => self
                 .builder
@@ -2212,6 +2280,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 })?;
                 let v = self.context.f64_type().const_float(f);
                 Ok((v.into(), LotusType::Decimal))
+            }
+            Expr::Literal(Literal::Time(s), _) => {
+                // v0 codegen mirrors the interpreter: store the
+                // source spelling as a NUL-terminated global. Real
+                // i64-since-epoch arithmetic lands later.
+                let p = self.global_string(s);
+                Ok((p.into(), LotusType::Time))
             }
             Expr::Ident(id) => {
                 let (alloca, ty) = scope
@@ -2267,28 +2342,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok((val, ty))
             }
             Expr::Field { receiver, name, .. } => {
-                // Non-self field access: `g.X` where `g` is a
-                // locally-bound `LocusRef` or `TypeRef`. Lower as
-                // GEP+load on the referent struct.
-                let recv_name = match receiver.as_ref() {
-                    Expr::Ident(i) => i.name.as_str(),
-                    _ => {
-                        return Err(CodegenError::Unsupported(format!(
-                            "field access on non-ident, non-self receiver"
-                        )));
-                    }
-                };
-                let (slot_ptr, slot_ty) = scope
-                    .locals
-                    .get(recv_name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        CodegenError::Unsupported(format!(
-                            "unknown identifier `{}` in field access",
-                            recv_name
-                        ))
-                    })?;
-                let (struct_ty, fields, ref_kind) = match &slot_ty {
+                // Generalized field access: lower the receiver as
+                // an expression. If it's a LocusRef or TypeRef
+                // pointer, GEP+load. This supports `g.X`, `g.x.y`,
+                // `self.kernel.multiplier`, expressions returning
+                // a TypeRef value, etc.
+                let (recv_val, recv_ty) = self.lower_expr(receiver, scope)?;
+                let (struct_ty, fields, ref_kind) = match &recv_ty {
                     LotusType::LocusRef(n) => {
                         let info = self
                             .user_loci
@@ -2307,8 +2367,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     }
                     other => {
                         return Err(CodegenError::Unsupported(format!(
-                            "field access `{}.{}` on non-record type {:?}",
-                            recv_name, name.name, other
+                            "field access `.{}` on non-record type {:?}",
+                            name.name, other
                         )));
                     }
                 };
@@ -2321,21 +2381,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             name.name, ref_kind
                         ))
                     })?;
-                // The slot stores the record pointer; load it to
-                // get the actual struct ptr, then GEP into that.
-                let ptr_t = self.context.ptr_type(AddressSpace::default());
-                let recv_ptr = self
-                    .builder
-                    .build_load(ptr_t, slot_ptr, recv_name)
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                    .into_pointer_value();
+                let recv_ptr = recv_val.into_pointer_value();
                 let field_ptr = self
                     .builder
                     .build_struct_gep(
                         struct_ty,
                         recv_ptr,
                         idx,
-                        &format!("{}.{}.ptr", recv_name, name.name),
+                        &format!("field.{}.ptr", name.name),
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 let llvm_ty = self.llvm_basic_type(&field_ty);
@@ -2344,7 +2397,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_load(
                         llvm_ty,
                         field_ptr,
-                        &format!("{}.{}", recv_name, name.name),
+                        &format!("field.{}", name.name),
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok((val, field_ty))
@@ -2436,6 +2489,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.context.f64_type().const_float(*f).into(),
                 LotusType::Decimal,
             ),
+            ParamValue::Time(s) => {
+                (self.global_string(s).into(), LotusType::Time)
+            }
         }
     }
 
@@ -2452,6 +2508,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             LotusType::Bool => self.context.bool_type().into(),
             LotusType::String
+            | LotusType::Time
             | LotusType::LocusRef(_)
             | LotusType::TypeRef(_) => {
                 self.context.ptr_type(AddressSpace::default()).into()
@@ -2704,7 +2761,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         chosen.into_pointer_value(),
                     ));
                 }
-                LotusType::String => {
+                LotusType::String | LotusType::Time => {
                     format.push_str("%s");
                     printf_args.push(BasicMetadataValueEnum::PointerValue(
                         val.into_pointer_value(),
@@ -3047,14 +3104,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         // Initialize each field. Overrides go through lower_expr in
         // the caller's scope so any expression — not just literals —
-        // can be passed; defaults are pre-resolved literals stored
-        // on the LocusInfo.
+        // can be passed. Defaults are either pre-resolved scalar
+        // literals (DefaultInit::Const → const_param) or deferred
+        // expressions (DefaultInit::Expr → lower_expr) that may
+        // construct composite values like `TradeKernel { ... }` at
+        // the instantiation site.
         for (i, (fname, default)) in info.defaults.iter().enumerate() {
             let (val, val_ty) = if let Some(expr) = overrides.get(fname.as_str())
             {
                 self.lower_expr(expr, scope)?
             } else {
-                self.const_param(default)
+                match default {
+                    DefaultInit::Const(pv) => self.const_param(pv),
+                    DefaultInit::Expr(e) => self.lower_expr(e, scope)?,
+                }
             };
             let (_, declared_ty) = info
                 .fields
@@ -3558,10 +3621,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
         }
 
-        let self_ptr = self
+        // Heap-allocate via malloc so the struct outlives the
+        // current stack frame. Bus payloads (publisher's frame
+        // returns before subscribers finish reading), composite
+        // locus param defaults (the default-init expr runs in
+        // lower_locus_instantiation, but the resulting pointer is
+        // stored on the locus and read later) — both need
+        // long-lived storage. v0 codegen never frees; the regional
+        // allocator will when it lands.
+        let size = info
+            .struct_ty
+            .size_of()
+            .expect("user struct has known size");
+        let malloc_fn = self
+            .module
+            .get_function("malloc")
+            .expect("malloc declared in declare_builtins");
+        let raw = self
             .builder
-            .build_alloca(info.struct_ty, &format!("{}.lit", type_name))
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            .build_call(
+                malloc_fn,
+                &[size.into()],
+                &format!("{}.malloc", type_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("malloc returns ptr");
+        let self_ptr = raw.into_pointer_value();
         for fname in &info.field_order {
             let expr = by_name
                 .get(fname.as_str())
@@ -3618,6 +3705,8 @@ enum ParamValue {
     Bool(bool),
     Duration(i64),
     Decimal(f64),
+    /// Time literal stored as its source spelling.
+    Time(String),
 }
 
 fn param_value(e: &Expr) -> Result<ParamValue, CodegenError> {
@@ -3637,6 +3726,7 @@ fn param_value(e: &Expr) -> Result<ParamValue, CodegenError> {
             })?;
             Ok(ParamValue::Decimal(f))
         }
+        Expr::Literal(Literal::Time(s), _) => Ok(ParamValue::Time(s.clone())),
         _ => Err(CodegenError::Unsupported(
             "param initializer must be a literal in milestone-1 codegen".to_string(),
         )),

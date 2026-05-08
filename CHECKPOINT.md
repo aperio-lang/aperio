@@ -1,8 +1,10 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 15 (closures, collapse-only
-path) on top of commit `cdd7353` (2026-05-08).
+new session. State as of codegen milestone 16 (Time + composite
+defaults + nested-field reads + heap-alloc'd type literals) on top
+of commit `cdd7353` (2026-05-08). **`trellis-demo` is now a build
+target.**
 
 This is part of the alpha-conjecture program (see
 `~/notes/alpha-conjecture/CLAUDE.md`). Lotus is the language-substrate
@@ -37,23 +39,24 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 17 of 18 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
-- **Phase 3 milestone 15** (codegen subset) — complete. 13 of 18
-  example projects build to native ELF via `lotus build`:
-  hello-world, 01-locus-with-run, 02-parent-child,
-  **03-closure-test**, 05-bus, 06-mutable-counter, 07-control-flow,
-  08-monotonic-sleep, 09-functions, 10-stateful-locus,
-  11-drain-dissolve, 12-user-types, 13-decimal-and-exit. Latest:
-  closures (collapse-only path) — synthetic
-  `<Locus>.__closures(self_ptr)` fn evaluates each
-  dissolve-epoch closure as `|left - right| <= tolerance`; pass
-  is silent, fail emits a `ClosureViolation` to stderr (via
-  `dprintf(2, ...)`) and exits non-zero. Inserted between
-  `drain()` and `dissolve()` per F.4 + F.9 ordering, mirroring
-  the interpreter's `dissolve_locus`.
+- **Phase 3 milestone 16** (codegen subset) — complete. **14 of 18
+  example projects build to native ELF**, including the marquee
+  **trellis-demo**: hello-world, 01-locus-with-run,
+  02-parent-child, 03-closure-test, 05-bus, 06-mutable-counter,
+  07-control-flow, 08-monotonic-sleep, 09-functions,
+  10-stateful-locus, 11-drain-dissolve, 12-user-types,
+  13-decimal-and-exit, **trellis-demo**. Latest: Time literals
+  (lowered as ptr-to-source-spelling, like Decimal-as-f64 v0
+  hack), composite locus param defaults (literal-only constraint
+  lifted; non-literal defaults are deferred to instantiation
+  site as `DefaultInit::Expr`), generalized field access
+  (recursive lower_expr through Field receivers — supports
+  `self.x.y`, `g.x.y`, etc.), and heap-allocated user-type
+  literals via libc malloc (was alloca; bus payloads + composite
+  defaults need to outlive the publisher's stack frame).
 - **Phase 3 next** — `on_failure` routing (absorb / bubble) for
   03b/03c; modes + `self.children` + `for` + arrays for 04;
-  composite locus param defaults + Time literals for
-  `trellis-demo`.
+  trellis-pair (cross-process bus + entry-point selection).
 
 ## Codegen milestone arc (Phase 3 progress)
 
@@ -79,6 +82,8 @@ m12 Codegen milestone 12: bus router (subscribe + <- + deferral)(5645eaa)
 m13 Codegen milestone 13: self.method() calls                   (b036c7f)
 m14 Codegen milestone 14: Decimal + return-from-main exit code  (b036c7f)
 m15 Codegen milestone 15: closures (collapse-only path)         (9bf21c1)
+m16 Codegen milestone 16: Time + composite defaults + heap lits (this commit)
+                          ⇒ trellis-demo builds to native ELF
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -117,6 +122,10 @@ m7 builds on the struct ABI.
 | `return n;` from main → process exit code | ✅ | ✅ |
 | Closures: collapse on pass, exit-non-zero on fail | ✅ | ✅ |
 | Closures: parent absorb / bubble routing (F.9) | ✅ | — |
+| Time literals + Time as a typechecked primitive | ✅ | ✅ (string-spelling v0) |
+| Composite locus param defaults | ✅ | ✅ |
+| Nested field reads (self.x.y, expr-receiver-of-Field) | ✅ | ✅ |
+| Heap-allocated user-type literals (escape via bus) | ✅ | ✅ |
 | Contracts (typecheck only — F.8) | ✅ | ✅ (skipped at codegen) |
 | `for` / `match` | ✅ | — |
 | Closure runtime (collapse / absorb / bubble) | ✅ | — |
@@ -375,6 +384,9 @@ rm examples/13-decimal-and-exit/main     # clean up artifact
 cargo run --bin lotus -- build examples/03-closure-test/main.lt
 ./examples/03-closure-test/main          # collapsed cleanly.
 rm examples/03-closure-test/main         # clean up artifact
+cargo run --bin lotus -- build examples/trellis-demo/main.lt
+./examples/trellis-demo/main             # 5x intent + 3x kernel hot-load
+rm examples/trellis-demo/main            # clean up artifact
 ```
 
-If all sixteen work, the checkpoint is intact.
+If all seventeen work, the checkpoint is intact.
