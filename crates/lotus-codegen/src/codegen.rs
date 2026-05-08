@@ -12,6 +12,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     TargetTriple,
 };
+use inkwell::types::StructType;
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
 };
@@ -94,8 +95,10 @@ pub fn build_executable(
         program,
         current_fn: None,
         current_user_fn_ret: None,
+        current_self: None,
         loops: Vec::new(),
         user_fns: BTreeMap::new(),
+        user_loci: BTreeMap::new(),
     };
 
     cx.declare_builtins();
@@ -153,6 +156,10 @@ struct Cx<'ctx, 'p> {
     /// any user fn — `return` is rejected there. Inner `None` means
     /// the user fn has no return type (void return).
     current_user_fn_ret: Option<Option<LotusType>>,
+    /// Set while lowering a locus lifecycle method body so that
+    /// `self.X` reads/writes lower to GEP+load/store on the struct
+    /// pointer passed as the method's first arg.
+    current_self: Option<SelfCx<'ctx>>,
     /// Stack of enclosing loops so `break` / `continue` can find
     /// their target blocks.
     loops: Vec<LoopFrame<'ctx>>,
@@ -160,6 +167,10 @@ struct Cx<'ctx, 'p> {
     /// `lower_program` so call sites can refer to fns declared
     /// later in the same file.
     user_fns: BTreeMap<String, FnSig<'ctx>>,
+    /// User-defined loci indexed by name. Filled in pass A of
+    /// `lower_program`; carries the LLVM struct type for the
+    /// locus's params + the lifecycle methods compiled against it.
+    user_loci: BTreeMap<String, LocusInfo<'ctx>>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +179,35 @@ struct FnSig<'ctx> {
     params: Vec<LotusType>,
     /// `None` = void (no return type in the lotus declaration).
     ret: Option<LotusType>,
+}
+
+/// Compiled locus type. Lifecycle methods take `self_ptr` as their
+/// first arg; field access in their bodies lowers to GEPs against
+/// `struct_ty` using the index from `fields`.
+#[derive(Debug, Clone)]
+struct LocusInfo<'ctx> {
+    struct_ty: StructType<'ctx>,
+    /// Field name → (index in struct, field type).
+    fields: BTreeMap<String, (u32, LotusType)>,
+    /// Field initializers in declaration order. Each entry is
+    /// (name, default_value) where default_value is the locus's
+    /// declared default. Overrides at instantiation sites replace
+    /// the default for that field.
+    defaults: Vec<(String, ParamValue)>,
+    /// Lifecycle method LLVM functions, keyed by lifecycle name
+    /// ("birth", "run", ...). Currently only `birth` and `run` are
+    /// supported by codegen — accept / drain / dissolve wait on
+    /// the parent-child + recovery work.
+    methods: BTreeMap<&'static str, FunctionValue<'ctx>>,
+}
+
+/// Carried on `Cx` while lowering a lifecycle method body so
+/// `self.X` reads/writes resolve to GEPs against the LLVM struct.
+#[derive(Debug, Clone)]
+struct SelfCx<'ctx> {
+    struct_ty: StructType<'ctx>,
+    self_ptr: PointerValue<'ctx>,
+    fields: BTreeMap<String, (u32, LotusType)>,
 }
 
 impl<'ctx, 'p> Cx<'ctx, 'p> {
@@ -215,7 +255,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 CodegenError::Unsupported("program has no `fn main()`".to_string())
             })?;
 
-        // Pass 1: declare every user-defined function so call sites
+        // Pass A: declare each user-defined locus's struct type +
+        // lifecycle method signatures. Done first so user fns and
+        // method bodies can both refer to compiled locus types.
+        let locus_decls: Vec<LocusDecl> = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopDecl::Locus(l) => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        for l in &locus_decls {
+            self.declare_user_locus(l)?;
+        }
+
+        // Pass B: declare every user-defined function so call sites
         // can refer to fns declared later in the file.
         let user_fn_decls: Vec<FnDecl> = self
             .program
@@ -230,7 +286,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.declare_user_fn(f)?;
         }
 
-        // Pass 2: lower bodies of user-defined fns.
+        // Pass C: lower lifecycle method bodies (birth, run, ...).
+        for l in &locus_decls {
+            self.lower_locus_method_bodies(l)?;
+        }
+
+        // Pass D: lower bodies of user-defined fns.
         for f in &user_fn_decls {
             self.lower_user_fn_body(f)?;
         }
@@ -247,6 +308,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder.position_at_end(entry);
         self.current_fn = Some(main_fn);
         self.current_user_fn_ret = None;
+        self.current_self = None;
 
         let mut scope = Scope::default();
         let end = self.lower_block(&main_decl.body, &mut scope)?;
@@ -303,6 +365,207 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 std::mem::discriminant(other)
             ))),
         }
+    }
+
+    /// Pass A: declare a locus's struct type + lifecycle method
+    /// signatures. Body lowering happens later (pass C).
+    ///
+    /// Each lifecycle method takes the struct pointer as its first
+    /// arg and returns void. accept / drain / dissolve are accepted
+    /// in the AST but rejected here until parent-child + recovery
+    /// work lands; running into one in source is an Unsupported.
+    fn declare_user_locus(
+        &mut self,
+        l: &LocusDecl,
+    ) -> Result<(), CodegenError> {
+        if !l.annotations.is_empty() {
+            // tier / projection annotations are fine to ignore for
+            // codegen — they're framework metadata, not ABI.
+        }
+
+        // Collect the params block. v0 codegen requires every locus
+        // param to have a literal default (so instantiation sites
+        // can omit it). Type ascription is optional in source; if
+        // present we type-check it against the inferred type, else
+        // we infer from the default literal.
+        let mut field_order: Vec<String> = Vec::new();
+        let mut fields: BTreeMap<String, (u32, LotusType)> = BTreeMap::new();
+        let mut defaults: Vec<(String, ParamValue)> = Vec::new();
+        let mut llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
+            Vec::new();
+        let mut idx: u32 = 0;
+        for member in &l.members {
+            if let LocusMember::Params(pb) = member {
+                for p in &pb.params {
+                    let default = match &p.init {
+                        ParamInit::Value(e) => param_value(e)?,
+                        ParamInit::Inferred => {
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` param `{}`: codegen requires a \
+                                 literal default",
+                                l.name.name, p.name.name
+                            )));
+                        }
+                    };
+                    let inferred_ty = match &default {
+                        ParamValue::Int(_) => LotusType::Int,
+                        ParamValue::Float(_) => LotusType::Float,
+                        ParamValue::Bool(_) => LotusType::Bool,
+                        ParamValue::String(_) => LotusType::String,
+                        ParamValue::Duration(_) => LotusType::Duration,
+                    };
+                    if let Some(ascribed) = &p.ty {
+                        let asc_ty = self.type_expr_to_lotus(ascribed)?;
+                        if asc_ty != inferred_ty {
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` param `{}`: declared {:?}, \
+                                 default {:?}",
+                                l.name.name, p.name.name, asc_ty, inferred_ty
+                            )));
+                        }
+                    }
+                    field_order.push(p.name.name.clone());
+                    fields.insert(
+                        p.name.name.clone(),
+                        (idx, inferred_ty),
+                    );
+                    defaults.push((p.name.name.clone(), default));
+                    llvm_field_tys.push(self.llvm_basic_type(inferred_ty));
+                    idx += 1;
+                }
+            }
+        }
+
+        let struct_ty = self
+            .context
+            .opaque_struct_type(&format!("locus.{}", l.name.name));
+        struct_ty.set_body(&llvm_field_tys, false);
+
+        // Declare lifecycle method LLVM signatures. Currently only
+        // `birth` and `run` lower; everything else (including modes,
+        // closures, contracts, bus subs) is rejected with a clear
+        // diagnostic so partial declarations don't generate dead
+        // code.
+        let mut methods: BTreeMap<&'static str, FunctionValue<'ctx>> =
+            BTreeMap::new();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let void_t = self.context.void_type();
+        for member in &l.members {
+            match member {
+                LocusMember::Params(_) => {}
+                LocusMember::Lifecycle(lc) => {
+                    let kind: &'static str = match lc.kind {
+                        LifecycleKind::Birth => "birth",
+                        LifecycleKind::Run => "run",
+                        LifecycleKind::Accept
+                        | LifecycleKind::Drain
+                        | LifecycleKind::Dissolve => {
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` lifecycle `{:?}`: codegen only \
+                                 supports `birth` and `run` in v0",
+                                l.name.name, lc.kind
+                            )));
+                        }
+                    };
+                    if !lc.params.is_empty() {
+                        return Err(CodegenError::Unsupported(format!(
+                            "locus `{}` lifecycle `{}` declares params; \
+                             only the implicit self is supported in v0",
+                            l.name.name, kind
+                        )));
+                    }
+                    if lc.ret.is_some() {
+                        return Err(CodegenError::Unsupported(format!(
+                            "locus `{}` lifecycle `{}` declares a return \
+                             type; only void is supported in v0",
+                            l.name.name, kind
+                        )));
+                    }
+                    let fn_ty = void_t.fn_type(&[ptr_t.into()], false);
+                    let fn_name = format!("{}.{}", l.name.name, kind);
+                    let func = self.module.add_function(&fn_name, fn_ty, None);
+                    methods.insert(kind, func);
+                }
+                LocusMember::Bus(_)
+                | LocusMember::Contract(_)
+                | LocusMember::Mode(_)
+                | LocusMember::Failure(_)
+                | LocusMember::Closure(_)
+                | LocusMember::Fn(_)
+                | LocusMember::Const(_)
+                | LocusMember::Type(_) => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "locus `{}` member kind not yet lowered to codegen",
+                        l.name.name
+                    )));
+                }
+            }
+        }
+
+        let _ = field_order; // kept available if future passes need ordered iteration
+        self.user_loci.insert(
+            l.name.name.clone(),
+            LocusInfo {
+                struct_ty,
+                fields,
+                defaults,
+                methods,
+            },
+        );
+        Ok(())
+    }
+
+    /// Pass C: lower each declared lifecycle method body. The
+    /// method's first arg becomes `self_ptr` on `Cx.current_self`,
+    /// so `self.X` in the body resolves via GEP+load/store.
+    fn lower_locus_method_bodies(
+        &mut self,
+        l: &LocusDecl,
+    ) -> Result<(), CodegenError> {
+        let info = self
+            .user_loci
+            .get(&l.name.name)
+            .cloned()
+            .expect("locus declared in pass A");
+        for member in &l.members {
+            if let LocusMember::Lifecycle(lc) = member {
+                let kind: &'static str = match lc.kind {
+                    LifecycleKind::Birth => "birth",
+                    LifecycleKind::Run => "run",
+                    _ => continue,
+                };
+                let func = *info
+                    .methods
+                    .get(kind)
+                    .expect("method declared in pass A");
+                let entry = self.context.append_basic_block(func, "entry");
+                self.builder.position_at_end(entry);
+                let self_ptr = func
+                    .get_nth_param(0)
+                    .expect("self_ptr param")
+                    .into_pointer_value();
+                self.current_fn = Some(func);
+                self.current_user_fn_ret = None;
+                self.current_self = Some(SelfCx {
+                    struct_ty: info.struct_ty,
+                    self_ptr,
+                    fields: info.fields.clone(),
+                });
+                self.loops.clear();
+
+                let mut scope = Scope::default();
+                let end = self.lower_block(&lc.body, &mut scope)?;
+                if end == BlockEnd::Open {
+                    self.builder
+                        .build_return(None)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+
+                self.current_fn = None;
+                self.current_self = None;
+            }
+        }
+        Ok(())
     }
 
     /// Declare a user-defined fn's LLVM function value and signature.
@@ -379,6 +642,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder.position_at_end(entry);
         self.current_fn = Some(func);
         self.current_user_fn_ret = Some(sig.ret);
+        self.current_self = None;
         self.loops.clear();
 
         let mut scope = Scope::default();
@@ -425,7 +689,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         name: &str,
         args: &[Expr],
         scope: &Scope<'ctx>,
-        self_state: &BTreeMap<String, ParamValue>,
     ) -> Result<Option<(BasicValueEnum<'ctx>, LotusType)>, CodegenError> {
         let sig = self
             .user_fns
@@ -445,7 +708,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let mut llvm_args: Vec<BasicMetadataValueEnum> =
             Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
-            let (v, ty) = self.lower_expr(a, scope, self_state)?;
+            let (v, ty) = self.lower_expr(a, scope)?;
             if ty != sig.params[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "fn `{}` arg {} type mismatch: expected {:?}, got {:?}",
@@ -487,22 +750,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             .join("::")
                     )));
                 }
-                let name = &path.segments[0].name;
-                let locus_decl = self
-                    .program
-                    .items
-                    .iter()
-                    .find_map(|item| match item {
-                        TopDecl::Locus(l) if &l.name.name == name => Some(l.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        CodegenError::Unsupported(format!(
-                            "no locus `{}` declared",
-                            name
-                        ))
-                    })?;
-                self.lower_locus_birth(&locus_decl, inits)?;
+                let name = path.segments[0].name.as_str();
+                self.lower_locus_instantiation(name, inits, scope)?;
                 Ok(BlockEnd::Open)
             }
             Stmt::Expr(Expr::Call { callee, args, .. }) => {
@@ -512,19 +761,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         if self.user_fns.contains_key(name) {
                             // Discard return value; statement-position
                             // call.
-                            let _ = self.lower_user_fn_call(
-                                name,
-                                args,
-                                scope,
-                                &BTreeMap::new(),
-                            )?;
+                            let _ = self.lower_user_fn_call(name, args, scope)?;
                         } else {
-                            self.lower_print_call(
-                                name,
-                                args,
-                                scope,
-                                &BTreeMap::new(),
-                            )?;
+                            self.lower_print_call(name, args, scope)?;
                         }
                     }
                     Expr::Path(qn) => {
@@ -539,7 +778,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok(BlockEnd::Open)
             }
             Stmt::Let { name, value, .. } => {
-                let (val, ty) = self.lower_expr(value, scope, &BTreeMap::new())?;
+                let (val, ty) = self.lower_expr(value, scope)?;
                 let alloca = self.alloca_for(ty, &name.name)?;
                 self.builder
                     .build_store(alloca, val)
@@ -548,32 +787,86 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok(BlockEnd::Open)
             }
             Stmt::Assign { target, op, value, .. } => {
-                // v0 codegen: only bare-local assignment. `self.X =`
-                // and field/index lvalues require the locus-as-struct
-                // ABI which lands later in phase 3.
-                if target.head.name == "self" || !target.tail.is_empty() {
+                // Resolve the target into a (slot_ptr, slot_ty)
+                // pair. Bare locals come from the scope; `self.X`
+                // GEPs into the current method's self-struct.
+                let (slot_ptr, slot_ty, slot_name) = if target.head.name
+                    == "self"
+                {
+                    if target.tail.len() != 1 {
+                        return Err(CodegenError::Unsupported(format!(
+                            "assignment target `self.{}` with {} segment(s) \
+                             not yet supported",
+                            target
+                                .tail
+                                .iter()
+                                .filter_map(|s| match s {
+                                    LValueSeg::Field(i) => Some(i.name.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("."),
+                            target.tail.len()
+                        )));
+                    }
+                    let field_name = match &target.tail[0] {
+                        LValueSeg::Field(i) => i.name.clone(),
+                        LValueSeg::Index(_) => {
+                            return Err(CodegenError::Unsupported(
+                                "indexed self assignment".to_string(),
+                            ));
+                        }
+                    };
+                    let cs = self.current_self.as_ref().cloned().ok_or_else(
+                        || {
+                            CodegenError::Unsupported(
+                                "`self.X =` outside a locus method".to_string(),
+                            )
+                        },
+                    )?;
+                    let (idx, ty) = *cs.fields.get(&field_name).ok_or_else(
+                        || {
+                            CodegenError::Unsupported(format!(
+                                "no field `{}` on locus self",
+                                field_name
+                            ))
+                        },
+                    )?;
+                    let ptr = self
+                        .builder
+                        .build_struct_gep(
+                            cs.struct_ty,
+                            cs.self_ptr,
+                            idx,
+                            &format!("self.{}.ptr", field_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    (ptr, ty, format!("self.{}", field_name))
+                } else if target.tail.is_empty() {
+                    let (alloca, ty) = scope
+                        .locals
+                        .get(&target.head.name)
+                        .copied()
+                        .ok_or_else(|| {
+                            CodegenError::Unsupported(format!(
+                                "assignment to unbound `{}`",
+                                target.head.name
+                            ))
+                        })?;
+                    (alloca, ty, target.head.name.clone())
+                } else {
                     return Err(CodegenError::Unsupported(
-                        "assignment target other than a local variable"
-                            .to_string(),
+                        "non-self field/index assignment target".to_string(),
                     ));
-                }
-                let (alloca, slot_ty) = scope
-                    .locals
-                    .get(&target.head.name)
-                    .copied()
-                    .ok_or_else(|| {
-                        CodegenError::Unsupported(format!(
-                            "assignment to unbound `{}`",
-                            target.head.name
-                        ))
-                    })?;
-                let (rhs, rhs_ty) =
-                    self.lower_expr(value, scope, &BTreeMap::new())?;
+                };
+
+                let (rhs, rhs_ty) = self.lower_expr(value, scope)?;
                 let new_val = if matches!(op, AssignOp::Eq) {
                     if rhs_ty != slot_ty {
                         return Err(CodegenError::Unsupported(format!(
-                            "type mismatch in assignment: slot {:?} vs rhs {:?}",
-                            slot_ty, rhs_ty
+                            "type mismatch in assignment to `{}`: \
+                             slot {:?} vs rhs {:?}",
+                            slot_name, slot_ty, rhs_ty
                         )));
                     }
                     rhs
@@ -594,13 +887,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     let llvm_ty = self.llvm_basic_type(slot_ty);
                     let cur = self
                         .builder
-                        .build_load(llvm_ty, alloca, &target.head.name)
+                        .build_load(llvm_ty, slot_ptr, &slot_name)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     let (v, _) = self.lower_binop(bin_op, cur, rhs, slot_ty)?;
                     v
                 };
                 self.builder
-                    .build_store(alloca, new_val)
+                    .build_store(slot_ptr, new_val)
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok(BlockEnd::Open)
             }
@@ -629,7 +922,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         scope: &mut Scope<'ctx>,
     ) -> Result<BlockEnd, CodegenError> {
         let (cond_v, cond_ty) =
-            self.lower_expr(&ifs.cond, scope, &BTreeMap::new())?;
+            self.lower_expr(&ifs.cond, scope)?;
         if cond_ty != LotusType::Bool {
             return Err(CodegenError::Unsupported(format!(
                 "if condition must be Bool; got {:?}",
@@ -708,7 +1001,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         // header: evaluate cond and branch
         self.builder.position_at_end(header_bb);
-        let (cond_v, cond_ty) = self.lower_expr(cond, scope, &BTreeMap::new())?;
+        let (cond_v, cond_ty) = self.lower_expr(cond, scope)?;
         if cond_ty != LotusType::Bool {
             return Err(CodegenError::Unsupported(format!(
                 "while condition must be Bool; got {:?}",
@@ -768,8 +1061,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }
             (Some(e), Some(declared_ty)) => {
-                let (v, got_ty) =
-                    self.lower_expr(e, scope, &BTreeMap::new())?;
+                let (v, got_ty) = self.lower_expr(e, scope)?;
                 if got_ty != declared_ty {
                     return Err(CodegenError::Unsupported(format!(
                         "return type mismatch: declared {:?}, got {:?}",
@@ -838,7 +1130,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         &mut self,
         e: &Expr,
         scope: &Scope<'ctx>,
-        self_state: &BTreeMap<String, ParamValue>,
     ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
         match e {
             Expr::Literal(Literal::Int(n), _) => {
@@ -881,17 +1172,39 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Expr::Field { receiver, name, .. }
                 if matches!(receiver.as_ref(), Expr::KwSelf(_)) =>
             {
-                let value = self_state.get(&name.name).ok_or_else(|| {
+                let cs = self.current_self.as_ref().cloned().ok_or_else(
+                    || {
+                        CodegenError::Unsupported(format!(
+                            "self.{} read outside a locus method",
+                            name.name
+                        ))
+                    },
+                )?;
+                let (idx, ty) = *cs.fields.get(&name.name).ok_or_else(|| {
                     CodegenError::Unsupported(format!(
-                        "self.{}: param not in compile-time state",
+                        "no field `{}` on locus self",
                         name.name
                     ))
                 })?;
-                Ok(self.const_param(value))
+                let ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cs.struct_ty,
+                        cs.self_ptr,
+                        idx,
+                        &format!("self.{}.ptr", name.name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let llvm_ty = self.llvm_basic_type(ty);
+                let val = self
+                    .builder
+                    .build_load(llvm_ty, ptr, &format!("self.{}", name.name))
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((val, ty))
             }
             Expr::Binary { op, left, right, span: _ } => {
-                let (lv, lt) = self.lower_expr(left, scope, self_state)?;
-                let (rv, rt) = self.lower_expr(right, scope, self_state)?;
+                let (lv, lt) = self.lower_expr(left, scope)?;
+                let (rv, rt) = self.lower_expr(right, scope)?;
                 if lt != rt {
                     return Err(CodegenError::Unsupported(format!(
                         "binary op operands of mixed types {:?} and {:?}",
@@ -901,17 +1214,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.lower_binop(*op, lv, rv, lt)
             }
             Expr::Unary { op, operand, .. } => {
-                let (v, t) = self.lower_expr(operand, scope, self_state)?;
+                let (v, t) = self.lower_expr(operand, scope)?;
                 self.lower_unop(*op, v, t)
             }
             Expr::Call { callee, args, .. } => match callee.as_ref() {
                 Expr::Ident(i) if self.user_fns.contains_key(&i.name) => {
-                    let result = self.lower_user_fn_call(
-                        i.name.as_str(),
-                        args,
-                        scope,
-                        self_state,
-                    )?;
+                    let result =
+                        self.lower_user_fn_call(i.name.as_str(), args, scope)?;
                     result.ok_or_else(|| {
                         CodegenError::Unsupported(format!(
                             "fn `{}` returns no value but is used in \
@@ -1105,16 +1414,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
     }
 
-    /// Lower a `print` / `println` call. Used from both the
-    /// fn-body context (where args may reference local
-    /// bindings) and the birth-body context (where args may
-    /// reference compile-time-known self.X params).
+    /// Lower a `print` / `println` call. Args resolve through the
+    /// current scope and (when set) the current `self` struct, so
+    /// the same lowering serves both ordinary fn bodies and
+    /// lifecycle-method bodies.
     fn lower_print_call(
         &mut self,
         name: &str,
         args: &[Expr],
         scope: &Scope<'ctx>,
-        self_state: &BTreeMap<String, ParamValue>,
     ) -> Result<(), CodegenError> {
         if name != "println" && name != "print" {
             return Err(CodegenError::Unsupported(format!("builtin `{}`", name)));
@@ -1135,7 +1443,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 format.push_str(&escape_format(s));
                 continue;
             }
-            let (val, ty) = self.lower_expr(a, scope, self_state)?;
+            let (val, ty) = self.lower_expr(a, scope)?;
             match ty {
                 LotusType::Int => {
                     format.push_str("%lld");
@@ -1203,9 +1511,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let segs: Vec<&str> =
             qn.segments.iter().map(|s| s.name.as_str()).collect();
         match segs.as_slice() {
-            ["time", "sleep"] => {
-                self.lower_time_sleep(args, scope, &BTreeMap::new())
-            }
+            ["time", "sleep"] => self.lower_time_sleep(args, scope),
             _ => Err(CodegenError::Unsupported(format!(
                 "path call `{}`",
                 segs.join("::")
@@ -1234,7 +1540,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         &mut self,
         args: &[Expr],
         scope: &Scope<'ctx>,
-        self_state: &BTreeMap<String, ParamValue>,
     ) -> Result<(), CodegenError> {
         if args.len() != 1 {
             return Err(CodegenError::Unsupported(format!(
@@ -1242,7 +1547,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 args.len()
             )));
         }
-        let (val, ty) = self.lower_expr(&args[0], scope, self_state)?;
+        let (val, ty) = self.lower_expr(&args[0], scope)?;
         if ty != LotusType::Duration {
             return Err(CodegenError::Unsupported(format!(
                 "time::sleep expects Duration, got {:?}",
@@ -1369,68 +1674,92 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(())
     }
 
-    /// Lower `LocusName { ... };` for a locus that has only
-    /// `params` and `birth()`. The locus's state is a flat
-    /// scope of scalars (string / Int / Float / Bool); birth()
-    /// runs inline against them. Beyond birth(), the rest of
-    /// the lifecycle is unimplemented in this milestone.
-    fn lower_locus_birth(
+    /// Statement-level locus instantiation `T { f: v, ... };`.
+    /// Allocates a struct on the caller's stack, fills its fields
+    /// (defaults overridden by the call site), then calls birth()
+    /// and run() if present. The locus is ephemeral: when the
+    /// surrounding fn returns the alloca is reclaimed. Long-lived
+    /// loci wait on the cooperative scheduler + region allocator.
+    fn lower_locus_instantiation(
         &mut self,
-        locus: &LocusDecl,
+        locus_name: &str,
         inits: &[StructInit],
+        scope: &Scope<'ctx>,
     ) -> Result<(), CodegenError> {
-        let mut state: std::collections::BTreeMap<String, ParamValue> =
-            std::collections::BTreeMap::new();
-        for member in &locus.members {
-            if let LocusMember::Params(pb) = member {
-                for p in &pb.params {
-                    if let ParamInit::Value(e) = &p.init {
-                        state.insert(p.name.name.clone(), param_value(e)?);
-                    }
-                }
+        let info = self
+            .user_loci
+            .get(locus_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "no locus `{}` declared",
+                    locus_name
+                ))
+            })?;
+
+        // Build a name → override-expr map for the call site.
+        let overrides: BTreeMap<&str, &Expr> = inits
+            .iter()
+            .map(|i| (i.name.name.as_str(), &i.value))
+            .collect();
+
+        let self_ptr = self
+            .builder
+            .build_alloca(info.struct_ty, &format!("{}.self", locus_name))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // Initialize each field. Overrides go through lower_expr in
+        // the caller's scope so any expression — not just literals —
+        // can be passed; defaults are pre-resolved literals stored
+        // on the LocusInfo.
+        for (i, (fname, default)) in info.defaults.iter().enumerate() {
+            let (val, val_ty) = if let Some(expr) = overrides.get(fname.as_str())
+            {
+                self.lower_expr(expr, scope)?
+            } else {
+                self.const_param(default)
+            };
+            let (_, declared_ty) = info
+                .fields
+                .get(fname)
+                .copied()
+                .expect("field declared by declare_user_locus");
+            if val_ty != declared_ty {
+                return Err(CodegenError::Unsupported(format!(
+                    "locus `{}` field `{}` type mismatch: declared {:?}, \
+                     got {:?}",
+                    locus_name, fname, declared_ty, val_ty
+                )));
             }
-        }
-        for init in inits {
-            state.insert(init.name.name.clone(), param_value(&init.value)?);
+            let field_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    i as u32,
+                    &format!("{}.{}.ptr", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(field_ptr, val)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
 
-        // Lower birth() body.
-        let birth = locus.members.iter().find_map(|m| match m {
-            LocusMember::Lifecycle(lc) if matches!(lc.kind, LifecycleKind::Birth) => {
-                Some(lc.body.clone())
+        // Fire birth(), then run() if either is declared. accept /
+        // drain / dissolve are not yet implemented for codegen.
+        for kind in &["birth", "run"] {
+            if let Some(method) = info.methods.get(kind) {
+                self.builder
+                    .build_call(
+                        *method,
+                        &[self_ptr.into()],
+                        &format!("{}.{}.call", locus_name, kind),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }
-            _ => None,
-        });
-        let Some(body) = birth else {
-            return Ok(());
-        };
-        for stmt in &body.stmts {
-            self.lower_birth_stmt(stmt, &state)?;
         }
+
         Ok(())
-    }
-
-    fn lower_birth_stmt(
-        &mut self,
-        stmt: &Stmt,
-        state: &BTreeMap<String, ParamValue>,
-    ) -> Result<(), CodegenError> {
-        match stmt {
-            Stmt::Expr(Expr::Call { callee, args, .. }) => {
-                let name = match callee.as_ref() {
-                    Expr::Ident(i) => i.name.as_str(),
-                    _ => {
-                        return Err(CodegenError::Unsupported(
-                            "non-identifier callee".to_string(),
-                        ))
-                    }
-                };
-                self.lower_print_call(name, args, &Scope::default(), state)
-            }
-            _ => Err(CodegenError::Unsupported(
-                "birth-body statement other than println / print".to_string(),
-            )),
-        }
     }
 
     fn global_string(&mut self, s: &str) -> PointerValue<'ctx> {

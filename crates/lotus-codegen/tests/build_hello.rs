@@ -561,6 +561,170 @@ fn monotonic_sleep_example_builds_and_runs() {
 }
 
 #[test]
+fn build_locus_runtime_self_reads_in_run() {
+    // self.n + self.greeting both read at runtime via GEP+load
+    // inside run()'s while loop — no compile-time constant
+    // shortcut.
+    let src = r#"
+        locus T {
+            params {
+                n: Int = 4;
+                greeting: String = "hi";
+            }
+            run() {
+                let mut i = 0;
+                while i < self.n {
+                    println(self.greeting, " ", i);
+                    i = i + 1;
+                }
+            }
+        }
+        fn main() { T { n: 3, greeting: "yo" }; }
+    "#;
+    let (stdout, status) = build_and_run("locus_runtime_reads", src);
+    assert!(status.success());
+    assert!(stdout.contains("yo 0"), "got: {:?}", stdout);
+    assert!(stdout.contains("yo 1"), "got: {:?}", stdout);
+    assert!(stdout.contains("yo 2"), "got: {:?}", stdout);
+    assert!(!stdout.contains("yo 3"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_locus_self_field_mutation() {
+    // birth() sets self.count, run() increments it in a loop and
+    // reads it back — exercises self.X = via GEP+store and the
+    // birth → run state handoff.
+    let src = r#"
+        locus Counter {
+            params {
+                count: Int = 0;
+                limit: Int = 5;
+            }
+            birth() {
+                self.count = 10;
+            }
+            run() {
+                while self.count < self.limit + 10 {
+                    self.count = self.count + 1;
+                }
+                println("final=", self.count);
+            }
+        }
+        fn main() { Counter { limit: 3 }; }
+    "#;
+    // birth: count=10. run loops while count<13 → count=13 then exit.
+    let (stdout, status) = build_and_run("locus_self_mut", src);
+    assert!(status.success());
+    assert!(stdout.contains("final=13"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_locus_compound_self_assignment() {
+    let src = r#"
+        locus C {
+            params { n: Int = 0; }
+            birth() {
+                self.n += 100;
+                self.n *= 2;
+                self.n -= 7;
+            }
+            run() {
+                println("n=", self.n);
+            }
+        }
+        fn main() { C { }; }
+    "#;
+    // 0 + 100 = 100; * 2 = 200; - 7 = 193
+    let (stdout, status) = build_and_run("locus_compound_self", src);
+    assert!(status.success());
+    assert!(stdout.contains("n=193"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_short_ticker_with_sleep_and_self() {
+    // Like 01-locus-with-run but with a 10ms interval to keep the
+    // test fast. Exercises the canonical pattern: self.n bound,
+    // self.interval threaded into time::sleep, mut local counter
+    // — all in run().
+    let src = r#"
+        locus Ticker {
+            params {
+                n: Int = 3;
+                interval: Duration = 10ms;
+            }
+            run() {
+                let mut i = 0;
+                while i < self.n {
+                    println("tick ", i);
+                    time::sleep(self.interval);
+                    i = i + 1;
+                }
+            }
+        }
+        fn main() { Ticker { }; }
+    "#;
+    let (stdout, status) = build_and_run("short_ticker", src);
+    assert!(status.success());
+    assert!(stdout.contains("tick 0"), "got: {:?}", stdout);
+    assert!(stdout.contains("tick 2"), "got: {:?}", stdout);
+    assert!(!stdout.contains("tick 3"), "got: {:?}", stdout);
+}
+
+#[test]
+fn locus_with_run_canonical_example_builds_and_runs() {
+    // The canonical 01-locus-with-run, rebuilt against the
+    // codegen path. 3 × 500ms sleeps land us at ~1.5s; tolerable
+    // for a single integration test.
+    let mut src_path = examples_dir();
+    src_path.push("01-locus-with-run");
+    src_path.push("main.lt");
+    let source = std::fs::read_to_string(&src_path).expect("read source");
+    let program = lotus_syntax::parse_source(&source).expect("parse");
+
+    let temp_dir = std::env::temp_dir();
+    let mut bin_path = temp_dir.clone();
+    bin_path.push("lotus_test_01_ticker");
+
+    build_executable(&program, &bin_path).expect("build");
+    let start = Instant::now();
+    let output = Command::new(&bin_path).output().expect("run");
+    let elapsed = start.elapsed();
+    let _ = std::fs::remove_file(&bin_path);
+
+    assert!(output.status.success(), "non-zero: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tick 0"), "got: {:?}", stdout);
+    assert!(stdout.contains("tick 2"), "got: {:?}", stdout);
+    assert!(
+        elapsed.as_millis() >= 1500,
+        "ticker returned too early: {:?}",
+        elapsed
+    );
+}
+
+#[test]
+fn stateful_locus_example_builds_and_runs() {
+    let mut src_path = examples_dir();
+    src_path.push("10-stateful-locus");
+    src_path.push("main.lt");
+    let source = std::fs::read_to_string(&src_path).expect("read source");
+    let program = lotus_syntax::parse_source(&source).expect("parse");
+
+    let temp_dir = std::env::temp_dir();
+    let mut bin_path = temp_dir.clone();
+    bin_path.push("lotus_test_10_stateful_locus");
+
+    build_executable(&program, &bin_path).expect("build");
+    let output = Command::new(&bin_path).output().expect("run");
+    let _ = std::fs::remove_file(&bin_path);
+
+    assert!(output.status.success(), "non-zero: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("total=160"), "got: {:?}", stdout);
+    assert!(stdout.contains("step=30"), "got: {:?}", stdout);
+}
+
+#[test]
 fn functions_example_builds_and_runs() {
     let mut src_path = examples_dir();
     src_path.push("09-functions");

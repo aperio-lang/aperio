@@ -303,6 +303,62 @@ For each locus, the compiler generates:
 The runtime provides the underlying bump allocators, free-list
 machinery, scheduler integration, and lifecycle dispatcher.
 
+## Codegen ABI (v0)
+
+The native-codegen path (`lotus build`) lowers each locus to an
+LLVM struct one field per declared param, and each lifecycle
+method to an LLVM function whose first parameter is a pointer to
+that struct. Field reads / writes via `self.X` lower to
+`getelementptr` + `load` / `store` against the `self_ptr`. This
+is the substrate the region allocator + scheduler will sit on top
+of when they land — the ABI is the load-bearing contract; the
+allocator and dispatcher refine *where* the struct is allocated
+and *how* methods get scheduled, not the struct's shape.
+
+```
+locus T {
+    params { n: Int = 0; interval: Duration = 1s; }
+    birth() { ... }
+    run()   { ... }
+}
+```
+
+lowers to:
+
+```
+%locus.T = type { i64, i64 }                ; n, interval
+declare void @T.birth(ptr %self)
+declare void @T.run(ptr %self)
+```
+
+Statement-level instantiation `T { ... };` lowers to: `alloca`
+on the caller's stack, store each field (call-site override or
+declared default), call `T.birth(self_ptr)`, call `T.run(self_ptr)`
+if declared. v0 codegen is **ephemeral-only** — the alloca is
+freed when the enclosing fn returns; long-lived loci, the
+parent-child region hierarchy described above, and `accept` /
+`drain` / `dissolve` lifecycle dispatch wait on the cooperative
+scheduler + region allocator work.
+
+Constraints v0 codegen enforces (will relax as more lands):
+
+- Only `birth` and `run` lifecycle methods compile; `accept`,
+  `drain`, `dissolve` are accepted in the AST but rejected at
+  codegen time.
+- Lifecycle methods take no user-declared params (only the
+  implicit `self`) and return `void`.
+- Locus param defaults must be literals (Int / Float / Bool /
+  String / Duration). Non-literal defaults compile under the
+  interpreter but not via `lotus build`.
+- Locus members other than `params` and `birth`/`run` (modes,
+  contracts, bus blocks, closures, nested fns / consts / types)
+  are rejected at declare time so a partially-supported locus
+  doesn't silently produce dead code.
+
+The struct ABI is what makes `01-locus-with-run` and
+`10-stateful-locus` compile to native ELF identically to their
+interpreter behavior.
+
 ## Future work
 
 - **Hot-load preservation across perspective updates.** When a

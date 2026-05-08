@@ -40,6 +40,15 @@ fn hello_world_runs() {
 }
 
 #[test]
+fn locus_with_run_runs() {
+    // Was previously deferred (3 × 500ms = 1.5s of sleep under
+    // cargo test). Now that the canonical example also has a
+    // codegen-side build test of the same shape, we may as well
+    // gate the interpreter path the same way.
+    assert_eq!(parse_and_run("01-locus-with-run/main.lt").unwrap(), 0);
+}
+
+#[test]
 fn parent_child_runs() {
     assert_eq!(parse_and_run("02-parent-child/main.lt").unwrap(), 0);
 }
@@ -112,6 +121,14 @@ fn functions_runs() {
 }
 
 #[test]
+fn stateful_locus_runs() {
+    assert_eq!(
+        parse_and_run("10-stateful-locus/main.lt").unwrap(),
+        0
+    );
+}
+
+#[test]
 fn bus_runs() {
     assert_eq!(parse_and_run("05-bus/main.lt").unwrap(), 0);
 }
@@ -139,10 +156,6 @@ fn bus_runs_under_ringbuffer_transport() {
     let exit = run_bundle_with_bus(&[&program], bus_config).unwrap();
     assert_eq!(exit, 0);
 }
-
-// 01-locus-with-run uses time::sleep with 500ms intervals;
-// running it under cargo test would stall. Smoke-tested
-// manually via `lotus run examples/01-locus-with-run/main.lt`.
 
 // 05-bus exits immediately under v0 (the bus router is a
 // no-op), so it doesn't exercise observable behavior.
