@@ -1,0 +1,77 @@
+// 04-modes — one kernel, three projections.
+//
+// An aggregator over leaf children that exposes the same
+// underlying state through three modes:
+//   - bulk:       total sum across all children (aggregate)
+//   - harmonic:   count of children (per-class projection;
+//                 for homogeneous accept, this is just the
+//                 cardinality)
+//   - resolution: largest single child value (tail / edge)
+//
+// All three read self.children, the locus's typed collection
+// of accepted coordinatees. They share the locus's arena (per
+// design commitment F.5), so no copy or extra allocation
+// happens between modes.
+
+locus LeafL {
+    params {
+        value: int = 0;
+    }
+    contract {
+        expose value: int;
+    }
+}
+
+locus AggregatorL {
+    params {
+        B: int = 100;
+        c: int = 1;
+        sigma: int = 1;
+        phi: float = 1.0;
+    }
+
+    contract {
+        consume value: int;
+    }
+
+    mode bulk() -> int {
+        let mut total: int = 0;
+        for child in self.children {
+            total = total + child.value;
+        }
+        return total;
+    }
+
+    mode harmonic() -> int {
+        let mut count: int = 0;
+        for child in self.children {
+            count = count + 1;
+        }
+        return count;
+    }
+
+    mode resolution() -> int {
+        let mut max: int = 0;
+        for child in self.children {
+            if child.value > max {
+                max = child.value;
+            }
+        }
+        return max;
+    }
+
+    run() {
+        // Bind so leaves persist for the duration of run().
+        let _l1 = LeafL { value: 10 };
+        let _l2 = LeafL { value: 20 };
+        let _l3 = LeafL { value: 30 };
+
+        println("bulk (total):     ", self.bulk());
+        println("harmonic (count): ", self.harmonic());
+        println("resolution (max): ", self.resolution());
+    }
+}
+
+fn main() {
+    AggregatorL { };
+}

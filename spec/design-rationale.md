@@ -898,6 +898,78 @@ ClosureViolation can:
   (semantics: the closure violation invalidates this child's
   state; restart gives a fresh attempt)
 
+### F.10 Mode keywords as member names
+
+(Added in v0.1.5 from 04-modes.)
+
+The keywords `bulk`, `harmonic`, `resolution` are reserved at
+the lexer level (per `tokens.md`). They appear at top-level in
+the grammar as part of `mode_decl`. They also need to appear
+post-`.` and post-`::` for member access — `self.bulk()` is the
+natural mode-invocation syntax.
+
+The grammar's `postfix_op` non-terminal admits a `member_name`
+production that accepts either an `IDENTIFIER` or one of the
+three mode keywords. This permits `self.bulk()` while keeping
+`bulk` as a reserved word at top-level.
+
+Considered and rejected:
+
+- *Rename modes to non-keywords (e.g., `BulkMode`).* Reject;
+  ruins framework-vocabulary alignment.
+- *Use a separate mode-invocation syntax (`self::bulk()` or
+  `mode_bulk(self)`).* Reject; less ergonomic than method-style.
+- *Make modes not-callable-by-name; only invoked via runtime
+  context.* Reject for v0; users want to be able to invoke
+  specific modes for debugging and direct queries. Future
+  versions might add an "implicit mode selection" mechanism on
+  top.
+
+This is the same approach Rust takes with raw identifiers
+(though Rust uses `r#` prefix for any keyword; lotus permits
+just the mode keywords post-dot, less surface area).
+
+### F.11 `self.children` typing and lifecycle
+
+(Added in v0.1.5 from 04-modes.)
+
+A locus that declares `accept(c: ChildType)` exposes
+`self.children` as a typed iterable — specifically, `[ChildType]`
+(slice / list) of the currently-attached coordinatees.
+
+Membership in `self.children`:
+
+- A child enters `self.children` *after* `accept(c)` returns
+  normally (i.e., accepts the child). Per F.7, `accept()` runs
+  before child registration; if `accept()` rejects, the child
+  is never added to `self.children`.
+- A child exits `self.children` when it dissolves — clean
+  collapse or explosion both remove the child from the
+  collection. (For explosions, the parent's
+  `on_failure(self, ClosureViolation)` is invoked alongside
+  removal.)
+
+Iteration with `for c in self.children` is O(N) for chunked-
+class loci. The cost reflects the projection class:
+
+- Rich (proj_rich): `self.children` is a small array; iteration
+  is trivial.
+- Chunked (proj_chunked): `self.children` is a chunked array
+  with sub-region pointers; iteration is O(N) with one indirect
+  load per child.
+- Recognition (proj_recognition): `self.children` is a fixed
+  pre-allocated pool with summary statistics — iteration may
+  be discouraged by the compiler in favor of summary access
+  (e.g., `self.children.count` vs `count = ...; for c in
+  self.children { count = count + 1; }`).
+
+**v0 limitation: single-accept-type only.** A locus with
+`accept(c: ChildType)` for a single ChildType has well-typed
+`self.children`. A locus that accepts multiple types
+(`accept(c: TypeA)` and `accept(c: TypeB)` overloads — not
+yet in grammar) would need `self.children` as a sum type
+(`[TypeA | TypeB]`) and is deferred to a future version.
+
 ### F.5 Mode-projections share the locus's arena
 
 A locus may declare any subset of `mode bulk`, `mode harmonic`,

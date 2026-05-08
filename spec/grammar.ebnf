@@ -374,10 +374,20 @@ multiplicative_expr = unary_expr , { ( "*" | "/" | "%" ) , unary_expr } ;
 unary_expr        = [ "-" | "!" | "~" ] , postfix_expr ;
 
 postfix_expr      = primary_expr , { postfix_op } ;
-postfix_op        = "." , IDENTIFIER
-                  | "::" , IDENTIFIER
+postfix_op        = "." , member_name
+                  | "::" , member_name
                   | "(" , [ argument_list ] , ")"
                   | "[" , expression , "]"
+                  ;
+
+(* member_name accepts identifiers AND mode keywords as field /
+   method names. Without this, `self.bulk()` would not parse
+   because `bulk` is a reserved keyword. Other contexts may
+   relax this further if needed. *)
+member_name       = IDENTIFIER
+                  | "bulk"
+                  | "harmonic"
+                  | "resolution"
                   ;
 
 primary_expr      = literal
