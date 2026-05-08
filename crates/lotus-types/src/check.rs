@@ -36,6 +36,42 @@ fn method_to_fn_ty(m: &MethodInfo) -> Ty {
     }
 }
 
+/// True if the match arms cover every possible scrutinee
+/// value. v0 rules:
+///   - Any arm without a guard whose pattern is wildcard `_`
+///     or a bare binding makes the match exhaustive.
+///   - For Bool scrutinee: literal `true` AND literal `false`
+///     arms (both unguarded) is also exhaustive.
+///   - For everything else: a wildcard / binding is required.
+///     The grammar's match is not currently used with
+///     enum-variant patterns; when that lands the rule will
+///     extend to "every variant covered".
+fn match_is_exhaustive(scrut_ty: &Ty, arms: &[MatchArm]) -> bool {
+    let unguarded = |a: &&MatchArm| a.guard.is_none();
+    let has_catchall = arms.iter().filter(unguarded).any(|a| {
+        matches!(a.pattern, Pattern::Wildcard(_) | Pattern::Binding(_))
+    });
+    if has_catchall {
+        return true;
+    }
+    if matches!(scrut_ty, Ty::Prim(PrimType::Bool)) {
+        let mut has_true = false;
+        let mut has_false = false;
+        for arm in arms.iter().filter(unguarded) {
+            if let Pattern::Literal(Literal::Bool(b), _) = &arm.pattern {
+                if *b {
+                    has_true = true;
+                } else {
+                    has_false = true;
+                }
+            }
+        }
+        return has_true && has_false;
+    }
+    // Be permissive on Unknown — we genuinely can't say.
+    matches!(scrut_ty, Ty::Unknown)
+}
+
 /// True if `e` is composed entirely of literals — no
 /// identifiers, no `self`, no calls, no field access. Used by
 /// closure-cycle-existence: a closure assertion with pure-
@@ -505,7 +541,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_match(&mut self, stmt: &MatchStmt) {
-        let _ = self.check_expr(&stmt.scrutinee);
+        let scrut_ty = self.check_expr(&stmt.scrutinee);
         for arm in &stmt.arms {
             if let Some(g) = &arm.guard {
                 let _ = self.check_expr(g);
@@ -516,6 +552,16 @@ impl<'a> Checker<'a> {
                 }
                 MatchArmBody::Block(b) => self.check_block(b),
             }
+        }
+        if !match_is_exhaustive(&scrut_ty, &stmt.arms) {
+            self.diags.push(Diag::ty(
+                stmt.span,
+                format!(
+                    "match is not exhaustive; add a `_` arm or cover all \
+                     cases of `{}`",
+                    scrut_ty.display()
+                ),
+            ));
         }
     }
 

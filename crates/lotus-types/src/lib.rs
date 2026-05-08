@@ -249,6 +249,77 @@ mod tests {
     }
 
     #[test]
+    fn err_match_not_exhaustive() {
+        let src = r#"
+            fn main() {
+                let x = 7;
+                match x {
+                    1 -> println("one"),
+                    2 -> println("two"),
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("not exhaustive")),
+            "expected exhaustiveness error; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_match_with_wildcard() {
+        let src = r#"
+            fn main() {
+                let x = 7;
+                match x {
+                    1 -> println("one"),
+                    _ -> println("other"),
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "expected no diags; got: {:?}", diags);
+    }
+
+    #[test]
+    fn ok_bool_match_covers_both_cases() {
+        let src = r#"
+            fn main() {
+                let x = true;
+                match x {
+                    true -> println("yes"),
+                    false -> println("no"),
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(diags.is_empty(), "expected no diags; got: {:?}", diags);
+    }
+
+    #[test]
+    fn err_bool_match_only_true() {
+        let src = r#"
+            fn main() {
+                let x = true;
+                match x {
+                    true -> println("yes"),
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("not exhaustive")),
+            "expected exhaustiveness error; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn err_typo_on_struct_value() {
         let src = r#"
             type Point { x: Int; y: Int; }
