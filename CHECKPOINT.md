@@ -69,7 +69,7 @@ m6  Codegen milestone 6: multi-fn programs                      (9955bea)
 m7  Codegen milestone 7: locus runtime ABI    ← load-bearing    (206fbd0)
 m8  Codegen milestone 8: accept() + parent-child wiring         (d5afffd)
 m9  Codegen milestone 9: time::monotonic() + Duration arith     (cdd7353)
-m10 Codegen milestone 10: drain() / dissolve() lifecycle        (this commit)
+m10 Codegen milestone 10: drain() / dissolve() lifecycle        (3ba3e05)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
