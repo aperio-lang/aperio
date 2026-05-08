@@ -11,24 +11,24 @@
 
 locus GreeterL {
     params {
-        greeting: string = "hello";
+        greeting: String = "hello";
     }
 
     contract {
-        expose greeting: string;
+        expose greeting: String;
     }
 }
 
 locus CoordinatorL {
     params {
-        B: int = 100;        // budget: 100 units
-        c: int = 1;          // attach cost per coordinatee
-        sigma: int = 1;      // summary cost per coordinatee
-        phi: float = 1.0;    // formality: fully typed contract
+        B: Int = 100;        // budget: 100 units
+        c: Int = 1;          // attach cost per coordinatee
+        sigma: Int = 1;      // summary cost per coordinatee
+        phi: Float = 1.0;    // formality: fully typed contract
     }
 
     contract {
-        consume greeting: string;
+        consume greeting: String;
     }
 
     accept(g: GreeterL) {

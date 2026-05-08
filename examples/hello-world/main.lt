@@ -6,7 +6,7 @@
 
 locus HelloL {
     params {
-        greeting: string = "hello, world";
+        greeting: String = "hello, world";
     }
 
     birth() {

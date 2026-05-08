@@ -123,13 +123,25 @@ or closure block. It refers to the enclosing locus's own params
 and contract-exposed state. Outside such a block, `self` is a
 parse error.
 
-### Type keywords (built-in primitives)
+### Predefined type names (NOT keywords)
 
 ```
-int             uint            float           decimal
-string          bool            time            duration
-bytes
+Int             Uint            Float           Decimal
+String          Bool            Time            Duration
+Bytes
 ```
+
+PascalCase per the type-name convention. The lexer emits these
+as `Ident` tokens; the parser recognizes them by name in **type
+position only**. In expression / namespace position, these names
+are unreserved — `time::sleep` is a regular path because `time`
+(lowercase) is an ordinary identifier. This eliminates the
+lexical collision between primitive type names and stdlib
+namespace names that would otherwise occur.
+
+Shadowing a predefined type name with a user-defined type
+(`type Int = ...`) is permitted by the grammar but produces a
+compiler warning.
 
 ### Reserved for future use (not yet legal)
 
@@ -175,6 +187,17 @@ yield           macro           where           with
 ```
 ~~          equivalent to `approx`; tests value approximate-equal
             within a stated tolerance band. Used in closure tests.
+```
+
+### Bus send
+
+```
+<-          Send a typed message on a declared bus subject:
+            `"subject" <- value;`. The left side names a subject
+            declared in the locus's `bus { publish ... }`; the
+            right side is the typed payload. Same Erlang-shape
+            as `Pid ! Msg`; one-direction (subscribe is
+            declarative, not an operator).
 ```
 
 ### Member access / call / index

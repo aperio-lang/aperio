@@ -119,16 +119,12 @@ pub enum TokenKind {
     Tier,
     KwSelf,
 
-    // Keywords — primitive types
-    Int,
-    Uint,
-    Float,
-    Decimal,
-    StringTy,
-    Bool,
-    Time,
-    Duration,
-    Bytes,
+    // (Primitive type names are not keywords. They are predefined
+    // identifiers — `Int`, `Uint`, `Float`, `Decimal`, `String`,
+    // `Bool`, `Time`, `Duration`, `Bytes` — recognized in type
+    // position by the parser. Lowercase forms have no language
+    // meaning and may be used as ordinary identifiers / namespaces
+    // (e.g. `time::sleep`).)
 
     // Keywords — reserved (parse-error if used)
     Trait,
@@ -162,6 +158,7 @@ pub enum TokenKind {
     Tilde,      // ~
     Shl,        // <<
     Shr,        // >>
+    LeftArrow,  // <-  (bus send: `"subject" <- msg`)
     PlusEq,     // +=
     MinusEq,    // -=
     StarEq,     // *=
@@ -421,16 +418,9 @@ impl<'a> Lexer<'a> {
             "tier" => TokenKind::Tier,
             "self" => TokenKind::KwSelf,
 
-            // Primitive types
-            "int" => TokenKind::Int,
-            "uint" => TokenKind::Uint,
-            "float" => TokenKind::Float,
-            "decimal" => TokenKind::Decimal,
-            "string" => TokenKind::StringTy,
-            "bool" => TokenKind::Bool,
-            "time" => TokenKind::Time,
-            "duration" => TokenKind::Duration,
-            "bytes" => TokenKind::Bytes,
+            // (Primitive type names are NOT keywords; they fall
+            // through to the `Ident` case below and are recognized
+            // by the parser in type position.)
 
             // Reserved
             "trait" => TokenKind::Trait,
@@ -784,6 +774,7 @@ impl<'a> Lexer<'a> {
                 "^=" => emit!(TokenKind::CaretEq, 2),
                 "~~" => emit!(TokenKind::TildeTilde, 2),
                 "->" => emit!(TokenKind::Arrow, 2),
+                "<-" => emit!(TokenKind::LeftArrow, 2),
                 "=>" => emit!(TokenKind::FatArrow, 2),
                 "::" => emit!(TokenKind::ColonColon, 2),
                 ".." => emit!(TokenKind::DotDot, 2),

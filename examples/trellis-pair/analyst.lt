@@ -16,10 +16,10 @@ import "trellis-pair/shared";
 locus AnalystL {
     params {
         // Locus capacity parameters
-        B: int = 1000;
-        c: int = 10;
-        sigma: int = 1;
-        phi: float = 1.0;
+        B: Int = 1000;
+        c: Int = 10;
+        sigma: Int = 1;
+        phi: Float = 1.0;
 
         // Locus state
         latest_kernel: TradeKernel = TradeKernel {
@@ -27,8 +27,8 @@ locus AnalystL {
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
-        published_count: int = 0;
-        validation_count: int = 0;
+        published_count: Int = 0;
+        validation_count: Int = 0;
     }
 
     bus {
@@ -53,7 +53,7 @@ locus AnalystL {
             validation_count: self.validation_count,
         };
         if p.is_stable() {
-            publish("trellis.kernel", self.latest_kernel);
+            "trellis.kernel" <- self.latest_kernel;
             self.published_count = self.published_count + 1;
         }
     }

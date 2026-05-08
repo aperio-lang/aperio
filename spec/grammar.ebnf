@@ -224,15 +224,21 @@ type_expr         = primitive_type
                   | "(" , type_expr , ")"
                   ;
 
-primitive_type    = "int"
-                  | "uint"
-                  | "float"
-                  | "decimal"
-                  | "string"
-                  | "bool"
-                  | "time"
-                  | "duration"
-                  | "bytes"
+(* Predefined primitive type names. PascalCase. The lexer emits
+   these as IDENTIFIER tokens; the parser recognizes them by
+   name in type position only. In expression / namespace
+   position, the lowercase forms (`time`, `string`, etc.) are
+   ordinary identifiers and may be used as stdlib namespaces.
+   See F.15 in design-rationale.md. *)
+primitive_type    = "Int"
+                  | "Uint"
+                  | "Float"
+                  | "Decimal"
+                  | "String"
+                  | "Bool"
+                  | "Time"
+                  | "Duration"
+                  | "Bytes"
                   ;
 
 named_type        = qualified_name , [ generic_args ] ;
@@ -268,6 +274,7 @@ block             = "{" , { statement } , "}" ;
 
 statement         = let_stmt
                   | assign_stmt
+                  | send_stmt
                   | if_stmt
                   | match_stmt
                   | for_stmt
@@ -286,8 +293,16 @@ let_stmt          = "let" , [ "mut" ] , IDENTIFIER ,
 assign_stmt       = lvalue , assign_op , expression , ";" ;
 assign_op         = "=" | "+=" | "-=" | "*=" | "/=" | "%="
                   | "&=" | "|=" | "^=" ;
-lvalue            = IDENTIFIER , { "." , IDENTIFIER
-                                 | "[" , expression , "]" } ;
+lvalue            = ( IDENTIFIER | "self" ) ,
+                    { "." , IDENTIFIER | "[" , expression , "]" } ;
+
+(* Bus send: `"subject" <- payload;`. Statement-shape only;
+   produces no value. The left side is a string literal naming
+   a subject declared in the enclosing locus's bus block; the
+   right side is the typed payload. The compiler verifies the
+   subject is declared and the type matches at each call site.
+   See F.12 in design-rationale.md. *)
+send_stmt         = expression , "<-" , expression , ";" ;
 
 if_stmt           = "if" , expression , block ,
                     { "else" , "if" , expression , block } ,

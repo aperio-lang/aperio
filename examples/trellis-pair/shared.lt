@@ -9,28 +9,28 @@
 // source.
 
 type Book {
-    bid_price: decimal;
-    ask_price: decimal;
-    timestamp: time;
+    bid_price: Decimal;
+    ask_price: Decimal;
+    timestamp: Time;
 }
 
 type TradeKernel {
-    multiplier: decimal;
-    valid_after: time;
-    perspective_id: int;
+    multiplier: Decimal;
+    valid_after: Time;
+    perspective_id: Int;
 }
 
 type Intent {
-    side: string;            // "buy" or "sell"
-    price: decimal;
-    quantity: decimal;
-    intent_id: int;
+    side: String;            // "buy" or "sell"
+    price: Decimal;
+    quantity: Decimal;
+    intent_id: Int;
 }
 
 type Fill {
-    intent_id: int;
-    fill_price: decimal;
-    fill_quantity: decimal;
+    intent_id: Int;
+    fill_price: Decimal;
+    fill_quantity: Decimal;
 }
 
 // A serializable parameter bundle within the shared schema.
@@ -40,7 +40,7 @@ type Fill {
 perspective TradeKernelPerspective {
     params {
         kernel: TradeKernel;
-        validation_count: int = 0;
+        validation_count: Int = 0;
     }
 
     stable_when {

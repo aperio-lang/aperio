@@ -418,6 +418,15 @@ pub enum Stmt {
         modifier: Option<RecoveryModifier>,
         span: Span,
     },
+    /// Bus send: `subject <- value;`. The `subject` expression must
+    /// resolve to a string-typed value naming a publish-declared
+    /// channel; the value's type must match the channel's declared
+    /// payload type. The compiler verifies both at type-check time.
+    Send {
+        subject: Expr,
+        value: Expr,
+        span: Span,
+    },
     Expr(Expr),
 }
 

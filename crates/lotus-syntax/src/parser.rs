@@ -1003,41 +1003,14 @@ impl Parser {
     fn parse_type_expr(&mut self) -> Result<TypeExpr, Diag> {
         let start = self.peek_token().span;
         match self.peek() {
-            TokenKind::Int => {
+            // Primitive type names are predefined identifiers; the
+            // parser recognizes the canonical PascalCase spellings
+            // and produces TypeExpr::Primitive. Lowercase / other
+            // names fall through to the named-type path.
+            TokenKind::Ident(name) if PRIMITIVE_TYPE_NAMES.contains(&name.as_str()) => {
+                let prim = primitive_from_name(name).expect("prim_type lookup");
                 self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Int, start))
-            }
-            TokenKind::Uint => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Uint, start))
-            }
-            TokenKind::Float => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Float, start))
-            }
-            TokenKind::Decimal => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Decimal, start))
-            }
-            TokenKind::StringTy => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::String, start))
-            }
-            TokenKind::Bool => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Bool, start))
-            }
-            TokenKind::Time => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Time, start))
-            }
-            TokenKind::Duration => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Duration, start))
-            }
-            TokenKind::Bytes => {
-                self.bump();
-                Ok(TypeExpr::Primitive(PrimType::Bytes, start))
+                Ok(TypeExpr::Primitive(prim, start))
             }
             TokenKind::Rich | TokenKind::Chunked | TokenKind::Recognition => {
                 let class_tok = self.bump();
@@ -1436,9 +1409,20 @@ impl Parser {
     }
 
     fn parse_expr_or_assign_stmt(&mut self) -> Result<Stmt, Diag> {
-        // Parse an expression; if followed by an assignment op, build
-        // an assign statement; else expr-stmt.
+        // Parse an expression; if followed by `<-`, build a send
+        // statement; if followed by an assignment op, build an
+        // assign statement; else expr-stmt.
         let expr = self.parse_expr()?;
+        if matches!(self.peek(), TokenKind::LeftArrow) {
+            self.bump();
+            let value = self.parse_expr()?;
+            let semi = self.expect(TokenKind::Semi, ";")?;
+            return Ok(Stmt::Send {
+                span: expr.span().merge(semi.span),
+                subject: expr,
+                value,
+            });
+        }
         if let Some(op) = self.peek_assign_op() {
             let op_span = self.peek_token().span;
             self.bump();
@@ -1452,8 +1436,7 @@ impl Parser {
                 value,
             });
         }
-        let semi = self.expect(TokenKind::Semi, ";")?;
-        let _ = semi;
+        let _ = self.expect(TokenKind::Semi, ";")?;
         Ok(Stmt::Expr(expr))
     }
 
@@ -1690,26 +1673,15 @@ impl Parser {
                 let m = self.parse_match_stmt()?;
                 Ok(Expr::Match(Box::new(m)))
             }
-            // Keyword token usable as identifier in expression
-            // position (e.g. `time::sleep(...)`, `publish(...)`).
-            // Mode keywords are excluded here because they only
-            // appear post-dot, never as expression heads.
-            tk if try_keyword_as_name(&tk).is_some()
-                && !matches!(
-                    tk,
-                    TokenKind::Bulk | TokenKind::Harmonic | TokenKind::Resolution
-                ) =>
-            {
-                let qn = self.parse_qualified_name()?;
-                if self.at(&TokenKind::LBrace) && self.looks_like_struct_lit() {
-                    return self.parse_struct_literal(qn);
-                }
-                if qn.segments.len() == 1 {
-                    return Ok(Expr::Ident(qn.segments.into_iter().next().unwrap()));
-                } else {
-                    return Ok(Expr::Path(qn));
-                }
-            }
+            // (Previously this dispatch had a fallthrough for
+            // primitive-type keywords and bus keywords used as
+            // expression-position identifiers. After the
+            // capitalize-types + bus-send-operator refactor,
+            // primitive types are predefined identifiers and
+            // `publish`/`subscribe` are no longer used as
+            // expression-position names. Mode keywords appear
+            // only post-dot, never as expression heads.)
+
             // Identifier — might be ident, path, struct expression, or call.
             TokenKind::Ident(name) => {
                 // Look-ahead for "sum(" or "prod(" to recognize as builtins.
@@ -1909,30 +1881,40 @@ fn bin_op_bp(op: BinOp) -> (u8, u8) {
 /// If the given keyword token is one we permit as an identifier
 /// in expression / path / member position, return its textual
 /// name. Otherwise None.
+///
+/// As of v0.2 (capitalize-types + bus-send-operator refactor), the
+/// only keywords still in this fallback are mode names — they need
+/// to be available as member names per F.10 (e.g., `self.bulk()`).
+/// Primitive types are no longer keywords (PascalCase predefined
+/// identifiers); `publish`/`subscribe` are no longer overloaded
+/// (the runtime publish action is the `<-` operator, not a builtin).
 fn try_keyword_as_name(k: &TokenKind) -> Option<&'static str> {
     Some(match k {
-        // Primitive type keywords are usable as identifier paths in
-        // expression position (so `time::sleep`, `duration::format`,
-        // etc. work).
-        TokenKind::Int => "int",
-        TokenKind::Uint => "uint",
-        TokenKind::Float => "float",
-        TokenKind::Decimal => "decimal",
-        TokenKind::StringTy => "string",
-        TokenKind::Bool => "bool",
-        TokenKind::Time => "time",
-        TokenKind::Duration => "duration",
-        TokenKind::Bytes => "bytes",
-        // Mode keywords post-dot per F.10.
         TokenKind::Bulk => "bulk",
         TokenKind::Harmonic => "harmonic",
         TokenKind::Resolution => "resolution",
-        // Bus keywords used as builtin function names. `publish` is
-        // both a bus-block declaration keyword (handled in
-        // parse_bus_member) and a runtime-builtin function (used in
-        // expression position; F.12).
-        TokenKind::Publish => "publish",
-        TokenKind::Subscribe => "subscribe",
+        _ => return None,
+    })
+}
+
+/// Canonical primitive type names. Recognized in type position;
+/// unreserved elsewhere.
+pub const PRIMITIVE_TYPE_NAMES: &[&str] = &[
+    "Int", "Uint", "Float", "Decimal", "String", "Bool", "Time",
+    "Duration", "Bytes",
+];
+
+fn primitive_from_name(name: &str) -> Option<PrimType> {
+    Some(match name {
+        "Int" => PrimType::Int,
+        "Uint" => PrimType::Uint,
+        "Float" => PrimType::Float,
+        "Decimal" => PrimType::Decimal,
+        "String" => PrimType::String,
+        "Bool" => PrimType::Bool,
+        "Time" => PrimType::Time,
+        "Duration" => PrimType::Duration,
+        "Bytes" => PrimType::Bytes,
         _ => return None,
     })
 }

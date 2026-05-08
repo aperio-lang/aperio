@@ -14,8 +14,8 @@
 
 locus CheckerL {
     params {
-        x: int = 5;
-        y: int = 5;
+        x: Int = 5;
+        y: Int = 5;
     }
 
     closure xy_match {

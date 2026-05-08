@@ -978,18 +978,41 @@ class loci. The cost reflects the projection class:
 yet in grammar) would need `self.children` as a sum type
 (`[TypeA | TypeB]`) and is deferred to a future version.
 
-### F.12 `publish` builtin and bus-block scoping
+### F.12 Bus send is the `<-` operator
 
-(Added in v0.1.6 from 05-bus.)
+(Added in v0.1.6 from 05-bus; revised in v0.1.8 — operator
+shape replaces the original `publish()` builtin.)
 
-The `publish(subject, msg)` builtin is in scope inside any
-locus that declares a matching `publish SUBJECT of type T`
-in its `bus { ... }` block. The compiler verifies at each call
-site that the subject is declared and the type matches.
+A locus emits a message on a declared subject with the `<-`
+operator at statement position:
 
-Out of scope in loci with no publish declarations. Calling
-`publish` outside a locus body, or with an undeclared subject,
-or with a mismatched type, is a compile-time error.
+```
+"trellis.intent" <- intent_value;
+```
+
+The left side names a subject declared in the locus's
+`bus { publish SUBJECT of type T; ... }`; the right side is
+any expression of the declared payload type. The compiler
+verifies at each call site that the subject is declared and
+the type matches.
+
+`<-` is in scope inside any locus that declares at least one
+matching `publish` entry in its `bus` block. Calling `<-`
+outside a locus body, or with an undeclared subject, or with
+a mismatched payload type, is a compile-time error.
+
+Send is a **statement, not an expression**. There is no
+`x = ("subject" <- v)`; the construct produces no value. This
+matches Erlang's `Pid ! Msg` shape — single-direction, no
+return — and avoids the need for a value-of-send convention.
+
+Subscribe is **declarative, not an operator**. A subscription
+is set up by the `subscribe SUBJECT as HANDLER of type T`
+clause inside the `bus` block, and the named handler runs as
+a regular `fn` on the locus body whenever a message arrives.
+There is no runtime `<- subject` (recv) operator; reception
+is attached to the locus structurally, not invoked
+dynamically.
 
 The runtime emits the message on whatever transport is bound
 to the subject in the deployment configuration (per
@@ -997,6 +1020,23 @@ to the subject in the deployment configuration (per
 declarations; deployment config selects transports;
 typechecking happens at compile time; routing happens at
 runtime.
+
+Considered and rejected:
+
+- *Keep `publish(subject, msg)` as a builtin function.*
+  Reject; "publish" reads as an action, and a builtin function
+  for what is structurally a message-pass operation hides the
+  shape. The operator makes the dataflow visible at a glance:
+  *something flows from right to left into a named channel.*
+- *Bidirectional `<-` (Go-shape, both send and receive).*
+  Reject; subscription is structural in lotus (declared in
+  `bus`, dispatched by the runtime), so a receive operator
+  has no statement position to occupy. Lotus's subscriptions
+  are closer to Erlang's process mailbox + `receive` block
+  than to Go's channel reads.
+- *`!` for send (Erlang-shape).* Reject; `!` is taken by
+  logical-not in C-family syntax, and we don't want to
+  overload it.
 
 ### F.13 Bus subscription handler signature
 
@@ -1074,6 +1114,70 @@ For now: a locus's `params` provide a default implementation
 for each contract field (read the field directly). User-defined
 fns can add additional implementations as long as they return
 the contract's typed surface.
+
+### F.15 Predefined type names are PascalCase, not keywords
+
+(Added in v0.1.8 — restructured to remove the lexical
+collision between primitive type names and stdlib namespace
+identifiers.)
+
+The built-in primitive types use **PascalCase** spellings:
+
+```
+Int  Uint  Float  Decimal  String  Bool  Time  Duration  Bytes
+```
+
+These names are emitted by the lexer as ordinary `Ident`
+tokens. They are **not reserved words**. The parser recognizes
+them by name in **type position only** (after `:`, in `->`
+return type, in generic args, in `type` declarations). In
+expression and namespace position, they are unreserved — so
+the lowercase names `time::sleep`, `string::to_upper`, etc.
+work as regular path expressions.
+
+Why this matters. The original design (v0.1.0) had `int`,
+`time`, `decimal`, etc. as reserved keywords. This created an
+unavoidable collision: the stdlib wanted `time::sleep`,
+`string::format`, but `time` and `string` were keywords and
+could not appear in path position. Working around the
+collision required either a `try_keyword_as_name` fallback
+(parser hack with action-at-a-distance behavior) or renaming
+the stdlib namespaces (`stdtime::sleep` — ugly).
+
+The PascalCase move resolves it cleanly:
+
+- `Int`, `String`, `Time`, `Duration`: type position only.
+- `int`, `string`, `time`, `duration`: ordinary identifiers
+  — free for stdlib namespaces, locals, fields.
+- The lexer is one-pass and context-free; the parser does
+  the type-vs-namespace split positionally.
+
+This also matches the case-convention rule from
+`spec/tokens.md` (PascalCase for type names) — type names
+were the only place we had been *violating* that convention,
+which was itself a smell.
+
+Considered and rejected:
+
+- *Rename the stdlib namespaces (`stdtime`, `stdstring`).*
+  Reject; ugly and team-wide-unfamiliar. Go got it right
+  with `time`, `strings`; we should match.
+- *Treat primitive types as keywords with a contextual
+  fallback.* Reject; the fallback worked for the parser but
+  is fragile (any new place a keyword can appear becomes a
+  new ad-hoc decision); also user-confusing (the same word
+  is a keyword sometimes and not other times).
+- *Lowercase type names as identifiers (Rust-shape `i32`,
+  `f64`).* Reject; the team is more familiar with PascalCase
+  (Go's `int` collides with stdlib namespace too, but Go
+  punts and uses `time.Time` — a workaround we don't need
+  if we just capitalize the type).
+
+Shadowing a predefined type name with a user-defined type
+(`type Int = ...`) is permitted by the grammar but produces
+a compiler warning. The compiler does not block shadowing
+(it's sometimes useful — e.g., a project-specific `Int`
+wrapper) but flags it for readers.
 
 ### F.5 Mode-projections share the locus's arena
 

@@ -8,12 +8,12 @@ import "std/time";
 
 locus TickerL {
     params {
-        n: int = 5;
-        interval: duration = 1s;
+        n: Int = 5;
+        interval: Duration = 1s;
     }
 
     run() {
-        let mut i: int = 0;
+        let mut i: Int = 0;
         while i < self.n {
             println("tick ", i);
             time::sleep(self.interval);

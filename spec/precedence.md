@@ -21,6 +21,7 @@ same precedence; their associativity is given in the right column.
 | 2 | `\|\|` | left | Logical or |
 | 1 | `..` `..=` | non-assoc | Range (reserved; not yet permitted) |
 | 0 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` | right | Assignment |
+| -1 | `<-` | non-assoc | Bus send (statement-shape only) |
 
 ## Notes
 
@@ -64,6 +65,23 @@ v0 does not provide turbofish; we'll add it if needed.
   `foo.bar`, `book.bid_side()`.
 - `::` accesses a name through a path: module, type, perspective:
   `messages::Book`, `Strategy::default()`.
+
+### Bus send is a statement, not an expression
+
+`<-` does not nest in expressions. It appears only at statement
+position:
+
+```
+"subject" <- value;
+```
+
+The left side is a string-literal subject (or an identifier
+bound to a publish handle in a future revision); the right side
+is any expression. The construct produces no value — there is no
+`x = ("s" <- v)`. The level −1 row in the table is bookkeeping:
+`<-` binds looser than every expression operator, so the parser
+recognizes the leading expression in full before deciding the
+statement is a send.
 
 ### Recovery primitives are statements, not operators
 

@@ -19,20 +19,20 @@ import "trellis-pair/shared";
 
 locus ExecutorL {
     params {
-        B: int = 10000;
-        c: int = 1;
-        sigma: int = 1;
-        phi: float = 1.0;
+        B: Int = 10000;
+        c: Int = 1;
+        sigma: Int = 1;
+        phi: Float = 1.0;
 
         current_kernel: TradeKernel = TradeKernel {
             multiplier: 1.0d,
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
-        intents_emitted: int = 0;
-        fills_received: int = 0;
-        next_intent_id: int = 1;
-        kernels_received: int = 0;
+        intents_emitted: Int = 0;
+        fills_received: Int = 0;
+        next_intent_id: Int = 1;
+        kernels_received: Int = 0;
     }
 
     bus {
@@ -51,7 +51,7 @@ locus ExecutorL {
         };
         self.next_intent_id = self.next_intent_id + 1;
         self.intents_emitted = self.intents_emitted + 1;
-        publish("trellis.intent", i);
+        "trellis.intent" <- i;
     }
 
     fn on_kernel(k: TradeKernel) {

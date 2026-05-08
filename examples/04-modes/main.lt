@@ -15,43 +15,43 @@
 
 locus LeafL {
     params {
-        value: int = 0;
+        value: Int = 0;
     }
     contract {
-        expose value: int;
+        expose value: Int;
     }
 }
 
 locus AggregatorL {
     params {
-        B: int = 100;
-        c: int = 1;
-        sigma: int = 1;
-        phi: float = 1.0;
+        B: Int = 100;
+        c: Int = 1;
+        sigma: Int = 1;
+        phi: Float = 1.0;
     }
 
     contract {
-        consume value: int;
+        consume value: Int;
     }
 
-    mode bulk() -> int {
-        let mut total: int = 0;
+    mode bulk() -> Int {
+        let mut total: Int = 0;
         for child in self.children {
             total = total + child.value;
         }
         return total;
     }
 
-    mode harmonic() -> int {
-        let mut count: int = 0;
+    mode harmonic() -> Int {
+        let mut count: Int = 0;
         for child in self.children {
             count = count + 1;
         }
         return count;
     }
 
-    mode resolution() -> int {
-        let mut max: int = 0;
+    mode resolution() -> Int {
+        let mut max: Int = 0;
         for child in self.children {
             if child.value > max {
                 max = child.value;

@@ -7,12 +7,12 @@
 // deployment configures.
 
 type Greeting {
-    text: string;
-    sender: string;
+    text: String;
+    sender: String;
 }
 
 type Acknowledgment {
-    received: string;
+    received: String;
 }
 
 locus EchoL {
@@ -23,7 +23,7 @@ locus EchoL {
 
     fn on_greeting(g: Greeting) {
         println("got: ", g.text, " from ", g.sender);
-        publish("demo.ack", Acknowledgment { received: g.text });
+        "demo.ack" <- Acknowledgment { received: g.text };
     }
 }
 
