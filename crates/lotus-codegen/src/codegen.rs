@@ -5,13 +5,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use inkwell::basic_block::BasicBlock;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     TargetTriple,
 };
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, PointerValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
+};
 use inkwell::{AddressSpace, OptimizationLevel};
 
 use lotus_syntax::ast::*;
@@ -26,6 +29,22 @@ enum LotusType {
     Float,
     Bool,
     String,
+}
+
+/// Did the last lowered statement leave the current basic block
+/// open for further IR (Open) or close it with a terminator like
+/// `br` / `ret` / `unreachable` (Terminated)? Statements after a
+/// Terminated must not emit further IR into the same block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockEnd {
+    Open,
+    Terminated,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopFrame<'ctx> {
+    continue_bb: BasicBlock<'ctx>,
+    break_bb: BasicBlock<'ctx>,
 }
 
 #[derive(Debug)]
@@ -67,6 +86,8 @@ pub fn build_executable(
         module,
         builder,
         program,
+        current_fn: None,
+        loops: Vec::new(),
     };
 
     cx.declare_builtins();
@@ -115,6 +136,12 @@ struct Cx<'ctx, 'p> {
     module: Module<'ctx>,
     builder: inkwell::builder::Builder<'ctx>,
     program: &'p Program,
+    /// Set while lowering a function's body so that `if` / `while`
+    /// can `append_basic_block` onto it.
+    current_fn: Option<FunctionValue<'ctx>>,
+    /// Stack of enclosing loops so `break` / `continue` can find
+    /// their target blocks.
+    loops: Vec<LoopFrame<'ctx>>,
 }
 
 impl<'ctx, 'p> Cx<'ctx, 'p> {
@@ -146,25 +173,44 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let main_fn = self.module.add_function("main", main_ty, None);
         let entry = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry);
+        self.current_fn = Some(main_fn);
 
         let mut scope = Scope::default();
-        for stmt in &main_decl.body.stmts {
-            self.lower_stmt(stmt, &mut scope)?;
-        }
+        let end = self.lower_block(&main_decl.body, &mut scope)?;
 
-        // return 0;
-        let zero = i32_t.const_int(0, false);
-        self.builder
-            .build_return(Some(&zero))
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Only emit `ret 0` if the body fell through. If it ended
+        // in a terminator (e.g. an unreachable `if` whose branches
+        // both `break`/`return`), the trailing block is already
+        // closed and writing more IR is unsound.
+        if end == BlockEnd::Open {
+            let zero = i32_t.const_int(0, false);
+            self.builder
+                .build_return(Some(&zero))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        self.current_fn = None;
         Ok(())
+    }
+
+    fn lower_block(
+        &mut self,
+        block: &Block,
+        scope: &mut Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        for stmt in &block.stmts {
+            match self.lower_stmt(stmt, scope)? {
+                BlockEnd::Open => continue,
+                BlockEnd::Terminated => return Ok(BlockEnd::Terminated),
+            }
+        }
+        Ok(BlockEnd::Open)
     }
 
     fn lower_stmt(
         &mut self,
         stmt: &Stmt,
         scope: &mut Scope<'ctx>,
-    ) -> Result<(), CodegenError> {
+    ) -> Result<BlockEnd, CodegenError> {
         match stmt {
             Stmt::Expr(Expr::Struct { path, inits, .. }) => {
                 if path.segments.len() != 1 {
@@ -193,7 +239,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ))
                     })?;
                 self.lower_locus_birth(&locus_decl, inits)?;
-                Ok(())
+                Ok(BlockEnd::Open)
             }
             Stmt::Expr(Expr::Call { callee, args, .. }) => {
                 let name = match callee.as_ref() {
@@ -204,7 +250,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ))
                     }
                 };
-                self.lower_print_call(name, args, scope, &BTreeMap::new())
+                self.lower_print_call(name, args, scope, &BTreeMap::new())?;
+                Ok(BlockEnd::Open)
             }
             Stmt::Let { name, value, .. } => {
                 let (val, ty) = self.lower_expr(value, scope, &BTreeMap::new())?;
@@ -213,7 +260,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_store(alloca, val)
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 scope.locals.insert(name.name.clone(), (alloca, ty));
-                Ok(())
+                Ok(BlockEnd::Open)
             }
             Stmt::Assign { target, op, value, .. } => {
                 // v0 codegen: only bare-local assignment. `self.X =`
@@ -270,8 +317,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.builder
                     .build_store(alloca, new_val)
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                Ok(())
+                Ok(BlockEnd::Open)
             }
+            Stmt::If(if_stmt) => self.lower_if(if_stmt, scope),
+            Stmt::While { cond, body, .. } => {
+                self.lower_while(cond, body, scope)
+            }
+            Stmt::Break(_) => self.lower_break(),
+            Stmt::Continue(_) => self.lower_continue(),
+            Stmt::Block(b) => self.lower_block(b, scope),
             Stmt::Expr(_) => Err(CodegenError::Unsupported(
                 "expression statement other than locus literal or builtin call"
                     .to_string(),
@@ -281,6 +335,144 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 std::mem::discriminant(stmt)
             ))),
         }
+    }
+
+    fn lower_if(
+        &mut self,
+        ifs: &IfStmt,
+        scope: &mut Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        let (cond_v, cond_ty) =
+            self.lower_expr(&ifs.cond, scope, &BTreeMap::new())?;
+        if cond_ty != LotusType::Bool {
+            return Err(CodegenError::Unsupported(format!(
+                "if condition must be Bool; got {:?}",
+                cond_ty
+            )));
+        }
+        let func = self
+            .current_fn
+            .expect("current_fn set while lowering an if");
+        let then_bb = self.context.append_basic_block(func, "then");
+        let else_bb = self.context.append_basic_block(func, "else");
+        let merge_bb = self.context.append_basic_block(func, "ifend");
+
+        self.builder
+            .build_conditional_branch(cond_v.into_int_value(), then_bb, else_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // then-branch
+        self.builder.position_at_end(then_bb);
+        let then_end = self.lower_block(&ifs.then_block, scope)?;
+        if then_end == BlockEnd::Open {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
+        // else-branch (or empty fall-through if absent)
+        self.builder.position_at_end(else_bb);
+        let else_end = match &ifs.else_block {
+            None => BlockEnd::Open,
+            Some(eb) => match eb.as_ref() {
+                ElseBranch::Else(b) => self.lower_block(b, scope)?,
+                ElseBranch::ElseIf(nested) => self.lower_if(nested, scope)?,
+            },
+        };
+        if else_end == BlockEnd::Open {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
+        // If both arms terminated, merge_bb has no predecessors —
+        // close it with `unreachable` so the function is well-formed,
+        // and report the if itself as Terminated so callers don't
+        // emit further code into it.
+        if then_end == BlockEnd::Terminated
+            && else_end == BlockEnd::Terminated
+        {
+            self.builder.position_at_end(merge_bb);
+            self.builder
+                .build_unreachable()
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            return Ok(BlockEnd::Terminated);
+        }
+
+        self.builder.position_at_end(merge_bb);
+        Ok(BlockEnd::Open)
+    }
+
+    fn lower_while(
+        &mut self,
+        cond: &Expr,
+        body: &Block,
+        scope: &mut Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        let func = self
+            .current_fn
+            .expect("current_fn set while lowering a while");
+        let header_bb = self.context.append_basic_block(func, "while.cond");
+        let body_bb = self.context.append_basic_block(func, "while.body");
+        let exit_bb = self.context.append_basic_block(func, "while.end");
+
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // header: evaluate cond and branch
+        self.builder.position_at_end(header_bb);
+        let (cond_v, cond_ty) = self.lower_expr(cond, scope, &BTreeMap::new())?;
+        if cond_ty != LotusType::Bool {
+            return Err(CodegenError::Unsupported(format!(
+                "while condition must be Bool; got {:?}",
+                cond_ty
+            )));
+        }
+        self.builder
+            .build_conditional_branch(cond_v.into_int_value(), body_bb, exit_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // body
+        self.builder.position_at_end(body_bb);
+        self.loops.push(LoopFrame {
+            continue_bb: header_bb,
+            break_bb: exit_bb,
+        });
+        let body_end = self.lower_block(body, scope)?;
+        self.loops.pop();
+        if body_end == BlockEnd::Open {
+            self.builder
+                .build_unconditional_branch(header_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
+        // The exit is reachable from the header (cond=false) and
+        // any `break`s inside the body, so it's always Open.
+        self.builder.position_at_end(exit_bb);
+        Ok(BlockEnd::Open)
+    }
+
+    fn lower_break(&mut self) -> Result<BlockEnd, CodegenError> {
+        let frame = self.loops.last().copied().ok_or_else(|| {
+            CodegenError::Unsupported("`break` outside a loop".to_string())
+        })?;
+        self.builder
+            .build_unconditional_branch(frame.break_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(BlockEnd::Terminated)
+    }
+
+    fn lower_continue(&mut self) -> Result<BlockEnd, CodegenError> {
+        let frame = self.loops.last().copied().ok_or_else(|| {
+            CodegenError::Unsupported(
+                "`continue` outside a loop".to_string(),
+            )
+        })?;
+        self.builder
+            .build_unconditional_branch(frame.continue_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(BlockEnd::Terminated)
     }
 
     fn alloca_for(

@@ -86,6 +86,14 @@ fn mutable_counter_runs() {
 }
 
 #[test]
+fn control_flow_runs() {
+    assert_eq!(
+        parse_and_run("07-control-flow/main.lt").unwrap(),
+        0
+    );
+}
+
+#[test]
 fn bus_runs() {
     assert_eq!(parse_and_run("05-bus/main.lt").unwrap(), 0);
 }

@@ -158,6 +158,128 @@ fn build_int_override_at_instantiation() {
 }
 
 #[test]
+fn build_if_else_picks_branch() {
+    let src = r#"
+        fn main() {
+            let n = 7;
+            if n > 5 {
+                println("hi");
+            } else {
+                println("lo");
+            }
+            if n == 7 {
+                println("seven");
+            }
+        }
+    "#;
+    let (stdout, status) = build_and_run("if_else", src);
+    assert!(status.success());
+    assert!(stdout.contains("hi"), "got: {:?}", stdout);
+    assert!(stdout.contains("seven"), "got: {:?}", stdout);
+    assert!(!stdout.contains("lo"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_else_if_chain() {
+    let src = r#"
+        fn main() {
+            let n = 2;
+            if n == 1 {
+                println("one");
+            } else if n == 2 {
+                println("two");
+            } else if n == 3 {
+                println("three");
+            } else {
+                println("other");
+            }
+        }
+    "#;
+    let (stdout, status) = build_and_run("else_if", src);
+    assert!(status.success());
+    assert!(stdout.contains("two"), "got: {:?}", stdout);
+    assert!(!stdout.contains("one"), "got: {:?}", stdout);
+    assert!(!stdout.contains("three"), "got: {:?}", stdout);
+    assert!(!stdout.contains("other"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_while_with_break_and_continue() {
+    // n iterates 1..=10; skip 7 (continue), break at 9. Sum of
+    // 1+2+3+4+5+6+8 == 29.
+    let src = r#"
+        fn main() {
+            let mut n = 0;
+            let mut sum = 0;
+            while n < 10 {
+                n = n + 1;
+                if n == 7 {
+                    continue;
+                }
+                if n == 9 {
+                    break;
+                }
+                sum = sum + n;
+            }
+            println("sum=", sum, " n=", n);
+        }
+    "#;
+    let (stdout, status) = build_and_run("while_break_continue", src);
+    assert!(status.success());
+    assert!(stdout.contains("sum=29 n=9"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_nested_while_breaks_inner_only() {
+    let src = r#"
+        fn main() {
+            let mut i = 0;
+            let mut hits = 0;
+            while i < 3 {
+                let mut j = 0;
+                while j < 10 {
+                    if j == 2 {
+                        break;
+                    }
+                    j = j + 1;
+                    hits = hits + 1;
+                }
+                i = i + 1;
+            }
+            println("hits=", hits);
+        }
+    "#;
+    // outer 3 iters * inner 2 hits each = 6.
+    let (stdout, status) = build_and_run("nested_while", src);
+    assert!(status.success());
+    assert!(stdout.contains("hits=6"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_if_both_branches_break() {
+    // Both arms terminate; the `if` itself is Terminated. The
+    // surrounding while still produces a valid binary because
+    // the unreachable merge BB gets a `unreachable` terminator.
+    let src = r#"
+        fn main() {
+            let mut n = 0;
+            while n < 100 {
+                if n == 5 {
+                    break;
+                } else {
+                    n = n + 1;
+                    continue;
+                }
+            }
+            println("n=", n);
+        }
+    "#;
+    let (stdout, status) = build_and_run("if_both_terminate", src);
+    assert!(status.success());
+    assert!(stdout.contains("n=5"), "got: {:?}", stdout);
+}
+
+#[test]
 fn mutable_counter_example_builds_and_runs() {
     let mut src_path = examples_dir();
     src_path.push("06-mutable-counter");
@@ -183,6 +305,31 @@ fn mutable_counter_example_builds_and_runs() {
     assert!(
         stdout.contains("n=2"),
         "expected n=2 in stdout; got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn control_flow_example_builds_and_runs() {
+    let mut src_path = examples_dir();
+    src_path.push("07-control-flow");
+    src_path.push("main.lt");
+    let source = std::fs::read_to_string(&src_path).expect("read source");
+    let program = lotus_syntax::parse_source(&source).expect("parse");
+
+    let temp_dir = std::env::temp_dir();
+    let mut bin_path = temp_dir.clone();
+    bin_path.push("lotus_test_07_control_flow");
+
+    build_executable(&program, &bin_path).expect("build");
+    let output = Command::new(&bin_path).output().expect("run");
+    let _ = std::fs::remove_file(&bin_path);
+
+    assert!(output.status.success(), "non-zero: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("sum=29 stopped at n=9"),
+        "got: {:?}",
         stdout
     );
 }
