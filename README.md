@@ -63,8 +63,14 @@ spec/
   tokens.md               -- lexical structure: keywords, operators, literals
   precedence.md           -- operator precedence and associativity
   design-rationale.md     -- why each construct looks this way
-examples/                 -- example programs (placeholder; first
-                             program is the trader/analyst pair)
+  testing.md              -- testing pipeline design (3 layers + perf)
+  runtime.md              -- what the lotus binary always ships with
+  stdlib.md               -- batteries-included module map
+examples/
+  hello-world/            -- minimal lotus program
+  ...                     -- subsequent examples build incrementally
+                              toward trellis-pair (the trader/analyst
+                              pair on grease UDP multicast)
 notes/                    -- working notes and open questions
 ```
 

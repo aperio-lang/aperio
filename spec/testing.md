@@ -1,0 +1,251 @@
+# Testing pipeline
+
+The testing pipeline is part of the language toolchain, not an
+add-on. `lotus test` ships in the same binary as `lotus build`.
+Test infrastructure exists from day 1 because the language's
+discipline (closure tests, k_max bounds, projection-class
+invariants, multi-perspective stability commit-rules) needs
+testing infrastructure to be enforced.
+
+This document specifies the *design* of the testing pipeline.
+Implementation follows once the compiler exists.
+
+## Three layers of correctness
+
+Lotus testing distinguishes three layers, each with its own
+tooling:
+
+### Layer 1 — Language correctness
+
+*Does this program parse, typecheck, and have the meaning the
+language spec says it should?*
+
+- **Parser tests.** Given source, the parser produces the
+  expected AST (or rejects with the expected error). Stored as
+  `.lt` files paired with `.expected.json` (or similar) AST
+  dumps. Driven by the grammar in `spec/grammar.ebnf`.
+- **Typechecker tests.** Given a program, the typechecker
+  accepts or rejects with the expected diagnostic. Same shape
+  as parser tests.
+- **Operational-semantics tests.** Given a program and inputs,
+  the program produces the expected output. Driven by the
+  operational semantics document (yet to be written).
+
+These run as part of `lotus test` and as part of compiler CI.
+A compiler regression should be caught here.
+
+### Layer 2 — Mathematical / framework correctness
+
+*Does the framework's discipline hold for this program?*
+
+The language's job is not just "compile the source" — it's
+"refuse to compile a program that violates framework discipline."
+The framework's commitments need test infrastructure:
+
+- **k_max bound verification.** For every locus, the compiler
+  computes `k_max = B / [(1 − phi) * c + phi * sigma]` and
+  checks that no `accept` call site can exceed it. Tests assert
+  the compiler rejects over-budget call sites.
+- **Closure-test existence.** For every `closure name { ... }`
+  block, the compiler verifies the cycle exists (both sides of
+  `~~` reference defined values within the same scope). Tests
+  assert the compiler rejects cycles that don't close.
+- **Projection-class invariants.** A locus declared `projection
+  rich` cannot be instantiated with N > rich's bound; etc.
+  Tests assert mismatches are rejected.
+- **Multi-perspective stability commit-rules.** A `perspective`
+  with `stable_when |perspectives| >= 3` cannot be serialized
+  with fewer perspectives validated. Tests assert violations
+  fail at runtime.
+- **Substrate-derivation discipline.** When a value carries
+  anchor metadata, anchor-self-consistent uses are flagged.
+  Tests assert anchor-self-consistency triggers a warning or
+  error per declared policy.
+- **Vertical-only flow.** Lateral references between sibling
+  loci are compile-time rejected. Tests assert the compiler
+  rejects sibling-to-sibling access.
+
+These tests are written in lotus itself. The standard library
+provides `assert(...)`, `assert_rejects(...)`, `assert_closure(...)`
+and similar primitives. Test programs are valid lotus programs;
+the framework discipline applies to them too.
+
+### Layer 3 — Performance
+
+*Does this program meet its declared performance envelope?
+And how does it compare to equivalent implementations in other
+languages?*
+
+#### Single-language benchmarks
+
+A benchmark is a function annotated with `bench` (TBD: grammar
+extension, or stdlib function with a magic name like Go's
+`Benchmark*`). The runner invokes it for a measured number of
+iterations; reports time-per-op, allocations-per-op, memory
+high-water.
+
+```
+fn bench_hello() {
+    HelloL { };
+}
+```
+
+Output is JSON-serializable for CI consumption. Baselines are
+checkpointed in version control; regressions produce a diff
+the developer must explicitly accept.
+
+#### Comparative benchmarks (lotus vs. other languages)
+
+This is the harder problem. Three approaches, all supported:
+
+1. **External-equivalent annotation.** A benchmark file declares
+   its equivalent in another language as a sibling:
+
+   ```
+   // bench_message_passing_test.lt
+   //
+   // @external_equivalents:
+   //   - lang: go
+   //     path: ./equivalents/message_passing.go
+   //   - lang: rust
+   //     path: ./equivalents/message_passing.rs
+   //   - lang: erlang
+   //     path: ./equivalents/message_passing.erl
+   ```
+
+   The runner builds and runs each; reports a comparison table.
+   Idiomatic implementation in each language, not a literal
+   port. Dev declares the comparison set; CI runs the whole
+   matrix.
+
+2. **The Computer Language Benchmarks Game** (CLBG) approach.
+   A small set of well-known algorithms (n-body, fasta,
+   spectral-norm, etc.) implemented in each language under
+   identical input. Standard, cross-validated, criticized.
+   Lotus implements the standard set; reports against the
+   CLBG corpus.
+
+3. **Domain-specific benchmark suites.**
+   - **Coordination-overhead.** Million-message-passing
+     scenarios. Compared against Erlang (our closest
+     existing analog) and Go (our team's reference).
+   - **Region-allocation throughput.** Allocation /
+     deallocation rate compared to GC'd languages.
+   - **Closure-test overhead.** Same program with closure
+     tests on / off / probabilistic.
+   - **Mode-projection.** Same kernel computed three ways
+     (bulk / harmonic / resolution) — comparing against a
+     hand-written N-implementation in another language.
+
+#### Performance regressions in CI
+
+Every benchmark has a stored baseline (numerical envelope, not
+a fixed value — a tolerance band). The runner asserts current
+runtime is within band. Bands tighten over time as the compiler
+improves; widening a band is an explicit, reviewed action.
+
+## Test file layout
+
+```
+project/
+├── src/
+│   └── *.lt            // production source
+└── tests/
+    ├── unit/
+    │   └── *_test.lt   // unit tests, by module
+    ├── integration/
+    │   └── *_test.lt   // multi-locus integration tests
+    ├── bench/
+    │   └── *_bench.lt  // benchmarks
+    └── equivalents/    // external-language equivalents for
+        ├── go/         // comparative benchmarks
+        ├── rust/
+        └── erlang/
+```
+
+Or, alternatively, Go-style: `*_test.lt` lives next to the
+source it tests. Both layouts are supported; the runner finds
+tests by suffix (`_test.lt`) regardless of location.
+
+## Toolchain commands
+
+| Command | Purpose |
+|---|---|
+| `lotus build` | Compile source → executable / library |
+| `lotus check` | Static checks: parse, typecheck, framework discipline |
+| `lotus test` | Run all `*_test.lt` files in the project |
+| `lotus test -run pattern` | Run matching tests only |
+| `lotus bench` | Run all `*_bench.lt` files |
+| `lotus bench -compare` | Build and run external equivalents alongside |
+| `lotus verify` | Layer-2 discipline checks specifically (no execution) |
+| `lotus fmt` | Canonical formatter (Go-style: zero config) |
+
+`lotus test` runs Layer 1 + Layer 2. `lotus bench` runs Layer 3.
+
+## Test assertion library
+
+Provided by `std::test`. Not a separate testing framework; the
+language's stdlib includes test primitives:
+
+```
+import std::test;
+
+fn test_hello_locus_dissolves_after_birth() {
+    let observed_dissolution = false;
+
+    locus ObserverL {
+        on_dissolve(c: HelloL) {
+            observed_dissolution = true;
+        }
+    }
+
+    let obs = ObserverL { };
+    HelloL { };  // unbound; should dissolve at this `;`
+
+    test::assert(observed_dissolution);
+}
+```
+
+(Sketch; precise stdlib API specified in stdlib.md.)
+
+## Property-based testing
+
+Reserved as a future extension. The language's strong
+type-and-discipline surface makes property-based testing
+particularly natural — you can declare properties that should
+hold for all inputs and let the runner generate counter-examples.
+Not in the v0.1 stdlib.
+
+## Continuous integration
+
+The toolchain emits machine-readable output:
+
+- `lotus test --json` produces JSON test results (per-test pass/fail,
+  per-test timing, error messages).
+- `lotus bench --json` produces JSON benchmark output (per-bench
+  time, allocations, comparative table if `-compare` given).
+- `lotus check --json` produces JSON diagnostics.
+
+CI consumes the JSON; standard reporters (JUnit XML, GitHub
+Actions annotations, etc.) are downstream conversions.
+
+## What writing this surfaces (for resolution)
+
+1. **`bench` annotation: keyword, attribute, or naming convention?**
+   Go uses `BenchmarkName`. Rust uses `#[bench]`. Lotus has
+   neither attributes nor magic-name conventions yet. Decision
+   pending; probably an attribute (`@bench fn ...`) added to
+   the grammar in v0.2.
+2. **What "idiomatic" means for external equivalents.** Who
+   judges? The dev who writes the comparison? A community
+   convention? CLBG-style "first-author submits, others may
+   challenge"? Probably author-decides for v0; community
+   review later.
+3. **Determinism.** For benchmarks, the runtime should be
+   isolatable (no GC pauses to confound; we don't have GC, so
+   that's free). Does the runtime need deterministic
+   scheduling for benchmark consistency? Probably yes for some
+   benchmark classes; opt-in.
+4. **External-language toolchain access.** `lotus bench
+   -compare` needs `go`, `rustc`, `erlc`, etc. on PATH.
+   Documenting this clearly is dev-experience work.
