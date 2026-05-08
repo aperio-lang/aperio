@@ -89,6 +89,13 @@ Specifically:
 
 ### Bus message router
 
+The runtime's bus is **transport-agnostic**. From the
+framework's perspective, a transport is the bus kernel projected
+through a parameter regime: NATS and UDP multicast and TCP and
+Unix sockets are the same primitive (typed pub-sub) at different
+(B, c, σ, φ) values. The runtime knows about subjects, channels,
+and modes; specific transports come from stdlib (`std::bus::*`).
+
 - **Subject → handler dispatch.** Declared `bus subscribe
   "..." as fn` declarations are wired by the runtime at
   startup; inbound messages on declared subjects route to the
@@ -96,11 +103,16 @@ Specifically:
 - **Outbound publish.** Declared `bus publish "..."` allows
   emit from any handler return; the runtime routes to the
   configured transport.
-- **Transport adaptation.** The runtime defines a `Transport`
-  trait (TBD: name; we don't have traits in v0 — call it a
-  built-in interface). Stdlib provides implementations
-  (NATS, UDP multicast, Unix socket, in-memory). The runtime
-  doesn't ship with any specific transport; stdlib does.
+- **Multi-transport dispatch.** A single binary may bind
+  different channels to different transports (a market-data
+  channel to UDP multicast; a control channel to NATS; a
+  test channel to in-memory). The router maintains per-channel
+  transport bindings established at deployment time from
+  config.
+- **Transport adaptation interface.** The runtime defines the
+  `Adapter` interface (built-in; standardized in stdlib); any
+  transport implementation conforming to it can be plugged in.
+  No specific transport ships with the runtime itself.
 
 ### Closure-test infrastructure
 

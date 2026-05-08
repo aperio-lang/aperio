@@ -99,13 +99,59 @@ Networking:
 
 ### `std::bus`
 
-Bus transports for the language's bus-block declarations:
-- `nats::Adapter` — connects bus subjects to NATS
-- `udp_multicast::Adapter` — UDP multicast (for grease)
-- `unix_socket::Adapter`
-- `in_memory::Adapter` — for tests
-- `Adapter` trait that user code can implement for custom
-  transports
+The framework's view: **a transport is the bus kernel projected
+through a parameter regime.** NATS and UDP multicast (and Unix
+sockets, and shared memory, and TCP) are the same primitive
+— typed pub-sub between loci — operating at different
+(B, c, σ, φ) values. The `std::bus` module exposes this directly:
+one `Adapter` interface; multiple implementations, each with its
+declared parameter envelope.
+
+```
+trait Adapter {
+    // Identifies the parameter regime this adapter operates in.
+    // Used by the runtime to bind channels to transports based
+    // on the channel's mode and declared envelope.
+    fn envelope() -> TransportEnvelope;
+
+    fn subscribe(subject: string, handler: ...) -> Subscription;
+    fn publish(subject: string, msg: T) -> Result<(), Error>;
+    // request_response is optional; some envelopes don't support it.
+    fn request(subject: string, msg: T, timeout: duration) -> Result<R, Error>;
+}
+
+struct TransportEnvelope {
+    latency_typical: duration;       // wire latency under load
+    throughput_messages_per_sec: int;
+    reliability: Reliability;        // BestEffort | AtLeastOnce | ExactlyOnce
+    request_response: bool;
+    fanout_max: int;                 // 1 for unicast, >1 for multicast / broker
+    ordering: Ordering;              // None | PerSubject | Total
+}
+```
+
+Provided implementations:
+
+- `bus::tcp::Adapter` — typed pub-sub over TCP. Ordered, reliable,
+  unicast or many-to-many via broker.
+- `bus::nats::Adapter` — broker-mediated; reliable; supports
+  request-response; per-subject ordering. Higher latency.
+- `bus::udp_multicast::Adapter` — best-effort; line-rate
+  fanout; no request-response. Sub-microsecond at LAN scale.
+- `bus::unix_socket::Adapter` — same-host, ordered, reliable.
+- `bus::in_memory::Adapter` — for tests; deterministic ordering.
+
+Channels declared in lotus source bind to transports at
+deployment time. The locus's `bus { subscribe "..." as h; }`
+declaration carries the channel's mode (bulk / harmonic /
+resolution); the deployment config maps mode + subject pattern
+to a transport whose envelope satisfies the requirement.
+
+A bulk-mode market-data channel binds to UDP multicast; a
+resolution-mode RFQ-quote channel binds to NATS; a closure-
+test reporting channel binds to TCP or Unix socket. Same
+source code, different transport per channel — chosen by
+parameter fit, not by name.
 
 ### `std::encoding`
 
