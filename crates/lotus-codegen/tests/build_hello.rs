@@ -53,6 +53,59 @@ fn build_int_param_and_println() {
 }
 
 #[test]
+fn build_let_and_int_arithmetic() {
+    let src = r#"
+        fn main() {
+            let a = 2 + 3 * 4;       // 14
+            let b = a - 5;           // 9
+            let c = b * 10 / 3;      // 30
+            let d = b % 4;           // 1
+            println("a=", a, " b=", b, " c=", c, " d=", d);
+        }
+    "#;
+    let (stdout, status) = build_and_run("let_int_arith", src);
+    assert!(status.success());
+    assert!(
+        stdout.contains("a=14 b=9 c=30 d=1"),
+        "got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn build_let_and_float_arithmetic() {
+    let src = r#"
+        fn main() {
+            let pi = 3.14;
+            let r = pi * 2.0;
+            println("r=", r);
+        }
+    "#;
+    let (stdout, status) = build_and_run("let_float_arith", src);
+    assert!(status.success());
+    assert!(stdout.contains("r=6.28"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_comparisons_yield_bool() {
+    let src = r#"
+        fn main() {
+            let lt = 5 < 10;
+            let eq = 7 == 7;
+            let gt = 1 > 100;
+            println("lt=", lt, " eq=", eq, " gt=", gt);
+        }
+    "#;
+    let (stdout, status) = build_and_run("comparisons", src);
+    assert!(status.success());
+    assert!(
+        stdout.contains("lt=true eq=true gt=false"),
+        "got: {:?}",
+        stdout
+    );
+}
+
+#[test]
 fn build_int_override_at_instantiation() {
     // Instantiation overrides the param default.
     let src = r#"

@@ -1,6 +1,7 @@
 //! AST → LLVM IR → object file → executable, for the
 //! milestone-0 subset.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,10 +11,22 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     TargetTriple,
 };
-use inkwell::values::{BasicMetadataValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
 use lotus_syntax::ast::*;
+
+/// Compile-time tag for a value's type. Mirrors a small subset
+/// of `lotus_types::Ty`; we don't pull the full type system in
+/// because codegen only needs to discriminate the lowered
+/// shapes (Int/Float/Bool are scalar; String is ptr).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LotusType {
+    Int,
+    Float,
+    Bool,
+    String,
+}
 
 #[derive(Debug)]
 pub enum CodegenError {
@@ -134,11 +147,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let entry = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry);
 
-        // Lower the body. The only statement shape currently
-        // handled at top level is locus instantiation as an
-        // expression statement: `LocusName { ... };`.
+        let mut scope = Scope::default();
         for stmt in &main_decl.body.stmts {
-            self.lower_stmt(stmt, main_fn)?;
+            self.lower_stmt(stmt, &mut scope)?;
         }
 
         // return 0;
@@ -152,7 +163,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     fn lower_stmt(
         &mut self,
         stmt: &Stmt,
-        _fn_val: FunctionValue<'ctx>,
+        scope: &mut Scope<'ctx>,
     ) -> Result<(), CodegenError> {
         match stmt {
             Stmt::Expr(Expr::Struct { path, inits, .. }) => {
@@ -184,14 +195,375 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.lower_locus_birth(&locus_decl, inits)?;
                 Ok(())
             }
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
+                let name = match callee.as_ref() {
+                    Expr::Ident(i) => i.name.as_str(),
+                    _ => {
+                        return Err(CodegenError::Unsupported(
+                            "non-identifier callee".to_string(),
+                        ))
+                    }
+                };
+                self.lower_print_call(name, args, scope, &BTreeMap::new())
+            }
+            Stmt::Let { name, value, .. } => {
+                let (val, ty) = self.lower_expr(value, scope, &BTreeMap::new())?;
+                let alloca = self.alloca_for(ty, &name.name)?;
+                self.builder
+                    .build_store(alloca, val)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                scope.locals.insert(name.name.clone(), (alloca, ty));
+                Ok(())
+            }
             Stmt::Expr(_) => Err(CodegenError::Unsupported(
-                "expression statement other than locus literal".to_string(),
+                "expression statement other than locus literal or builtin call"
+                    .to_string(),
             )),
             _ => Err(CodegenError::Unsupported(format!(
                 "statement form {:?}",
                 std::mem::discriminant(stmt)
             ))),
         }
+    }
+
+    fn alloca_for(
+        &self,
+        ty: LotusType,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        match ty {
+            LotusType::Int => self
+                .builder
+                .build_alloca(self.context.i64_type(), name)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
+            LotusType::Float => self
+                .builder
+                .build_alloca(self.context.f64_type(), name)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
+            LotusType::Bool => self
+                .builder
+                .build_alloca(self.context.bool_type(), name)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
+            LotusType::String => self
+                .builder
+                .build_alloca(self.context.ptr_type(AddressSpace::default()), name)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
+        }
+    }
+
+    fn lower_expr(
+        &mut self,
+        e: &Expr,
+        scope: &Scope<'ctx>,
+        self_state: &BTreeMap<String, ParamValue>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        match e {
+            Expr::Literal(Literal::Int(n), _) => {
+                let v = self.context.i64_type().const_int(*n as u64, true);
+                Ok((v.into(), LotusType::Int))
+            }
+            Expr::Literal(Literal::Float(f), _) => {
+                let v = self.context.f64_type().const_float(*f);
+                Ok((v.into(), LotusType::Float))
+            }
+            Expr::Literal(Literal::Bool(b), _) => {
+                let v = self.context.bool_type().const_int(*b as u64, false);
+                Ok((v.into(), LotusType::Bool))
+            }
+            Expr::Literal(Literal::String(s), _) => {
+                let p = self.global_string(s);
+                Ok((p.into(), LotusType::String))
+            }
+            Expr::Ident(id) => {
+                let (alloca, ty) = scope.locals.get(&id.name).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "unknown identifier `{}`",
+                        id.name
+                    ))
+                })?;
+                let llvm_ty = self.llvm_basic_type(*ty);
+                let loaded = self
+                    .builder
+                    .build_load(llvm_ty, *alloca, &id.name)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((loaded, *ty))
+            }
+            Expr::Field { receiver, name, .. }
+                if matches!(receiver.as_ref(), Expr::KwSelf(_)) =>
+            {
+                let value = self_state.get(&name.name).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "self.{}: param not in compile-time state",
+                        name.name
+                    ))
+                })?;
+                Ok(self.const_param(value))
+            }
+            Expr::Binary { op, left, right, span: _ } => {
+                let (lv, lt) = self.lower_expr(left, scope, self_state)?;
+                let (rv, rt) = self.lower_expr(right, scope, self_state)?;
+                if lt != rt {
+                    return Err(CodegenError::Unsupported(format!(
+                        "binary op operands of mixed types {:?} and {:?}",
+                        lt, rt
+                    )));
+                }
+                self.lower_binop(*op, lv, rv, lt)
+            }
+            Expr::Unary { op, operand, .. } => {
+                let (v, t) = self.lower_expr(operand, scope, self_state)?;
+                self.lower_unop(*op, v, t)
+            }
+            _ => Err(CodegenError::Unsupported(format!(
+                "expression form {:?}",
+                std::mem::discriminant(e)
+            ))),
+        }
+    }
+
+    fn const_param(
+        &mut self,
+        v: &ParamValue,
+    ) -> (BasicValueEnum<'ctx>, LotusType) {
+        match v {
+            ParamValue::Int(n) => (
+                self.context.i64_type().const_int(*n as u64, true).into(),
+                LotusType::Int,
+            ),
+            ParamValue::Float(f) => (
+                self.context.f64_type().const_float(*f).into(),
+                LotusType::Float,
+            ),
+            ParamValue::Bool(b) => (
+                self.context.bool_type().const_int(*b as u64, false).into(),
+                LotusType::Bool,
+            ),
+            ParamValue::String(s) => (self.global_string(s).into(), LotusType::String),
+        }
+    }
+
+    fn llvm_basic_type(
+        &self,
+        t: LotusType,
+    ) -> inkwell::types::BasicTypeEnum<'ctx> {
+        match t {
+            LotusType::Int => self.context.i64_type().into(),
+            LotusType::Float => self.context.f64_type().into(),
+            LotusType::Bool => self.context.bool_type().into(),
+            LotusType::String => self.context.ptr_type(AddressSpace::default()).into(),
+        }
+    }
+
+    fn lower_binop(
+        &mut self,
+        op: BinOp,
+        lv: BasicValueEnum<'ctx>,
+        rv: BasicValueEnum<'ctx>,
+        ty: LotusType,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        use inkwell::IntPredicate as IP;
+        use inkwell::FloatPredicate as FP;
+        match (op, ty) {
+            (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod, LotusType::Int) => {
+                let l = lv.into_int_value();
+                let r = rv.into_int_value();
+                let v = match op {
+                    BinOp::Add => self.builder.build_int_add(l, r, "add"),
+                    BinOp::Sub => self.builder.build_int_sub(l, r, "sub"),
+                    BinOp::Mul => self.builder.build_int_mul(l, r, "mul"),
+                    BinOp::Div => self.builder.build_int_signed_div(l, r, "sdiv"),
+                    BinOp::Mod => self.builder.build_int_signed_rem(l, r, "srem"),
+                    _ => unreachable!(),
+                };
+                let v = v.map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Int))
+            }
+            (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, LotusType::Float) => {
+                let l = lv.into_float_value();
+                let r = rv.into_float_value();
+                let v = match op {
+                    BinOp::Add => self.builder.build_float_add(l, r, "fadd"),
+                    BinOp::Sub => self.builder.build_float_sub(l, r, "fsub"),
+                    BinOp::Mul => self.builder.build_float_mul(l, r, "fmul"),
+                    BinOp::Div => self.builder.build_float_div(l, r, "fdiv"),
+                    _ => unreachable!(),
+                };
+                let v = v.map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Float))
+            }
+            (BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq,
+                LotusType::Int) =>
+            {
+                let l = lv.into_int_value();
+                let r = rv.into_int_value();
+                let pred = match op {
+                    BinOp::Eq => IP::EQ,
+                    BinOp::NotEq => IP::NE,
+                    BinOp::Lt => IP::SLT,
+                    BinOp::Gt => IP::SGT,
+                    BinOp::LtEq => IP::SLE,
+                    BinOp::GtEq => IP::SGE,
+                    _ => unreachable!(),
+                };
+                let v = self
+                    .builder
+                    .build_int_compare(pred, l, r, "icmp")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Bool))
+            }
+            (BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq,
+                LotusType::Float) =>
+            {
+                let l = lv.into_float_value();
+                let r = rv.into_float_value();
+                let pred = match op {
+                    BinOp::Eq => FP::OEQ,
+                    BinOp::NotEq => FP::ONE,
+                    BinOp::Lt => FP::OLT,
+                    BinOp::Gt => FP::OGT,
+                    BinOp::LtEq => FP::OLE,
+                    BinOp::GtEq => FP::OGE,
+                    _ => unreachable!(),
+                };
+                let v = self
+                    .builder
+                    .build_float_compare(pred, l, r, "fcmp")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Bool))
+            }
+            (BinOp::And, LotusType::Bool) => {
+                let v = self
+                    .builder
+                    .build_and(lv.into_int_value(), rv.into_int_value(), "and")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Bool))
+            }
+            (BinOp::Or, LotusType::Bool) => {
+                let v = self
+                    .builder
+                    .build_or(lv.into_int_value(), rv.into_int_value(), "or")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Bool))
+            }
+            _ => Err(CodegenError::Unsupported(format!(
+                "binop {:?} on {:?}",
+                op, ty
+            ))),
+        }
+    }
+
+    fn lower_unop(
+        &mut self,
+        op: UnaryOp,
+        v: BasicValueEnum<'ctx>,
+        ty: LotusType,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        match (op, ty) {
+            (UnaryOp::Neg, LotusType::Int) => {
+                let zero = self.context.i64_type().const_int(0, true);
+                let r = self
+                    .builder
+                    .build_int_sub(zero, v.into_int_value(), "neg")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((r.into(), LotusType::Int))
+            }
+            (UnaryOp::Neg, LotusType::Float) => {
+                let r = self
+                    .builder
+                    .build_float_neg(v.into_float_value(), "fneg")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((r.into(), LotusType::Float))
+            }
+            (UnaryOp::Not, LotusType::Bool) => {
+                let r = self
+                    .builder
+                    .build_not(v.into_int_value(), "not")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((r.into(), LotusType::Bool))
+            }
+            _ => Err(CodegenError::Unsupported(format!(
+                "unop {:?} on {:?}",
+                op, ty
+            ))),
+        }
+    }
+
+    /// Lower a `print` / `println` call. Used from both the
+    /// fn-body context (where args may reference local
+    /// bindings) and the birth-body context (where args may
+    /// reference compile-time-known self.X params).
+    fn lower_print_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        self_state: &BTreeMap<String, ParamValue>,
+    ) -> Result<(), CodegenError> {
+        if name != "println" && name != "print" {
+            return Err(CodegenError::Unsupported(format!("builtin `{}`", name)));
+        }
+        let mut format = String::new();
+        let mut printf_args: Vec<BasicMetadataValueEnum> =
+            Vec::with_capacity(args.len() + 1);
+        // Reserve format-string slot at index 0; filled in
+        // after we know the format.
+        printf_args.push(BasicMetadataValueEnum::PointerValue(
+            self.context.ptr_type(AddressSpace::default()).const_null(),
+        ));
+        for a in args {
+            // String literals splice into the format directly
+            // (no value pushed); everything else lowers to an
+            // LLVM value.
+            if let Expr::Literal(Literal::String(s), _) = a {
+                format.push_str(&escape_format(s));
+                continue;
+            }
+            let (val, ty) = self.lower_expr(a, scope, self_state)?;
+            match ty {
+                LotusType::Int => {
+                    format.push_str("%lld");
+                    printf_args.push(BasicMetadataValueEnum::IntValue(val.into_int_value()));
+                }
+                LotusType::Float => {
+                    format.push_str("%g");
+                    printf_args
+                        .push(BasicMetadataValueEnum::FloatValue(val.into_float_value()));
+                }
+                LotusType::Bool => {
+                    // No printf %b; widen to a string at format
+                    // time via a select on the lowered i1.
+                    let true_s = self.global_string("true");
+                    let false_s = self.global_string("false");
+                    let chosen = self
+                        .builder
+                        .build_select(val.into_int_value(), true_s, false_s, "boolstr")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    format.push_str("%s");
+                    printf_args.push(BasicMetadataValueEnum::PointerValue(
+                        chosen.into_pointer_value(),
+                    ));
+                }
+                LotusType::String => {
+                    format.push_str("%s");
+                    printf_args.push(BasicMetadataValueEnum::PointerValue(
+                        val.into_pointer_value(),
+                    ));
+                }
+            }
+        }
+        if name == "println" {
+            format.push('\n');
+        }
+        let fmt_ptr = self.global_string(&format);
+        printf_args[0] = BasicMetadataValueEnum::PointerValue(fmt_ptr);
+        let printf = self
+            .module
+            .get_function("printf")
+            .expect("printf declared");
+        self.builder
+            .build_call(printf, &printf_args, "printf_call")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
     }
 
     /// Lower `LocusName { ... };` for a locus that has only
@@ -238,7 +610,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     fn lower_birth_stmt(
         &mut self,
         stmt: &Stmt,
-        state: &std::collections::BTreeMap<String, ParamValue>,
+        state: &BTreeMap<String, ParamValue>,
     ) -> Result<(), CodegenError> {
         match stmt {
             Stmt::Expr(Expr::Call { callee, args, .. }) => {
@@ -250,43 +622,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ))
                     }
                 };
-                if name != "println" && name != "print" {
-                    return Err(CodegenError::Unsupported(format!(
-                        "builtin `{}`",
-                        name
-                    )));
-                }
-                // Compose a single printf format + arg list.
-                // Each argument contributes a format fragment
-                // (with `%` escaped in literal text) and
-                // optionally a value to plug in.
-                let mut format = String::new();
-                let mut printf_args: Vec<BasicMetadataValueEnum> =
-                    Vec::with_capacity(args.len() + 1);
-                // Reserve the format-string slot at index 0.
-                printf_args.push(BasicMetadataValueEnum::PointerValue(
-                    self.context.ptr_type(AddressSpace::default()).const_null(),
-                ));
-                for a in args {
-                    let (fmt, value) = self.resolve_arg(a, state)?;
-                    format.push_str(&fmt);
-                    if let Some(v) = value {
-                        printf_args.push(v);
-                    }
-                }
-                if name == "println" {
-                    format.push('\n');
-                }
-                let fmt_ptr = self.global_string(&format);
-                printf_args[0] = BasicMetadataValueEnum::PointerValue(fmt_ptr);
-                let printf = self
-                    .module
-                    .get_function("printf")
-                    .expect("printf declared");
-                self.builder
-                    .build_call(printf, &printf_args, "printf_call")
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                Ok(())
+                self.lower_print_call(name, args, &Scope::default(), state)
             }
             _ => Err(CodegenError::Unsupported(
                 "birth-body statement other than println / print".to_string(),
@@ -301,72 +637,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("build_global_string_ptr");
         g.as_pointer_value()
     }
+}
 
-    /// Lower one println argument. Returns:
-    /// - `String`: the format-string fragment to splice in
-    ///   (literal text with `%` escaped, or a printf format
-    ///   specifier like `%s` / `%lld` / `%g`).
-    /// - `Option<BasicMetadataValueEnum>`: the LLVM value to
-    ///   pass to printf, if the fragment was a specifier;
-    ///   `None` if the argument was a literal text fragment.
-    fn resolve_arg(
-        &mut self,
-        e: &Expr,
-        state: &std::collections::BTreeMap<String, ParamValue>,
-    ) -> Result<(String, Option<BasicMetadataValueEnum<'ctx>>), CodegenError> {
-        match e {
-            Expr::Literal(Literal::String(s), _) => Ok((escape_format(s), None)),
-            Expr::Literal(Literal::Int(n), _) => {
-                let v = self.context.i64_type().const_int(*n as u64, true);
-                Ok(("%lld".to_string(), Some(BasicMetadataValueEnum::IntValue(v))))
-            }
-            Expr::Literal(Literal::Float(f), _) => {
-                let v = self.context.f64_type().const_float(*f);
-                Ok(("%g".to_string(), Some(BasicMetadataValueEnum::FloatValue(v))))
-            }
-            Expr::Literal(Literal::Bool(b), _) => {
-                let s = if *b { "true" } else { "false" };
-                Ok((s.to_string(), None))
-            }
-            Expr::Field { receiver, name, .. } if matches!(receiver.as_ref(), Expr::KwSelf(_)) => {
-                let value = state.get(&name.name).ok_or_else(|| {
-                    CodegenError::Unsupported(format!(
-                        "self.{}: param not found in compile-time state",
-                        name.name
-                    ))
-                })?;
-                match value {
-                    ParamValue::String(s) => {
-                        let ptr = self.global_string(s);
-                        Ok((
-                            "%s".to_string(),
-                            Some(BasicMetadataValueEnum::PointerValue(ptr)),
-                        ))
-                    }
-                    ParamValue::Int(n) => {
-                        let v = self.context.i64_type().const_int(*n as u64, true);
-                        Ok((
-                            "%lld".to_string(),
-                            Some(BasicMetadataValueEnum::IntValue(v)),
-                        ))
-                    }
-                    ParamValue::Float(f) => {
-                        let v = self.context.f64_type().const_float(*f);
-                        Ok((
-                            "%g".to_string(),
-                            Some(BasicMetadataValueEnum::FloatValue(v)),
-                        ))
-                    }
-                    ParamValue::Bool(b) => {
-                        Ok(((if *b { "true" } else { "false" }).to_string(), None))
-                    }
-                }
-            }
-            _ => Err(CodegenError::Unsupported(
-                "println argument is neither literal nor self.<param>".to_string(),
-            )),
-        }
-    }
+#[derive(Default)]
+struct Scope<'ctx> {
+    locals: BTreeMap<String, (PointerValue<'ctx>, LotusType)>,
 }
 
 #[derive(Debug, Clone)]
