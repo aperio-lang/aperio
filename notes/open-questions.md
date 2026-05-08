@@ -158,6 +158,24 @@ runtime.
     give a fast path to a parser; LLVM backend gives native
     code. Both are well-trodden.
 
+## Implementation gaps vs. spec
+
+These are spec commitments the implementation has not yet caught
+up to. Not bugs — the spec is forward content; the implementation
+fills in incrementally — but tracking them avoids silent drift.
+
+23. **Immutable-binding compile-time enforcement.**
+    Spec (`design-rationale.md` §E,
+    `types.md` "Mutability") commits: `let x = 0; x = 1;` is
+    a compile-time error; only `let mut x` permits
+    reassignment. The current typechecker (`crates/lotus-types/`)
+    does not enforce this — both interpreter and codegen accept
+    reassignment to a non-mut binding without diagnostic. Should
+    land alongside the next typechecker pass that touches
+    expression-statement / assignment resolution. Low-risk fix
+    (track is_mut on the symbol table entry; raise diagnostic
+    on Stmt::Assign if the resolved symbol is not mut).
+
 ---
 
 These questions are not blockers for the spec being committed.

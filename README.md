@@ -4,12 +4,16 @@ A programming language whose primitives are the lotus framework's
 coordination primitives.
 
 **Status.** v0 compiler runs lotus programs end-to-end via a
-tree-walking interpreter; LLVM codegen is the next deep push.
+tree-walking interpreter AND emits native ELF binaries via LLVM
+for a growing subset of the language. Phase 3 (codegen) is at
+milestone 5: literals + arithmetic, `let`/`let mut` + assignment
++ compound ops, `if`/`else`/`while` + `break`/`continue`, and
+`time::sleep` on `CLOCK_MONOTONIC` with EINTR retry.
 
 Phase 0 (spec stabilization + example ladder) and Phase 1
 (compiler frontend: lex / parse / typecheck) are complete. The
 v0 runtime (Phase 2 first cut) is a tree-walking interpreter
-that executes 8 of 9 example projects end-to-end, including
+that executes 11 of 13 example projects end-to-end, including
 the trellis-demo pipeline. The bus router has a Transport
 trait with two implementations (sync dispatch, LMAX-style ring
 buffer); the typechecker enforces the framework's distinctive
@@ -20,11 +24,13 @@ Quick start:
 
 ```
 cargo build
-cargo run --bin lotus -- run examples/hello-world/main.lt
-cargo test --workspace
+cargo run --bin lotus -- run   examples/hello-world/main.lt
+cargo run --bin lotus -- build examples/07-control-flow/main.lt
+./examples/07-control-flow/main
+cargo test --workspace                                # 71 tests
 ```
 
-Working CLI commands: `lex`, `parse`, `check`, `run` —
+Working CLI commands: `lex`, `parse`, `check`, `run`, `build` —
 single-file or whole-project (multi-file bundle) targets.
 
 Full delivery plan to team-wide-internal v1.0:
@@ -125,11 +131,11 @@ constrained by the closed graph above. This repo formalizes it.
 
 ```
 spec/
-  grammar.ebnf            456 lines  formal grammar (source of truth)
-  tokens.md               304 lines  lexical structure
-  precedence.md           105 lines  operator precedence
-  design-rationale.md   1,117 lines  why each construct looks this way
-  runtime.md              241 lines  what the lotus binary ships with
+  grammar.ebnf            483 lines  formal grammar (source of truth)
+  tokens.md               327 lines  lexical structure
+  precedence.md           123 lines  operator precedence
+  design-rationale.md   1,329 lines  why each construct looks this way
+  runtime.md              258 lines  what the lotus binary ships with
   stdlib.md               272 lines  batteries-included module map
   testing.md              247 lines  3-layer testing pipeline design
   memory.md               322 lines  formal memory model
@@ -151,6 +157,13 @@ examples/
                           iteration
   05-bus/                 typed pub-sub via in-process router; sender
                           + echo + ack-logger
+  06-mutable-counter/     `let mut` + plain/compound assignment via
+                          codegen (hand-unrolled, no control flow)
+  07-control-flow/        if/else/while + break/continue via codegen;
+                          folds 06's counter into a loop
+  08-monotonic-sleep/     time::sleep on CLOCK_MONOTONIC with EINTR
+                          retry; identical observable behavior on
+                          interpreter and codegen paths
   trellis-demo/           full producer→analyst→executor→logger
                           pipeline as one process; F.4 program-end
                           dissolve fires the analyst's audit closure
@@ -163,22 +176,28 @@ examples/
 notes/
   open-questions.md       deferred decisions and future directions
 
-crates/                   (Phase 1 + 2 v0)
+crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-5)
   lotus-syntax/           lexer + parser + AST + diagnostics
   lotus-types/            symbol resolution + type checker (F.8,
                           field strictness, closure cycle, match
                           exhaustiveness, k_max recognition)
   lotus-runtime/          tree-walking interpreter + bus router
                           (Transport trait: SyncDispatch / RingBuffer)
-                          + dissolve cascade (F.4 + F.9)
-  lotus-codegen/          LLVM codegen (placeholder; Phase 3 next)
-  lotus-cli/              `lotus` binary (lex / parse / check / run)
+                          + dissolve cascade (F.4 + F.9); time::sleep
+                          via libc::clock_nanosleep on CLOCK_MONOTONIC
+  lotus-codegen/          LLVM codegen (inkwell + llvm-18); literals,
+                          arithmetic, let mut + assignment, control
+                          flow, time::sleep on CLOCK_MONOTONIC
+  lotus-cli/              `lotus` binary (lex / parse / check / run /
+                          build)
 ```
 
-Example ladder: 9 projects from hello-world → trellis-demo;
+Example ladder: 13 projects from hello-world → trellis-demo;
 ~700 lines of source + ~1,000+ lines of README walk-throughs.
-50 tests across the workspace; 8 of 9 projects run end-to-end
-under `lotus run`.
+71 tests across the workspace; 11 of 13 projects run end-to-end
+under `lotus run`, and 5 of those (hello-world, 06, 07, 08, plus
+mixed-type println variants) also build to native ELF via
+`lotus build`.
 
 ## Toolchain
 
@@ -189,12 +208,13 @@ lotus lex   <file>           tokenize and print tokens
 lotus parse <file>           parse and print the AST
 lotus check <file | dir>     parse + typecheck (the full F-rules)
 lotus run   <file | dir>     parse + typecheck + interpret
+lotus build <file>           parse + typecheck + emit native ELF
+                              (Phase 3, milestone-5 subset)
 ```
 
 Per `spec/testing.md`, the planned full surface adds:
 
 ```
-lotus build       compile source → executable / library (Phase 3)
 lotus test        run all *_test.lt files
 lotus bench       run all *_bench.lt files
 lotus bench -compare  build + run external-language equivalents alongside
@@ -219,7 +239,13 @@ Per the delivery plan:
   with collapse / absorb / bubble; program-end dissolve.
   Region allocator + cooperative scheduler are the remaining
   Phase 2 deep-pushes.
-- **Phase 3** — Codegen in Rust targeting LLVM. *Next.*
+- **Phase 3** — Codegen in Rust targeting LLVM. *In progress;
+  milestone 5 of N complete.* Working subset: literals, arithmetic,
+  `let`/`let mut` + assignment + compound ops, mixed-type println,
+  if/else/while + break/continue, `time::sleep` on CLOCK_MONOTONIC.
+  Up next: multi-fn programs, then the locus-as-struct runtime ABI
+  that gates `run()`/`accept()`/`dissolve()`, struct-field mutation,
+  and arrays.
 - **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
   Phase 3.
 - **Phase 5** — Toolchain. Overlaps Phase 3–4.
