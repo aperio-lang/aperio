@@ -42,6 +42,12 @@ enum LotusType {
     /// name; the layout + field map live in `Cx.user_loci`. Used
     /// for the child param of `accept(g: ChildLocus)`.
     LocusRef(String),
+    /// Pointer to a user-defined type's struct (`type T { ... }`).
+    /// The string carries the type name; the layout + field map
+    /// live in `Cx.user_types`. Used for type-literal expressions
+    /// like `Greeting { text: "hi", ... }` and for field access on
+    /// values bound from those literals.
+    TypeRef(String),
 }
 
 /// Did the last lowered statement leave the current basic block
@@ -105,6 +111,7 @@ pub fn build_executable(
         loops: Vec::new(),
         user_fns: BTreeMap::new(),
         user_loci: BTreeMap::new(),
+        user_types: BTreeMap::new(),
     };
 
     cx.declare_builtins();
@@ -177,6 +184,11 @@ struct Cx<'ctx, 'p> {
     /// `lower_program`; carries the LLVM struct type for the
     /// locus's params + the lifecycle methods compiled against it.
     user_loci: BTreeMap<String, LocusInfo<'ctx>>,
+    /// User-defined `type` declarations indexed by name. Filled
+    /// in pass A0 of `lower_program`; carries the LLVM struct
+    /// type and field map for plain data records (no methods).
+    /// Used for type literals like `Point { x: 3, y: 4 }`.
+    user_types: BTreeMap<String, TypeInfo<'ctx>>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +222,22 @@ struct LocusInfo<'ctx> {
     /// lowering and child-instantiation sites (which must call
     /// parent.accept before child.birth, per F.7).
     accept_param: Option<(String, String)>,
+}
+
+/// Compiled user `type` (a plain data record). No methods, no
+/// lifecycle; just the struct type + field map. Field access
+/// lowers to GEP+load; instantiation lowers to alloca + per-field
+/// store + return-the-pointer.
+#[derive(Debug, Clone)]
+struct TypeInfo<'ctx> {
+    struct_ty: StructType<'ctx>,
+    /// Field name → (index in struct, field type).
+    fields: BTreeMap<String, (u32, LotusType)>,
+    /// Field declaration order; needed because a struct literal
+    /// might list fields in a different order than the type
+    /// declaration, and field stores still go to the right
+    /// indexed slot.
+    field_order: Vec<String>,
 }
 
 /// Carried on `Cx` while lowering a lifecycle method body so
@@ -278,6 +306,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .ok_or_else(|| {
                 CodegenError::Unsupported("program has no `fn main()`".to_string())
             })?;
+
+        // Pass A0: declare every user-defined `type` so locus
+        // params, fn signatures, and struct literals can reference
+        // them by name regardless of source order. Plain data
+        // records — no methods, no lifecycle.
+        let type_decls: Vec<TypeDecl> = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopDecl::Type(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        for t in &type_decls {
+            self.declare_user_type(t)?;
+        }
 
         // Pass A: declare each user-defined locus. Split in two so
         // accept's child-locus param can resolve regardless of the
@@ -395,6 +440,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let name = &path.segments[0].name;
                 if self.user_loci.contains_key(name) {
                     Ok(LotusType::LocusRef(name.clone()))
+                } else if self.user_types.contains_key(name) {
+                    Ok(LotusType::TypeRef(name.clone()))
                 } else {
                     Err(CodegenError::Unsupported(format!(
                         "unknown type name `{}` in signature",
@@ -407,6 +454,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 std::mem::discriminant(other)
             ))),
         }
+    }
+
+    /// Pass A0: declare a user `type` decl as an LLVM struct type.
+    /// Aliases and enums are not yet lowered — only struct bodies.
+    /// No defaults are expected (the language requires struct
+    /// literals to provide every field at the call site).
+    fn declare_user_type(&mut self, t: &TypeDecl) -> Result<(), CodegenError> {
+        if !t.generics.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "generic type `{}`",
+                t.name.name
+            )));
+        }
+        let struct_fields = match &t.body {
+            TypeDeclBody::Struct(fs) => fs,
+            TypeDeclBody::Alias(_) => {
+                return Err(CodegenError::Unsupported(format!(
+                    "type alias `{}`: codegen v0 only lowers struct types",
+                    t.name.name
+                )));
+            }
+            TypeDeclBody::Enum(_) => {
+                return Err(CodegenError::Unsupported(format!(
+                    "enum type `{}`: codegen v0 only lowers struct types",
+                    t.name.name
+                )));
+            }
+        };
+
+        let mut fields: BTreeMap<String, (u32, LotusType)> = BTreeMap::new();
+        let mut field_order: Vec<String> = Vec::new();
+        let mut llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
+            Vec::new();
+        for (idx, f) in struct_fields.iter().enumerate() {
+            let ft = self.type_expr_to_lotus(&f.ty)?;
+            llvm_field_tys.push(self.llvm_basic_type(&ft));
+            fields.insert(f.name.name.clone(), (idx as u32, ft));
+            field_order.push(f.name.name.clone());
+        }
+        let struct_ty = self
+            .context
+            .opaque_struct_type(&format!("type.{}", t.name.name));
+        struct_ty.set_body(&llvm_field_tys, false);
+
+        self.user_types.insert(
+            t.name.name.clone(),
+            TypeInfo {
+                struct_ty,
+                fields,
+                field_order,
+            },
+        );
+        Ok(())
     }
 
     /// Pass A: declare a locus's struct type + lifecycle method
@@ -752,7 +852,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some(LotusType::Bool) => {
                 self.context.bool_type().fn_type(&llvm_param_tys, false)
             }
-            Some(LotusType::String) | Some(LotusType::LocusRef(_)) => self
+            Some(LotusType::String)
+            | Some(LotusType::LocusRef(_))
+            | Some(LotusType::TypeRef(_)) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .fn_type(&llvm_param_tys, false),
@@ -887,7 +989,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Stmt::Expr(Expr::Struct { path, inits, .. }) => {
                 if path.segments.len() != 1 {
                     return Err(CodegenError::Unsupported(format!(
-                        "qualified-name locus literal `{}`",
+                        "qualified-name struct literal `{}`",
                         path.segments
                             .iter()
                             .map(|s| s.name.as_str())
@@ -896,7 +998,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )));
                 }
                 let name = path.segments[0].name.as_str();
-                self.lower_locus_instantiation(name, inits, scope)?;
+                if self.user_loci.contains_key(name) {
+                    self.lower_locus_instantiation(name, inits, scope)?;
+                } else if self.user_types.contains_key(name) {
+                    // Statement-position type literal: build it,
+                    // discard the pointer. Useful for side-effect-
+                    // free expressions like `Foo {};` (rare but legal).
+                    let _ = self.lower_user_type_instantiation(name, inits, scope)?;
+                } else {
+                    return Err(CodegenError::Unsupported(format!(
+                        "struct literal `{}`: no locus or type by that name",
+                        name
+                    )));
+                }
                 Ok(BlockEnd::Open)
             }
             Stmt::Expr(Expr::Call { callee, args, .. }) => {
@@ -1264,7 +1378,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .builder
                 .build_alloca(self.context.bool_type(), name)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
-            LotusType::String | LotusType::LocusRef(_) => self
+            LotusType::String
+            | LotusType::LocusRef(_)
+            | LotusType::TypeRef(_) => self
                 .builder
                 .build_alloca(self.context.ptr_type(AddressSpace::default()), name)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
@@ -1355,8 +1471,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             Expr::Field { receiver, name, .. } => {
                 // Non-self field access: `g.X` where `g` is a
-                // locally-bound `LocusRef`. Lower as GEP+load on
-                // the referent locus's struct.
+                // locally-bound `LocusRef` or `TypeRef`. Lower as
+                // GEP+load on the referent struct.
                 let recv_name = match receiver.as_ref() {
                     Expr::Ident(i) => i.name.as_str(),
                     _ => {
@@ -1375,34 +1491,43 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             recv_name
                         ))
                     })?;
-                let locus_name = match &slot_ty {
-                    LotusType::LocusRef(n) => n.clone(),
+                let (struct_ty, fields, ref_kind) = match &slot_ty {
+                    LotusType::LocusRef(n) => {
+                        let info = self
+                            .user_loci
+                            .get(n)
+                            .cloned()
+                            .expect("LocusRef points to a declared locus");
+                        (info.struct_ty, info.fields, format!("locus `{}`", n))
+                    }
+                    LotusType::TypeRef(n) => {
+                        let info = self
+                            .user_types
+                            .get(n)
+                            .cloned()
+                            .expect("TypeRef points to a declared type");
+                        (info.struct_ty, info.fields, format!("type `{}`", n))
+                    }
                     other => {
                         return Err(CodegenError::Unsupported(format!(
-                            "field access `{}.{}` on non-locus type {:?}",
+                            "field access `{}.{}` on non-record type {:?}",
                             recv_name, name.name, other
                         )));
                     }
                 };
-                let info = self
-                    .user_loci
-                    .get(&locus_name)
-                    .cloned()
-                    .expect("LocusRef points to a declared locus");
-                let (idx, field_ty) = info
-                    .fields
+                let (idx, field_ty) = fields
                     .get(&name.name)
                     .cloned()
                     .ok_or_else(|| {
                         CodegenError::Unsupported(format!(
-                            "no field `{}` on locus `{}`",
-                            name.name, locus_name
+                            "no field `{}` on {}",
+                            name.name, ref_kind
                         ))
                     })?;
-                // The slot stores the child pointer; load it to get
-                // the actual locus struct ptr, then GEP into that.
+                // The slot stores the record pointer; load it to
+                // get the actual struct ptr, then GEP into that.
                 let ptr_t = self.context.ptr_type(AddressSpace::default());
-                let child_ptr = self
+                let recv_ptr = self
                     .builder
                     .build_load(ptr_t, slot_ptr, recv_name)
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
@@ -1410,8 +1535,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let field_ptr = self
                     .builder
                     .build_struct_gep(
-                        info.struct_ty,
-                        child_ptr,
+                        struct_ty,
+                        recv_ptr,
                         idx,
                         &format!("{}.{}.ptr", recv_name, name.name),
                     )
@@ -1460,6 +1585,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     std::mem::discriminant(callee.as_ref())
                 ))),
             },
+            Expr::Struct { path, inits, .. }
+                if path.segments.len() == 1
+                    && self.user_types.contains_key(&path.segments[0].name) =>
+            {
+                let name = path.segments[0].name.clone();
+                let ptr = self.lower_user_type_instantiation(&name, inits, scope)?;
+                Ok((ptr.into(), LotusType::TypeRef(name)))
+            }
             _ => Err(CodegenError::Unsupported(format!(
                 "expression form {:?}",
                 std::mem::discriminant(e)
@@ -1502,7 +1635,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             LotusType::Float => self.context.f64_type().into(),
             LotusType::Bool => self.context.bool_type().into(),
-            LotusType::String | LotusType::LocusRef(_) => {
+            LotusType::String
+            | LotusType::LocusRef(_)
+            | LotusType::TypeRef(_) => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
         }
@@ -1751,6 +1886,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     return Err(CodegenError::Unsupported(format!(
                         "println of a locus value (LocusRef `{}`) — \
                          lotus has no Display protocol yet",
+                        name
+                    )));
+                }
+                LotusType::TypeRef(name) => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "println of a type value (TypeRef `{}`) — \
+                         print individual fields instead",
                         name
                     )));
                 }
@@ -2160,6 +2302,80 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
 
         Ok(())
+    }
+
+    /// Lower a user-type struct literal `T { f: v, ... }` to an
+    /// alloca + per-field store, returning the pointer. Every
+    /// field declared on `T` must be supplied by the literal —
+    /// type literals don't have defaults at codegen v0 (only
+    /// locus params do). Bus payloads will use this same lowering
+    /// in m12 once `<-` dispatch lands.
+    fn lower_user_type_instantiation(
+        &mut self,
+        type_name: &str,
+        inits: &[StructInit],
+        scope: &Scope<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let info = self
+            .user_types
+            .get(type_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "no type `{}` declared",
+                    type_name
+                ))
+            })?;
+        let by_name: BTreeMap<&str, &Expr> = inits
+            .iter()
+            .map(|i| (i.name.name.as_str(), &i.value))
+            .collect();
+        for fname in &info.field_order {
+            if !by_name.contains_key(fname.as_str()) {
+                return Err(CodegenError::Unsupported(format!(
+                    "type `{}` literal missing field `{}` (no defaults at \
+                     codegen v0)",
+                    type_name, fname
+                )));
+            }
+        }
+
+        let self_ptr = self
+            .builder
+            .build_alloca(info.struct_ty, &format!("{}.lit", type_name))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        for fname in &info.field_order {
+            let expr = by_name
+                .get(fname.as_str())
+                .copied()
+                .expect("field presence checked above");
+            let (val, val_ty) = self.lower_expr(expr, scope)?;
+            let (idx, declared_ty) = info
+                .fields
+                .get(fname)
+                .cloned()
+                .expect("field declared by declare_user_type");
+            if val_ty != declared_ty {
+                return Err(CodegenError::Unsupported(format!(
+                    "type `{}` field `{}` type mismatch: declared {:?}, \
+                     got {:?}",
+                    type_name, fname, declared_ty, val_ty
+                )));
+            }
+            let field_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    idx,
+                    &format!("{}.{}.ptr", type_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(field_ptr, val)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        Ok(self_ptr)
     }
 
     fn global_string(&mut self, s: &str) -> PointerValue<'ctx> {

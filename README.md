@@ -7,7 +7,8 @@ coordination primitives.
 tree-walking interpreter AND emits native ELF binaries via LLVM
 for a substantial subset of the language including the full
 lifecycle quartet (`birth` / `accept` / `run` / `drain` /
-`dissolve`). Phase 3 (codegen) is at milestone 10: literals +
+`dissolve`) and user-defined `type` declarations. Phase 3
+(codegen) is at milestone 11: literals +
 arithmetic, `let`/`let mut` + assignment + compound ops,
 `if`/`else`/`while` + `break`/`continue`, `time::sleep` on
 `CLOCK_MONOTONIC` with EINTR retry, `time::monotonic()` +
@@ -16,13 +17,15 @@ params + return + recursion), the **locus runtime ABI** (each
 locus → LLVM struct, lifecycle methods take `self_ptr`,
 `self.X` reads/writes via `getelementptr`), parent-child
 **`accept()` lifecycle** with F.7 ordering (accept fires before
-child birth), and **`drain()` / `dissolve()` lifecycle methods**
-with F.4 depth-first cascade (children dissolve before parent).
+child birth), **`drain()` / `dissolve()` lifecycle methods**
+with F.4 depth-first cascade (children dissolve before parent),
+and **user-defined `type` declarations** (struct literals + GEP
+field access) — the substrate the bus router will sit on top of.
 
 Phase 0 (spec stabilization + example ladder) and Phase 1
 (compiler frontend: lex / parse / typecheck) are complete. The
 v0 runtime (Phase 2 first cut) is a tree-walking interpreter
-that executes 15 of 16 example projects end-to-end, including
+that executes 16 of 17 example projects end-to-end, including
 the trellis-demo pipeline. The bus router has a Transport
 trait with two implementations (sync dispatch, LMAX-style ring
 buffer); the typechecker enforces the framework's distinctive
@@ -185,6 +188,9 @@ examples/
                           F.4 depth-first cascade via synchronous
                           instantiation; identical interpreter +
                           codegen output
+  12-user-types/          user-defined `type` declarations as plain
+                          data records: struct literals + GEP field
+                          access; substrate for the bus router
   trellis-demo/           full producer→analyst→executor→logger
                           pipeline as one process; F.4 program-end
                           dissolve fires the analyst's audit closure
@@ -197,7 +203,7 @@ examples/
 notes/
   open-questions.md       deferred decisions and future directions
 
-crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-10)
+crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-11)
   lotus-syntax/           lexer + parser + AST + diagnostics
   lotus-types/            symbol resolution + type checker (F.8,
                           field strictness, closure cycle, match
@@ -213,17 +219,19 @@ crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-10)
                           user-defined fns, the locus runtime ABI,
                           the full lifecycle quartet (birth + accept
                           w/ F.7 ordering + run + drain + dissolve
-                          w/ F.4 cascade) + self.X / g.X via GEP
+                          w/ F.4 cascade) + self.X / g.X via GEP +
+                          user `type` decls (struct literals + field
+                          reads on TypeRef values)
   lotus-cli/              `lotus` binary (lex / parse / check / run /
                           build)
 ```
 
-Example ladder: 16 projects from hello-world → trellis-pair;
-~800 lines of source + ~1,300+ lines of README walk-throughs.
-91 tests across the workspace; 15 of 16 projects run end-to-end
+Example ladder: 17 projects from hello-world → trellis-pair;
+~830 lines of source + ~1,350+ lines of README walk-throughs.
+91 tests across the workspace; 16 of 17 projects run end-to-end
 under `lotus run` (only multi-binary trellis-pair waits on the
-cross-process bus). Nine projects (hello-world, 01, 02, 06, 07,
-08, 09, 10, 11) also build to native ELF via `lotus build`.
+cross-process bus). Ten projects (hello-world, 01, 02, 06, 07,
+08, 09, 10, 11, 12) also build to native ELF via `lotus build`.
 
 ## Toolchain
 
@@ -235,7 +243,7 @@ lotus parse <file>           parse and print the AST
 lotus check <file | dir>     parse + typecheck (the full F-rules)
 lotus run   <file | dir>     parse + typecheck + interpret
 lotus build <file>           parse + typecheck + emit native ELF
-                              (Phase 3, milestone-10 subset)
+                              (Phase 3, milestone-11 subset)
 ```
 
 Per `spec/testing.md`, the planned full surface adds:
@@ -266,19 +274,20 @@ Per the delivery plan:
   Region allocator + cooperative scheduler are the remaining
   Phase 2 deep-pushes.
 - **Phase 3** — Codegen in Rust targeting LLVM. *In progress;
-  milestone 10 of N complete.* Working subset: literals, arithmetic,
+  milestone 11 of N complete.* Working subset: literals, arithmetic,
   `let`/`let mut` + assignment + compound ops, mixed-type println,
   if/else/while + break/continue, `time::sleep` + `time::monotonic`
   on `CLOCK_MONOTONIC` with EINTR retry, Duration arithmetic /
   comparisons, user-defined fns (typed params + return +
-  recursion), the locus runtime ABI, parent-child `accept()`
-  lifecycle with F.7 ordering, and the `drain()` / `dissolve()`
-  lifecycle quartet with F.4 depth-first cascade.
-  `01-locus-with-run`, `02-parent-child`, `10-stateful-locus`,
-  and `11-drain-dissolve` all compile to native ELF and run
-  identically to the interpreter. Up next: bus router lowering
-  for `05-bus`, then modes, closures, and decimal arithmetic
-  before `trellis-demo` is a build target.
+  recursion), the locus runtime ABI, the full lifecycle quartet
+  (birth + accept w/ F.7 + run + drain + dissolve w/ F.4
+  cascade), and user-defined `type` declarations + struct
+  literals + field reads. `01-locus-with-run`, `02-parent-child`,
+  `10-stateful-locus`, `11-drain-dissolve`, and `12-user-types`
+  all compile to native ELF and run identically to the
+  interpreter. Up next: bus router lowering for `05-bus`, then
+  modes, closures, and decimal arithmetic before `trellis-demo`
+  is a build target.
 - **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
   Phase 3.
 - **Phase 5** — Toolchain. Overlaps Phase 3–4.

@@ -1,8 +1,8 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 10 (drain/dissolve)
-on top of commit `cdd7353` (2026-05-08).
+new session. State as of codegen milestone 11 (user types) on top
+of commit `cdd7353` (2026-05-08).
 
 This is part of the alpha-conjecture program (see
 `~/notes/alpha-conjecture/CLAUDE.md`). Lotus is the language-substrate
@@ -34,22 +34,22 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 15 of 16 example
+- **Phase 2 v0** (interpreter + bus router) — 16 of 17 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
-- **Phase 3 milestone 10** (codegen subset) — complete. 9 of 16
+- **Phase 3 milestone 11** (codegen subset) — complete. 10 of 17
   example projects build to native ELF via `lotus build`:
   hello-world, 01-locus-with-run, 02-parent-child, 06-mutable-
   counter, 07-control-flow, 08-monotonic-sleep, 09-functions,
-  10-stateful-locus, 11-drain-dissolve. Latest: `drain()` /
-  `dissolve()` lifecycle methods lowered + cascade-ordered
-  dispatch (F.4 depth-first via synchronous instantiation), with
-  matching interpreter parity (drain bodies now fire; ephemeral
-  child no longer double-dissolves).
-- **Phase 3 next** — bus router lowering for `05-bus`. Then
-  modes (bulk / harmonic / resolution), closures, and decimal
-  arithmetic — the remaining big pieces before `trellis-demo` is
-  a build target.
+  10-stateful-locus, 11-drain-dissolve, 12-user-types. Latest:
+  user-defined `type` declarations + struct literals + field
+  reads on `TypeRef` values — foundational substrate for the bus
+  router.
+- **Phase 3 next** — bus router lowering for `05-bus` (subject
+  → handler registry, `<-` dispatch). Then modes (bulk /
+  harmonic / resolution), closures, and decimal arithmetic —
+  the remaining big pieces before `trellis-demo` is a build
+  target.
 
 ## Codegen milestone arc (Phase 3 progress)
 
@@ -70,6 +70,7 @@ m7  Codegen milestone 7: locus runtime ABI    ← load-bearing    (206fbd0)
 m8  Codegen milestone 8: accept() + parent-child wiring         (d5afffd)
 m9  Codegen milestone 9: time::monotonic() + Duration arith     (cdd7353)
 m10 Codegen milestone 10: drain() / dissolve() lifecycle        (3ba3e05)
+m11 Codegen milestone 11: user `type` decls + struct literals   (this commit)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -99,6 +100,7 @@ m7 builds on the struct ABI.
 | `self.X = ...` mutation in lifecycle methods | ✅ | ✅ |
 | `accept()` lifecycle method (F.7 ordering) + child `g.X` reads | ✅ | ✅ |
 | `drain()` / `dissolve()` lifecycle methods (F.4 cascade) | ✅ | ✅ |
+| User `type` decls + struct literals + field reads | ✅ | ✅ |
 | Contracts (typecheck only — F.8) | ✅ | ✅ (skipped at codegen) |
 | `for` / `match` | ✅ | — |
 | Bus router (`<-` send + subscribe dispatch) | ✅ | — |
@@ -343,6 +345,9 @@ rm examples/10-stateful-locus/main       # clean up artifact
 cargo run --bin lotus -- build examples/11-drain-dissolve/main.lt
 ./examples/11-drain-dissolve/main        # parent: birth, child-a/b drain+dissolve, parent: drain+dissolve
 rm examples/11-drain-dissolve/main       # clean up artifact
+cargo run --bin lotus -- build examples/12-user-types/main.lt
+./examples/12-user-types/main            # p.x=3 p.y=4, q.x=13 q.y=8, alice says hello (priority 7)
+rm examples/12-user-types/main           # clean up artifact
 ```
 
-If all twelve work, the checkpoint is intact.
+If all thirteen work, the checkpoint is intact.
