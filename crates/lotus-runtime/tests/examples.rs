@@ -59,6 +59,11 @@ fn bus_runs() {
     assert_eq!(parse_and_run("05-bus/main.lt").unwrap(), 0);
 }
 
+#[test]
+fn trellis_demo_runs() {
+    assert_eq!(parse_and_run("trellis-demo/main.lt").unwrap(), 0);
+}
+
 /// Ring-buffer transport delivers the same observable result
 /// as sync dispatch for 05-bus. Source unchanged; transport
 /// configured at runtime construction.

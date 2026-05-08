@@ -968,6 +968,21 @@ fn eval_literal(lit: &Literal) -> Value {
     }
 }
 
+fn parse_decimal(s: &str) -> Option<f64> {
+    // Strip a trailing `d` if the source spelling carried it.
+    let s = s.strip_suffix('d').unwrap_or(s);
+    s.parse::<f64>().ok()
+}
+
+fn fmt_decimal(f: f64) -> String {
+    // v0: format without the `d` suffix — the suffix is part
+    // of literal syntax, not the value's printed form. Matches
+    // how Decimal literals are stored by the lexer (`1.0`, not
+    // `1.0d`). Precision is not yet shopspring/decimal-grade;
+    // milestone 3 swaps the internal store.
+    format!("{}", f)
+}
+
 fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     use BinOp::*;
     match (op, l, r) {
@@ -982,6 +997,50 @@ fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         (Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
         (Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
         (Div, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
+        (Add, Value::Decimal(a), Value::Decimal(b)) => {
+            let af = parse_decimal(a)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", a))?;
+            let bf = parse_decimal(b)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", b))?;
+            Ok(Value::Decimal(fmt_decimal(af + bf)))
+        }
+        (Sub, Value::Decimal(a), Value::Decimal(b)) => {
+            let af = parse_decimal(a)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", a))?;
+            let bf = parse_decimal(b)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", b))?;
+            Ok(Value::Decimal(fmt_decimal(af - bf)))
+        }
+        (Mul, Value::Decimal(a), Value::Decimal(b)) => {
+            let af = parse_decimal(a)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", a))?;
+            let bf = parse_decimal(b)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", b))?;
+            Ok(Value::Decimal(fmt_decimal(af * bf)))
+        }
+        (Div, Value::Decimal(a), Value::Decimal(b)) => {
+            let af = parse_decimal(a)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", a))?;
+            let bf = parse_decimal(b)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", b))?;
+            if bf == 0.0 {
+                return Err("decimal division by zero".to_string());
+            }
+            Ok(Value::Decimal(fmt_decimal(af / bf)))
+        }
+        (Lt | Gt | LtEq | GtEq, Value::Decimal(a), Value::Decimal(b)) => {
+            let af = parse_decimal(a)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", a))?;
+            let bf = parse_decimal(b)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", b))?;
+            Ok(Value::Bool(match op {
+                Lt => af < bf,
+                Gt => af > bf,
+                LtEq => af <= bf,
+                GtEq => af >= bf,
+                _ => unreachable!(),
+            }))
+        }
         (Add, Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
         (Eq, a, b) => Ok(Value::Bool(values_equal(a, b))),
         (NotEq, a, b) => Ok(Value::Bool(!values_equal(a, b))),
