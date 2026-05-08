@@ -108,11 +108,47 @@ fn monotonic_sleep_ns(ns: i64) {
     }
 }
 
+/// `time::monotonic()` — current value of the monotonic clock as
+/// a Duration (i64 nanoseconds since an unspecified reference).
+/// Only meaningful for elapsed-time differences; the absolute
+/// value has no calendar interpretation. Pairs with the
+/// `clock_nanosleep(CLOCK_MONOTONIC, ...)` discipline used by
+/// `time::sleep` so all scheduling decisions sit on one clock.
+///
+/// `CLOCK_REALTIME` (wall-clock) and the corresponding
+/// `time::now()` are reserved for observation only — they're not
+/// suitable for scheduling because NTP slewing and leap seconds
+/// can warp the value.
+pub fn time_monotonic(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "time::monotonic takes no arguments, got {}",
+            args.len()
+        ));
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if r != 0 {
+        return Err(format!(
+            "clock_gettime(CLOCK_MONOTONIC) failed: errno {}",
+            r
+        ));
+    }
+    let ns = (ts.tv_sec as i64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as i64);
+    Ok(Value::Duration(ns))
+}
+
 pub fn resolve_path(segments: &[&str]) -> Option<Value> {
     match segments {
         ["time", "sleep"] => Some(Value::Builtin(BuiltinRef {
             name: "time::sleep",
             func: Rc::new(time_sleep),
+        })),
+        ["time", "monotonic"] => Some(Value::Builtin(BuiltinRef {
+            name: "time::monotonic",
+            func: Rc::new(time_monotonic),
         })),
         _ => None,
     }

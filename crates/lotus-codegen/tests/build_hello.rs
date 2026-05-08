@@ -832,6 +832,34 @@ fn parent_child_canonical_example_builds_and_runs() {
 }
 
 #[test]
+fn build_time_monotonic_returns_duration() {
+    // Two reads of the monotonic clock with a 20ms sleep between
+    // them; the elapsed Duration must be at least the sleep
+    // interval. Exercises:
+    //   - time::monotonic() in expression position (let binding)
+    //   - Duration - Duration → Duration
+    //   - Duration > Duration comparison
+    //   - if/else branching on the comparison
+    let src = r#"
+        fn main() {
+            let t0 = time::monotonic();
+            time::sleep(20ms);
+            let t1 = time::monotonic();
+            let elapsed = t1 - t0;
+            if elapsed > 20ms {
+                println("ok");
+            } else {
+                println("fail");
+            }
+        }
+    "#;
+    let (stdout, status) = build_and_run("time_monotonic", src);
+    assert!(status.success());
+    assert!(stdout.contains("ok"), "got: {:?}", stdout);
+    assert!(!stdout.contains("fail"), "got: {:?}", stdout);
+}
+
+#[test]
 fn stateful_locus_example_builds_and_runs() {
     let mut src_path = examples_dir();
     src_path.push("10-stateful-locus");

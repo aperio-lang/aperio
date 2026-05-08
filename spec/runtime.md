@@ -177,8 +177,14 @@ and modes; specific transports come from stdlib (`std::bus::*`).
 ### Time
 
 - **Monotonic + wall-clock.** `time::now()` and
-  `time::monotonic()` are runtime-provided. Mocking is
-  available for tests via `time::mock_clock(...)` (stdlib).
+  `time::monotonic()` are runtime-provided. `time::monotonic()`
+  returns a `Duration` (i64 nanoseconds since an unspecified
+  reference); only meaningful for elapsed-time differences.
+  Backed by `clock_gettime(CLOCK_MONOTONIC)` on both interpreter
+  and codegen paths. `time::now()` (wall-clock) is reserved for
+  observation and waits on richer `Time` typing.
+  Mocking is available for tests via `time::mock_clock(...)`
+  (stdlib).
 - **Monotonic-only scheduling.** Every scheduling primitive in
   lotus — `time::sleep`, `time::tick`, the cooperative
   scheduler's deadline queue — is grounded on the monotonic

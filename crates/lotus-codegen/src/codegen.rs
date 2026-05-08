@@ -244,6 +244,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             i32_t.fn_type(&[i32_t.into(), i32_t.into(), ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function("clock_nanosleep", clock_nanosleep_ty, None);
+
+        // declare i32 @clock_gettime(i32, ptr)
+        //
+        // Backing primitive for `time::monotonic()` (and, when it
+        // lands, `time::now()`). Same MONOTONIC vs REALTIME
+        // discipline as `clock_nanosleep`.
+        let clock_gettime_ty =
+            i32_t.fn_type(&[i32_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("clock_gettime", clock_gettime_ty, None);
     }
 
     /// LLVM struct type matching `struct timespec` on Linux x86_64
@@ -1445,6 +1455,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ))
                     })
                 }
+                Expr::Path(qn) => self.lower_path_call_expr(qn, args),
                 _ => Err(CodegenError::Unsupported(format!(
                     "non-user-fn call in expression position: {:?}",
                     std::mem::discriminant(callee.as_ref())
@@ -1522,6 +1533,41 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 };
                 let v = v.map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok((v.into(), LotusType::Int))
+            }
+            // Duration arithmetic — add/sub produce Duration. Mul
+            // / div / mod don't have natural Duration semantics
+            // (multiply by a scalar would, but we don't have
+            // scalar-by-Duration overloads yet).
+            (BinOp::Add | BinOp::Sub, LotusType::Duration) => {
+                let l = lv.into_int_value();
+                let r = rv.into_int_value();
+                let v = match op {
+                    BinOp::Add => self.builder.build_int_add(l, r, "dadd"),
+                    BinOp::Sub => self.builder.build_int_sub(l, r, "dsub"),
+                    _ => unreachable!(),
+                };
+                let v = v.map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Duration))
+            }
+            (BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq,
+                LotusType::Duration) =>
+            {
+                let l = lv.into_int_value();
+                let r = rv.into_int_value();
+                let pred = match op {
+                    BinOp::Eq => IP::EQ,
+                    BinOp::NotEq => IP::NE,
+                    BinOp::Lt => IP::SLT,
+                    BinOp::Gt => IP::SGT,
+                    BinOp::LtEq => IP::SLE,
+                    BinOp::GtEq => IP::SGE,
+                    _ => unreachable!(),
+                };
+                let v = self
+                    .builder
+                    .build_int_compare(pred, l, r, "dcmp")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), LotusType::Bool))
             }
             (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, LotusType::Float) => {
                 let l = lv.into_float_value();
@@ -1729,6 +1775,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// Dispatch a `path::ident(...)` call. Currently only
     /// `time::sleep` is recognized; other namespaced calls land in
     /// the stdlib lowering when those features arrive.
+    /// Statement-position path call. Currently dispatches to the
+    /// few stdlib paths codegen recognizes; everything else errors.
     fn lower_path_call(
         &mut self,
         qn: &QualifiedName,
@@ -1739,11 +1787,96 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             qn.segments.iter().map(|s| s.name.as_str()).collect();
         match segs.as_slice() {
             ["time", "sleep"] => self.lower_time_sleep(args, scope),
+            ["time", "monotonic"] => {
+                // statement-position: just discard the returned value
+                let _ = self.lower_time_monotonic(args)?;
+                Ok(())
+            }
             _ => Err(CodegenError::Unsupported(format!(
                 "path call `{}`",
                 segs.join("::")
             ))),
         }
+    }
+
+    /// Expression-position path call — must return a value.
+    fn lower_path_call_expr(
+        &mut self,
+        qn: &QualifiedName,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        let segs: Vec<&str> =
+            qn.segments.iter().map(|s| s.name.as_str()).collect();
+        match segs.as_slice() {
+            ["time", "monotonic"] => self.lower_time_monotonic(args),
+            _ => Err(CodegenError::Unsupported(format!(
+                "path call `{}` in expression position",
+                segs.join("::")
+            ))),
+        }
+    }
+
+    /// Lower `time::monotonic()` to `clock_gettime(CLOCK_MONOTONIC,
+    /// &ts)` followed by `ts.tv_sec * 1_000_000_000 + ts.tv_nsec`.
+    /// Result is a `Duration` (i64 nanoseconds since an
+    /// unspecified reference).
+    fn lower_time_monotonic(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "time::monotonic takes 0 arguments, got {}",
+                args.len()
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let ts_t = self.timespec_type();
+
+        let ts = self
+            .builder
+            .build_alloca(ts_t, "ts")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let cgt = self
+            .module
+            .get_function("clock_gettime")
+            .expect("clock_gettime declared");
+        // CLOCK_MONOTONIC = 1 on Linux.
+        let clock_id = i32_t.const_int(1, false);
+        self.builder
+            .build_call(cgt, &[clock_id.into(), ts.into()], "cgt.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Ignore the return value best-effort; CLOCK_MONOTONIC
+        // shouldn't fail. tv_sec * 1e9 + tv_nsec.
+        let sec_ptr = self
+            .builder
+            .build_struct_gep(ts_t, ts, 0, "ts.sec.ptr")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let nsec_ptr = self
+            .builder
+            .build_struct_gep(ts_t, ts, 1, "ts.nsec.ptr")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let sec = self
+            .builder
+            .build_load(i64_t, sec_ptr, "ts.sec")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let nsec = self
+            .builder
+            .build_load(i64_t, nsec_ptr, "ts.nsec")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let billion = i64_t.const_int(1_000_000_000, false);
+        let sec_ns = self
+            .builder
+            .build_int_mul(sec, billion, "sec.ns")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let total = self
+            .builder
+            .build_int_add(sec_ns, nsec, "now.ns")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((total.into(), LotusType::Duration))
     }
 
     /// Lower `time::sleep(duration)` to a monotonic-clock,

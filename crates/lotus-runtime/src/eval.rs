@@ -1492,6 +1492,18 @@ fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
             }))
         }
         (Add, Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
+        // Duration arithmetic. Add / sub produce Duration; Lt/Gt
+        // are useful for timeout-style comparisons.
+        (Add, Value::Duration(a), Value::Duration(b)) => {
+            Ok(Value::Duration(a + b))
+        }
+        (Sub, Value::Duration(a), Value::Duration(b)) => {
+            Ok(Value::Duration(a - b))
+        }
+        (Lt, Value::Duration(a), Value::Duration(b)) => Ok(Value::Bool(a < b)),
+        (Gt, Value::Duration(a), Value::Duration(b)) => Ok(Value::Bool(a > b)),
+        (LtEq, Value::Duration(a), Value::Duration(b)) => Ok(Value::Bool(a <= b)),
+        (GtEq, Value::Duration(a), Value::Duration(b)) => Ok(Value::Bool(a >= b)),
         (Eq, a, b) => Ok(Value::Bool(values_equal(a, b))),
         (NotEq, a, b) => Ok(Value::Bool(!values_equal(a, b))),
         (Lt, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
