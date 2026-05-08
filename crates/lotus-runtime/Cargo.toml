@@ -4,4 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Lotus runtime (Phase 2 — placeholder)"
+description = "Lotus runtime — interpreter (v0) + region/scheduler/bus (Phase 2)"
+
+[dependencies]
+lotus-syntax = { path = "../lotus-syntax" }
+lotus-types = { path = "../lotus-types" }

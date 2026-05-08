@@ -6,7 +6,9 @@ version = 4
 name = "lotus-cli"
 version = "0.0.1"
 dependencies = [
+ "lotus-runtime",
  "lotus-syntax",
+ "lotus-types",
 ]
 
 [[package]]
@@ -16,6 +18,10 @@ version = "0.0.1"
 [[package]]
 name = "lotus-runtime"
 version = "0.0.1"
+dependencies = [
+ "lotus-syntax",
+ "lotus-types",
+]
 
 [[package]]
 name = "lotus-syntax"

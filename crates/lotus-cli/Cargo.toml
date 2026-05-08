@@ -12,3 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 lotus-syntax = { path = "../lotus-syntax" }
+lotus-types = { path = "../lotus-types" }
+lotus-runtime = { path = "../lotus-runtime" }
