@@ -92,6 +92,7 @@ locus AnalystL {
             perspective_id: 0,
         };
         validation_count: Int = 0;
+        published_count: Int = 0;
     }
 
     bus {
@@ -114,7 +115,17 @@ locus AnalystL {
         // after >=3 independent validations.
         if self.validation_count >= 3 {
             "trellis.kernel" <- self.latest_kernel;
+            self.published_count = self.published_count + 1;
         }
+    }
+
+    // Audit invariant: the publish stream tracks validations
+    // with a fixed offset (the first ≥3 validations are
+    // absorbed before the first publish). Tolerance of 1
+    // for pre-threshold transients. Fires at program-end
+    // dissolve via the F.4 cascade.
+    closure publish_keeps_pace {
+        self.published_count ~~ self.validation_count - 2 within 1;
     }
 }
 

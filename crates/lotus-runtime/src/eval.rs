@@ -86,6 +86,11 @@ struct Interpreter {
     /// In-memory bus router. Subscribers register on locus
     /// instantiation; `<-` dispatches through it.
     bus: BusRouter,
+    /// Long-lived loci instantiated at program top level (no
+    /// enclosing parent on the stack at instantiation time).
+    /// Their closures fire at program end via the dissolve
+    /// cascade — the F.4 / F.9 endpoint of the audit graph.
+    top_level_loci: Vec<LocusHandle>,
 }
 
 impl Interpreter {
@@ -99,6 +104,7 @@ impl Interpreter {
             self_stack: Vec::new(),
             parent_stack: Vec::new(),
             bus: BusRouter::new(),
+            top_level_loci: Vec::new(),
         }
     }
 
@@ -148,11 +154,31 @@ impl Interpreter {
             Some(Value::Fn(f)) => f,
             _ => return Err("no `fn main()` defined".to_string()),
         };
-        match self.call_fn(&main, &[]) {
-            Ok(_) => Ok(0),
-            Err(Signal::Error(s)) => Err(s),
-            Err(Signal::Return(_)) => Ok(0),
-            Err(_) => Err("unexpected control-flow signal at main".to_string()),
+        let main_result = self.call_fn(&main, &[]);
+        let main_signal = match main_result {
+            Ok(_) => None,
+            Err(Signal::Return(_)) => None,
+            Err(s) => Some(s),
+        };
+
+        // Program-end dissolve cascade. Iterate in reverse-
+        // instantiation order (last registered, first
+        // dissolved) — depth-first cleanup of the audit graph,
+        // F.4 + F.9. Any unabsorbed closure violation becomes
+        // a non-zero exit; main's own error (if any) takes
+        // precedence.
+        let mut dissolve_signal: Option<Signal> = None;
+        let to_dissolve = std::mem::take(&mut self.top_level_loci);
+        for handle in to_dissolve.into_iter().rev() {
+            if let Err(sig) = self.dissolve_locus(handle, None) {
+                dissolve_signal.get_or_insert(sig);
+            }
+        }
+
+        match main_signal.or(dissolve_signal) {
+            None => Ok(0),
+            Some(Signal::Error(s)) => Err(s),
+            Some(_) => Err("unexpected control-flow signal at program end".to_string()),
         }
     }
 
@@ -820,19 +846,20 @@ impl Interpreter {
             self.run_lifecycle(handle.clone(), &run_decl, &[])?;
         }
 
-        // Dissolve discipline (F.9): evaluate any closure with
-        // epoch=dissolve. v0 cut: a locus is "ephemeral" — and
-        // therefore dissolves at end of instantiation — if it
-        // has no run() and no bus *subscribe* declarations. A
-        // long-lived locus (run, or subscribed) stays registered
-        // until program end (program-end dissolve cascade is a
-        // future iteration). Closures evaluated here surface
-        // collapse vs explosion per F.9; the immediate parent
-        // (if any) is captured here so its on_failure handler
-        // can absorb violations.
+        // Dissolve discipline (F.9): a locus is "ephemeral" if
+        // it has no run() and no bus subscribe declarations —
+        // it dissolves immediately at end of instantiation,
+        // firing any epoch=dissolve closures. Long-lived loci
+        // (run, or subscribed) register for program-end
+        // dissolve when instantiated at top level (no parent
+        // on the stack); when instantiated inside a parent
+        // they're owned by that parent and dissolve via its
+        // child cascade.
         if is_ephemeral_locus(&decl) {
             let parent = self.parent_stack.last().cloned();
             self.dissolve_locus(handle.clone(), parent)?;
+        } else if self.parent_stack.is_empty() {
+            self.top_level_loci.push(handle.clone());
         }
 
         Ok(Value::Locus(handle))
