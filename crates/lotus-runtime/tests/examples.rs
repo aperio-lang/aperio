@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use lotus_runtime::run_program;
+use lotus_runtime::{run_bundle_with_bus, run_program, TransportKind};
 
 fn examples_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -57,6 +57,25 @@ fn modes_runs() {
 #[test]
 fn bus_runs() {
     assert_eq!(parse_and_run("05-bus/main.lt").unwrap(), 0);
+}
+
+/// Ring-buffer transport delivers the same observable result
+/// as sync dispatch for 05-bus. Source unchanged; transport
+/// configured at runtime construction.
+#[test]
+fn bus_runs_under_ringbuffer_transport() {
+    let mut path = examples_dir();
+    path.push("05-bus");
+    path.push("main.lt");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let program = lotus_syntax::parse_source(&source).unwrap();
+
+    let bus_config = vec![
+        ("demo.greeting".to_string(), TransportKind::Ring { capacity: 16 }),
+        ("demo.ack".to_string(), TransportKind::Ring { capacity: 16 }),
+    ];
+    let exit = run_bundle_with_bus(&[&program], bus_config).unwrap();
+    assert_eq!(exit, 0);
 }
 
 // 01-locus-with-run uses time::sleep with 500ms intervals;

@@ -46,6 +46,23 @@ pub fn run_bundle(programs: &[&Program]) -> Result<i32, String> {
     interp.run_main()
 }
 
+/// Run a bundle with a custom bus configuration. Used by tests
+/// that exercise specific transport choices (ring buffer) on
+/// otherwise-default sources.
+pub fn run_bundle_with_bus(
+    programs: &[&Program],
+    bus_config: Vec<(String, crate::bus::TransportKind)>,
+) -> Result<i32, String> {
+    let mut interp = Interpreter::new();
+    for (subject, kind) in bus_config {
+        interp.bus.with_transport(subject, kind);
+    }
+    for p in programs {
+        interp.load_program(p);
+    }
+    interp.run_main()
+}
+
 struct Interpreter {
     env: Env,
     /// Top-level decls indexed by name. Fns and consts are
@@ -852,15 +869,25 @@ impl Interpreter {
         }
     }
 
-    /// Synchronously deliver a published message to every
-    /// subscriber registered for the subject. Re-entrancy is
-    /// safe because `subscribers_for` snapshots the list before
-    /// dispatching — a handler may publish more messages
-    /// without invalidating the iteration.
+    /// Publish a payload on a subject, then drain all pending
+    /// deliveries until none remain. The drain loop catches
+    /// re-entrant publishes from inside handlers — a handler
+    /// that calls `<-` puts more deliveries in the queue, and
+    /// we keep draining until quiescence.
     fn dispatch_bus(&mut self, subject: &str, payload: Value) -> Result<(), Signal> {
-        let subs = self.bus.subscribers_for(subject);
-        for sub in subs {
-            self.run_handler(sub.locus, &sub.handler, payload.clone())?;
+        self.bus.publish(subject, payload);
+        loop {
+            let batch = self.bus.drain_all();
+            if batch.is_empty() {
+                break;
+            }
+            for delivery in batch {
+                self.run_handler(
+                    delivery.subscription.locus,
+                    &delivery.subscription.handler,
+                    delivery.payload,
+                )?;
+            }
         }
         Ok(())
     }

@@ -16,5 +16,6 @@ pub mod env;
 pub mod eval;
 pub mod value;
 
-pub use eval::{run_bundle, run_program};
+pub use bus::{BusRouter, RingBuffer, SyncDispatch, Transport, TransportKind};
+pub use eval::{run_bundle, run_bundle_with_bus, run_program};
 pub use value::Value;
