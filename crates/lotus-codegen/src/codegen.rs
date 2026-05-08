@@ -112,6 +112,8 @@ pub fn build_executable(
         user_fns: BTreeMap::new(),
         user_loci: BTreeMap::new(),
         user_types: BTreeMap::new(),
+        bus_state: None,
+        deferred_dissolves: Vec::new(),
     };
 
     cx.declare_builtins();
@@ -189,6 +191,32 @@ struct Cx<'ctx, 'p> {
     /// type and field map for plain data records (no methods).
     /// Used for type literals like `Point { x: 3, y: 4 }`.
     user_types: BTreeMap<String, TypeInfo<'ctx>>,
+    /// Bus state generated when any locus declares a subscribe.
+    /// `entries` is a fixed-size array global of `(subject_ptr,
+    /// self_ptr, handler_ptr)` triples; `count` tracks how many
+    /// have been registered at runtime. None means no subscribes
+    /// in the program — `<-` becomes a no-op.
+    bus_state: Option<BusState<'ctx>>,
+    /// Stack of "deferred-dissolve" frames: each enclosing fn
+    /// body / lifecycle method body opens one. Long-lived loci
+    /// (any locus with a `bus subscribe` declaration) instantiated
+    /// inside that body are pushed here instead of dissolving
+    /// immediately, then drained + dissolved in reverse order at
+    /// scope exit so they outlive synchronous publishes.
+    deferred_dissolves: Vec<Vec<(PointerValue<'ctx>, String)>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BusState<'ctx> {
+    /// `[N x { ptr, ptr, ptr }]` global, all-zero-initialized.
+    entries: inkwell::values::GlobalValue<'ctx>,
+    /// `i64` global, initialized to 0; tracks current entry count.
+    count: inkwell::values::GlobalValue<'ctx>,
+    /// Capacity baked into `entries` array.
+    capacity: u64,
+    /// `void (ptr subject, ptr payload)` — the per-program dispatch
+    /// fn body emitted once after pass A.
+    dispatch_fn: FunctionValue<'ctx>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +250,17 @@ struct LocusInfo<'ctx> {
     /// lowering and child-instantiation sites (which must call
     /// parent.accept before child.birth, per F.7).
     accept_param: Option<(String, String)>,
+    /// User-defined `fn` members on the locus (called as bus
+    /// handlers, mode dispatchers, etc.). Each entry is
+    /// (method name → LLVM function value). Methods take
+    /// `self_ptr` plus their declared params.
+    user_methods: BTreeMap<String, FunctionValue<'ctx>>,
+    /// Each `bus subscribe "S" as h ...` declaration on this
+    /// locus: (subject_literal, handler_method_name). At
+    /// instantiation time, registration emits a triple
+    /// (subject_str, self_ptr, handler_fn_ptr) into the global
+    /// bus table.
+    subscriptions: Vec<(String, String)>,
 }
 
 /// Compiled user `type` (a plain data record). No methods, no
@@ -282,6 +321,351 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             i32_t.fn_type(&[i32_t.into(), ptr_t.into()], false);
         self.module
             .add_function("clock_gettime", clock_gettime_ty, None);
+
+        // declare i32 @strcmp(ptr, ptr)
+        //
+        // Used by `@bus_dispatch` to match subscription subjects
+        // against the publish subject. Subjects are NUL-terminated
+        // global strings so the standard libc primitive applies.
+        let strcmp_ty = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module.add_function("strcmp", strcmp_ty, None);
+    }
+
+    /// LLVM struct type for one entry in the bus subscription
+    /// table: `{ ptr subject, ptr self, ptr handler }`. With LLVM
+    /// 18 opaque pointers the per-element type only matters for
+    /// allocation + GEP indexing.
+    fn bus_entry_type(&self) -> inkwell::types::StructType<'ctx> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        self.context.struct_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false)
+    }
+
+    /// Emit the bus subscription table + counter + dispatch fn.
+    /// Called once per module after we know the total subscription
+    /// count. Capacity is fixed at compile time — every subscribe
+    /// declaration in source contributes one slot, and registration
+    /// at locus instantiation just bumps the counter to fill it.
+    fn init_bus_state(&mut self, capacity: u64) -> Result<(), CodegenError> {
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let void_t = self.context.void_type();
+        let entry_ty = self.bus_entry_type();
+        let table_ty = entry_ty.array_type(capacity as u32);
+
+        let entries_global = self.module.add_global(table_ty, None, "bus.entries");
+        entries_global.set_initializer(&table_ty.const_zero());
+        entries_global.set_linkage(inkwell::module::Linkage::Internal);
+
+        let count_global = self.module.add_global(i64_t, None, "bus.count");
+        count_global.set_initializer(&i64_t.const_int(0, false));
+        count_global.set_linkage(inkwell::module::Linkage::Internal);
+
+        // void @bus_dispatch(ptr %subject, ptr %payload):
+        //   for (i = 0; i < bus.count; i++)
+        //     if (strcmp(bus.entries[i].subject, %subject) == 0)
+        //       bus.entries[i].handler(bus.entries[i].self, %payload)
+        let dispatch_ty =
+            void_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        let dispatch_fn = self
+            .module
+            .add_function("lotus.bus_dispatch", dispatch_ty, None);
+        let entry_bb = self.context.append_basic_block(dispatch_fn, "entry");
+        let header_bb =
+            self.context.append_basic_block(dispatch_fn, "loop.header");
+        let check_bb =
+            self.context.append_basic_block(dispatch_fn, "loop.check");
+        let call_bb =
+            self.context.append_basic_block(dispatch_fn, "loop.call");
+        let inc_bb = self.context.append_basic_block(dispatch_fn, "loop.inc");
+        let done_bb = self.context.append_basic_block(dispatch_fn, "done");
+
+        self.builder.position_at_end(entry_bb);
+        let i_slot = self
+            .builder
+            .build_alloca(i64_t, "i.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(i_slot, i64_t.const_int(0, false))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(header_bb);
+        let count = self
+            .builder
+            .build_load(i64_t, count_global.as_pointer_value(), "count")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let i = self
+            .builder
+            .build_load(i64_t, i_slot, "i")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let in_range = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::ULT,
+                i,
+                count,
+                "in.range",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(in_range, check_bb, done_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // check_bb: load entry[i].subject; strcmp; branch
+        self.builder.position_at_end(check_bb);
+        let subj_param = dispatch_fn
+            .get_nth_param(0)
+            .expect("subject param")
+            .into_pointer_value();
+        let subj_slot_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    entries_global.as_pointer_value(),
+                    &[i64_t.const_int(0, false), i, i32_t.const_int(0, false)],
+                    "entry.subject.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let subj_loaded = self
+            .builder
+            .build_load(ptr_t, subj_slot_ptr, "entry.subject")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let strcmp_fn = self
+            .module
+            .get_function("strcmp")
+            .expect("strcmp declared in declare_builtins");
+        let cmp = self
+            .builder
+            .build_call(
+                strcmp_fn,
+                &[subj_loaded.into(), subj_param.into()],
+                "subj.cmp",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let cmp_int = cmp
+            .try_as_basic_value()
+            .left()
+            .expect("strcmp returns i32")
+            .into_int_value();
+        let is_match = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                cmp_int,
+                i32_t.const_int(0, false),
+                "is.match",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_match, call_bb, inc_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // call_bb: load self + handler, call handler(self, payload)
+        self.builder.position_at_end(call_bb);
+        let self_slot_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    entries_global.as_pointer_value(),
+                    &[i64_t.const_int(0, false), i, i32_t.const_int(1, false)],
+                    "entry.self.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let entry_self = self
+            .builder
+            .build_load(ptr_t, self_slot_ptr, "entry.self")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let handler_slot_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    entries_global.as_pointer_value(),
+                    &[i64_t.const_int(0, false), i, i32_t.const_int(2, false)],
+                    "entry.handler.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let handler = self
+            .builder
+            .build_load(ptr_t, handler_slot_ptr, "entry.handler")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let payload_param = dispatch_fn
+            .get_nth_param(1)
+            .expect("payload param")
+            .into_pointer_value();
+        let handler_callee_ty =
+            void_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.builder
+            .build_indirect_call(
+                handler_callee_ty,
+                handler,
+                &[entry_self.into(), payload_param.into()],
+                "handler.call",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(inc_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // inc_bb: i++; branch to header
+        self.builder.position_at_end(inc_bb);
+        let i_now = self
+            .builder
+            .build_load(i64_t, i_slot, "i.now")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let i_next = self
+            .builder
+            .build_int_add(i_now, i64_t.const_int(1, false), "i.next")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(i_slot, i_next)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // done_bb: ret
+        self.builder.position_at_end(done_bb);
+        self.builder
+            .build_return(None)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.bus_state = Some(BusState {
+            entries: entries_global,
+            count: count_global,
+            capacity,
+            dispatch_fn,
+        });
+        Ok(())
+    }
+
+    /// Push a fresh deferred-dissolve frame onto the stack. Each
+    /// fn body / lifecycle method body opens one at entry and
+    /// flushes at exit so long-lived loci instantiated inside it
+    /// outlive synchronous publishes within the same body.
+    fn push_dissolve_frame(&mut self) {
+        self.deferred_dissolves.push(Vec::new());
+    }
+
+    /// Pop the top deferred-dissolve frame and emit its drain →
+    /// dissolve calls in reverse instantiation order. Called just
+    /// before the body's final `ret` so the alloca slots are still
+    /// live when their drain/dissolve methods read self.X.
+    fn flush_dissolve_frame(&mut self) -> Result<(), CodegenError> {
+        let frame = self
+            .deferred_dissolves
+            .pop()
+            .expect("flush without matching push");
+        for (self_ptr, locus_name) in frame.into_iter().rev() {
+            let info = self
+                .user_loci
+                .get(&locus_name)
+                .cloned()
+                .expect("deferred locus declared");
+            for kind in &["drain", "dissolve"] {
+                if let Some(method) = info.methods.get(kind) {
+                    self.builder
+                        .build_call(
+                            *method,
+                            &[self_ptr.into()],
+                            &format!("{}.{}.call", locus_name, kind),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit a single subscription registration:
+    ///   bus.entries[bus.count] = { subject_str, self_ptr, handler_fn }
+    ///   bus.count += 1
+    /// Called once per `bus subscribe` declaration when its locus
+    /// is instantiated.
+    fn emit_bus_register(
+        &mut self,
+        subject: &str,
+        self_ptr: PointerValue<'ctx>,
+        handler_fn: FunctionValue<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let bus = self
+            .bus_state
+            .expect("subscriptions registered ⇒ bus_state initialized");
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let entry_ty = self.bus_entry_type();
+        let table_ty = entry_ty.array_type(bus.capacity as u32);
+
+        let count = self
+            .builder
+            .build_load(i64_t, bus.count.as_pointer_value(), "bus.count.cur")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let subj_str = self.global_string(subject);
+        let handler_ptr = handler_fn.as_global_value().as_pointer_value();
+
+        // entries[count].subject = subj_str
+        let subj_slot = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    bus.entries.as_pointer_value(),
+                    &[i64_t.const_int(0, false), count, i32_t.const_int(0, false)],
+                    "reg.subject.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.builder
+            .build_store(subj_slot, subj_str)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // entries[count].self = self_ptr
+        let self_slot = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    bus.entries.as_pointer_value(),
+                    &[i64_t.const_int(0, false), count, i32_t.const_int(1, false)],
+                    "reg.self.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.builder
+            .build_store(self_slot, self_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // entries[count].handler = handler_ptr
+        let handler_slot = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    bus.entries.as_pointer_value(),
+                    &[i64_t.const_int(0, false), count, i32_t.const_int(2, false)],
+                    "reg.handler.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.builder
+            .build_store(handler_slot, handler_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // bus.count = count + 1
+        let next = self
+            .builder
+            .build_int_add(count, i64_t.const_int(1, false), "bus.count.next")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(bus.count.as_pointer_value(), next)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
     }
 
     /// LLVM struct type matching `struct timespec` on Linux x86_64
@@ -345,6 +729,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.declare_locus_methods(l)?;
         }
 
+        // After A2: if any locus declared a `bus subscribe`,
+        // emit the bus globals + the linear-scan dispatch fn.
+        // The dispatch fn body is generated before any call site
+        // can need it; the globals' capacity is baked from the
+        // total subscription count across all loci.
+        let total_subs: u64 = self
+            .user_loci
+            .values()
+            .map(|info| info.subscriptions.len() as u64)
+            .sum();
+        if total_subs > 0 {
+            self.init_bus_state(total_subs)?;
+        }
+
         // Pass B: declare every user-defined function so call sites
         // can refer to fns declared later in the file.
         let user_fn_decls: Vec<FnDecl> = self
@@ -383,6 +781,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.current_fn = Some(main_fn);
         self.current_user_fn_ret = None;
         self.current_self = None;
+        self.push_dissolve_frame();
 
         let mut scope = Scope::default();
         let end = self.lower_block(&main_decl.body, &mut scope)?;
@@ -392,10 +791,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // both `break`/`return`), the trailing block is already
         // closed and writing more IR is unsound.
         if end == BlockEnd::Open {
+            self.flush_dissolve_frame()?;
             let zero = i32_t.const_int(0, false);
             self.builder
                 .build_return(Some(&zero))
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        } else {
+            // Body terminated unconditionally — drop the frame
+            // without emitting the dissolve calls. Any deferred
+            // dissolves are unreachable.
+            let _ = self.deferred_dissolves.pop();
         }
         self.current_fn = None;
         Ok(())
@@ -591,6 +996,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 defaults,
                 methods: BTreeMap::new(),
                 accept_param: None,
+                user_methods: BTreeMap::new(),
+                subscriptions: Vec::new(),
             },
         );
         Ok(())
@@ -619,6 +1026,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let mut methods: BTreeMap<&'static str, FunctionValue<'ctx>> =
             BTreeMap::new();
         let mut accept_param: Option<(String, String)> = None;
+        let mut user_methods: BTreeMap<String, FunctionValue<'ctx>> =
+            BTreeMap::new();
+        let mut subscriptions: Vec<(String, String)> = Vec::new();
         for member in &l.members {
             match member {
                 LocusMember::Params(_) | LocusMember::Contract(_) => {
@@ -698,11 +1108,84 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         }
                     }
                 }
-                LocusMember::Bus(_)
-                | LocusMember::Mode(_)
+                LocusMember::Bus(bb) => {
+                    // Collect subscribe declarations; publish is
+                    // typecheck-only (the `<-` operator does the
+                    // emit at codegen). Subject must be a literal
+                    // string at compile time.
+                    for bm in &bb.members {
+                        match bm {
+                            BusMember::Subscribe { subject, handler, .. } => {
+                                subscriptions
+                                    .push((subject.clone(), handler.name.clone()));
+                            }
+                            BusMember::Publish { .. } => {
+                                // No-op at codegen; type info
+                                // already enforced by typechecker.
+                            }
+                        }
+                    }
+                }
+                LocusMember::Fn(fd) => {
+                    // Locus user-fn: declare as
+                    // `<Locus>.<name>(self_ptr, ...args)`. Body
+                    // lowered in pass C.
+                    if !fd.generics.is_empty() {
+                        return Err(CodegenError::Unsupported(format!(
+                            "locus `{}` method `{}`: generics not lowered",
+                            l.name.name, fd.name.name
+                        )));
+                    }
+                    let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum> =
+                        Vec::with_capacity(fd.params.len() + 1);
+                    llvm_param_tys.push(ptr_t.into());
+                    for p in &fd.params {
+                        if p.default.is_some() {
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` method `{}` param `{}` default \
+                                 values not yet lowered",
+                                l.name.name, fd.name.name, p.name.name
+                            )));
+                        }
+                        let lt = self.type_expr_to_lotus(&p.ty)?;
+                        llvm_param_tys.push(self.llvm_basic_type(&lt).into());
+                    }
+                    let fn_ty = match &fd.ret {
+                        None => void_t.fn_type(&llvm_param_tys, false),
+                        Some(t) => {
+                            let rt = self.type_expr_to_lotus(t)?;
+                            match rt {
+                                LotusType::Int | LotusType::Duration => self
+                                    .context
+                                    .i64_type()
+                                    .fn_type(&llvm_param_tys, false),
+                                LotusType::Float => self
+                                    .context
+                                    .f64_type()
+                                    .fn_type(&llvm_param_tys, false),
+                                LotusType::Bool => self
+                                    .context
+                                    .bool_type()
+                                    .fn_type(&llvm_param_tys, false),
+                                LotusType::String
+                                | LotusType::LocusRef(_)
+                                | LotusType::TypeRef(_) => self
+                                    .context
+                                    .ptr_type(AddressSpace::default())
+                                    .fn_type(&llvm_param_tys, false),
+                            }
+                        }
+                    };
+                    let func = self.module.add_function(
+                        &format!("{}.{}", l.name.name, fd.name.name),
+                        fn_ty,
+                        None,
+                    );
+                    user_methods.insert(fd.name.name.clone(), func);
+                }
+                LocusMember::Mode(_)
                 | LocusMember::Failure(_)
                 | LocusMember::Closure(_)
-                | LocusMember::Fn(_)
                 | LocusMember::Const(_)
                 | LocusMember::Type(_) => {
                     return Err(CodegenError::Unsupported(format!(
@@ -721,6 +1204,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("locus struct declared in pass A1");
         info.methods = methods;
         info.accept_param = accept_param;
+        info.user_methods = user_methods;
+        info.subscriptions = subscriptions;
         Ok(())
     }
 
@@ -765,6 +1250,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     fields: info.fields.clone(),
                 });
                 self.loops.clear();
+                self.push_dissolve_frame();
 
                 let mut scope = Scope::default();
 
@@ -801,12 +1287,86 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
                 let end = self.lower_block(&lc.body, &mut scope)?;
                 if end == BlockEnd::Open {
+                    self.flush_dissolve_frame()?;
                     self.builder
                         .build_return(None)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                } else {
+                    let _ = self.deferred_dissolves.pop();
                 }
 
                 self.current_fn = None;
+                self.current_self = None;
+            }
+        }
+
+        // Locus user-fns (`fn` members): same body lowering as
+        // lifecycle methods, but with their declared param list
+        // (after self_ptr) bound as locals + their declared
+        // return type tracked.
+        for member in &l.members {
+            if let LocusMember::Fn(fd) = member {
+                let func = *info
+                    .user_methods
+                    .get(&fd.name.name)
+                    .expect("locus fn declared in pass A2");
+                let entry = self.context.append_basic_block(func, "entry");
+                self.builder.position_at_end(entry);
+                let self_ptr = func
+                    .get_nth_param(0)
+                    .expect("self_ptr param")
+                    .into_pointer_value();
+                self.current_fn = Some(func);
+                let ret_ty = match &fd.ret {
+                    None => None,
+                    Some(t) => Some(self.type_expr_to_lotus(t)?),
+                };
+                self.current_user_fn_ret = Some(ret_ty.clone());
+                self.current_self = Some(SelfCx {
+                    locus_name: l.name.name.clone(),
+                    struct_ty: info.struct_ty,
+                    self_ptr,
+                    fields: info.fields.clone(),
+                });
+                self.loops.clear();
+                self.push_dissolve_frame();
+
+                let mut scope = Scope::default();
+                for (i, p) in fd.params.iter().enumerate() {
+                    let lt = self.type_expr_to_lotus(&p.ty)?;
+                    let alloca = self.alloca_for(&lt, &p.name.name)?;
+                    let v = func
+                        .get_nth_param((i + 1) as u32)
+                        .expect("locus method arg index in range");
+                    self.builder
+                        .build_store(alloca, v)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    scope.locals.insert(p.name.name.clone(), (alloca, lt));
+                }
+
+                let end = self.lower_block(&fd.body, &mut scope)?;
+                if end == BlockEnd::Open {
+                    self.flush_dissolve_frame()?;
+                    match ret_ty {
+                        None => {
+                            self.builder
+                                .build_return(None)
+                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        }
+                        Some(_) => {
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` method `{}` falls through without \
+                                 returning a value",
+                                l.name.name, fd.name.name
+                            )));
+                        }
+                    }
+                } else {
+                    let _ = self.deferred_dissolves.pop();
+                }
+
+                self.current_fn = None;
+                self.current_user_fn_ret = None;
                 self.current_self = None;
             }
         }
@@ -891,6 +1451,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.current_user_fn_ret = Some(sig.ret.clone());
         self.current_self = None;
         self.loops.clear();
+        self.push_dissolve_frame();
 
         let mut scope = Scope::default();
         for (i, p) in f.params.iter().enumerate() {
@@ -907,6 +1468,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         let end = self.lower_block(&f.body, &mut scope)?;
         if end == BlockEnd::Open {
+            self.flush_dissolve_frame()?;
             match &sig.ret {
                 None => {
                     self.builder
@@ -920,6 +1482,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )));
                 }
             }
+        } else {
+            let _ = self.deferred_dissolves.pop();
         }
 
         self.current_fn = None;
@@ -1164,6 +1728,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Stmt::Continue(_) => self.lower_continue(),
             Stmt::Block(b) => self.lower_block(b, scope),
             Stmt::Return(expr_opt, _) => self.lower_return(expr_opt.as_ref(), scope),
+            Stmt::Send { subject, value, .. } => {
+                self.lower_send(subject, value, scope)?;
+                Ok(BlockEnd::Open)
+            }
             Stmt::Expr(_) => Err(CodegenError::Unsupported(
                 "expression statement other than locus literal or builtin call"
                     .to_string(),
@@ -2279,17 +2847,42 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
         }
 
-        // Fire birth → run → drain → dissolve in order. Each
-        // method is optional; only declared ones are called.
+        // Bus subscription registration runs BEFORE birth so a
+        // locus's own birth() can publish on subjects it
+        // subscribes to (rare but legal). For each declared
+        // `bus subscribe "S" as h ...`: append (S, self_ptr,
+        // <Locus>.h) into the global bus table.
+        for (subject, handler_name) in &info.subscriptions {
+            let handler_fn = info
+                .user_methods
+                .get(handler_name)
+                .copied()
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "locus `{}` subscribes to `{}` with handler `{}` \
+                         but no such method declared",
+                        locus_name, subject, handler_name
+                    ))
+                })?;
+            self.emit_bus_register(subject, self_ptr, handler_fn)?;
+        }
+
+        // Fire birth → run in order. drain → dissolve are deferred
+        // if this locus is long-lived (has any bus subscribe), so
+        // it can keep receiving published events until its
+        // enclosing scope ends. Otherwise (ephemeral), all four
+        // fire immediately like before.
         //
         // F.4 depth-first cascade: any child loci instantiated
         // inside this locus's run() body have already gone
         // through their full birth → run → drain → dissolve
         // sequence (each via this same lowering, recursively)
-        // before run() returns. So when drain() fires here, all
-        // descendants are already gone — the cascade is implicit
-        // in v0's all-ephemeral, synchronous-instantiation model.
-        for kind in &["birth", "run", "drain", "dissolve"] {
+        // before run() returns. Long-lived loci defer drain →
+        // dissolve to scope end via `deferred_dissolves`; the
+        // cascade still fires depth-first when those scope-exit
+        // calls run.
+        let is_long_lived = !info.subscriptions.is_empty();
+        for kind in &["birth", "run"] {
             if let Some(method) = info.methods.get(kind) {
                 self.builder
                     .build_call(
@@ -2300,7 +2893,78 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }
         }
+        if !is_long_lived {
+            for kind in &["drain", "dissolve"] {
+                if let Some(method) = info.methods.get(kind) {
+                    self.builder
+                        .build_call(
+                            *method,
+                            &[self_ptr.into()],
+                            &format!("{}.{}.call", locus_name, kind),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+            }
+        } else if let Some(top) = self.deferred_dissolves.last_mut() {
+            top.push((self_ptr, locus_name.to_string()));
+        } else {
+            // Should be unreachable: every fn body / lifecycle
+            // body opens a frame in lower_program/method body
+            // setup. If we hit this, the locus instantiation is
+            // outside any tracked scope and won't get cleaned up.
+            return Err(CodegenError::Unsupported(format!(
+                "long-lived locus `{}` instantiated outside any tracked \
+                 scope (no deferred-dissolve frame)",
+                locus_name
+            )));
+        }
 
+        Ok(())
+    }
+
+    /// Lower a `subject <- payload;` statement to a call into the
+    /// generated `lotus.bus_dispatch` fn. Subject must be a String
+    /// literal (or evaluate to a String pointer); payload must be
+    /// a TypeRef value (a pointer to a user-type struct). The
+    /// dispatch fn linear-scans the global subscription table and
+    /// invokes each matching handler with `(self_ptr, payload_ptr)`.
+    fn lower_send(
+        &mut self,
+        subject: &Expr,
+        value: &Expr,
+        scope: &Scope<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let bus = self.bus_state.ok_or_else(|| {
+            CodegenError::Unsupported(
+                "bus send `<-` used but no `bus subscribe` declared in \
+                 program — nothing to dispatch to"
+                    .to_string(),
+            )
+        })?;
+        let (subj_val, subj_ty) = self.lower_expr(subject, scope)?;
+        if subj_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "bus send subject must be String; got {:?}",
+                subj_ty
+            )));
+        }
+        let (payload_val, payload_ty) = self.lower_expr(value, scope)?;
+        match payload_ty {
+            LotusType::TypeRef(_) => {}
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "bus send payload must be a user-type value; got {:?}",
+                    other
+                )));
+            }
+        }
+        self.builder
+            .build_call(
+                bus.dispatch_fn,
+                &[subj_val.into(), payload_val.into()],
+                "bus.dispatch.call",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(())
     }
 

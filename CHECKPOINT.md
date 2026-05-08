@@ -1,7 +1,7 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 11 (user types) on top
+new session. State as of codegen milestone 12 (bus router) on top
 of commit `cdd7353` (2026-05-08).
 
 This is part of the alpha-conjecture program (see
@@ -37,19 +37,24 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 16 of 17 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
-- **Phase 3 milestone 11** (codegen subset) — complete. 10 of 17
+- **Phase 3 milestone 12** (codegen subset) — complete. 11 of 17
   example projects build to native ELF via `lotus build`:
-  hello-world, 01-locus-with-run, 02-parent-child, 06-mutable-
-  counter, 07-control-flow, 08-monotonic-sleep, 09-functions,
-  10-stateful-locus, 11-drain-dissolve, 12-user-types. Latest:
-  user-defined `type` declarations + struct literals + field
-  reads on `TypeRef` values — foundational substrate for the bus
-  router.
-- **Phase 3 next** — bus router lowering for `05-bus` (subject
-  → handler registry, `<-` dispatch). Then modes (bulk /
-  harmonic / resolution), closures, and decimal arithmetic —
-  the remaining big pieces before `trellis-demo` is a build
-  target.
+  hello-world, 01-locus-with-run, 02-parent-child, 05-bus,
+  06-mutable-counter, 07-control-flow, 08-monotonic-sleep,
+  09-functions, 10-stateful-locus, 11-drain-dissolve,
+  12-user-types. Latest: bus router lowering — locus methods
+  (`fn` members) lowered as `<Locus>.<name>(self_ptr, ...args)`,
+  global `@bus.entries` table + `@bus.count`, generated
+  `lotus.bus_dispatch` linear-scan dispatch fn (uses `strcmp` to
+  match subjects), subscription registration emitted at locus
+  instantiation, long-lived locus deferred-dissolve mechanism so
+  subscribers outlive synchronous publishes within their
+  enclosing scope.
+- **Phase 3 next** — modes (bulk / harmonic / resolution),
+  closures, and decimal arithmetic. After modes, `04-modes` is
+  a build target. Closures unblock `03-closure-test`. Decimal
+  arithmetic + closures together get us to `trellis-demo` as a
+  build target.
 
 ## Codegen milestone arc (Phase 3 progress)
 
@@ -71,6 +76,7 @@ m8  Codegen milestone 8: accept() + parent-child wiring         (d5afffd)
 m9  Codegen milestone 9: time::monotonic() + Duration arith     (cdd7353)
 m10 Codegen milestone 10: drain() / dissolve() lifecycle        (3ba3e05)
 m11 Codegen milestone 11: user `type` decls + struct literals   (5cb4882)
+m12 Codegen milestone 12: bus router (subscribe + <- + deferral)(this commit)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -101,9 +107,11 @@ m7 builds on the struct ABI.
 | `accept()` lifecycle method (F.7 ordering) + child `g.X` reads | ✅ | ✅ |
 | `drain()` / `dissolve()` lifecycle methods (F.4 cascade) | ✅ | ✅ |
 | User `type` decls + struct literals + field reads | ✅ | ✅ |
+| Locus `fn` members (called from bus dispatch, etc.) | ✅ | ✅ |
+| Bus router (`<-` send + subscribe dispatch) | ✅ | ✅ |
+| Long-lived locus deferred drain/dissolve (subscribers) | ✅ | ✅ |
 | Contracts (typecheck only — F.8) | ✅ | ✅ (skipped at codegen) |
 | `for` / `match` | ✅ | — |
-| Bus router (`<-` send + subscribe dispatch) | ✅ | — |
 | Closure runtime (collapse / absorb / bubble) | ✅ | — |
 | Modes as methods | ✅ | — |
 | Recovery primitives (bubble) | ✅ | — |
@@ -258,19 +266,17 @@ user-facing). Each is a focused single-commit chunk unless noted.
 
 **Codegen surface expansion (Tier 4, the LLVM path):**
 
-1. **Bus router lowering** — vtable-style dispatch, sync transport
-   first; ring buffer follows. With this, `05-bus` becomes a
-   build target.
-2. **Modes (bulk / harmonic / resolution)** — share the locus's
+1. **Modes (bulk / harmonic / resolution)** — share the locus's
    alloca'd struct with three projection-specific dispatch entry
    points. `04-modes` becomes a build target.
-3. **Closure runtime as a small C-runtime support library**
+2. **Closure runtime as a small C-runtime support library**
    (statically linked) — once we're ready to compile away from
    the interpreter for the closure-test path. `03-closure-test`
    becomes a build target.
-4. **`for` loops + arrays.** Need an array runtime representation;
+3. **`for` loops + arrays.** Need an array runtime representation;
    simplest is `{ i64 len, ptr data }` for fixed-size arrays
    first. Unblocks `self.children` iteration patterns.
+4. **Decimal arithmetic** — needed for `trellis-demo`.
 
 **Smaller follow-ups available in any commit:**
 - `return n;` from main → process exit code (one-line lowering
@@ -348,6 +354,9 @@ rm examples/11-drain-dissolve/main       # clean up artifact
 cargo run --bin lotus -- build examples/12-user-types/main.lt
 ./examples/12-user-types/main            # p.x=3 p.y=4, q.x=13 q.y=8, alice says hello (priority 7)
 rm examples/12-user-types/main           # clean up artifact
+cargo run --bin lotus -- build examples/05-bus/main.lt
+./examples/05-bus/main                   # got: hello from sender-1, ack: hello
+rm examples/05-bus/main                  # clean up artifact
 ```
 
-If all thirteen work, the checkpoint is intact.
+If all fourteen work, the checkpoint is intact.

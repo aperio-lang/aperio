@@ -391,16 +391,70 @@ Constraints v0 codegen enforces (will relax as more lands):
   in the AST and skipped by codegen. The expose / consume
   surfaces are still type-checked across coordinator / coordinatee
   per F.8 by the typechecker pass.
-- Locus members other than `params`, `contract`, and the
-  five-method lifecycle set (modes, bus blocks, closures,
-  failure handlers, nested fns / consts / types) are rejected
-  at declare time so a partially-supported locus doesn't
-  silently produce dead code.
+- Locus members beyond `params`, `contract`, the five-method
+  lifecycle set, `bus { subscribe / publish }` declarations, and
+  `fn` members (used as bus handlers) are rejected at declare
+  time. Modes, closures, failure handlers, and nested
+  consts/types wait on later milestones.
 
 The struct ABI + accept + drain/dissolve dispatch is what makes
 `01-locus-with-run`, `02-parent-child`, `10-stateful-locus`, and
 `11-drain-dissolve` compile to native ELF identically to their
 interpreter behavior.
+
+### Bus router (m12)
+
+The bus router lowers as **one global subscription table per
+program**, sized at compile time from the total `bus subscribe`
+declaration count. Layout:
+
+```
+%lotus.bus_entry = type { ptr, ptr, ptr }   ; subject, self, handler
+@bus.entries = internal global [N x %lotus.bus_entry] zeroinitializer
+@bus.count   = internal global i64 0
+```
+
+Each `bus subscribe "S" as h ...` declaration on a locus
+contributes one slot; registration happens when the locus is
+instantiated, BEFORE its `birth()` runs:
+
+```
+@bus.entries[bus.count] = { @.str.S, %self_ptr, @<Locus>.h }
+bus.count += 1
+```
+
+`<-` lowers to a call into the generated dispatch fn:
+
+```
+define void @lotus.bus_dispatch(ptr %subject, ptr %payload) {
+   ; for i in 0..bus.count:
+   ;   if strcmp(bus.entries[i].subject, %subject) == 0:
+   ;     bus.entries[i].handler(bus.entries[i].self, %payload)
+}
+```
+
+Subject equality uses libc `strcmp` (subjects are NUL-terminated
+global strings). Handler functions are called through a
+type-erased function pointer — every bus handler has the same
+LLVM signature `void (ptr self, ptr payload)`, with payload
+typing enforced by the typechecker upstream.
+
+#### Long-lived locus deferral
+
+A locus with any `bus subscribe` declaration is **long-lived**:
+its drain/dissolve must NOT fire at the end of its instantiation
+expression (which would dangle its `self_ptr` in the bus table
+before later publishes can reach it). Instead, each fn body /
+lifecycle method body opens a deferred-dissolve frame; long-lived
+loci instantiated inside push their `(self_ptr, locus_name)` onto
+the frame; at body exit (just before `ret`) the frame is flushed
+in reverse instantiation order, calling drain → dissolve on each.
+
+Ephemeral loci (no subscribe) keep the original semantics:
+drain → dissolve fires at end of `lower_locus_instantiation`,
+inside the same lifecycle body that instantiated them. The
+F.4 cascade still falls out structurally — children dissolve
+before their parent, regardless of which mechanism handles each.
 
 ## Future work
 
