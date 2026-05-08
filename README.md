@@ -3,21 +3,29 @@
 A programming language whose primitives are the lotus framework's
 coordination primitives.
 
-**Status.** v0 spec stable + Phase 1 milestone 1 (lex/parse/AST)
-running, 2026-05-08.
+**Status.** v0 compiler runs lotus programs end-to-end via a
+tree-walking interpreter; LLVM codegen is the next deep push.
 
-Phase 0 (spec stabilization + example ladder + gate program) is
-complete. Phase 1 milestone 1 (Rust compiler frontend: lexer,
-parser, AST, CLI) is functional: all 9 example `.lt` files parse
-cleanly. Type checker, codegen, and runtime are next.
+Phase 0 (spec stabilization + example ladder) and Phase 1
+(compiler frontend: lex / parse / typecheck) are complete. The
+v0 runtime (Phase 2 first cut) is a tree-walking interpreter
+that executes 8 of 9 example projects end-to-end, including
+the trellis-demo pipeline. The bus router has a Transport
+trait with two implementations (sync dispatch, LMAX-style ring
+buffer); the typechecker enforces the framework's distinctive
+primitives (F.8 contract compatibility, closure cycle
+existence, match exhaustiveness, k_max as a built-in field).
 
 Quick start:
 
 ```
 cargo build
-cargo run --bin lotus -- parse examples/hello-world/main.lt
-cargo test
+cargo run --bin lotus -- run examples/hello-world/main.lt
+cargo test --workspace
 ```
+
+Working CLI commands: `lex`, `parse`, `check`, `run` —
+single-file or whole-project (multi-file bundle) targets.
 
 Full delivery plan to team-wide-internal v1.0:
 `~/.claude/plans/witty-foraging-lightning.md`
@@ -70,7 +78,7 @@ Concretely:
 ## Design commitments locked
 
 The v0 spec locks the following commitments (see `spec/design-
-rationale.md` §F.1–F.14):
+rationale.md` §F.1–F.18):
 
 | Ref | Commitment |
 |---|---|
@@ -81,13 +89,17 @@ rationale.md` §F.1–F.14):
 | F.5 | Mode projections share the locus's arena |
 | F.6 | Lifecycle methods are not implicit loci |
 | F.7 | `accept()` runs before child birth |
-| F.8 | Contract compatibility is type-checked |
-| F.9 | Collapse vs. explosion as dissolution modes |
+| F.8 | Contract compatibility is type-checked across coordinator/coordinatee |
+| F.9 | Collapse vs. explosion + parent on_failure routing (absorb / bubble) |
 | F.10 | Mode keywords accepted post-dot as member names |
 | F.11 | `self.children` typing and lifecycle |
-| F.12 | `publish` builtin + bus-block scoping |
+| F.12 | Bus send is the `<-` operator; subscribe is declarative |
 | F.13 | Bus subscription handler signature |
 | F.14 | Three-way interface; translation return type ⊆ contract |
+| F.15 | Predefined type names are PascalCase, not keywords |
+| F.16 | `self.k_max` as built-in computed field (F.1 made executable) |
+| F.17 | Strict field-access; method types on locus / perspective values |
+| F.18 | Match exhaustiveness checked at typecheck |
 
 ## Design lineage
 
@@ -130,42 +142,62 @@ examples/
   02-parent-child/        contract expose/consume, accept, parent-child
                           memory hierarchy
   03-closure-test/        closure declaration, ~~ operator, collapse
-                          vs explosion
+                          (clean dissolution)
+  03b-closure-absorbed/   F.9 absorb path: parent on_failure handles
+                          ClosureViolation
+  03c-closure-bubbled/    F.9 bubble path: bubble(err), no further
+                          handler → process exits non-zero
   04-modes/               bulk/harmonic/resolution, self.children
                           iteration
-  05-bus/                 typed pub-sub, transport-agnostic source +
-                          deployment.yaml
-  trellis-pair/           Phase 0 exit gate: analyst + executor
-                          binaries on shared schema, full integration
+  05-bus/                 typed pub-sub via in-process router; sender
+                          + echo + ack-logger
+  trellis-demo/           full producer→analyst→executor→logger
+                          pipeline as one process; F.4 program-end
+                          dissolve fires the analyst's audit closure
+  trellis-pair/           production form: analyst + executor as
+                          separate binaries on shared schema. Spec-
+                          gate program; runs as two-binary form when
+                          cross-process bus + entry-point selection
+                          land.
 
 notes/
   open-questions.md       deferred decisions and future directions
 
-crates/                   (Phase 1+)
-  lotus-syntax/           lexer + parser + AST (functional)
-  lotus-types/            type checker (placeholder; Phase 1.5)
-  lotus-runtime/          runtime (placeholder; Phase 2)
-  lotus-codegen/          LLVM codegen (placeholder; Phase 3)
-  lotus-cli/              `lotus` binary (lex / parse subcommands)
+crates/                   (Phase 1 + 2 v0)
+  lotus-syntax/           lexer + parser + AST + diagnostics
+  lotus-types/            symbol resolution + type checker (F.8,
+                          field strictness, closure cycle, match
+                          exhaustiveness, k_max recognition)
+  lotus-runtime/          tree-walking interpreter + bus router
+                          (Transport trait: SyncDispatch / RingBuffer)
+                          + dissolve cascade (F.4 + F.9)
+  lotus-codegen/          LLVM codegen (placeholder; Phase 3 next)
+  lotus-cli/              `lotus` binary (lex / parse / check / run)
 ```
 
-Total v0 spec: ~3,741 lines across 10 documents.
-Example ladder: 6 rungs from hello-world → trellis-pair, ~300+
-lines of source + ~1,000+ lines of README walk-throughs.
+Example ladder: 9 projects from hello-world → trellis-demo;
+~700 lines of source + ~1,000+ lines of README walk-throughs.
+50 tests across the workspace; 8 of 9 projects run end-to-end
+under `lotus run`.
 
-Phase 1 milestone 1: ~3,500 lines of Rust across `crates/`.
-9/9 example files parse; 8 unit tests + 1 integration test pass.
+## Toolchain
 
-## Toolchain (planned, not yet implemented)
-
-Per `spec/testing.md`:
+Working today:
 
 ```
-lotus build       compile source → executable / library
-lotus check       static checks: parse, typecheck, framework discipline
+lotus lex   <file>           tokenize and print tokens
+lotus parse <file>           parse and print the AST
+lotus check <file | dir>     parse + typecheck (the full F-rules)
+lotus run   <file | dir>     parse + typecheck + interpret
+```
+
+Per `spec/testing.md`, the planned full surface adds:
+
+```
+lotus build       compile source → executable / library (Phase 3)
 lotus test        run all *_test.lt files
 lotus bench       run all *_bench.lt files
-lotus bench -compare  build and run external-language equivalents alongside
+lotus bench -compare  build + run external-language equivalents alongside
 lotus verify      framework-discipline checks specifically (no execution)
 lotus fmt         canonical formatter (zero config)
 ```
@@ -179,19 +211,21 @@ Per the delivery plan:
 
 - **Phase 0** — Spec stabilization. *Complete.*
 - **Phase 1** — Compiler frontend in Rust (parse + typecheck).
-  2–3 months.
-- **Phase 2** — Reference runtime in Rust. 2–3 months,
-  overlaps Phase 1.
-- **Phase 3** — Codegen in Rust targeting LLVM. 3–4 months.
-- **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. 3–6 months,
-  overlaps Phase 3.
-- **Phase 5** — Toolchain. 1–2 months, overlaps Phase 3–4.
-- **Phase 6** — Self-host (compiler rewrite in lotus). 4–8 months.
+  *Complete (v0).* All F.1–F.18 typecheck rules enforced;
+  9/9 example projects parse and typecheck cleanly.
+- **Phase 2** — Reference runtime in Rust. *v0 complete
+  (interpreter).* 8/9 example projects execute end-to-end;
+  bus router with pluggable transports; closure semantics
+  with collapse / absorb / bubble; program-end dissolve.
+  Region allocator + cooperative scheduler are the remaining
+  Phase 2 deep-pushes.
+- **Phase 3** — Codegen in Rust targeting LLVM. *Next.*
+- **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
+  Phase 3.
+- **Phase 5** — Toolchain. Overlaps Phase 3–4.
+- **Phase 6** — Self-host (compiler rewrite in lotus).
 - **Phase 7** — Trellis production deployment. Parallel.
-- **Phase 8** — v1.0 stabilization. 3–6 months.
-
-Total: ~18–30 months to team-wide internal v1.0;
-trellis-running-on-lotus reachable at ~9–15 months.
+- **Phase 8** — v1.0 stabilization.
 
 Implementation strategy: **Rust bootstrap → self-host in lotus**.
 The compiler-in-lotus milestone is the empirical anchor for the

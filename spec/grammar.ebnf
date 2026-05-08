@@ -395,14 +395,26 @@ postfix_op        = "." , member_name
                   | "[" , expression , "]"
                   ;
 
-(* member_name accepts identifiers AND mode keywords as field /
-   method names. Without this, `self.bulk()` would not parse
-   because `bulk` is a reserved keyword. Other contexts may
-   relax this further if needed. *)
+(* member_name accepts identifiers AND framework-vocabulary
+   keywords as field / method names. Post-`.` is unambiguous
+   member-name position, so admitting reserved words here is
+   safe. The mode keywords (per F.10) and the locus-member
+   keywords are admitted so that e.g. `self.bulk()`,
+   `err.closure`, `err.locus` typecheck without renaming. *)
 member_name       = IDENTIFIER
                   | "bulk"
                   | "harmonic"
                   | "resolution"
+                  | "closure"
+                  | "locus"
+                  | "params"
+                  | "contract"
+                  | "bus"
+                  | "mode"
+                  | "tier"
+                  | "projection"
+                  | "perspective"
+                  | "type"
                   ;
 
 primary_expr      = literal

@@ -405,6 +405,21 @@ R12 cyclic-closure pattern). Making it syntactic enables:
 The `~~` operator is reserved for closure assertions only (per
 precedence.md); using it elsewhere is a parse error.
 
+**Cycle-existence rule.** A closure assertion must observe at
+least one runtime-varying value. An assertion whose left and
+right are both pure literals (no identifiers, no `self`, no
+calls) is a compile error: the result is fixed at compile
+time and the closure can't audit anything. This is the first
+narrowing of the cycle-existence rule; the deeper version
+(left and right reach a common producer through some causal
+chain) requires the typechecker to track param-to-param
+dataflow and lands in a later iteration.
+
+Field references inside closure assertions resolve through
+the strict locus surface (params + methods + `self.children`
++ `self.k_max`); a typoed field name like `self.greting` is
+a compile error rather than a silent `Ty::Unknown` slip.
+
 **Considered and rejected.**
 
 - *Closure tests as library calls (`assert_closure(...)`).*
@@ -854,6 +869,13 @@ This is the framework's contract-graded visibility commitment
 expressed as a type rule. The full typing rule lives in
 `spec/types.md` (Phase 0 deliverable).
 
+The check fires once per parent locus that declares any
+`consume` entry. The parent's `accept(c: ChildType)`
+declaration tells the compiler which child to verify
+against. A parent that declares `consume` but no `accept` is
+itself a compile-time error — the consume surface has nothing
+to bind against.
+
 ### F.9 Collapse vs. explosion as dissolution modes
 
 (Added in v0.1.4 from 03-closure-test.)
@@ -899,12 +921,29 @@ information.
 **Recovery primitives interact.** A parent's `on_failure` for a
 ClosureViolation can:
 
-- `ignore` (return without action) — treat as collapse
-- `absorb(violation)` — fold the discrepancy into self's state
-- `bubble(err)` — pass to grandparent
+- *Return without re-raising* — absorption; treated as
+  collapse from the grandparent's perspective.
+- `bubble(err)` — re-raise the violation; if no further
+  handler catches it, the process exits non-zero with the
+  formatted ClosureViolation.
 - `restart(child)` — re-instantiate the failed locus
   (semantics: the closure violation invalidates this child's
-  state; restart gives a fresh attempt)
+  state; restart gives a fresh attempt). v0 parses; the
+  full restart cycle requires the region allocator and
+  scheduler.
+
+The handler receives a structured ClosureViolation value with
+fields:
+
+- `locus` — name of the locus whose closure failed
+- `closure` — name of the failed closure
+- `left`, `right` — the assertion's two values at evaluation
+- `tolerance` — the band
+- `diff` — left − right when both are numeric
+
+Field access uses the standard `err.closure`, `err.locus`,
+etc. — the parser admits these reserved-word names in member
+position because post-`.` is unambiguous.
 
 ### F.10 Mode keywords as member names
 
@@ -1195,6 +1234,75 @@ arena. The compiler is responsible for verifying that the modes
 don't conflict (e.g., resolution-mode mutating state that
 bulk-mode also writes is a compile-time error if the writes
 race).
+
+### F.16 `self.k_max` is a built-in computed field
+
+Any locus that declares the framework parameters as numeric
+params (`B`, `c`, `sigma`, `phi`) exposes `self.k_max` as a
+built-in field of type `Float`. The runtime computes:
+
+```
+self.k_max = B / [(1 − phi) · c + phi · sigma]
+```
+
+from current state values — the params are mutable, so the
+bound floats with them. A locus that adjusts `phi` to
+formalize its interface at runtime sees `k_max` move
+correspondingly.
+
+The typechecker recognizes `k_max` on every locus type as
+`Ty::Float`; the runtime errors cleanly on missing params or
+zero denominator rather than producing NaN or infinity.
+
+This makes the framework's signature equation an executable
+language primitive. A closure can audit against it directly:
+
+```
+closure within_capacity {
+    self.children.length ~~ 0 within self.k_max;
+}
+```
+
+Numerically: B=100, c=10, sigma=1, phi=0.5 yields k_max ≈ 18.18,
+the small-k regime paper 1 predicts for mixed formality.
+
+### F.17 Strict field-access checking + method types on locus values
+
+Every Locus, Type, and Perspective value has a known surface
+of fields and methods. The typechecker enforces it strictly:
+when the receiver type is statically resolvable and the
+named field doesn't exist on it, that's a compile error.
+Permissive only on `Ty::Unknown` receivers (stdlib paths,
+externally typed values, anything the bundle can't see).
+
+Methods on a locus or perspective — free `fn` members, mode
+declarations (`bulk` / `harmonic` / `resolution`), the
+implicit `is_stable() -> Bool` on every perspective — appear
+in the same field-lookup namespace as params. They resolve
+to `Ty::Function` so `handle.method(args)` typechecks
+through the standard call machinery.
+
+This catches typo bugs that would otherwise be silent
+runtime no-ops (`self.greting` returning `Ty::Unknown` and
+sneaking through every check downstream).
+
+### F.18 Match exhaustiveness checked at typecheck
+
+A `match` whose arms don't cover all scrutinee values is a
+compile error. v0 rules:
+
+- An unguarded arm with `_` or a bare binding pattern is a
+  catch-all → exhaustive.
+- For `Bool` scrutinees: covered iff both `true` and `false`
+  literal arms are present (unguarded).
+- For everything else: a catch-all is required.
+
+Permissive on `Ty::Unknown` scrutinees. The runtime previously
+fell through silently when no arm matched, so a typoed match
+became a hidden no-op. The check makes match safe by default.
+
+When enum-variant patterns land (deferred — requires enum
+typing surface), the rule extends to "every variant covered."
 
 ## 16. What's deferred
 
