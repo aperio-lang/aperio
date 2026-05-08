@@ -709,6 +709,43 @@ impl Interpreter {
                         .collect();
                     return Ok(Value::Array(Rc::new(RefCell::new(arr))));
                 }
+                if name == "k_max" {
+                    // F.1: k_max = B / [(1-phi)c + phi*sigma].
+                    // Computed from current B/c/sigma/phi state
+                    // values — the params are mutable so the
+                    // bound floats. Missing params default to
+                    // sensible neutral values that surface the
+                    // configuration error rather than NaN.
+                    let state = handle.state.borrow();
+                    let b = numeric(state.get("B"))
+                        .ok_or_else(|| Signal::Error(format!(
+                            "locus `{}`: self.k_max requires param `B`",
+                            handle.name
+                        )))?;
+                    let c = numeric(state.get("c"))
+                        .ok_or_else(|| Signal::Error(format!(
+                            "locus `{}`: self.k_max requires param `c`",
+                            handle.name
+                        )))?;
+                    let sigma = numeric(state.get("sigma"))
+                        .ok_or_else(|| Signal::Error(format!(
+                            "locus `{}`: self.k_max requires param `sigma`",
+                            handle.name
+                        )))?;
+                    let phi = numeric(state.get("phi"))
+                        .ok_or_else(|| Signal::Error(format!(
+                            "locus `{}`: self.k_max requires param `phi`",
+                            handle.name
+                        )))?;
+                    let denom = (1.0 - phi) * c + phi * sigma;
+                    if denom == 0.0 {
+                        return Err(Signal::Error(format!(
+                            "locus `{}`: k_max denominator is zero",
+                            handle.name
+                        )));
+                    }
+                    return Ok(Value::Float(b / denom));
+                }
                 if let Some(v) = handle.state.borrow().get(name).cloned() {
                     return Ok(v);
                 }
@@ -1223,6 +1260,15 @@ fn format_violation(v: &Value) -> String {
         );
     }
     format!("bubble: {}", v.display())
+}
+
+fn numeric(v: Option<&Value>) -> Option<f64> {
+    match v? {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        Value::Decimal(s) => parse_decimal(s),
+        _ => None,
+    }
 }
 
 fn lookup_failure(decl: &LocusDecl) -> Option<FailureDecl> {

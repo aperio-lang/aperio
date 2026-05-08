@@ -26,6 +26,58 @@ mod tests {
     use lotus_syntax::parse_source;
 
     #[test]
+    fn k_max_computes_from_framework_params() {
+        // F.1: k_max = B / [(1-phi)c + phi*sigma].
+        // B=10, c=2, sigma=1, phi=0.0 -> denom = 2 -> k_max = 5.
+        let src = r#"
+            locus L {
+                params {
+                    B: Int = 10;
+                    c: Int = 2;
+                    sigma: Int = 1;
+                    phi: Float = 0.0;
+                }
+                birth() {
+                    println("k_max=", self.k_max);
+                }
+            }
+            fn main() { L { }; }
+        "#;
+        let program = parse_source(src).unwrap();
+        assert_eq!(run_program(&program).unwrap(), 0);
+    }
+
+    #[test]
+    fn k_max_in_closure_assertion() {
+        // The framework primitive can be referenced as the
+        // tolerance band in a closure: assert that count
+        // never exceeds k_max. This is the F.1 invariant
+        // operationalized in source.
+        let src = r#"
+            locus L {
+                params {
+                    B: Int = 10;
+                    c: Int = 1;
+                    sigma: Int = 1;
+                    phi: Float = 1.0;
+                    count: Int = 0;
+                }
+                bus { subscribe "ping" as on_ping of type Int; }
+                fn on_ping(n: Int) {
+                    self.count = self.count + 1;
+                }
+                closure within_capacity {
+                    self.count ~~ 0 within self.k_max;
+                }
+            }
+            fn main() { L { }; }
+        "#;
+        let program = parse_source(src).unwrap();
+        // No pings sent → count stays 0 → 0 ~~ 0 within k_max → pass.
+        assert_eq!(run_program(&program).unwrap(), 0);
+    }
+
+    #[test]
     fn long_lived_closure_passes_at_program_end() {
         // SubscriberL has a bus subscribe (long-lived) and a
         // closure that should pass at program-end dissolve.

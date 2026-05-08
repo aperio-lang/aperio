@@ -630,6 +630,13 @@ impl<'a> Checker<'a> {
                             None => Ty::Array(Box::new(Ty::Unknown), None),
                         });
                     }
+                    if name == "k_max" {
+                        // F.1: k_max = B / [(1-phi)c + phi*sigma].
+                        // Fractional in general; Float regardless of
+                        // whether B/c/sigma are Int (the divisor is
+                        // a phi-weighted blend).
+                        return Some(Ty::Prim(PrimType::Float));
+                    }
                     if let Some(p) = info.params.iter().find(|p| p.name == name) {
                         return Some(p.ty.clone());
                     }
