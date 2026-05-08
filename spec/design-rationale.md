@@ -624,13 +624,13 @@ Considered and rejected:
 - *`this` instead of `self`.* Reject; `self` is more aligned
   with Rust / Python and avoids the C++/Java baggage.
 
-## D. Function scope as implicit locus
+## D. Function scope as implicit locus (and lifecycle methods are not)
 
-(Added in v0.1.2, after the 01-locus-with-run example surfaced
-this.)
+(Added in v0.1.2 from 01-locus-with-run; refined in v0.1.3
+from 02-parent-child.)
 
-Every function — `fn main()`, `fn helper()`, lifecycle methods
-inside a locus — has an **implicit locus** at its scope.
+**Free `fn` functions have implicit loci.** Every `fn main()`,
+`fn helper()`, etc. has an **implicit locus** at its scope.
 Locally-bound handles and anonymous children of the function
 body are children of this implicit locus. The function returns
 when:
@@ -644,10 +644,33 @@ the ticker's `run()` has completed (or been drained). This makes
 "main returns when its work is done" the natural semantics
 without requiring explicit `wait()` or `join()` calls.
 
+**Lifecycle methods do not have their own implicit locus.**
+`birth`, `accept`, `run`, `drain`, `dissolve`, `on_failure` are
+not regular functions — they run *as the locus*. Children
+instantiated inside a lifecycle method attach to the enclosing
+locus, not to a fresh implicit scope.
+
+```
+locus CoordinatorL {
+    accept(g: GreeterL) {
+        println(g.greeting);  // reads child's exposed state
+    }
+    run() {
+        // GreeterL { ... } here: child of CoordinatorL,
+        // NOT of run()'s scope. accept() will be invoked.
+        GreeterL { greeting: "hi" };
+    }
+}
+```
+
+This distinction matters because the framework's "locus is the
+unit of region" commitment means lifecycle methods can't have
+their own region — they ARE the locus.
+
 The implicit-function-locus model also underwrites SIGINT
 handling: SIGINT triggers `drain()` on the runtime root locus
 (which contains main); the drain cascades to main's implicit
-locus, which cascades to its children. See §E (drain cascade).
+locus, which cascades to its children. See F.4 (drain cascade).
 
 ## C. Default lifecycle methods
 
@@ -757,6 +780,48 @@ SIGINT triggers `drain()` on the runtime root locus, cascading
 through the entire process tree. This gives clean shutdown for
 free: from the user's perspective, "Ctrl-C and the program exits
 cleanly" is the default.
+
+### F.6 Lifecycle methods are not implicit loci
+
+(See §D for full discussion.) Lifecycle methods (`birth`,
+`accept`, `run`, `drain`, `dissolve`, `on_failure`) run *as*
+the locus, not in their own scope. Children instantiated
+inside a lifecycle method attach to the enclosing locus.
+
+### F.7 `accept()` runs before child birth
+
+When a child locus is instantiated inside a parent's lifecycle
+method, the parent's `accept()` runs **before** the child's
+region is allocated and `birth()` runs. This lets `accept()`
+inspect the child's declared params + contract surface and
+reject the child (panic, return error) before any resources
+are committed.
+
+If `accept()` rejects the child, the child instantiation
+expression fails. The child's region is never allocated; its
+`birth()` never runs.
+
+If `accept()` accepts the child, the child's region is allocated
+as a sub-region of the parent's, and `birth()` runs. The
+instantiation expression returns the child handle.
+
+For an unbound child instantiation, the child dissolves at the
+enclosing statement boundary (per §A) if it has no `run`, or
+becomes an anonymous child of the parent if it has `run`. The
+parent's lifetime bounds the child's.
+
+### F.8 Contract compatibility is type-checked
+
+When a parent declares `consume X: T` and a child declares
+`expose X: T`, the compiler verifies at compile time that the
+child's expose-surface is a superset of the parent's
+consume-surface, and that the types match. A mismatch (missing
+field, wrong type, missing trait bound) is a compile-time
+error.
+
+This is the framework's contract-graded visibility commitment
+expressed as a type rule. The full typing rule lives in
+`spec/types.md` (Phase 0 deliverable).
 
 ### F.5 Mode-projections share the locus's arena
 

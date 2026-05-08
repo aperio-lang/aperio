@@ -1,0 +1,52 @@
+// 02-parent-child — coordinator + greeter children.
+//
+// A coordinator locus that accepts greeter children and reads
+// their state through the contract surface. Demonstrates:
+//   - contract { expose ... } and contract { consume ... }
+//   - accept() lifecycle method
+//   - instantiating children inside a parent's lifecycle method
+//   - parent reading child's exposed state via the contract
+//   - the parent-child memory hierarchy (child region nested
+//     inside parent region)
+
+locus GreeterL {
+    params {
+        greeting: string = "hello";
+    }
+
+    contract {
+        expose greeting: string;
+    }
+}
+
+locus CoordinatorL {
+    params {
+        B: int = 100;        // budget: 100 units
+        c: int = 1;          // attach cost per coordinatee
+        sigma: int = 1;      // summary cost per coordinatee
+        phi: float = 1.0;    // formality: fully typed contract
+    }
+
+    contract {
+        consume greeting: string;
+    }
+
+    accept(g: GreeterL) {
+        // accept() runs once for each child attached. We can
+        // read the child's exposed contract state here.
+        println("greeting from child: ", g.greeting);
+    }
+
+    run() {
+        // Inside lifecycle methods, child instantiations attach
+        // to *self* (the coordinator), not to the lifecycle
+        // method's scope. accept() is invoked for each.
+        GreeterL { greeting: "hello" };
+        GreeterL { greeting: "hi" };
+        GreeterL { greeting: "yo" };
+    }
+}
+
+fn main() {
+    CoordinatorL { };
+}
