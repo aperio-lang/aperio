@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lotus-syntax",
+    "crates/lotus-types",
+    "crates/lotus-runtime",
+    "crates/lotus-codegen",
+    "crates/lotus-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["Riley Rook <riley@srcry.xyz>"]
+license = "MIT OR Apache-2.0"
+repository = "local"
+
+[workspace.dependencies]
+# All crates use only std for v0. Dependencies added as needed.

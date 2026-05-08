@@ -17,3 +17,7 @@ Thumbs.db
 
 # Working notes (untracked by default; promote to notes/ when stable)
 .scratch/
+
+# Rust build artifacts
+/target/
+# Cargo.lock IS committed (binary workspace, reproducible builds).

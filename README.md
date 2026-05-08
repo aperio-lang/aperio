@@ -3,10 +3,21 @@
 A programming language whose primitives are the lotus framework's
 coordination primitives.
 
-**Status.** v0 spec stable, 2026-05-08.
-**No compiler exists yet.** Phase 0 (spec stabilization +
-example ladder + gate program) is complete; Phase 1 (Rust
-compiler frontend) is the next milestone per the delivery plan.
+**Status.** v0 spec stable + Phase 1 milestone 1 (lex/parse/AST)
+running, 2026-05-08.
+
+Phase 0 (spec stabilization + example ladder + gate program) is
+complete. Phase 1 milestone 1 (Rust compiler frontend: lexer,
+parser, AST, CLI) is functional: all 9 example `.lt` files parse
+cleanly. Type checker, codegen, and runtime are next.
+
+Quick start:
+
+```
+cargo build
+cargo run --bin lotus -- parse examples/hello-world/main.lt
+cargo test
+```
 
 Full delivery plan to team-wide-internal v1.0:
 `~/.claude/plans/witty-foraging-lightning.md`
@@ -129,11 +140,21 @@ examples/
 
 notes/
   open-questions.md       deferred decisions and future directions
+
+crates/                   (Phase 1+)
+  lotus-syntax/           lexer + parser + AST (functional)
+  lotus-types/            type checker (placeholder; Phase 1.5)
+  lotus-runtime/          runtime (placeholder; Phase 2)
+  lotus-codegen/          LLVM codegen (placeholder; Phase 3)
+  lotus-cli/              `lotus` binary (lex / parse subcommands)
 ```
 
 Total v0 spec: ~3,741 lines across 10 documents.
 Example ladder: 6 rungs from hello-world → trellis-pair, ~300+
 lines of source + ~1,000+ lines of README walk-throughs.
+
+Phase 1 milestone 1: ~3,500 lines of Rust across `crates/`.
+9/9 example files parse; 8 unit tests + 1 integration test pass.
 
 ## Toolchain (planned, not yet implemented)
 
