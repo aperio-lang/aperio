@@ -316,48 +316,76 @@ allocator and dispatcher refine *where* the struct is allocated
 and *how* methods get scheduled, not the struct's shape.
 
 ```
-locus T {
-    params { n: Int = 0; interval: Duration = 1s; }
-    birth() { ... }
-    run()   { ... }
+locus Greeter {
+    params { greeting: String = "hi"; }
+    contract { expose greeting: String; }
+}
+locus Coord {
+    params { factor: Int = 1; }
+    contract { consume greeting: String; }
+    accept(g: Greeter) { ... }
+    run()              { ... }
 }
 ```
 
 lowers to:
 
 ```
-%locus.T = type { i64, i64 }                ; n, interval
-declare void @T.birth(ptr %self)
-declare void @T.run(ptr %self)
+%locus.Greeter = type { ptr }              ; greeting
+%locus.Coord   = type { i64 }              ; factor
+
+declare void @Coord.accept(ptr %self, ptr %child)
+declare void @Coord.run(ptr %self)
 ```
 
 Statement-level instantiation `T { ... };` lowers to: `alloca`
 on the caller's stack, store each field (call-site override or
-declared default), call `T.birth(self_ptr)`, call `T.run(self_ptr)`
-if declared. v0 codegen is **ephemeral-only** — the alloca is
-freed when the enclosing fn returns; long-lived loci, the
-parent-child region hierarchy described above, and `accept` /
-`drain` / `dissolve` lifecycle dispatch wait on the cooperative
-scheduler + region allocator work.
+declared default), then dispatch lifecycle methods in the F.7
+order:
+
+1. **If we're inside a parent locus's lifecycle method AND that
+   parent has an `accept(child: T)` method matching the locus
+   being instantiated** → call `parent.accept(parent_self, child_ptr)`.
+2. Call `T.birth(child_ptr)` if declared.
+3. Call `T.run(child_ptr)` if declared.
+
+`accept` runs *before* the child's own `birth`, per F.7. This
+is how `02-parent-child`'s `Coord.accept(g: GreeterL)` fires for
+each `GreeterL { ... }` instantiated in the coordinator's `run()`
+body. Inside `accept`, `self.X` GEPs through the parent's struct
+and `g.X` GEPs through the child's struct — different `getelementptr`
+chains, same lowering machinery.
+
+v0 codegen is **ephemeral-only**: every alloca is on the caller's
+stack and freed when the enclosing fn returns. Long-lived loci,
+the parent-child region hierarchy described above (each child's
+region nested in the parent's), and `drain` / `dissolve`
+lifecycle dispatch wait on the cooperative scheduler + region
+allocator work.
 
 Constraints v0 codegen enforces (will relax as more lands):
 
-- Only `birth` and `run` lifecycle methods compile; `accept`,
-  `drain`, `dissolve` are accepted in the AST but rejected at
-  codegen time.
-- Lifecycle methods take no user-declared params (only the
-  implicit `self`) and return `void`.
+- Lifecycle methods supported: `birth`, `accept`, `run`. `drain`
+  and `dissolve` are rejected at declare time.
+- `birth` and `run` take no user-declared params (only implicit
+  `self`); `accept` takes exactly one param, the typed child
+  reference. All lifecycle methods return `void`.
 - Locus param defaults must be literals (Int / Float / Bool /
   String / Duration). Non-literal defaults compile under the
   interpreter but not via `lotus build`.
-- Locus members other than `params` and `birth`/`run` (modes,
-  contracts, bus blocks, closures, nested fns / consts / types)
-  are rejected at declare time so a partially-supported locus
-  doesn't silently produce dead code.
+- Contracts are typecheck-only at this layer — they're accepted
+  in the AST and skipped by codegen. The expose / consume
+  surfaces are still type-checked across coordinator / coordinatee
+  per F.8 by the typechecker pass.
+- Locus members other than `params`, `contract`, and the
+  `birth` / `accept` / `run` lifecycle methods (modes, bus
+  blocks, closures, failure handlers, nested fns / consts /
+  types) are rejected at declare time so a partially-supported
+  locus doesn't silently produce dead code.
 
-The struct ABI is what makes `01-locus-with-run` and
-`10-stateful-locus` compile to native ELF identically to their
-interpreter behavior.
+The struct ABI + accept dispatch is what makes
+`01-locus-with-run`, `02-parent-child`, and `10-stateful-locus`
+compile to native ELF identically to their interpreter behavior.
 
 ## Future work
 

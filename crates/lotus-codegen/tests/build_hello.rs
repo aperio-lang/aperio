@@ -703,6 +703,135 @@ fn locus_with_run_canonical_example_builds_and_runs() {
 }
 
 #[test]
+fn build_accept_runs_before_child_birth() {
+    // F.7: parent.accept(self, child) fires before child.birth.
+    // We verify by checking the println order.
+    let src = r#"
+        locus Child {
+            params { id: Int = 0; }
+            birth() {
+                println("child.birth id=", self.id);
+            }
+        }
+        locus Parent {
+            params { _u: Int = 0; }
+            accept(c: Child) {
+                println("accept id=", c.id);
+            }
+            run() {
+                Child { id: 1 };
+                Child { id: 2 };
+            }
+        }
+        fn main() { Parent { }; }
+    "#;
+    let (stdout, status) = build_and_run("accept_order", src);
+    assert!(status.success());
+    // Expected order per F.7: accept(1) → child.birth(1) → accept(2) → child.birth(2)
+    let expected = "accept id=1\nchild.birth id=1\naccept id=2\nchild.birth id=2";
+    assert!(
+        stdout.contains(expected),
+        "expected accept-before-birth ordering; got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn build_child_field_read_in_accept() {
+    // The child's contract field is readable from the parent's
+    // accept() body via `g.field`. Each child carries its own
+    // overridden value.
+    let src = r#"
+        locus Greeter {
+            params { greeting: String = "default"; }
+            contract { expose greeting: String; }
+        }
+        locus Coord {
+            params { _u: Int = 0; }
+            contract { consume greeting: String; }
+            accept(g: Greeter) {
+                println("got: ", g.greeting);
+            }
+            run() {
+                Greeter { greeting: "alpha" };
+                Greeter { greeting: "beta" };
+                Greeter { greeting: "gamma" };
+            }
+        }
+        fn main() { Coord { }; }
+    "#;
+    let (stdout, status) = build_and_run("child_field", src);
+    assert!(status.success());
+    assert!(stdout.contains("got: alpha"), "got: {:?}", stdout);
+    assert!(stdout.contains("got: beta"), "got: {:?}", stdout);
+    assert!(stdout.contains("got: gamma"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_accept_with_self_reads() {
+    // Parent's accept body can mix `self.X` (parent state) with
+    // `g.X` (child state) freely — they GEP through different
+    // structs.
+    let src = r#"
+        locus Worker {
+            params { value: Int = 0; }
+            contract { expose value: Int; }
+        }
+        locus Boss {
+            params { factor: Int = 10; }
+            contract { consume value: Int; }
+            accept(w: Worker) {
+                println("scaled=", w.value * self.factor);
+            }
+            run() {
+                Worker { value: 3 };
+                Worker { value: 7 };
+            }
+        }
+        fn main() { Boss { factor: 100 }; }
+    "#;
+    let (stdout, status) = build_and_run("accept_self_mix", src);
+    assert!(status.success());
+    assert!(stdout.contains("scaled=300"), "got: {:?}", stdout);
+    assert!(stdout.contains("scaled=700"), "got: {:?}", stdout);
+}
+
+#[test]
+fn parent_child_canonical_example_builds_and_runs() {
+    let mut src_path = examples_dir();
+    src_path.push("02-parent-child");
+    src_path.push("main.lt");
+    let source = std::fs::read_to_string(&src_path).expect("read source");
+    let program = lotus_syntax::parse_source(&source).expect("parse");
+
+    let temp_dir = std::env::temp_dir();
+    let mut bin_path = temp_dir.clone();
+    bin_path.push("lotus_test_02_parent_child");
+
+    build_executable(&program, &bin_path).expect("build");
+    let output = Command::new(&bin_path).output().expect("run");
+    let _ = std::fs::remove_file(&bin_path);
+
+    assert!(output.status.success(), "non-zero: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("greeting from child: hello"),
+        "got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("greeting from child: hi"),
+        "got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("greeting from child: yo"),
+        "got: {:?}",
+        stdout
+    );
+}
+
+#[test]
 fn stateful_locus_example_builds_and_runs() {
     let mut src_path = examples_dir();
     src_path.push("10-stateful-locus");
