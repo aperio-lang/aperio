@@ -1,7 +1,7 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of commit `9955bea` (2026-05-08).
+new session. State as of commit `206fbd0` (2026-05-08).
 
 This is part of the alpha-conjecture program (see
 `~/notes/alpha-conjecture/CLAUDE.md`). Lotus is the language-substrate
@@ -12,7 +12,8 @@ coordination primitives.
 
 A working compiler that **runs** lotus programs end-to-end (tree-
 walking interpreter) AND **produces** native ELF binaries (LLVM via
-inkwell) for a tractable subset. 78 tests pass across the workspace.
+inkwell) for a substantial subset including loci with `run()`
+lifecycle methods. 86 tests pass across the workspace.
 
 ```
 $ lotus run examples/hello-world/main.lt        # interpreter path
@@ -29,16 +30,19 @@ Phase status:
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
 - **Phase 2 v0** (interpreter + bus router) — 8 of 9 example projects
   execute end-to-end
-- **Phase 3 milestone 6** (codegen subset) — complete; literals,
+- **Phase 3 milestone 7** (codegen subset) — complete; literals,
   arithmetic, let / let mut bindings, assignment + compound ops,
   mixed-type println, if/else/while + break/continue,
-  `time::sleep` on CLOCK_MONOTONIC, user-defined fns (typed
-  params + return, recursion, void fns)
-- **Phase 3 next** — locus runtime ABI: locus-as-struct allocation,
-  `self.X` reads/writes via getelementptr, lifecycle method
-  dispatch (`run()`/`accept()`/`dissolve()`). The big gating push —
-  unblocks `01-locus-with-run`, struct-field mutation, arrays, and
-  most of the interpreter's surface for codegen.
+  `time::sleep` on CLOCK_MONOTONIC, user-defined fns, and the
+  **locus runtime ABI**: each locus → LLVM struct, lifecycle
+  methods take `self_ptr`, `self.X` reads/writes via
+  getelementptr, statement-level instantiation does
+  alloca → fill defaults+overrides → call birth → call run.
+- **Phase 3 next** — `accept()` / `drain()` / `dissolve()`
+  lifecycle methods (parent-child + recovery primitives), then
+  `time::now()` / `time::monotonic()` value-returners, then the
+  bus router lowering. After accept lands, `02-parent-child`
+  becomes the next visible build-target.
 
 ## What runs vs. what builds
 
@@ -48,17 +52,17 @@ Phase status:
 | Int / Float / Bool / String literals + params | ✅ | ✅ |
 | `let` bindings | ✅ | ✅ |
 | Arithmetic, comparisons, logical ops | ✅ | ✅ |
-| `self.X` reads (in birth) | ✅ | ✅ (compile-time const) |
-| Locus instantiation + birth() | ✅ | ✅ (ephemeral only) |
+| `self.X` reads (in lifecycle methods) | ✅ | ✅ (runtime GEP+load) |
+| Locus instantiation + `birth()` | ✅ | ✅ (ephemeral only) |
 | Mixed-type println (single printf) | ✅ | ✅ |
-| `let mut` + assignment (incl. compound `+=` etc.) | ✅ | ✅ (bare-local lvalues) |
+| `let mut` + assignment (incl. compound `+=` etc.) | ✅ | ✅ |
 | `if` / `else` / `else if` / `while` + `break` / `continue` | ✅ | ✅ |
 | `time::sleep` on CLOCK_MONOTONIC + EINTR retry | ✅ | ✅ |
 | User-defined fns called from main / each other | ✅ | ✅ |
+| `run()` lifecycle method | ✅ | ✅ |
+| `self.X = ...` mutation in lifecycle methods | ✅ | ✅ |
 | `for` / `match` | ✅ | — |
-| User-defined fns called from main | ✅ | — |
-| Multiple lifecycle methods (run, accept, dissolve) | ✅ | — |
-| `self.X = ...` mutation | ✅ | — |
+| `accept()` / `drain()` / `dissolve()` lifecycle methods | ✅ | — |
 | Bus router (`<-` send + subscribe dispatch) | ✅ | — |
 | Closure runtime (collapse / absorb / bubble) | ✅ | — |
 | Modes as methods | ✅ | — |
@@ -153,6 +157,8 @@ real-world use case for lotus.
 ## Recent commit history (last 30, newest first)
 
 ```
+206fbd0 Codegen milestone 7: locus runtime ABI
+79ae75f CHECKPOINT.md: refresh for milestone 6
 9955bea Codegen milestone 6: multi-fn programs
 29c8bdf README + open-questions: sync to milestone-5 state
 fd53a6d CHECKPOINT.md: refresh for milestone 5
@@ -184,7 +190,7 @@ e07b3ce Phase 2 v0: tree-walking interpreter — `lotus run` works
 5a961f0 Phase 1 milestone 1: lex / parse / AST threaded through
 ```
 
-38 commits ahead of origin/master at checkpoint time.
+40 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
@@ -193,30 +199,39 @@ user-facing). Each is a focused single-commit chunk unless noted.
 
 **Codegen surface expansion (Tier 4, the LLVM path):**
 
-1. **`self.X` as runtime LLVM value** (struct allocation +
-   getelementptr) — locus-as-struct runtime ABI. The big gating
-   push: needed before any non-ephemeral lifecycle compiles,
-   before `run()` / `accept()` / `dissolve()`, before
-   `self.X = ...` mutation, before `for` loops over arrays. After
-   this, most of the interpreter's surface comes online for
-   codegen — and `01-locus-with-run` should compile.
+1. **Parent-child lifecycle: `accept()` / `drain()` / `dissolve()`
+   + child loci.** `accept()` takes the parent reference; child
+   loci attach to a `self.children` slot. With this, `02-parent-
+   child` becomes a build target. Touches the locus runtime ABI's
+   "ephemeral-only" constraint — long-lived child loci need a
+   region-allocator ancestor before they can stay alive past the
+   surrounding fn return. Initial scope: scope-bounded parent
+   holding stack-allocated children + drain cascade at scope exit.
 2. **`time::now()` / `time::monotonic()`** — the value-returning
    side of the clock module. `clock_gettime(CLOCK_MONOTONIC)` and
    `clock_gettime(CLOCK_REALTIME)` lowering; pairs with the
    monotonic-only-scheduling discipline locked in by milestone 5
    (see spec/runtime.md "Time" section).
 3. **Bus router lowering** — vtable-style dispatch, sync transport
-   first; ring buffer follows. Depends on the locus runtime ABI.
-4. **Closure runtime as a small C-runtime support library**
+   first; ring buffer follows. Depends on accept lowering.
+4. **Modes (bulk / harmonic / resolution)** — share the locus's
+   alloca'd struct with three projection-specific dispatch entry
+   points.
+5. **Closure runtime as a small C-runtime support library**
    (statically linked) — once we're ready to compile away from
    the interpreter for the closure-test path.
+6. **`for` loops + arrays.** Need an array runtime representation;
+   simplest is `{ i64 len, ptr data }` for fixed-size arrays
+   first.
 
 **Smaller follow-ups behind the locus ABI work:**
 - `return n;` from main → process exit code (one-line lowering
-  once the locus ABI is unblocked enough to free up the special-
-  cased main path)
+  once the special-cased main path can lift `return`)
 - Default param values on user fns (already in AST; declare time
   rejects them today)
+- Locus param defaults that aren't literals (current constraint:
+  literal-only at declare time; lift by deferring default eval to
+  the instantiation site through `lower_expr`)
 
 **Runtime side (Tier 0/1, deferred):**
 
@@ -245,17 +260,21 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 78 tests.
+all 86 tests (the locus-with-run test runs 3×500ms sleeps so the
+runtime + codegen integration buckets clock ~1.5s each).
 
 ## How to verify the checkpoint
 
 ```
 cd ~/code/lotus-lang
-cargo test --workspace --tests           # 78 passed
+cargo test --workspace --tests           # 86 passed
 cargo run --bin lotus -- run examples/trellis-demo/main.lt
 cargo run --bin lotus -- build examples/hello-world/main.lt
 ./examples/hello-world/main              # prints "hello, world"
 rm examples/hello-world/main             # clean up artifact
+cargo run --bin lotus -- build examples/01-locus-with-run/main.lt
+./examples/01-locus-with-run/main        # tick 0..2 over 1.5s
+rm examples/01-locus-with-run/main       # clean up artifact
 cargo run --bin lotus -- build examples/06-mutable-counter/main.lt
 ./examples/06-mutable-counter/main       # prints "n=2"
 rm examples/06-mutable-counter/main      # clean up artifact
@@ -268,6 +287,9 @@ rm examples/08-monotonic-sleep/main      # clean up artifact
 cargo run --bin lotus -- build examples/09-functions/main.lt
 ./examples/09-functions/main             # prints square(7)=49 / fib(12)=144 / ...
 rm examples/09-functions/main            # clean up artifact
+cargo run --bin lotus -- build examples/10-stateful-locus/main.lt
+./examples/10-stateful-locus/main        # prints total=160 / step=30
+rm examples/10-stateful-locus/main       # clean up artifact
 ```
 
-If all eight work, the checkpoint is intact.
+If all ten work, the checkpoint is intact.
