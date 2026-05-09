@@ -346,6 +346,7 @@ mod tests {
                 children: Rc::new(RefCell::new(Vec::new())),
                 decl: Rc::new(decl),
                 dissolved: Rc::new(std::cell::Cell::new(false)),
+                restart_count: Rc::new(std::cell::Cell::new(0)),
             },
             handler: handler.to_string(),
         }

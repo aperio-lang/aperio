@@ -438,10 +438,37 @@ impl Interpreter {
                         let payload = arg_vs.into_iter().next().unwrap_or(Value::Nil);
                         Err(Signal::Bubble(payload))
                     }
-                    // restart / restart_in_place / drain / dissolve /
+                    // m40: restart(c) bumps c.restart_count by 1
+                    // unconditionally — the post-on_failure
+                    // dispatch in `instantiate_locus` checks
+                    // pre/post values + the cap (2 attempts) to
+                    // decide whether to re-run birth() + birth-
+                    // epoch closures. We don't gate the bump
+                    // here so the cap is observable: a third
+                    // restart() raises count to 3 (>2) and the
+                    // re-run is skipped.
+                    RecoveryOp::Restart => {
+                        let target = arg_vs.into_iter().next().ok_or_else(|| {
+                            Signal::Error(
+                                "restart() takes one locus argument".into(),
+                            )
+                        })?;
+                        match target {
+                            Value::Locus(handle) => {
+                                let cur = handle.restart_count.get();
+                                handle.restart_count.set(cur + 1);
+                                Ok(())
+                            }
+                            other => Err(Signal::Error(format!(
+                                "restart() expects a locus argument; got {}",
+                                other.type_name()
+                            ))),
+                        }
+                    }
+                    // restart_in_place / drain / dissolve /
                     // quarantine / reorganize: parsed for surface
-                    // completeness; full semantics land with the
-                    // scheduler + region allocator.
+                    // completeness; full semantics land with later
+                    // milestones.
                     _ => Ok(()),
                 }
             }
@@ -1068,6 +1095,7 @@ impl Interpreter {
             children: Rc::new(RefCell::new(Vec::new())),
             decl: decl.clone(),
             dissolved: Rc::new(std::cell::Cell::new(false)),
+            restart_count: Rc::new(std::cell::Cell::new(0)),
         };
 
         // Register every bus subscription on the router.
@@ -1096,17 +1124,15 @@ impl Interpreter {
             }
         }
 
-        // Run birth().
-        if let Some(birth_decl) = lookup_lifecycle(&decl, LifecycleKind::Birth) {
-            self.run_lifecycle(handle.clone(), &birth_decl, &[])?;
-        }
-
-        // m39: birth-epoch closures fire right after birth(),
-        // before run(). Same routing as dissolve-epoch
-        // (`deliver_violation` checks parent on_failure if any,
-        // else returns a non-zero-exit Signal::Error). The
-        // ordering — birth → birth-epoch closures → run — keeps
-        // run()'s body sitting on a checked invariant.
+        // Run birth() + birth-epoch closures, with m40 restart
+        // re-runs if the parent's on_failure body called
+        // restart(self). The re-run is a depth-bounded loop
+        // rather than recursion: we capture restart_count before
+        // each on_failure call, and after deliver_violation
+        // returns we check whether the count was bumped within
+        // the cap (2). Bounded loop count = bounded recursion;
+        // each iteration re-runs birth() + the same closure
+        // sequence on the same handle.
         let birth_closures: Vec<ClosureDecl> = handle
             .decl
             .members
@@ -1118,21 +1144,52 @@ impl Interpreter {
                 _ => None,
             })
             .collect();
-        let mut birth_violations: Vec<Value> = Vec::new();
-        for closure in &birth_closures {
-            match self.evaluate_closure(handle.clone(), closure)? {
-                ClosureOutcome::Pass => {}
-                ClosureOutcome::Violation(v) => birth_violations.push(v),
+
+        loop {
+            // birth() runs at the top of every attempt — first
+            // attempt is the natural birth; subsequent attempts
+            // are restart-driven re-runs of the same lifecycle.
+            if let Some(birth_decl) =
+                lookup_lifecycle(&decl, LifecycleKind::Birth)
+            {
+                self.run_lifecycle(handle.clone(), &birth_decl, &[])?;
             }
-        }
-        if !birth_violations.is_empty() {
-            let parent = self.parent_stack.last().cloned();
-            for violation in birth_violations {
-                self.deliver_violation(
-                    handle.clone(),
-                    parent.as_ref(),
-                    violation,
-                )?;
+
+            // Evaluate every birth-epoch closure. On failure,
+            // deliver_violation invokes the parent's on_failure
+            // (if any). We capture pre-/post-restart_count
+            // around each delivery so we can detect a restart()
+            // call in the handler body.
+            let mut should_rerun = false;
+            for closure in &birth_closures {
+                match self.evaluate_closure(handle.clone(), closure)? {
+                    ClosureOutcome::Pass => {}
+                    ClosureOutcome::Violation(v) => {
+                        let parent = self.parent_stack.last().cloned();
+                        let pre = handle.restart_count.get();
+                        self.deliver_violation(
+                            handle.clone(),
+                            parent.as_ref(),
+                            v,
+                        )?;
+                        let post = handle.restart_count.get();
+                        // Cap of 2 attempts per locus lifetime.
+                        // Bumped + within cap → re-run birth +
+                        // closures; otherwise keep iterating
+                        // through remaining closures (parent
+                        // already absorbed via on_failure
+                        // returning, or deliver_violation would
+                        // have raised Signal::Error).
+                        if post > pre && post <= 2 {
+                            should_rerun = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !should_rerun {
+                break;
             }
         }
 

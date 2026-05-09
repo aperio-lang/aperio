@@ -57,6 +57,15 @@ pub struct LocusHandle {
     /// observe the (post-dissolve) state — the locus's `state`
     /// Rc is shared, so reads remain valid even after dissolution.
     pub dissolved: Rc<std::cell::Cell<bool>>,
+    /// m40: restart attempt counter — bumped by the
+    /// `restart(child)` recovery primitive inside an
+    /// `on_failure` body. The post-on_failure dispatch in
+    /// `instantiate_locus` reads it to decide whether to re-run
+    /// `birth()` + birth-epoch closures. Cap is 2 attempts per
+    /// locus lifetime (v0 default); past the cap, restart is a
+    /// no-op and the violation falls through to the parent's
+    /// collapse path.
+    pub restart_count: Rc<std::cell::Cell<i64>>,
 }
 
 #[derive(Debug, Clone)]

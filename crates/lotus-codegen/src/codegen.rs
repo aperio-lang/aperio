@@ -400,6 +400,14 @@ struct LocusInfo<'ctx> {
     /// the dispatch fn doesn't know which locus type its
     /// self_ptr came from).
     arena_field_idx: u32,
+    /// m40: index of the synthetic `__restart_count: i64` field.
+    /// Always present (zero-init at instantiation). The
+    /// `restart(child)` recovery primitive bumps it; the
+    /// post-on_failure dispatch check inside synthesized
+    /// `__birth_closures` reads it to decide whether to re-run
+    /// birth() + birth-epoch closures. Cap is 2 attempts per
+    /// locus lifetime (v0 default).
+    restart_count_field_idx: u32,
     /// Index of the synthetic `__mailbox: ptr` field carrying this
     /// locus's `lotus_mailbox_t*`. Only set for pinned-class loci
     /// that declare `bus subscribe` — those need a per-locus
@@ -2095,6 +2103,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         } else {
             None
         };
+
+        // m40: synthetic `__restart_count: i64` field, always
+        // appended to every locus struct. Zero-initialized at
+        // instantiation; bumped by the `restart(child)` recovery
+        // primitive when the parent's on_failure handler asks
+        // for a retry. The default cap is 2 attempts per locus
+        // lifetime — past that, restart() no-ops and the
+        // violation falls through to the parent's collapse path.
+        // Always-present so the runtime check after on_failure
+        // doesn't need to branch on whether the locus opted in.
+        let i64_t_struct = self.context.i64_type();
+        let restart_count_field_idx = idx;
+        llvm_field_tys.push(i64_t_struct.into());
+        idx += 1;
         let _ = idx;
 
         let struct_ty = self
@@ -2119,6 +2141,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 children_field_idx,
                 child_count_field_idx,
                 arena_field_idx,
+                restart_count_field_idx,
                 mailbox_field_idx,
                 projection_class,
                 schedule_class,
@@ -2789,6 +2812,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     assertion,
                     parent_self_arg,
                     parent_handler_arg,
+                    c_epoch.clone(),
                 )?;
             }
 
@@ -3487,6 +3511,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 match op {
                     RecoveryOp::Bubble => self.lower_bubble_call(args, scope),
+                    RecoveryOp::Restart => self.lower_restart_call(args, scope),
                     other => Err(CodegenError::Unsupported(format!(
                         "recovery op {:?} not lowered",
                         other
@@ -6396,6 +6421,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
 
+        // m40: zero-init the synthetic __restart_count field.
+        // Always present on every locus struct so the
+        // `restart(child)` recovery primitive can bump it
+        // without first checking whether the locus opted in.
+        // Cap of 2 attempts per locus lifetime — past that,
+        // restart() returns false and the violation falls
+        // through to the parent's collapse path.
+        let rc_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.restart_count_field_idx,
+                &format!("{}.__restart_count.ptr", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let zero = self.context.i64_type().const_int(0, false);
+        self.builder
+            .build_store(rc_ptr, zero)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
         // F.7 ordering: if we're inside a parent locus's lifecycle
         // method AND the parent has an accept(child: ThisLocus) that
         // matches our type, call parent.accept(parent_self, child)
@@ -7100,6 +7146,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         ass: &ClosureAssertion,
         parent_self_or_null: PointerValue<'ctx>,
         on_failure_or_null: PointerValue<'ctx>,
+        epoch: EpochSpec,
     ) -> Result<(), CodegenError> {
         let scope = Scope::default();
         let (lv, lt) = self.lower_expr(&ass.left, &scope)?;
@@ -7304,12 +7351,54 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .as_ref()
             .expect("__closures runs with current_self set")
             .self_ptr;
+        let cs_struct_ty = self
+            .current_self
+            .as_ref()
+            .expect("__closures runs with current_self set")
+            .struct_ty;
         let ptr_t = self.context.ptr_type(AddressSpace::default());
         let void_t = self.context.void_type();
         let handler_callee_ty = void_t.fn_type(
             &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
             false,
         );
+
+        // m40: birth-epoch closures snapshot the pre-call value of
+        // __restart_count so we can detect whether the parent's
+        // on_failure body called restart(self). If it did and the
+        // count is within the cap, we re-run birth() + the entire
+        // __birth_closures fn before returning (a recursive call
+        // into the synthesized eval fn). Dissolve-epoch closures
+        // skip this — restart isn't applicable at end-of-life.
+        let info = self
+            .user_loci
+            .get(locus_name)
+            .cloned()
+            .expect("locus declared in pass A1");
+        let i64_t = self.context.i64_type();
+        let pre_count: Option<inkwell::values::IntValue<'ctx>> =
+            if matches!(epoch, EpochSpec::Birth)
+                && info.birth_closures_fn.is_some()
+                && info.methods.contains_key("birth")
+            {
+                let rc_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cs_struct_ty,
+                        child_self,
+                        info.restart_count_field_idx,
+                        "restart.count.pre.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let v = self
+                    .builder
+                    .build_load(i64_t, rc_ptr, "restart.count.pre")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Some(v.into_int_value())
+            } else {
+                None
+            };
+
         self.builder
             .build_indirect_call(
                 handler_callee_ty,
@@ -7322,9 +7411,96 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 "on_failure.call",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_unconditional_branch(post_bb)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        if let Some(pre) = pre_count {
+            // Post-handler restart check.
+            // bumped = post > pre; under_cap = post <= 2;
+            // should_rerun = bumped && under_cap.
+            let rc_ptr = self
+                .builder
+                .build_struct_gep(
+                    cs_struct_ty,
+                    child_self,
+                    info.restart_count_field_idx,
+                    "restart.count.post.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let post = self
+                .builder
+                .build_load(i64_t, rc_ptr, "restart.count.post")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_int_value();
+            let bumped = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SGT,
+                    post,
+                    pre,
+                    "restart.bumped",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let cap = i64_t.const_int(2, false);
+            let under_cap = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SLE,
+                    post,
+                    cap,
+                    "restart.under_cap",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let should_rerun = self
+                .builder
+                .build_and(bumped, under_cap, "restart.should_rerun")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let func = self
+                .current_fn
+                .expect("current_fn set in __birth_closures body");
+            let rerun_bb = self
+                .context
+                .append_basic_block(func, "restart.rerun");
+            self.builder
+                .build_conditional_branch(should_rerun, rerun_bb, post_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // rerun_bb: call birth(self) + recursively call
+            // __birth_closures(self, parent_self, on_failure),
+            // then ret void. The recursive call may itself fail +
+            // restart, so the cap is enforced naturally as the
+            // counter accumulates across attempts.
+            self.builder.position_at_end(rerun_bb);
+            let birth_fn = *info
+                .methods
+                .get("birth")
+                .expect("birth method present");
+            self.builder
+                .build_call(
+                    birth_fn,
+                    &[child_self.into()],
+                    "restart.birth.call",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let birth_closures_fn = info
+                .birth_closures_fn
+                .expect("birth_closures_fn present");
+            self.builder
+                .build_call(
+                    birth_closures_fn,
+                    &[
+                        child_self.into(),
+                        parent_self_or_null.into(),
+                        on_failure_or_null.into(),
+                    ],
+                    "restart.birth_closures.call",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_return(None)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        } else {
+            self.builder
+                .build_unconditional_branch(post_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
 
         // bare_bb: no handler — emit the v0 fallback report and
         // exit(1).
@@ -7379,6 +7555,68 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// codegen prints a fixed "ClosureViolation: bubbled" message;
     /// preserving the original violation's locus/closure fields
     /// would require reading them off the err pointer, which works
+    /// m40: lower a `restart(child);` recovery call. Bumps
+    /// child.__restart_count by 1; the post-on_failure dispatch
+    /// inside __birth_closures re-runs birth() + birth-epoch
+    /// closures iff the new count is <= 2 (the v0 cap).
+    /// Beyond the cap, the bump still happens but the dispatch
+    /// path skips the re-run, falling through to the parent's
+    /// collapse path. The intent is design-time configurable
+    /// (cap = 2 today, may become a per-locus annotation
+    /// later) with runtime cost = one i64 load + add + store
+    /// per call.
+    fn lower_restart_call(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "restart() takes exactly one argument, got {}",
+                args.len()
+            )));
+        }
+        let (val, ty) = self.lower_expr(&args[0], scope)?;
+        let locus_name = match &ty {
+            LotusType::LocusRef(n) => n.clone(),
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "restart() requires a locus reference; got {:?}",
+                    other
+                )));
+            }
+        };
+        let info = self
+            .user_loci
+            .get(&locus_name)
+            .cloned()
+            .expect("LocusRef points to a declared locus");
+        let child_ptr = val.into_pointer_value();
+        let i64_t = self.context.i64_type();
+        let rc_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                child_ptr,
+                info.restart_count_field_idx,
+                "restart.count.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let cur = self
+            .builder
+            .build_load(i64_t, rc_ptr, "restart.count.cur")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let one = i64_t.const_int(1, false);
+        let next = self
+            .builder
+            .build_int_add(cur.into_int_value(), one, "restart.count.next")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(rc_ptr, next)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(BlockEnd::Open)
+    }
+
     /// but isn't required to ship 03c.
     fn lower_bubble_call(
         &mut self,

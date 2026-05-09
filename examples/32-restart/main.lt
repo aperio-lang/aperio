@@ -1,0 +1,89 @@
+// 32-restart — F.9 restart recovery primitive (substrate
+// deepening companion to m39's birth-epoch closures).
+//
+// m39 delivered the trigger half of F.9: birth-epoch closures
+// fire right after birth() returns and route violations to
+// the parent's on_failure handler. m40 delivers the response
+// half: from inside on_failure, the parent can call
+// `restart(child)` to bump a per-locus retry counter; if the
+// new count is within the v0 cap (2 attempts per locus
+// lifetime), the runtime re-runs birth() + the entire birth-
+// epoch closure sequence on the SAME memory.
+//
+// The semantic is "give birth another shot." The locus's
+// state at the start of the second attempt is whatever the
+// first attempt left it in — birth() can mutate state to
+// recover. Past the cap, restart() still bumps the counter
+// (so callers can observe attempt count) but the runtime
+// skips the re-run; the violation falls through to the
+// parent's collapse path.
+//
+// Cap of 2 is the v0 default. Per the user's "design-time
+// parameterized, no perf hit" framing, the cap could become
+// a per-locus annotation later — the runtime cost is one
+// i64 load + add + store per restart() call, no hot-path
+// branch when restart() isn't used.
+
+locus Worker {
+    params {
+        // `attempts` tracks how many birth() calls have run
+        // (incremented inside birth itself). A failing
+        // closure triggers restart, which re-runs birth and
+        // bumps this counter — until the closure passes or
+        // the cap is hit.
+        attempts: Int = 0;
+        // `target` is what we want `attempts` to equal for
+        // the closure to pass. Set so birth() needs to run
+        // exactly twice (initial + one retry).
+        target: Int = 2;
+    }
+
+    closure attempt_reached_target {
+        // Inclusive: passes once attempts reaches target.
+        self.attempts ~~ self.target within 0;
+        epoch birth;
+    }
+
+    birth() {
+        self.attempts = self.attempts + 1;
+        println("Worker.birth: attempts=", self.attempts);
+    }
+}
+
+locus Coordinator {
+    on_failure(c: Worker, err: ClosureViolation) {
+        println("Coordinator: ", err.closure,
+                " on ", err.locus,
+                " — calling restart");
+        restart(c);
+    }
+
+    run() {
+        println("--- attempt fits within cap (target=2) ---");
+        // First birth: attempts=1, closure fails (1 != 2).
+        // Coordinator calls restart, bumping count to 1.
+        // Second birth: attempts=2, closure passes.
+        Worker { target: 2 };
+
+        println("--- single attempt suffices (target=1) ---");
+        // birth runs once: attempts=1, target=1 → passes
+        // immediately, no restart needed.
+        Worker { target: 1 };
+
+        println("--- exceeds cap (target=4) ---");
+        // birth1: attempts=1, restart→1
+        // birth2: attempts=2, restart→2 (still within cap)
+        // birth3: attempts=3, restart→3 (>2, runtime skips
+        //   re-run; closure violation falls through)
+        // The Coordinator's on_failure absorbs (no bubble),
+        // so the program continues but we never reach
+        // attempts=target.
+        Worker { target: 4 };
+
+        println("--- run() ends ---");
+    }
+}
+
+fn main() {
+    Coordinator { };
+}
