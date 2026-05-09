@@ -804,6 +804,40 @@ impl Interpreter {
                 eval_unop(*op, &v).map_err(Signal::Error)
             }
             Expr::Call { callee, args, .. } => {
+                // m44: intercept `check_closures()` before
+                // ident resolution — it's a substrate
+                // primitive (like `quarantine` / `restart`)
+                // that fires explicit-epoch closures on the
+                // current self. Returns Unit so it fits in
+                // both Stmt::Expr and (less idiomatic) Expr
+                // position.
+                if let Expr::Ident(i) = callee.as_ref() {
+                    if i.name == "check_closures" {
+                        if !args.is_empty() {
+                            return Err(Signal::Error(format!(
+                                "check_closures() takes 0 arguments, got {}",
+                                args.len()
+                            )));
+                        }
+                        let handle =
+                            self.self_stack.last().cloned().ok_or_else(|| {
+                                Signal::Error(
+                                    "check_closures() must be called from \
+                                     inside a locus body"
+                                        .into(),
+                                )
+                            })?;
+                        // m44: the locus's actual parent was
+                        // captured at instantiation time on
+                        // handle.parent; parent_stack during a
+                        // bus handler / lifecycle body has self
+                        // overlaid on top so the local
+                        // parent_stack reading is wrong here.
+                        let parent = handle.parent.borrow().clone();
+                        self.fire_explicit_closures(handle, parent)?;
+                        return Ok(Value::Unit);
+                    }
+                }
                 let callee_v = self.eval_expr(callee)?;
                 let mut arg_vs = Vec::with_capacity(args.len());
                 for a in args {
@@ -1125,6 +1159,11 @@ impl Interpreter {
                 _ => false,
             })
             .count();
+        // m44: capture parent at instantiation so primitives
+        // like check_closures() — called from inside the
+        // locus's body where parent_stack is overlaid with
+        // self — can route violations to the right handler.
+        let parent_at_birth = self.parent_stack.last().cloned();
         let handle = LocusHandle {
             name: decl.name.name.clone(),
             state: Rc::new(RefCell::new(state)),
@@ -1134,6 +1173,7 @@ impl Interpreter {
             restart_count: Rc::new(std::cell::Cell::new(0)),
             quarantined: Rc::new(std::cell::Cell::new(false)),
             duration_last_fire: Rc::new(RefCell::new(vec![now_ns; duration_count])),
+            parent: Rc::new(RefCell::new(parent_at_birth)),
         };
 
         // Register every bus subscription on the router. m42:
@@ -1578,6 +1618,48 @@ impl Interpreter {
         Ok(())
     }
 
+    /// m44: evaluate every explicit-epoch closure on `handle`
+    /// and route violations through the parent's `on_failure`.
+    /// Called by the `check_closures();` builtin from inside a
+    /// locus body — never automatically. Skipped when the
+    /// locus is quarantined.
+    fn fire_explicit_closures(
+        &mut self,
+        handle: LocusHandle,
+        parent: Option<LocusHandle>,
+    ) -> Result<(), Signal> {
+        if handle.quarantined.get() {
+            return Ok(());
+        }
+        let explicit_closures: Vec<ClosureDecl> = handle
+            .decl
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                LocusMember::Closure(c) if closure_fires_at_explicit(c) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for closure in &explicit_closures {
+            match self.evaluate_closure(handle.clone(), closure)? {
+                ClosureOutcome::Pass => {}
+                ClosureOutcome::Violation(v) => {
+                    self.deliver_violation(
+                        handle.clone(),
+                        parent.as_ref(),
+                        v,
+                    )?;
+                    if handle.quarantined.get() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// m43: evaluate every duration-epoch closure on `handle`
     /// gated on monotonic-elapsed-since-last-fire >= the
     /// closure's declared duration expression. Called at the
@@ -1868,6 +1950,16 @@ fn closure_fires_at_duration(c: &ClosureDecl) -> bool {
     // monotonic-elapsed-since-last-fire >= duration.
     c.clauses.iter().any(|clause| {
         matches!(clause, ClosureClause::Epoch(EpochSpec::Duration(_)))
+    })
+}
+
+fn closure_fires_at_explicit(c: &ClosureDecl) -> bool {
+    // m44: closure fires at explicit iff an explicit
+    // `epoch explicit;` clause was declared. Fires only
+    // when the user calls `check_closures();` from inside
+    // the locus's body — never automatically.
+    c.clauses.iter().any(|clause| {
+        matches!(clause, ClosureClause::Epoch(EpochSpec::Explicit))
     })
 }
 

@@ -79,6 +79,17 @@ pub struct LocusHandle {
     /// instantiation so the first fire happens after `N`
     /// has elapsed since birth, not immediately.
     pub duration_last_fire: Rc<RefCell<Vec<i64>>>,
+    /// m44: the locus's parent at instantiation time
+    /// (`parent_stack.last()` at the moment the LocusHandle
+    /// was built). Stored so primitives like
+    /// `check_closures();` — called from inside the locus's
+    /// body where parent_stack has been pushed with self —
+    /// can route violations to the correct on_failure
+    /// handler. None for top-level loci. Creates an Rc
+    /// cycle (parent.children references child, child.parent
+    /// references parent) but the cycle only matters at
+    /// process exit; v0 accepts the leak.
+    pub parent: Rc<RefCell<Option<LocusHandle>>>,
 }
 
 #[derive(Debug, Clone)]

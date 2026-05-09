@@ -365,6 +365,7 @@ mod tests {
                 restart_count: Rc::new(std::cell::Cell::new(0)),
                 quarantined: Rc::new(std::cell::Cell::new(false)),
                 duration_last_fire: Rc::new(RefCell::new(Vec::new())),
+                parent: Rc::new(RefCell::new(None)),
             },
             handler: handler.to_string(),
             parent: None,

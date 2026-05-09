@@ -463,6 +463,16 @@ struct LocusInfo<'ctx> {
     /// returns) — duration shares the cell-boundary cadence
     /// but gates each closure on elapsed-since-last-fire.
     duration_closures_fn: Option<FunctionValue<'ctx>>,
+    /// m44: synthetic `<Locus>.__explicit_closures(self,
+    /// parent_self_or_null, on_failure_or_null)` fn. Called
+    /// only by the `check_closures();` builtin from inside a
+    /// locus method body — fires every explicit-epoch
+    /// closure on the current self. Where birth/tick/duration
+    /// fire automatically at substrate-cell boundaries, the
+    /// explicit epoch is user-triggered: useful for "audit at
+    /// this checkpoint" patterns where the locus author knows
+    /// when an invariant should hold.
+    explicit_closures_fn: Option<FunctionValue<'ctx>>,
     /// Index of the synthetic `__mailbox: ptr` field carrying this
     /// locus's `lotus_mailbox_t*`. Only set for pinned-class loci
     /// that declare `bus subscribe` — those need a per-locus
@@ -2267,6 +2277,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 tick_wrapper_fn: None,
                 duration_closures_fn: None,
                 duration_last_fire_field_idxs,
+                explicit_closures_fn: None,
                 failure_handler: None,
                 children_field_idx,
                 child_count_field_idx,
@@ -2505,39 +2516,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     user_methods.insert(fd.name.name.clone(), func);
                 }
                 LocusMember::Closure(c) => {
-                    // m39 + m42 + m43: Birth + Dissolve + Tick +
-                    // Duration epochs lower (each into its own
-                    // synthetic eval fn). Explicit still rejects —
-                    // it needs a `check_closures(self)` builtin
-                    // surface. Default (no epoch clause) =
-                    // Dissolve, matching pre-m39 semantics.
+                    // m39 + m42 + m43 + m44: all five closure
+                    // epochs now lower. Default (no epoch
+                    // clause) = Dissolve, matching pre-m39
+                    // semantics.
                     let mut epoch = EpochSpec::Dissolve;
                     for clause in &c.clauses {
                         match clause {
                             ClosureClause::Epoch(spec) => {
-                                match spec {
-                                    EpochSpec::Birth
-                                    | EpochSpec::Dissolve
-                                    | EpochSpec::Tick
-                                    | EpochSpec::Duration(_) => {
-                                        epoch = spec.clone();
-                                    }
-                                    other => {
-                                        return Err(CodegenError::Unsupported(
-                                            format!(
-                                                "closure `{}` on `{}`: \
-                                                 epoch {:?} not yet \
-                                                 lowered (codegen \
-                                                 covers Birth + \
-                                                 Dissolve + Tick + \
-                                                 Duration)",
-                                                c.name.name,
-                                                l.name.name,
-                                                other
-                                            ),
-                                        ));
-                                    }
-                                }
+                                epoch = spec.clone();
                             }
                             ClosureClause::PersistsThrough(_)
                             | ClosureClause::ResetsOn(_) => {
@@ -2687,6 +2674,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let has_duration = closures
             .iter()
             .any(|(_, _, ep)| matches!(ep, EpochSpec::Duration(_)));
+        let has_explicit = closures
+            .iter()
+            .any(|(_, _, ep)| matches!(ep, EpochSpec::Explicit));
         let make_eval_fn = |name: &str| {
             let fn_ty = void_t.fn_type(
                 &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
@@ -2748,6 +2738,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         } else {
             None
         };
+        // m44: __explicit_closures has the same 3-arg shape.
+        // Called only by the `check_closures();` builtin —
+        // user-triggered audit at a chosen checkpoint.
+        let explicit_closures_fn = if has_explicit {
+            Some(make_eval_fn(&format!(
+                "{}.__explicit_closures",
+                l.name.name
+            )))
+        } else {
+            None
+        };
         // m42: tick-call placement. An earlier draft wrapped
         // each subscribed handler with a post-call thunk;
         // that broke order because the handler's own tail
@@ -2773,6 +2774,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         info.tick_closures_fn = tick_closures_fn;
         info.tick_wrapper_fn = tick_wrapper_fn;
         info.duration_closures_fn = duration_closures_fn;
+        info.explicit_closures_fn = explicit_closures_fn;
         info.failure_handler = failure_handler;
         Ok(())
     }
@@ -2960,11 +2962,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // passed a non-null handler. Pass paths flow through
         // silently. Same body shape per epoch — only the closure
         // subset differs — so we use a small helper closure.
-        for epoch in [EpochSpec::Birth, EpochSpec::Dissolve, EpochSpec::Tick].iter() {
+        for epoch in [
+            EpochSpec::Birth,
+            EpochSpec::Dissolve,
+            EpochSpec::Tick,
+            EpochSpec::Explicit,
+        ]
+        .iter()
+        {
             let fn_slot = match epoch {
                 EpochSpec::Birth => info.birth_closures_fn,
                 EpochSpec::Dissolve => info.dissolve_closures_fn,
                 EpochSpec::Tick => info.tick_closures_fn,
+                EpochSpec::Explicit => info.explicit_closures_fn,
                 _ => None,
             };
             let func = match fn_slot {
@@ -3010,18 +3020,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )?;
             }
 
-            // m42: tick fires INSIDE the cooperative drain loop
-            // (per-substrate-cell), so we must NOT call
-            // flush_dissolve_frame here — its `emit_bus_drain`
-            // would recursively re-enter the drain and pull
-            // every remaining queued cell into a single tick's
-            // call stack. For Birth + Dissolve the drain is
-            // historically OK (those run outside the drain
-            // context). For Tick we just pop the frame manually
-            // and ret. Closure assertions can't instantiate
-            // loci anyway, so the deferred-dissolve frame is
-            // always empty here.
-            if matches!(epoch, EpochSpec::Tick) {
+            // m42 + m44: tick AND explicit fire inside / from
+            // contexts where re-entering the bus queue would
+            // be wrong. Tick fires from the cooperative drain
+            // (recursive drain would pull every remaining cell
+            // into one tick's call stack). Explicit fires at
+            // a user-chosen checkpoint inside the locus's
+            // body — the surrounding body's normal
+            // flush_dissolve_frame at scope exit will handle
+            // any drain at the right time. So both pop the
+            // frame manually and skip the drain. For
+            // Birth + Dissolve the drain is historically OK
+            // (those run outside the drain context).
+            if matches!(epoch, EpochSpec::Tick | EpochSpec::Explicit) {
                 let _ = self.deferred_dissolves.pop();
             } else {
                 self.flush_dissolve_frame()?;
@@ -3784,6 +3795,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             // Terminated up so the lower_block walker
                             // stops emitting IR after this stmt.
                             return self.lower_bubble_call(args, scope);
+                        } else if name == "check_closures" {
+                            // m44: explicit-epoch closure check
+                            // surface. `check_closures();` from
+                            // inside a locus body fires every
+                            // explicit-epoch closure on the
+                            // current self, routing violations
+                            // through the locus's parent
+                            // on_failure (matching the
+                            // birth/dissolve/tick paths).
+                            self.lower_check_closures_call(args)?;
                         } else if self.user_fns.contains_key(name) {
                             // Discard return value; statement-position
                             // call.
@@ -8572,6 +8593,96 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.builder.position_at_end(done_bb);
         }
         Ok(BlockEnd::Open)
+    }
+
+    /// m44: lower a `check_closures();` builtin call. Fires
+    /// every explicit-epoch closure on the current self —
+    /// the user-triggered audit checkpoint. Routes violations
+    /// through the same parent on_failure path the
+    /// birth/dissolve/tick epochs use (resolved at the call
+    /// site via `resolve_failure_route`). Takes 0 arguments;
+    /// implicit self is read from `current_self`. A no-op
+    /// when the locus has no explicit-epoch closures —
+    /// rather than rejecting at compile time, this lets a
+    /// user idiomatically call `check_closures()` after a
+    /// state change without first checking whether any
+    /// such closure exists.
+    fn lower_check_closures_call(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "check_closures() takes 0 arguments, got {}",
+                args.len()
+            )));
+        }
+        let cs = self.current_self.as_ref().ok_or_else(|| {
+            CodegenError::Unsupported(
+                "check_closures() must be called from inside a locus body"
+                    .into(),
+            )
+        })?;
+        let locus_name = cs.locus_name.clone();
+        let self_ptr = cs.self_ptr;
+        let info = self
+            .user_loci
+            .get(&locus_name)
+            .cloned()
+            .expect("current_self points to a declared locus");
+        let Some(explicit_fn) = info.explicit_closures_fn else {
+            // No explicit closures on this locus — silent no-op.
+            return Ok(());
+        };
+        // Read __parent_self / __parent_on_failure baked onto
+        // the struct at instantiation time. resolve_failure_route
+        // is the wrong helper here — it answers "as a parent
+        // running my child's instantiation, what's MY
+        // failure_handler for that child?" — but check_closures
+        // routes the caller's-OWN violations to the caller's
+        // parent's on_failure, which is what the m42 struct
+        // fields hold.
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let parent_self_slot = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.parent_self_field_idx,
+                "explicit.parent_self.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let parent_self = self
+            .builder
+            .build_load(ptr_t, parent_self_slot, "explicit.parent_self")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let handler_slot = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.parent_on_failure_field_idx,
+                "explicit.parent_handler.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let handler_ptr = self
+            .builder
+            .build_load(ptr_t, handler_slot, "explicit.parent_handler")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        self.builder
+            .build_call(
+                explicit_fn,
+                &[
+                    self_ptr.into(),
+                    parent_self.into(),
+                    handler_ptr.into(),
+                ],
+                &format!("{}.__explicit_closures.call", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
     }
 
     /// but isn't required to ship 03c.
