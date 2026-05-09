@@ -1,17 +1,23 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of m44 (explicit-epoch closures — fired on
-demand via `check_closures();`; closes the closure-epoch lowering
-arc — all five epochs Birth + Dissolve + Tick + Duration + Explicit
-now lower). Surface-completeness arc through m38, then the
+new session. State as of m45 (`restart_in_place` recovery primitive —
+factory-reset variant of m40's restart that zeros user fields back
+to declared defaults before re-running birth; shares the cap-2
+budget with plain restart). Also bumped bus.entries cap × 32 so
+multiple instances of the same subscribed locus type can register
+their own bus entries (was a pre-existing m41b limit; workaround
+documented in 34-quarantine-bus). Surface-completeness arc through m38, then the
 substrate-foundation arc with m39 (trigger half: birth-epoch
 closures), m40 (response half: restart with cap-2 default), m41
 (quarantine — stop-trying flag, gates run()), m41b (quarantine
 extends to bus dispatch), m42 (tick — steady-state pulse), m43
 (duration — every-N-of-monotonic-time gate), m44 (explicit —
-user-triggered checkpoint via `check_closures();`). The F.9
-invariant-and-repair substrate is closure-epoch-complete.
+user-triggered checkpoint via `check_closures();`), m45
+(`restart_in_place` recovery primitive). The F.9
+invariant-and-repair substrate is closure-epoch-complete and
+the recovery primitive set covers restart / restart_in_place
+/ quarantine / bubble.
 Substrate arc: m19→m23 (region allocator with
 rich/chunked/recognition + per-locus arenas + bus copy), m24
 (`match`), m25 (bimodal schedule-class annotation), m26
@@ -49,7 +55,9 @@ returns; substrate-coupling between F.9 invariants and the
 cooperative scheduler's substrate-cell boundary), m43
 (duration-epoch closures — every-N-of-monotonic-time gate
 on top of the tick cadence), m44 (explicit-epoch closures —
-user-triggered checkpoint via `check_closures();`). **41 of 42
+user-triggered checkpoint via `check_closures();`), m45
+(`restart_in_place` factory-reset recovery + bus.entries
+cap × 32 for multi-instance subscribers). **43 of 44
 examples build to native ELF — every single-binary
 example.** Only `trellis-pair` (multi-binary, cross-process
 bus) remains.
@@ -109,9 +117,37 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 41 of 42 example
+- **Phase 2 v0** (interpreter + bus router) — 43 of 44 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 45** (restart_in_place recovery primitive
+  + bus.entries multi-instance fix) — complete. Two related
+  fixes shipped together. (1) `restart_in_place(c)` is a
+  factory-reset variant of m40's `restart(c)` that zeros user
+  fields back to declared defaults BEFORE re-running birth(),
+  rather than preserving whatever state the previous attempt
+  left. Both share the cap-2 budget on the same retry counter.
+  When to choose which: plain `restart` for "advance the state
+  machine forward" patterns, `restart_in_place` for "got into
+  an inconsistent state, retry from clean" patterns. Codegen:
+  one synthetic `__restart_in_place_pending: i64` flag added
+  to every locus struct after `__quarantined`; zero-init at
+  instantiation; set by `restart_in_place(c)`; the rerun
+  branch in `__birth_closures` gates on it (zero-fields block
+  re-evaluates each declared default into its slot, then
+  clears the flag, before falling into the call_birth block).
+  Interpreter: LocusHandle.restart_in_place_pending: Cell<bool>
+  with the same handshake. New `examples/38-restart-in-place/`.
+  (2) bus.entries capacity bumped to `total_subs × 32` so
+  multiple instances of the same subscribed locus type can
+  each register their own runtime entry without overflowing
+  the global. Pre-fix limit was "use distinct types"
+  (workaround in 34-quarantine-bus); fix unblocks the
+  natural multi-instance pattern. New
+  `examples/39-multi-instance-bus/` exercises three Watcher
+  instances on one subject. Proper fix is to migrate
+  bus.entries storage to a C-runtime dynamic vec; captured
+  in next-steps as future polish.
 - **Phase 3 milestone 44** (explicit-epoch closures —
   user-triggered checkpoint) — complete. Closes the closure-
   epoch lowering arc: all five epochs Birth + Dissolve +
@@ -1033,6 +1069,37 @@ m41b   m41b: bus-dispatch quarantine gating                   (cbf23cc)
                             quarantined locus. + LOTUS_DUMP_IR
                             env var for codegen debugging.
                           + examples/34-quarantine-bus
+m45    m45: restart_in_place recovery primitive             (01f4e69)
+                          ⇒ Variant of m40's restart(c)
+                            that zeros user fields back to
+                            declared defaults BEFORE re-
+                            running birth(). Shared cap-2
+                            budget on the same retry counter.
+                            Synthetic __restart_in_place_
+                            pending flag distinguishes the
+                            two re-run kinds. New
+                            lower_restart_in_place_call
+                            shares lower_restart_call_kind
+                            body. Rerun branch in
+                            __birth_closures gates on the
+                            flag and re-stores defaults
+                            before call_birth. Interpreter
+                            mirrors via LocusHandle.
+                            restart_in_place_pending +
+                            top-of-loop zero pass.
+                          + examples/38-restart-in-place
+m45fix m45 follow-up: bus.entries cap × 32                  (fc72504)
+                          ⇒ Quick fix for a pre-existing
+                            m41b limit: bus.entries was
+                            sized to one slot per declared
+                            subscription, so multiple
+                            instances of the same locus type
+                            overflowed at runtime. Multiplier
+                            bumps capacity to 32 instances/
+                            type. Proper fix (C-runtime
+                            dynamic vec) deferred to future
+                            polish.
+                          + examples/39-multi-instance-bus
 m43    m43: duration-epoch closures (per-N-monotonic gate)   (c115829)
                           ⇒ EpochSpec::Duration lowers
                             alongside Birth + Dissolve + Tick.
@@ -1195,6 +1262,7 @@ m7 builds on the struct ABI.
 | Duration-epoch closures (fire when N monotonic elapsed) | ✅ | ✅ |
 | Explicit-epoch closures (fire on `check_closures();`) | ✅ | ✅ |
 | `restart(child)` recovery (cap-2 birth re-run) | ✅ | ✅ |
+| `restart_in_place(child)` recovery (factory-reset re-run) | ✅ | ✅ |
 | `quarantine(child)` recovery (sticky flag, gates run + bus) | ✅ | ✅ |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
@@ -1315,6 +1383,9 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
+fc72504 m45 follow-up: bus.entries cap × 32 for multi-instance subs
+01f4e69 m45: restart_in_place recovery primitive
+d4367c1 CHECKPOINT.md: m43 + m44 closure-epoch refresh
 b4512df m44: explicit-epoch closures (substrate)
 c115829 m43: duration-epoch closures (substrate)
 5a2c93c CHECKPOINT.md: m42 tick-epoch closures refresh
@@ -1383,57 +1454,62 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-9 commits ahead of origin/master at checkpoint time. This
-session shipped m42 + m43 + m44 — the closure-epoch
-lowering arc is now closure-epoch-complete: all five F.9
-epochs (Birth + Dissolve + Tick + Duration + Explicit)
-lower in both interpreter and codegen. m42 wired tick to
-substrate-cell boundaries (post-handler + post-run); m43
-added the every-N-of-monotonic-time gate on top of that
-cadence; m44 added the user-triggered `check_closures();`
-checkpoint primitive. Side-fix from m42: subscribed
-handlers now check __quarantined at entry so cells
-already in the cooperative queue observe the stop-trying
-signal, matching the interpreter's dispatch_bus check.
-Prior sessions shipped m30 → m41b — the F.9 substrate
-now has invariant detection at all five epochs + the
-restart/quarantine response menu, with quarantine
-substrate-complete across run() + bus dispatch.
+12 commits ahead of origin/master at checkpoint time. This
+session shipped m42 + m43 + m44 + m45 (+ a bus.entries
+multi-instance follow-up). The F.9 substrate is now
+closure-epoch-complete (all 5 epochs: Birth + Dissolve +
+Tick + Duration + Explicit) AND has both restart variants
+(plain restart preserves state, restart_in_place factory-
+resets to defaults). With this session's work the locus-
+of-design substrate covers the F.9 invariant-and-repair
+pair end-to-end: detect-at-any-epoch, route-via-on_failure,
+respond-via-restart-or-quarantine. Prior sessions shipped
+m30 → m41b. Multi-instance bus subscribers now work
+without the "use distinct types" workaround.
 
 ## Next steps in priority order
 
 The bimodal scheduler (m28a/b/c), the surface-completeness
 arc (m29 → m38), and the full F.9 invariant-and-repair
 substrate (m39 birth + m40 restart + m41 quarantine + m41b
-bus-dispatch gating + m42 tick + m43 duration + m44 explicit)
-have shipped. With m44 landed, all five closure epochs lower;
-the F.9 invariant-and-repair substrate is closure-epoch-
-complete. Remaining work divides into closure-recovery
-polish, region-allocator polish, and contained substrate
-plumbing.
+bus-dispatch gating + m42 tick + m43 duration + m44 explicit
++ m45 restart_in_place) have shipped. With m45 landed, the
+recovery primitive set covers restart / restart_in_place /
+quarantine / bubble; the closure-epoch lowering arc is
+already complete. What's left in the locus-of-design tower
+is closure accumulators (parsed-but-unused language surface),
+spec-aligned recovery primitives that haven't been wired
+(reorganize, drain/dissolve as recovery), and proper-fix
+polish on top of the v0 unblocks.
 
-**1. Recovery primitive: `restart_in_place`.** Variant of
-`restart(c)` that zeros user fields back to declared defaults
-before re-running birth. Complements m40's "give birth
-another shot on dirty state" with a "factory reset"
-alternative. Small compared to m40 once `restart` is in
-place — just an additional zero-fields pass at re-run time.
-
-**2. Closure accumulator clauses.** `persists_through(...)`
+**1. Closure accumulator clauses.** `persists_through(...)`
 and `resets_on(...)` clauses are parsed today but ignored
 at lowering. They'd let closures track running statistics
 that survive (or reset on) recovery events. Pairs naturally
 with the duration-epoch surface m43 just landed — duration-
 sampled accumulators are the canonical "drift detection"
-shape.
+shape. Bigger lift: requires designing the accumulator
+state surface (what kinds of accumulators? sum / mean /
+rolling window?) before the persists_through / resets_on
+clauses have anything to govern.
 
-**3. `bus.entries` dynamic capacity.** Pre-existing bug
-surfaced by m41b's flex example: the array is sized per-locus-
-type at compile time, but each instance registers its own
-runtime entry. Two instances of the same subscriber
-type → buffer overflow. Today's workaround is "use
-distinct types"; the proper fix is heap-resize on register
-or a static cap >> instance count.
+**2. `bus.entries` dynamic capacity (proper fix).** m45
+follow-up bumped the static cap × 32 to unblock multi-
+instance subscribers. Proper fix: migrate bus storage from
+the LLVM-side global array to a C-runtime-owned dynamic
+vec so capacity grows on demand. Approx 200-line refactor:
+new C-runtime register/dispatch/unregister fns; replace
+init_bus_state's LLVM dispatch fn with extern decls; replace
+emit_bus_register's GEP+store with a single call; replace
+the unregister-self walk in lower_quarantine_call with a
+single call.
+
+**3. Recovery primitives: `reorganize` + `drain` /
+`dissolve` as recovery ops.** All parsed; `reorganize`
+needs a child-tree restructuring semantic (defer until a
+workload exercises it); `drain` / `dissolve` as recovery
+ops (vs lifecycle methods) overlap with quarantine + the
+ephemeral cascade — design needed before lowering.
 
 **Polish (any time):**
 - `restart_in_place` recovery primitive. Variant of
@@ -1608,6 +1684,12 @@ rm examples/36-duration-closures/main
 cargo run --bin lotus -- build examples/37-explicit-closures/main.lt
 ./examples/37-explicit-closures/main     # Ledger explicit balance: imbalance after Tx#3 → Auditor absorbs; Tx#4 rebalances
 rm examples/37-explicit-closures/main
+cargo run --bin lotus -- build examples/38-restart-in-place/main.lt
+./examples/38-restart-in-place/main      # Worker scratch resets to 0 between attempts; cap-2 hit
+rm examples/38-restart-in-place/main
+cargo run --bin lotus -- build examples/39-multi-instance-bus/main.lt
+./examples/39-multi-instance-bus/main    # 3 Watcher instances all receive 3 published Samples
+rm examples/39-multi-instance-bus/main
 ```
 
-If all forty-one work, the checkpoint is intact.
+If all forty-three work, the checkpoint is intact.
