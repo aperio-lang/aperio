@@ -72,6 +72,13 @@ pub struct LocusHandle {
     /// still fire (cleanup is unconditional). Bus-dispatch
     /// gating waits on m41b.
     pub quarantined: Rc<std::cell::Cell<bool>>,
+    /// m43: per-duration-closure last-fire timestamps in
+    /// monotonic nanoseconds. Vec is parallel to the locus's
+    /// declared duration-epoch closures (in declaration
+    /// order). Initialized to time::monotonic() at
+    /// instantiation so the first fire happens after `N`
+    /// has elapsed since birth, not immediately.
+    pub duration_last_fire: Rc<RefCell<Vec<i64>>>,
 }
 
 #[derive(Debug, Clone)]

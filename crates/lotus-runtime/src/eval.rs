@@ -1112,6 +1112,19 @@ impl Interpreter {
             state.insert(init.name.name.clone(), v);
         }
 
+        // m43: count duration-epoch closures and seed the
+        // last-fire timestamps to monotonic-now so the first
+        // fire happens after `N` elapses since instantiation
+        // (not immediately).
+        let now_ns = monotonic_ns_now();
+        let duration_count = decl
+            .members
+            .iter()
+            .filter(|m| match m {
+                LocusMember::Closure(c) => closure_fires_at_duration(c),
+                _ => false,
+            })
+            .count();
         let handle = LocusHandle {
             name: decl.name.name.clone(),
             state: Rc::new(RefCell::new(state)),
@@ -1120,6 +1133,7 @@ impl Interpreter {
             dissolved: Rc::new(std::cell::Cell::new(false)),
             restart_count: Rc::new(std::cell::Cell::new(0)),
             quarantined: Rc::new(std::cell::Cell::new(false)),
+            duration_last_fire: Rc::new(RefCell::new(vec![now_ns; duration_count])),
         };
 
         // Register every bus subscription on the router. m42:
@@ -1238,7 +1252,11 @@ impl Interpreter {
                 // (parent_stack still holds it; the lifecycle
                 // method's push has been popped by run_lifecycle).
                 let parent = self.parent_stack.last().cloned();
-                self.fire_tick_closures(handle.clone(), parent)?;
+                self.fire_tick_closures(handle.clone(), parent.clone())?;
+                // m43: duration shares the cell-boundary
+                // cadence; fires only when declared `duration N`
+                // has elapsed.
+                self.fire_duration_closures(handle.clone(), parent)?;
             }
         }
 
@@ -1560,6 +1578,81 @@ impl Interpreter {
         Ok(())
     }
 
+    /// m43: evaluate every duration-epoch closure on `handle`
+    /// gated on monotonic-elapsed-since-last-fire >= the
+    /// closure's declared duration expression. Called at the
+    /// same sites as fire_tick_closures (after each bus
+    /// handler, after run() returns) so duration shares the
+    /// cell-boundary cadence — a duration closure fires at
+    /// most once per cell, but only if N has elapsed.
+    /// On fire, last_fire is updated to monotonic-now BEFORE
+    /// the assertion runs so a violation routed to on_failure
+    /// (which can take arbitrary time) doesn't reset the
+    /// interval clock.
+    fn fire_duration_closures(
+        &mut self,
+        handle: LocusHandle,
+        parent: Option<LocusHandle>,
+    ) -> Result<(), Signal> {
+        if handle.quarantined.get() {
+            return Ok(());
+        }
+        let duration_closures: Vec<(usize, ClosureDecl)> = handle
+            .decl
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                LocusMember::Closure(c) if closure_fires_at_duration(c) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            })
+            .enumerate()
+            .collect();
+        for (idx, closure) in &duration_closures {
+            let duration_expr = duration_expr_for(closure)
+                .expect("duration_closures filter ⇒ duration epoch");
+            // Evaluate the duration expression in the locus's
+            // own self_stack (so `self.poll_interval` etc work).
+            self.self_stack.push(handle.clone());
+            let dur_result = self.eval_expr(duration_expr);
+            self.self_stack.pop();
+            let duration_ns = match dur_result? {
+                Value::Duration(ns) => ns,
+                Value::Int(n) => n,
+                other => {
+                    return Err(Signal::Error(format!(
+                        "duration epoch on `{}.{}`: duration expression \
+                         must evaluate to Duration or Int (ns); got {}",
+                        handle.name,
+                        closure.name.name,
+                        other.type_name()
+                    )));
+                }
+            };
+            let now = monotonic_ns_now();
+            let last = handle.duration_last_fire.borrow()[*idx];
+            if now - last < duration_ns {
+                continue;
+            }
+            handle.duration_last_fire.borrow_mut()[*idx] = now;
+            match self.evaluate_closure(handle.clone(), closure)? {
+                ClosureOutcome::Pass => {}
+                ClosureOutcome::Violation(v) => {
+                    self.deliver_violation(
+                        handle.clone(),
+                        parent.as_ref(),
+                        v,
+                    )?;
+                    if handle.quarantined.get() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Publish a payload on a subject, then drain all pending
     /// deliveries until none remain. The drain loop catches
     /// re-entrant publishes from inside handlers — a handler
@@ -1593,7 +1686,12 @@ impl Interpreter {
                 // invariant violated by the handler's state
                 // change reaches the parent's on_failure
                 // before the next cell starts.
-                self.fire_tick_closures(sub_locus, sub_parent)?;
+                self.fire_tick_closures(sub_locus.clone(), sub_parent.clone())?;
+                // m43: duration-epoch closures share the cell-
+                // boundary cadence with tick but fire only when
+                // their declared `duration N` has elapsed since
+                // last fire.
+                self.fire_duration_closures(sub_locus, sub_parent)?;
             }
         }
         Ok(())
@@ -1760,6 +1858,32 @@ fn closure_fires_at_tick(c: &ClosureDecl) -> bool {
     c.clauses.iter().any(|clause| {
         matches!(clause, ClosureClause::Epoch(EpochSpec::Tick))
     })
+}
+
+fn closure_fires_at_duration(c: &ClosureDecl) -> bool {
+    // m43: closure fires at duration iff an explicit
+    // `epoch duration <expr>;` clause was declared. The
+    // expression is evaluated at fire-check time (so it
+    // can reference self.X), gating the assertion on
+    // monotonic-elapsed-since-last-fire >= duration.
+    c.clauses.iter().any(|clause| {
+        matches!(clause, ClosureClause::Epoch(EpochSpec::Duration(_)))
+    })
+}
+
+fn duration_expr_for(c: &ClosureDecl) -> Option<&Expr> {
+    c.clauses.iter().find_map(|clause| match clause {
+        ClosureClause::Epoch(EpochSpec::Duration(e)) => Some(e),
+        _ => None,
+    })
+}
+
+fn monotonic_ns_now() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let _ = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as i64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as i64)
 }
 
 fn approx_pass(l: &Value, r: &Value, tol: &Value) -> Result<bool, String> {

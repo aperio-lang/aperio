@@ -445,6 +445,24 @@ struct LocusInfo<'ctx> {
     /// parent's `on_failure` fn ptr (or null). Read by the
     /// tick wrapper to decide whether to absorb-or-stderr.
     parent_on_failure_field_idx: u32,
+    /// m43: indices of the synthetic
+    /// `__duration_last_fire_<i>: i64` fields, parallel to the
+    /// locus's declared duration-epoch closures (in declaration
+    /// order). Empty when the locus has no duration closures.
+    /// Each field holds monotonic-ns of the closure's last
+    /// fire; instantiation seeds it with time::monotonic() so
+    /// the first fire happens after `N` elapses (not
+    /// immediately). The synthesized `__duration_closures`
+    /// fn loads each, compares now - last >= N, and fires
+    /// when so.
+    duration_last_fire_field_idxs: Vec<u32>,
+    /// m43: synthetic `<Locus>.__duration_closures(self,
+    /// parent_self_or_null, on_failure_or_null)` fn. None when
+    /// the locus has no duration closures. Called at the same
+    /// sites tick fires (after each bus handler, after run()
+    /// returns) — duration shares the cell-boundary cadence
+    /// but gates each closure on elapsed-since-last-fire.
+    duration_closures_fn: Option<FunctionValue<'ctx>>,
     /// Index of the synthetic `__mailbox: ptr` field carrying this
     /// locus's `lotus_mailbox_t*`. Only set for pinned-class loci
     /// that declare `bus subscribe` — those need a per-locus
@@ -2208,6 +2226,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let parent_on_failure_field_idx = idx;
         llvm_field_tys.push(ptr_field_t.into());
         idx += 1;
+        // m43: append one i64 __duration_last_fire field per
+        // duration-epoch closure on this locus (in declaration
+        // order). Init at instantiation to time::monotonic()
+        // so the first fire happens after `N` elapses.
+        let mut duration_last_fire_field_idxs: Vec<u32> = Vec::new();
+        for member in &l.members {
+            if let LocusMember::Closure(c) = member {
+                let is_duration = c.clauses.iter().any(|cl| {
+                    matches!(cl, ClosureClause::Epoch(EpochSpec::Duration(_)))
+                });
+                if is_duration {
+                    duration_last_fire_field_idxs.push(idx);
+                    llvm_field_tys.push(i64_t_struct.into());
+                    idx += 1;
+                }
+            }
+        }
         let _ = idx;
 
         let struct_ty = self
@@ -2230,6 +2265,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 dissolve_closures_fn: None,
                 tick_closures_fn: None,
                 tick_wrapper_fn: None,
+                duration_closures_fn: None,
+                duration_last_fire_field_idxs,
                 failure_handler: None,
                 children_field_idx,
                 child_count_field_idx,
@@ -2468,15 +2505,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     user_methods.insert(fd.name.name.clone(), func);
                 }
                 LocusMember::Closure(c) => {
-                    // m39 + m42: Birth + Dissolve + Tick epochs
-                    // lower (each into its own synthetic eval
-                    // fn). Duration / Explicit still reject —
-                    // those need the runtime epoch engine
-                    // (Duration: per-locus duration timer
-                    // tied to time::monotonic; Explicit:
-                    // user-call escape hatch). Default (no
-                    // epoch clause) = Dissolve, matching
-                    // pre-m39 semantics.
+                    // m39 + m42 + m43: Birth + Dissolve + Tick +
+                    // Duration epochs lower (each into its own
+                    // synthetic eval fn). Explicit still rejects —
+                    // it needs a `check_closures(self)` builtin
+                    // surface. Default (no epoch clause) =
+                    // Dissolve, matching pre-m39 semantics.
                     let mut epoch = EpochSpec::Dissolve;
                     for clause in &c.clauses {
                         match clause {
@@ -2484,7 +2518,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 match spec {
                                     EpochSpec::Birth
                                     | EpochSpec::Dissolve
-                                    | EpochSpec::Tick => {
+                                    | EpochSpec::Tick
+                                    | EpochSpec::Duration(_) => {
                                         epoch = spec.clone();
                                     }
                                     other => {
@@ -2494,7 +2529,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                                  epoch {:?} not yet \
                                                  lowered (codegen \
                                                  covers Birth + \
-                                                 Dissolve + Tick)",
+                                                 Dissolve + Tick + \
+                                                 Duration)",
                                                 c.name.name,
                                                 l.name.name,
                                                 other
@@ -2648,6 +2684,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let has_tick = closures
             .iter()
             .any(|(_, _, ep)| matches!(ep, EpochSpec::Tick));
+        let has_duration = closures
+            .iter()
+            .any(|(_, _, ep)| matches!(ep, EpochSpec::Duration(_)));
         let make_eval_fn = |name: &str| {
             let fn_ty = void_t.fn_type(
                 &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
@@ -2696,6 +2735,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         } else {
             None
         };
+        // m43: __duration_closures has the standard 3-arg
+        // shape. Bodies do their own gating on
+        // monotonic-elapsed-since-last-fire per closure;
+        // shared with tick at the lifecycle call sites
+        // (post-handler, post-run).
+        let duration_closures_fn = if has_duration {
+            Some(make_eval_fn(&format!(
+                "{}.__duration_closures",
+                l.name.name
+            )))
+        } else {
+            None
+        };
         // m42: tick-call placement. An earlier draft wrapped
         // each subscribed handler with a post-call thunk;
         // that broke order because the handler's own tail
@@ -2720,6 +2772,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         info.dissolve_closures_fn = dissolve_closures_fn;
         info.tick_closures_fn = tick_closures_fn;
         info.tick_wrapper_fn = tick_wrapper_fn;
+        info.duration_closures_fn = duration_closures_fn;
         info.failure_handler = failure_handler;
         Ok(())
     }
@@ -2980,6 +3033,144 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.current_self = None;
         }
 
+        // m43: __duration_closures body. Each duration-epoch
+        // closure gates on monotonic-elapsed-since-last-fire
+        // before evaluating the assertion. last_fire is
+        // updated to monotonic-now BEFORE the assertion runs
+        // so a routed-and-absorbed violation in on_failure
+        // doesn't reset the interval clock. Per-closure last-
+        // fire fields parallel info.duration_last_fire_field_idxs
+        // in declaration order.
+        if let Some(duration_fn) = info.duration_closures_fn {
+            let entry =
+                self.context.append_basic_block(duration_fn, "entry");
+            self.builder.position_at_end(entry);
+            let self_ptr = duration_fn
+                .get_nth_param(0)
+                .expect("self_ptr param")
+                .into_pointer_value();
+            let parent_self_arg = duration_fn
+                .get_nth_param(1)
+                .expect("parent_self_or_null param")
+                .into_pointer_value();
+            let parent_handler_arg = duration_fn
+                .get_nth_param(2)
+                .expect("on_failure_or_null param")
+                .into_pointer_value();
+            self.current_fn = Some(duration_fn);
+            self.current_user_fn_ret = None;
+            self.current_self = Some(SelfCx {
+                locus_name: l.name.name.clone(),
+                struct_ty: info.struct_ty,
+                self_ptr,
+                fields: info.fields.clone(),
+            });
+            self.loops.clear();
+            self.push_dissolve_frame();
+
+            let i64_t = self.context.i64_type();
+            let mut duration_idx: usize = 0;
+            // Snapshot info.closures to a local (we'll be
+            // emitting nested LLVM that may otherwise alias
+            // through self.user_loci while we work).
+            let closures_snapshot = info.closures.clone();
+            for (cname, assertion, c_epoch) in &closures_snapshot {
+                let duration_expr = match c_epoch {
+                    EpochSpec::Duration(e) => e.clone(),
+                    _ => continue,
+                };
+                let last_field_idx = info
+                    .duration_last_fire_field_idxs[duration_idx];
+                duration_idx += 1;
+
+                // last = load __duration_last_fire_<i>
+                let last_slot = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        self_ptr,
+                        last_field_idx,
+                        &format!(
+                            "{}.duration[{}].last.ptr",
+                            l.name.name, cname
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let last = self
+                    .builder
+                    .build_load(i64_t, last_slot, "duration.last")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_int_value();
+                // now = time::monotonic() (i64 ns)
+                let (now_v, _) =
+                    self.lower_time_monotonic(&[])?;
+                let now = now_v.into_int_value();
+                // Evaluate the duration expression in self-scope
+                // — same approach as closure assertions, so it
+                // can reference self.X (e.g.
+                // `duration(self.poll_interval)`).
+                let scope = Scope::default();
+                let (dur_v, _) =
+                    self.lower_expr(&duration_expr, &scope)?;
+                let dur_n = dur_v.into_int_value();
+                let elapsed = self
+                    .builder
+                    .build_int_sub(now, last, "duration.elapsed")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let should_fire = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::SGE,
+                        elapsed,
+                        dur_n,
+                        "duration.should_fire",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let fire_bb = self.context.append_basic_block(
+                    duration_fn,
+                    &format!("duration.{}.fire", cname),
+                );
+                let skip_bb = self.context.append_basic_block(
+                    duration_fn,
+                    &format!("duration.{}.skip", cname),
+                );
+                self.builder
+                    .build_conditional_branch(should_fire, fire_bb, skip_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                // fire_bb: store now -> last_fire, then run
+                // the assertion check (which routes to
+                // on_failure on violation).
+                self.builder.position_at_end(fire_bb);
+                self.builder
+                    .build_store(last_slot, now)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.lower_closure_check(
+                    &l.name.name,
+                    cname,
+                    assertion,
+                    parent_self_arg,
+                    parent_handler_arg,
+                    c_epoch.clone(),
+                )?;
+                self.builder
+                    .build_unconditional_branch(skip_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                self.builder.position_at_end(skip_bb);
+            }
+
+            // Same flush-skip rationale as tick: duration
+            // fires inside the cooperative drain loop, so we
+            // can't recursively re-enter the queue here.
+            let _ = self.deferred_dissolves.pop();
+            self.builder
+                .build_return(None)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.current_fn = None;
+            self.current_self = None;
+        }
+
         // m42: tick_wrapper body. The bus drain loop calls
         // tick_wrapper(self) after each handler returns; the
         // wrapper loads the parent fields baked onto the struct
@@ -3165,43 +3356,47 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .iter()
                         .any(|(_, h)| h == &fd.name.name);
                     if is_subscribed_handler {
+                        // Load parent_self and parent_handler
+                        // once; both tick and duration fns
+                        // need them and the loads are pure
+                        // GEP+load.
+                        let parent_self_slot = self
+                            .builder
+                            .build_struct_gep(
+                                info.struct_ty,
+                                self_ptr,
+                                info.parent_self_field_idx,
+                                "epoch.parent_self.ptr",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        let parent_self_v = self
+                            .builder
+                            .build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                parent_self_slot,
+                                "epoch.parent_self",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                            .into_pointer_value();
+                        let parent_handler_slot = self
+                            .builder
+                            .build_struct_gep(
+                                info.struct_ty,
+                                self_ptr,
+                                info.parent_on_failure_field_idx,
+                                "epoch.parent_handler.ptr",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        let parent_handler_v = self
+                            .builder
+                            .build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                parent_handler_slot,
+                                "epoch.parent_handler",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                            .into_pointer_value();
                         if let Some(tick_fn) = info.tick_closures_fn {
-                            let parent_self_slot = self
-                                .builder
-                                .build_struct_gep(
-                                    info.struct_ty,
-                                    self_ptr,
-                                    info.parent_self_field_idx,
-                                    "tick.parent_self.ptr",
-                                )
-                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                            let parent_self_v = self
-                                .builder
-                                .build_load(
-                                    self.context.ptr_type(AddressSpace::default()),
-                                    parent_self_slot,
-                                    "tick.parent_self",
-                                )
-                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                                .into_pointer_value();
-                            let parent_handler_slot = self
-                                .builder
-                                .build_struct_gep(
-                                    info.struct_ty,
-                                    self_ptr,
-                                    info.parent_on_failure_field_idx,
-                                    "tick.parent_handler.ptr",
-                                )
-                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                            let parent_handler_v = self
-                                .builder
-                                .build_load(
-                                    self.context.ptr_type(AddressSpace::default()),
-                                    parent_handler_slot,
-                                    "tick.parent_handler",
-                                )
-                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                                .into_pointer_value();
                             self.builder
                                 .build_call(
                                     tick_fn,
@@ -3212,6 +3407,28 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     ],
                                     &format!(
                                         "{}.{}.tick.post_handler.call",
+                                        l.name.name, fd.name.name
+                                    ),
+                                )
+                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        }
+                        // m43: duration shares the cell-boundary
+                        // cadence with tick — same call site,
+                        // each closure self-gates on elapsed
+                        // time inside the synthesized fn.
+                        if let Some(duration_fn) =
+                            info.duration_closures_fn
+                        {
+                            self.builder
+                                .build_call(
+                                    duration_fn,
+                                    &[
+                                        self_ptr.into(),
+                                        parent_self_v.into(),
+                                        parent_handler_v.into(),
+                                    ],
+                                    &format!(
+                                        "{}.{}.duration.post_handler.call",
                                         l.name.name, fd.name.name
                                     ),
                                 )
@@ -6841,6 +7058,38 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_store(parent_handler_slot, parent_handler_val)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
+        // m43: init each __duration_last_fire_<i> field to
+        // monotonic-now so the first fire happens after the
+        // declared `N` elapses (not immediately at birth).
+        // One time::monotonic() call per duration closure —
+        // a tiny cost paid only for loci that declare
+        // duration epochs.
+        if !info.duration_last_fire_field_idxs.is_empty() {
+            let (now_v, _) = self.lower_time_monotonic(&[])?;
+            let now = now_v.into_int_value();
+            for (i, field_idx) in info
+                .duration_last_fire_field_idxs
+                .iter()
+                .enumerate()
+            {
+                let slot = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        self_ptr,
+                        *field_idx,
+                        &format!(
+                            "{}.__duration_last_fire[{}].ptr",
+                            locus_name, i
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(slot, now)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+        }
+
         // F.7 ordering: if we're inside a parent locus's lifecycle
         // method AND the parent has an accept(child: ThisLocus) that
         // matches our type, call parent.accept(parent_self, child)
@@ -7393,6 +7642,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ],
                         &format!(
                             "{}.__tick_closures.post_run.call",
+                            locus_name
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+            // m43: duration shares the cell-boundary cadence
+            // with tick — fires only when declared `N` has
+            // elapsed since last fire of each duration closure.
+            if let Some(duration_fn) = info.duration_closures_fn {
+                let (parent_self_d, handler_ptr_d) =
+                    self.resolve_failure_route(&locus_name);
+                self.builder
+                    .build_call(
+                        duration_fn,
+                        &[
+                            self_ptr.into(),
+                            parent_self_d.into(),
+                            handler_ptr_d.into(),
+                        ],
+                        &format!(
+                            "{}.__duration_closures.post_run.call",
                             locus_name
                         ),
                     )

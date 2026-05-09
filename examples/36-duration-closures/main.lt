@@ -1,0 +1,111 @@
+// 36-duration-closures — m43: duration-epoch closures.
+//
+// `closure C { ...; epoch duration N; }` fires AT MOST once
+// per substrate cell, and only when at least `N` of monotonic
+// time has elapsed since the closure's last fire (or since
+// instantiation for the first). Where m42's tick fires every
+// cell, duration fires every-N-of-time. This is the right
+// epoch for "drift" / "heartbeat" / "rate-limited audit"
+// invariants — anything where polling on every cell is too
+// noisy or too expensive.
+//
+// Implementation:
+//   - Codegen: per-locus struct gains one i64
+//     __duration_last_fire_<i> field per duration closure
+//     (in declaration order). Init at instantiation to
+//     time::monotonic() so first fire happens after `N`
+//     elapses (not immediately). At the same call sites tick
+//     fires (after each bus handler, after run() returns),
+//     each duration closure compares elapsed = now - last
+//     and only fires when elapsed >= N.
+//   - Interpreter: LocusHandle.duration_last_fire is a
+//     parallel Vec<i64>. Same predicate-and-fire pattern.
+//
+// What this exercises:
+//   - A Watcher locus with a 5ms-duration closure that
+//     intentionally fails (always-fail self-assertion) so
+//     each fire shows up as a violation routed to the
+//     parent's on_failure.
+//   - A Pulser that publishes 4 cells with `yield` + sleep
+//     between each, so the cooperative drain hits each cell
+//     spaced roughly 7ms apart in real monotonic time.
+//   - First cell (yield 1) sees ~0ms elapsed since
+//     instantiation — no fire.
+//   - Cells 2..4 each see ≥5ms elapsed — fire each time.
+//   - Expected: 3 fires (one less than the cell count
+//     because the first cell's elapsed is too small).
+
+import "std/time";
+
+type Tick {
+    value: Int;
+}
+
+locus Watcher {
+    params {
+        n: Int = 0;
+        magic: Int = 0;
+    }
+
+    closure heartbeat {
+        // Always-fail: |0 - 1| > 0. Used here as a
+        // visible-when-fired signal — the parent's
+        // on_failure prints once per fire so the test can
+        // count duration-gated invocations.
+        self.magic ~~ 1 within 0;
+        epoch duration(5ms);
+    }
+
+    bus {
+        subscribe "tick" as on_tick of type Tick;
+    }
+
+    fn on_tick(t: Tick) {
+        self.n = self.n + 1;
+        println("Watcher.on_tick: n=", self.n);
+    }
+}
+
+locus Pulser {
+    params {
+        fires: Int = 0;
+    }
+
+    on_failure(w: Watcher, err: ClosureViolation) {
+        self.fires = self.fires + 1;
+        println("heartbeat fired #", self.fires);
+    }
+
+    bus {
+        publish "tick" of type Tick;
+    }
+
+    run() {
+        Watcher { };
+
+        // 4 cells, ~7ms apart. yield drains the queued cell
+        // between each so the duration check observes real
+        // elapsed time per fire boundary.
+        "tick" <- Tick { value: 1 };
+        yield;
+        time::sleep(7ms);
+
+        "tick" <- Tick { value: 2 };
+        yield;
+        time::sleep(7ms);
+
+        "tick" <- Tick { value: 3 };
+        yield;
+        time::sleep(7ms);
+
+        "tick" <- Tick { value: 4 };
+        // No yield after the last publish — the post-run
+        // drain at scope exit will pick it up.
+
+        println("--- run done, post-run drain follows ---");
+    }
+}
+
+fn main() {
+    Pulser { };
+}

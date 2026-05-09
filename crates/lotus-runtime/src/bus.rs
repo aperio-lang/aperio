@@ -364,6 +364,7 @@ mod tests {
                 dissolved: Rc::new(std::cell::Cell::new(false)),
                 restart_count: Rc::new(std::cell::Cell::new(0)),
                 quarantined: Rc::new(std::cell::Cell::new(false)),
+                duration_last_fire: Rc::new(RefCell::new(Vec::new())),
             },
             handler: handler.to_string(),
             parent: None,
