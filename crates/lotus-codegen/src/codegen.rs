@@ -3155,10 +3155,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 "expression statement other than locus literal or builtin call"
                     .to_string(),
             )),
-            _ => Err(CodegenError::Unsupported(format!(
-                "statement form {:?}",
-                std::mem::discriminant(stmt)
-            ))),
         }
     }
 
