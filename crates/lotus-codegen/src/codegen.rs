@@ -3869,11 +3869,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         let end = self.lower_block(&f.body, &mut scope)?;
         if end == BlockEnd::Open {
-            self.flush_dissolve_frame()?;
             match &sig.ret {
                 None => {
                     // Void fall-through: br to exit; epilogue
-                    // builds `ret void`.
+                    // flushes deferred-dissolves + builds
+                    // `ret void`. m53: flush moved into exit so
+                    // both fall-through and explicit-return
+                    // paths share a single drain + dissolve
+                    // sequence.
                     self.builder
                         .build_unconditional_branch(exit_bb)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
@@ -3885,11 +3888,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )));
                 }
             }
-        } else {
-            let _ = self.deferred_dissolves.pop();
         }
+        // For terminated bodies (a `return` or other terminator
+        // inside the body), the Stmt::Return path already br'd to
+        // exit_bb. The frame stays on the deferred_dissolves
+        // stack and gets flushed by emit_fn_exit_epilogue below.
 
-        // m49: emit the fn.exit epilogue. Position there, do the
+        // m49: emit the fn.exit epilogue. Position there, flush
+        // the deferred-dissolves frame (drains the bus queue +
+        // dissolves any loci bound in the fn body — m53), do the
         // deep-copy of ret_alloca → caller_arena (only for heap
         // types), destroy the subregion, build_return.
         self.emit_fn_exit_epilogue(&sig)?;
@@ -3918,6 +3925,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .current_user_fn_exit_bb
             .expect("exit_bb set during fn body lowering");
         self.builder.position_at_end(exit_bb);
+
+        // m53: free-fn handle-rooting. Flush the deferred-
+        // dissolves frame opened at fn entry so any long-lived
+        // loci bound in the fn body (e.g. `let _w = Watcher { };`
+        // where Watcher subscribes to a bus subject) get drained
+        // + dissolved before fn return. Pre-m53 the typed-return
+        // path silently popped the frame without flushing,
+        // leaking those handles past fn return. Per spec/memory
+        // §"Free `fn` functions": "the function returns when:
+        // body's last statement completes, AND all children of
+        // the implicit locus have dissolved." flush_dissolve_frame
+        // realizes the second clause at the codegen substrate.
+        // The bus drain inside the flush dispatches any cells
+        // published during the body (or by birth() of the loci
+        // we're about to dissolve) before they go away. Same
+        // entry point as locus-method scope-exit so the
+        // semantics is uniform across all fn flavors.
+        self.flush_dissolve_frame()?;
 
         let caller_arena_alloca = self
             .current_user_fn_caller_arena
