@@ -1412,6 +1412,14 @@ impl Parser {
                 self.bump();
                 Ok(Pattern::Literal(Literal::Float(f), span))
             }
+            TokenKind::DecimalLit(s) => {
+                self.bump();
+                Ok(Pattern::Literal(Literal::Decimal(s), span))
+            }
+            TokenKind::DurationLit(ns) => {
+                self.bump();
+                Ok(Pattern::Literal(Literal::Duration(ns), span))
+            }
             TokenKind::StringLit(s) => {
                 self.bump();
                 Ok(Pattern::Literal(Literal::String(s), span))

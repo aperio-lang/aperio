@@ -2327,6 +2327,10 @@ fn literal_matches(lit: &Literal, val: &Value) -> bool {
     match (lit, val) {
         (Literal::Int(a), Value::Int(b)) => a == b,
         (Literal::Float(a), Value::Float(b)) => a == b,
+        (Literal::Decimal(a), Value::Decimal(b)) => {
+            DecimalVal::parse(a).map(|p| DecimalVal::eq(p, *b)).unwrap_or(false)
+        }
+        (Literal::Duration(a), Value::Duration(b)) => a == b,
         (Literal::String(a), Value::String(b)) => a == b,
         (Literal::Bool(a), Value::Bool(b)) => a == b,
         (Literal::Nil, Value::Nil) => true,
