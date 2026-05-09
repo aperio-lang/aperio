@@ -46,6 +46,149 @@ pub fn install_builtins(env: &crate::env::Env) {
             func: Rc::new(builtin_to_string),
         }),
     );
+    env.define(
+        "min",
+        Value::Builtin(BuiltinRef {
+            name: "min",
+            func: Rc::new(builtin_min),
+        }),
+    );
+    env.define(
+        "max",
+        Value::Builtin(BuiltinRef {
+            name: "max",
+            func: Rc::new(builtin_max),
+        }),
+    );
+    env.define(
+        "abs",
+        Value::Builtin(BuiltinRef {
+            name: "abs",
+            func: Rc::new(builtin_abs),
+        }),
+    );
+    env.define(
+        "starts_with",
+        Value::Builtin(BuiltinRef {
+            name: "starts_with",
+            func: Rc::new(builtin_starts_with),
+        }),
+    );
+    env.define(
+        "contains",
+        Value::Builtin(BuiltinRef {
+            name: "contains",
+            func: Rc::new(builtin_contains),
+        }),
+    );
+}
+
+fn builtin_min(args: &[Value]) -> Result<Value, String> {
+    binop_choose(args, "min", true)
+}
+
+fn builtin_max(args: &[Value]) -> Result<Value, String> {
+    binop_choose(args, "max", false)
+}
+
+fn binop_choose(
+    args: &[Value],
+    name: &str,
+    pick_smaller: bool,
+) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "`{}` expects exactly 2 arguments, got {}",
+            name,
+            args.len()
+        ));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => {
+            Ok(Value::Int(if pick_smaller { *a.min(b) } else { *a.max(b) }))
+        }
+        (Value::Float(a), Value::Float(b)) => {
+            let chosen = if pick_smaller { a.min(*b) } else { a.max(*b) };
+            Ok(Value::Float(chosen))
+        }
+        (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(
+            if pick_smaller { *a.min(b) } else { *a.max(b) },
+        )),
+        (Value::Decimal(a), Value::Decimal(b)) => {
+            // Decimal stored as a string in fmt_decimal shape;
+            // parse, compare, return the chosen original.
+            let af = crate::eval::parse_decimal_pub(a)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", a))?;
+            let bf = crate::eval::parse_decimal_pub(b)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", b))?;
+            let pick_a = if pick_smaller { af <= bf } else { af >= bf };
+            Ok(Value::Decimal(if pick_a { a.clone() } else { b.clone() }))
+        }
+        (l, r) => Err(format!(
+            "`{}` not supported for {} and {}",
+            name,
+            l.type_name(),
+            r.type_name()
+        )),
+    }
+}
+
+fn builtin_abs(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "`abs` expects exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
+    match &args[0] {
+        Value::Int(n) => Ok(Value::Int(n.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        Value::Duration(n) => Ok(Value::Duration(n.abs())),
+        Value::Decimal(s) => {
+            let f = crate::eval::parse_decimal_pub(s)
+                .ok_or_else(|| format!("decimal parse failed: `{}`", s))?;
+            Ok(Value::Decimal(crate::eval::fmt_decimal_pub(f.abs())))
+        }
+        other => Err(format!("`abs` not supported for {}", other.type_name())),
+    }
+}
+
+fn builtin_starts_with(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "`starts_with` expects exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    match (&args[0], &args[1]) {
+        (Value::String(s), Value::String(p)) => {
+            Ok(Value::Bool(s.starts_with(p.as_str())))
+        }
+        (l, r) => Err(format!(
+            "`starts_with` expects two String args; got {} and {}",
+            l.type_name(),
+            r.type_name()
+        )),
+    }
+}
+
+fn builtin_contains(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "`contains` expects exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    match (&args[0], &args[1]) {
+        (Value::String(s), Value::String(sub)) => {
+            Ok(Value::Bool(s.contains(sub.as_str())))
+        }
+        (l, r) => Err(format!(
+            "`contains` expects two String args; got {} and {}",
+            l.type_name(),
+            r.type_name()
+        )),
+    }
 }
 
 fn builtin_to_string(args: &[Value]) -> Result<Value, String> {

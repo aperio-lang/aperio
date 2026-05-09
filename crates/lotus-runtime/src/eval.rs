@@ -1650,6 +1650,14 @@ pub(crate) fn fmt_decimal_pub(f: f64) -> String {
     fmt_decimal(f)
 }
 
+/// Public alias for `parse_decimal` (m38). Used by the
+/// `min` / `max` / `abs` builtins so they can compare /
+/// transform Decimal values stored as strings without
+/// duplicating the strip-`d`-then-parse-f64 logic.
+pub(crate) fn parse_decimal_pub(s: &str) -> Option<f64> {
+    parse_decimal(s)
+}
+
 fn fmt_decimal(f: f64) -> String {
     // Match codegen's printf("%g", ...) behavior: at most 6
     // fractional digits, trailing zeros + dangling `.` stripped.

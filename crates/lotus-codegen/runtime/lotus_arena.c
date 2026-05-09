@@ -680,3 +680,24 @@ char *lotus_str_from_duration(lotus_arena_t *a, int64_t ns) {
     snprintf(out, 32, "%lldns", (long long)ns);
     return out;
 }
+
+/*
+ * starts_with / contains (m38).
+ *
+ * Both return i32 0/1 (codegen truncates to i1). Empty
+ * prefix / sub matches any string (matches Rust semantics).
+ * No locale folding — byte-exact comparison so the result
+ * doesn't drift across systems.
+ */
+int lotus_str_starts_with(const char *s, const char *prefix) {
+    if (!s || !prefix) return 0;
+    size_t lp = strlen(prefix);
+    if (lp == 0) return 1;
+    return strncmp(s, prefix, lp) == 0 ? 1 : 0;
+}
+
+int lotus_str_contains(const char *s, const char *sub) {
+    if (!s || !sub) return 0;
+    if (*sub == '\0') return 1;
+    return strstr(s, sub) ? 1 : 0;
+}

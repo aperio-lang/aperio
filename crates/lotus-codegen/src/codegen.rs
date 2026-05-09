@@ -607,6 +607,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_str_from_duration", str_from_dur_ty, None);
 
+        // m38: starts_with / contains string predicates.
+        // declare i32 @lotus_str_starts_with(ptr s, ptr prefix)
+        // declare i32 @lotus_str_contains(ptr s, ptr sub)
+        let str_predicate_ty =
+            i32_t_local.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_str_starts_with",
+            str_predicate_ty,
+            None,
+        );
+        self.module
+            .add_function("lotus_str_contains", str_predicate_ty, None);
+
         // The single program-wide arena pointer. Initialized in
         // the prelude of main; consulted by every arena-allocated
         // user-type literal and ClosureViolation. m20 makes this
@@ -3608,6 +3621,200 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
     }
 
+    /// m38: lower min(a, b) / max(a, b) / abs(x). All work
+    /// across the four numeric types (Int / Duration via
+    /// signed integer ops, Float / Decimal via float ops).
+    /// abs takes 1 arg; min/max take 2.
+    fn lower_math_builtin(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        let arity = if name == "abs" { 1 } else { 2 };
+        if args.len() != arity {
+            return Err(CodegenError::Unsupported(format!(
+                "`{}` expects exactly {} argument(s), got {}",
+                name,
+                arity,
+                args.len()
+            )));
+        }
+        let (av, at) = self.lower_expr(&args[0], scope)?;
+        if name == "abs" {
+            return self.lower_abs(av, &at);
+        }
+        let (bv, bt) = self.lower_expr(&args[1], scope)?;
+        if at != bt {
+            return Err(CodegenError::Unsupported(format!(
+                "`{}`: operand types must match; got {:?} and {:?}",
+                name, at, bt
+            )));
+        }
+        match at {
+            LotusType::Int | LotusType::Duration => {
+                let pred = match name {
+                    "min" => inkwell::IntPredicate::SLT,
+                    "max" => inkwell::IntPredicate::SGT,
+                    _ => unreachable!(),
+                };
+                let cmp = self
+                    .builder
+                    .build_int_compare(
+                        pred,
+                        av.into_int_value(),
+                        bv.into_int_value(),
+                        &format!("{}.cmp", name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let v = self
+                    .builder
+                    .build_select(cmp, av, bv, &format!("{}.sel", name))
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v, at))
+            }
+            LotusType::Float | LotusType::Decimal => {
+                let pred = match name {
+                    "min" => inkwell::FloatPredicate::OLT,
+                    "max" => inkwell::FloatPredicate::OGT,
+                    _ => unreachable!(),
+                };
+                let cmp = self
+                    .builder
+                    .build_float_compare(
+                        pred,
+                        av.into_float_value(),
+                        bv.into_float_value(),
+                        &format!("{}.fcmp", name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let v = self
+                    .builder
+                    .build_select(cmp, av, bv, &format!("{}.sel", name))
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v, at))
+            }
+            other => Err(CodegenError::Unsupported(format!(
+                "`{}` not supported for type {:?}",
+                name, other
+            ))),
+        }
+    }
+
+    fn lower_abs(
+        &mut self,
+        v: BasicValueEnum<'ctx>,
+        ty: &LotusType,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        match ty {
+            LotusType::Int | LotusType::Duration => {
+                let i64_t = self.context.i64_type();
+                let zero = i64_t.const_int(0, true);
+                let iv = v.into_int_value();
+                let neg = self
+                    .builder
+                    .build_int_sub(zero, iv, "abs.neg")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let is_neg = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::SLT,
+                        iv,
+                        zero,
+                        "abs.is_neg",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let chosen = self
+                    .builder
+                    .build_select(is_neg, neg.into(), v, "abs.sel")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((chosen, ty.clone()))
+            }
+            LotusType::Float | LotusType::Decimal => {
+                let fv = v.into_float_value();
+                let neg = self
+                    .builder
+                    .build_float_neg(fv, "abs.fneg")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let zero = self.context.f64_type().const_float(0.0);
+                let is_neg = self
+                    .builder
+                    .build_float_compare(
+                        inkwell::FloatPredicate::OLT,
+                        fv,
+                        zero,
+                        "abs.is_neg",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let chosen = self
+                    .builder
+                    .build_select(is_neg, neg.into(), v, "abs.sel")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((chosen, ty.clone()))
+            }
+            other => Err(CodegenError::Unsupported(format!(
+                "`abs` not supported for type {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// m38: lower starts_with(s, prefix) / contains(s, sub).
+    /// Both take two String args, return Bool. C runtime helpers
+    /// return i32 0/1 which we truncate to i1 by comparing to 1.
+    fn lower_str_predicate_builtin(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "`{}` expects exactly 2 arguments, got {}",
+                name,
+                args.len()
+            )));
+        }
+        let (sv, st) = self.lower_expr(&args[0], scope)?;
+        let (pv, pt) = self.lower_expr(&args[1], scope)?;
+        if !matches!(st, LotusType::String) || !matches!(pt, LotusType::String) {
+            return Err(CodegenError::Unsupported(format!(
+                "`{}` expects two String args; got {:?} and {:?}",
+                name, st, pt
+            )));
+        }
+        let runtime_fn_name = format!("lotus_str_{}", name);
+        let f = self
+            .module
+            .get_function(&runtime_fn_name)
+            .expect("string predicate runtime fn declared");
+        let raw = self
+            .builder
+            .build_call(
+                f,
+                &[
+                    sv.into_pointer_value().into(),
+                    pv.into_pointer_value().into(),
+                ],
+                &format!("str.{}", name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("string predicate returns i32");
+        let one = self.context.i32_type().const_int(1, false);
+        let v = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                raw.into_int_value(),
+                one,
+                &format!("str.{}.bool", name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((v.into(), LotusType::Bool))
+    }
+
     /// m37: lower a `to_string(x)` builtin call. Routes by the
     /// argument's LotusType to the right snprintf-backed runtime
     /// helper; result is a fresh arena-owned NUL-terminated
@@ -4903,6 +5110,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 Expr::Ident(i) if i.name == "to_string" => {
                     self.lower_to_string_builtin(args, scope)
+                }
+                Expr::Ident(i)
+                    if matches!(
+                        i.name.as_str(),
+                        "min" | "max" | "abs"
+                    ) =>
+                {
+                    self.lower_math_builtin(&i.name, args, scope)
+                }
+                Expr::Ident(i)
+                    if matches!(
+                        i.name.as_str(),
+                        "starts_with" | "contains"
+                    ) =>
+                {
+                    self.lower_str_predicate_builtin(&i.name, args, scope)
                 }
                 Expr::Ident(i) if self.user_fns.contains_key(&i.name) => {
                     let result =
