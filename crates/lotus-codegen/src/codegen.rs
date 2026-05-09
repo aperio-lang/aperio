@@ -2062,6 +2062,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let mut subscriptions: Vec<(String, String)> = Vec::new();
         let mut closures: Vec<(String, ClosureAssertion)> = Vec::new();
         let mut failure_handler: Option<(String, FunctionValue<'ctx>)> = None;
+
+        // Pre-collect bus-handler method names so we can reject
+        // defaults on them: bus dispatch is a fixed (self, payload)
+        // C-runtime call that can't materialize default values for
+        // extra params. Defaults on non-handler methods (called via
+        // `self.method(...)`) work fine — m33 lifts that gate.
+        let bus_handler_names: std::collections::BTreeSet<String> = l
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                LocusMember::Bus(bb) => Some(bb.members.iter().filter_map(|bm| {
+                    match bm {
+                        BusMember::Subscribe { handler, .. } => Some(handler.name.clone()),
+                        _ => None,
+                    }
+                })),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
         for member in &l.members {
             match member {
                 LocusMember::Params(_) | LocusMember::Contract(_) => {
@@ -2172,12 +2193,25 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum> =
                         Vec::with_capacity(fd.params.len() + 1);
                     llvm_param_tys.push(ptr_t.into());
+                    let is_bus_handler =
+                        bus_handler_names.contains(&fd.name.name);
+                    let mut seen_default = false;
                     for p in &fd.params {
                         if p.default.is_some() {
+                            if is_bus_handler {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "locus `{}` method `{}`: bus-subscribed \
+                                     handlers can't have default param values \
+                                     (bus dispatch is fixed-arity self+payload)",
+                                    l.name.name, fd.name.name
+                                )));
+                            }
+                            seen_default = true;
+                        } else if seen_default {
                             return Err(CodegenError::Unsupported(format!(
-                                "locus `{}` method `{}` param `{}`: default \
-                                 values on locus methods aren't lowered yet \
-                                 (free fns support them as of m32)",
+                                "locus `{}` method `{}`: required param `{}` \
+                                 follows a defaulted param; defaults must form \
+                                 a suffix",
                                 l.name.name, fd.name.name, p.name.name
                             )));
                         }
@@ -6010,19 +6044,40 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 _ => None,
             })
             .expect("method declaration was visited in pass A2");
-        if args.len() != sig.params.len() {
+        // Caller may omit a contiguous tail of defaulted params
+        // (suffix-only rule enforced at decl time). Each missing
+        // slot's default expression evaluates at the call site
+        // — same semantics as free-fn defaults (m32).
+        if args.len() > sig.params.len() {
             return Err(CodegenError::Unsupported(format!(
-                "self.{}: expected {} args, got {}",
+                "self.{}: expected at most {} args, got {}",
                 method_name,
                 sig.params.len(),
                 args.len()
             )));
         }
+        for (i, p) in sig.params.iter().enumerate() {
+            if i >= args.len() && p.default.is_none() {
+                return Err(CodegenError::Unsupported(format!(
+                    "self.{}: required param `{}` not provided (only {} \
+                     args given)",
+                    method_name,
+                    p.name.name,
+                    args.len()
+                )));
+            }
+        }
         let mut llvm_args: Vec<BasicMetadataValueEnum> =
-            Vec::with_capacity(args.len() + 1);
+            Vec::with_capacity(sig.params.len() + 1);
         llvm_args.push(cs.self_ptr.into());
-        for (i, a) in args.iter().enumerate() {
-            let (v, ty) = self.lower_expr(a, scope)?;
+        for i in 0..sig.params.len() {
+            let (v, ty) = if i < args.len() {
+                self.lower_expr(&args[i], scope)?
+            } else {
+                let default_expr =
+                    sig.params[i].default.as_ref().expect("checked above");
+                self.lower_expr(default_expr, scope)?
+            };
             let want = self.type_expr_to_lotus(&sig.params[i].ty)?;
             if ty != want {
                 return Err(CodegenError::Unsupported(format!(

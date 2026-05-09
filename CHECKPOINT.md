@@ -520,7 +520,7 @@ m32    m32: default fn param values (free fns)                 (d211c60)
                             caller's scope. Locus methods still
                             reject — m32 is free-fn-only.
                           + examples/24-default-params
-m33    m33: import resolution for multi-file projects          (pending)
+m33    m33: import resolution for multi-file projects          (3440a92)
                           ⇒ CLI's parse_with_imports walks the
                             entry's `import "..."` directives,
                             recursively parses each, dedups by
@@ -532,6 +532,17 @@ m33    m33: import resolution for multi-file projects          (pending)
                             `lotus build` use the merged Program
                             for single-file targets.
                           + examples/25-imports
+m34    m34: default param values on locus `fn` methods         (pending)
+                          ⇒ Locus methods called via
+                            `self.method(...)` now support
+                            default param values (suffix-only
+                            rule, fill at call site). Bus-
+                            subscribed handlers reject defaults
+                            with a clear error (bus dispatch is
+                            fixed-arity self+payload). Mode
+                            methods still reject — F.10 keeps
+                            their param surface tight.
+                          + examples/24-default-params (extended)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -588,7 +599,7 @@ m7 builds on the struct ABI.
 | Indexed local-array assignment `arr[i] = v` | ✅ | ✅ |
 | `for i in lo..hi` / `lo..=hi` range loops | ✅ | ✅ |
 | Default fn param values (free fns; suffix-only rule) | ✅ | ✅ |
-| Default values on locus methods | ✅ | — |
+| Default values on locus methods (non-bus, non-mode) | ✅ | ✅ |
 | `import "..."` resolution (multi-file projects) | ✅ | ✅ |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
@@ -743,7 +754,7 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-89 commits ahead of origin/master at checkpoint time.
+90 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
@@ -791,10 +802,11 @@ ladder. Two pieces:
 
 - Tuple / Constructor patterns in match (needs tuple values
   in codegen first)
-- Default param values on locus methods (free fns work as of
-  m32; locus methods need a richer dispatch plumb because
-  bus-dispatch / mode-dispatch / `self.method()` calls all
-  have different arity stories)
+- Default param values on bus-subscribed handlers + mode methods
+  (locus `fn` methods called via `self.method(...)` work as of
+  m34; bus dispatch is fixed-arity at the C-runtime level so
+  defaults there'd need dispatch-side default evaluation;
+  modes take a tighter param surface per F.10)
 - Recovery primitives execution (restart / quarantine /
   reorganize — interpreter parses, neither runs)
 - Recognition-class real bitmap-pool (currently chunked-

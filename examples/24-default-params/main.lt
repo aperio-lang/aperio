@@ -13,9 +13,13 @@
 // caller-visible binding will see THAT binding, not a
 // snapshot from the fn body.
 //
-// Locus-method defaults aren't lowered yet — m32 only does
-// free fns. The locus-method path involves bus-dispatch arity
-// + mode-dispatch arity that need a separate plumb.
+// Locus methods support defaults too (m34). Bus-handler
+// methods reject defaults — bus dispatch is fixed-arity
+// `(self, payload)` at the C-runtime level and can't fill
+// defaults for extra params at call time. Mode methods
+// (bulk / harmonic / resolution) also still reject defaults
+// — modes are designated regime selectors and v0 keeps their
+// param surface tight.
 
 fn greet(name: String, greeting: String = "hello", times: Int = 1) {
     let mut i = 0;
@@ -31,6 +35,26 @@ fn pow(base: Int, exp: Int = 2) -> Int {
         acc = acc * base;
     }
     return acc;
+}
+
+// Locus method with defaults — `step` defaults to 1, so the
+// caller can write `self.bump()` for the common case and
+// `self.bump(5)` to skip ahead.
+locus Counter {
+    params {
+        n: Int = 0;
+    }
+
+    fn bump(step: Int = 1) {
+        self.n = self.n + step;
+        println("counter = ", self.n);
+    }
+
+    run() {
+        self.bump();      // step defaults to 1 → 0 + 1 = 1
+        self.bump();      //                   → 1 + 1 = 2
+        self.bump(10);    // explicit          → 2 + 10 = 12
+    }
 }
 
 fn main() {
@@ -49,4 +73,7 @@ fn main() {
 
     // Override the default for cubes.
     println("2^5 = ", pow(2, 5));
+
+    // Locus method with default param.
+    Counter { };
 }
