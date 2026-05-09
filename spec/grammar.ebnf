@@ -284,6 +284,7 @@ statement         = let_stmt
                   | return_stmt
                   | break_stmt
                   | continue_stmt
+                  | yield_stmt
                   | recovery_stmt
                   | block
                   | expr_stmt
@@ -336,6 +337,7 @@ while_stmt        = "while" , expression , block ;
 return_stmt       = "return" , [ expression ] , ";" ;
 break_stmt        = "break" , ";" ;
 continue_stmt     = "continue" , ";" ;
+yield_stmt        = "yield" , ";" ;
 
 (* Recovery primitives. Statement-level only. *)
 recovery_stmt     = recovery_op , "(" , [ argument_list ] , ")" ,

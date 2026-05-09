@@ -317,6 +317,16 @@ impl Interpreter {
             }
             Stmt::Break(_) => Err(Signal::Break),
             Stmt::Continue(_) => Err(Signal::Continue),
+            Stmt::Yield(_) => {
+                // Interpreter is single-threaded with synchronous
+                // bus dispatch — there's no pending-cell queue to
+                // drain. Codegen lowers `yield` to
+                // `lotus_bus_queue_drain` where the substrate
+                // actually has cells; here it's a no-op (semantic
+                // is preserved: the program continues; nothing
+                // pending was missed because nothing was deferred).
+                Ok(())
+            }
             Stmt::Block(b) => self.exec_block(b),
             Stmt::Recovery { op, args, .. } => {
                 let mut arg_vs = Vec::with_capacity(args.len());

@@ -1178,6 +1178,11 @@ impl Parser {
                 let semi = self.expect(TokenKind::Semi, ";")?;
                 Ok(Stmt::Continue(kw.span.merge(semi.span)))
             }
+            TokenKind::Yield => {
+                let kw = self.bump();
+                let semi = self.expect(TokenKind::Semi, ";")?;
+                Ok(Stmt::Yield(kw.span.merge(semi.span)))
+            }
             TokenKind::LBrace => Ok(Stmt::Block(self.parse_block()?)),
             // Recovery primitives
             TokenKind::Restart

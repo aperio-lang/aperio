@@ -507,7 +507,7 @@ impl<'a> Checker<'a> {
                     let _ = self.check_expr(e);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Yield(_) => {}
             Stmt::Block(b) => self.check_block(b),
             Stmt::Recovery { args, modifier, .. } => {
                 for a in args {

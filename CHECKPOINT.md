@@ -1,12 +1,11 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 26 (cooperative
-scheduler semantics — bus dispatch is deferred; cells run
-through a process-wide FIFO queue drained between substrate-
-cell yield points) on top of m25 (bimodal schedule-class
+new session. State as of codegen milestone 26b (explicit `yield`
+primitive) on top of m26 (cooperative scheduler semantics — bus
+dispatch deferred via FIFO queue), m25 (bimodal schedule-class
 annotation), m24 (`match` expressions), and the m19→m23
-region-allocator arc. **20 of 21 examples build to native ELF —
+region-allocator arc. **21 of 22 examples build to native ELF —
 every single-binary example.** Only `trellis-pair`
 (multi-binary, cross-process bus) remains, gated on
 substantial new infrastructure.
@@ -77,6 +76,18 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 17 of 18 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 26b** (explicit `yield` primitive) —
+  complete. `yield` lifted from reserved keyword to a real
+  statement. Codegen lowers `yield;` to a call to
+  `lotus_bus_queue_drain` at this point — pending substrate
+  cells fire mid-body. Interpreter treats it as a no-op
+  (single-threaded synchronous dispatch — no queue to drain).
+  Per spec/runtime.md cooperative yield points: "explicit
+  `yield` (rare, for long-running computations)" — the
+  implicit yield points (handler exit, lifecycle transition,
+  bus dispatch) cover most cases; `yield` is the escape hatch
+  for long-internal-loop bodies. New `examples/17-yield/`
+  exercises the primitive end-to-end.
 - **Phase 3 milestone 26** (cooperative scheduler semantics) —
   complete. Bus dispatch is now deferred: each `<-` enqueues
   `(handler, self, payload_copy)` cells onto a program-wide
@@ -314,13 +325,18 @@ m25 Codegen milestone 25: schedule-class annotation infra      (bbe2731 +
                             Bimodal-only: greedy dropped on
                             review as a bimodality violation.
                           + examples/16-schedule-classes
-m26 Codegen milestone 26: cooperative scheduler semantics      (this commit)
+m26 Codegen milestone 26: cooperative scheduler semantics      (9c0ba40)
                           ⇒ bus dispatch deferred via process-
                             wide FIFO queue (lotus_bus_queue_*);
                             drain runs at flush_dissolve_frame
                             entry so subscribers process cells
                             before they dissolve; cells enqueued
                             during dissolves are leaked (v0)
+m26b Codegen milestone 26b: explicit `yield` primitive         (this commit)
+                          ⇒ yield lifted from reserved to real;
+                            codegen lowers to lotus_bus_queue_drain;
+                            interpreter no-op
+                          + examples/17-yield
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,

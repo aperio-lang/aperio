@@ -25,13 +25,15 @@ stub behind the same path, and `<-` copies payloads from the
 publisher's arena into the subscriber's arena per
 spec/memory.md, (m24) **match expressions** with Literal /
 Wildcard / Binding patterns, (m25) **bimodal schedule-class
-annotations** (`: schedule cooperative | pinned`), and (m26)
+annotations** (`: schedule cooperative | pinned`), (m26)
 **cooperative scheduler semantics** — bus dispatch is deferred
 via a process-wide FIFO queue; cells run between substrate
-yield points instead of nesting in publisher frames; m27 will
-spawn dedicated threads for pinned loci. **20 of 21 examples
-build to native ELF — every single-binary example is a build
-target.** Phase 3 (codegen) is at milestone 26: literals +
+yield points instead of nesting in publisher frames, and (m26b)
+**explicit `yield`** as the user-placed cell boundary for
+long-internal-loop bodies; m27 will spawn dedicated threads for
+pinned loci. **21 of 22 examples build to native ELF — every
+single-binary example is a build target.** Phase 3 (codegen) is
+at milestone 26b: literals +
 arithmetic, `let`/`let mut` + assignment + compound ops,
 `if`/`else`/`while` + `break`/`continue`, `time::sleep` on
 `CLOCK_MONOTONIC` with EINTR retry, `time::monotonic()` +
@@ -266,11 +268,11 @@ crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-18)
                           object file (m19 substrate).
 ```
 
-Example ladder: 21 projects from hello-world → trellis-pair;
-~890 lines of source + ~1,400+ lines of README walk-throughs.
-91 tests across the workspace; 20 of 21 projects run end-to-end
+Example ladder: 22 projects from hello-world → trellis-pair;
+~900 lines of source + ~1,400+ lines of README walk-throughs.
+91 tests across the workspace; 21 of 22 projects run end-to-end
 under `lotus run` (only multi-binary trellis-pair waits on the
-cross-process bus). **20 of 21 projects** also build to native
+cross-process bus). **21 of 22 projects** also build to native
 ELF via `lotus build` — every single-binary example. Only
 `trellis-pair` (cross-process bus + entry-point selection) is
 not a build target.
@@ -316,7 +318,7 @@ Per the delivery plan:
   Region allocator + cooperative scheduler are the remaining
   Phase 2 deep-pushes.
 - **Phase 3** — Codegen in Rust targeting LLVM. *In progress;
-  milestone 26 of N complete.* Working subset: literals, arithmetic,
+  milestone 26b of N complete.* Working subset: literals, arithmetic,
   `let`/`let mut` + assignment + compound ops, mixed-type println,
   if/else/while + break/continue, `time::sleep` + `time::monotonic`
   on `CLOCK_MONOTONIC` with EINTR retry, Duration / Decimal /
@@ -343,15 +345,16 @@ Per the delivery plan:
   patterns (Tuple / Constructor + guards remain
   interpreter-only), (m25) **bimodal schedule-class annotations**
   (`: schedule cooperative | pinned` — no third "greedy" class
-  per bimodality), and (m26) **cooperative scheduler semantics**:
+  per bimodality), (m26) **cooperative scheduler semantics** —
   bus dispatch is deferred via a process-wide FIFO queue; cells
   run between substrate yield points instead of nesting in
-  publisher frames. Spec-aligned per
-  `spec/runtime.md::Schedule classes`; m27 ships pinned threads.
-  **20 of 21 example projects compile to native ELF — every
-  single-binary example.** Only `trellis-pair` (cross-process
-  bus + entry-point selection) remains, gated on substantial
-  new infrastructure.
+  publisher frames, and (m26b) **explicit `yield`** as the rare
+  user-placed substrate cell boundary for long-internal-loop
+  bodies. Spec-aligned per `spec/runtime.md::Schedule classes`;
+  m27 ships pinned threads. **21 of 22 example projects compile
+  to native ELF — every single-binary example.** Only
+  `trellis-pair` (cross-process bus + entry-point selection)
+  remains, gated on substantial new infrastructure.
 - **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
   Phase 3.
 - **Phase 5** — Toolchain. Overlaps Phase 3–4.

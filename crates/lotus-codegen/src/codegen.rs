@@ -2848,6 +2848,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             Stmt::Break(_) => self.lower_break(),
             Stmt::Continue(_) => self.lower_continue(),
+            Stmt::Yield(_) => {
+                // m26b: explicit yield → drain the bus queue at
+                // this point. Per spec/runtime.md cooperative
+                // yield points: "explicit `yield` (rare, for
+                // long-running computations)." Use case: a
+                // long-internal-loop body where you want pending
+                // bus cells to fire mid-body rather than waiting
+                // for the body's normal scope-exit drain.
+                self.emit_bus_drain()?;
+                Ok(BlockEnd::Open)
+            }
             Stmt::Block(b) => self.lower_block(b, scope),
             Stmt::Return(expr_opt, _) => self.lower_return(expr_opt.as_ref(), scope),
             Stmt::Recovery { op, args, modifier, .. } => {

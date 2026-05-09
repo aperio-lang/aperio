@@ -153,7 +153,17 @@ compiler warning.
 
 ```
 trait           impl            async           await
-yield           macro           where           with
+macro           where           with
+```
+
+`yield` is a real statement keyword (m26b) — explicit
+cooperative yield point; lowers to a bus-queue drain in
+codegen. Listed under cooperative-scheduler keywords.
+
+### Cooperative-scheduler keywords
+
+```
+yield
 ```
 
 ## Operators

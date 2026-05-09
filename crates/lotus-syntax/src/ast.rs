@@ -441,6 +441,15 @@ pub enum Stmt {
     Return(Option<Expr>, Span),
     Break(Span),
     Continue(Span),
+    /// Explicit cooperative yield point (m26b). `yield;` drains the
+    /// program-wide bus queue at this point, processing any
+    /// pending substrate cells. Per spec/runtime.md cooperative
+    /// yield points include "explicit `yield` (rare, for
+    /// long-running computations)" — the implicit yield points
+    /// (handler exit, lifecycle transition, bus dispatch) cover
+    /// most cases; `yield` is for the exceptional long-internal-
+    /// loop case where you want pending events to fire mid-body.
+    Yield(Span),
     Block(Block),
     Recovery {
         op: RecoveryOp,

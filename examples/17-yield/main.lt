@@ -1,0 +1,59 @@
+// 17-yield — explicit cooperative yield point.
+//
+// Per spec/runtime.md::Schedule classes, the cooperative yield
+// points are: handler exit, lifecycle transition, bus dispatch,
+// `time::sleep`, and explicit `yield`. The first four are
+// implicit (the substrate does the right thing automatically).
+// `yield;` is the escape hatch for the rare case where you have
+// a long-internal-loop that wants to let pending bus events
+// fire mid-body rather than waiting for the body's normal
+// scope-exit drain.
+//
+// In codegen, `yield;` lowers to lotus_bus_queue_drain at this
+// point — every enqueued substrate cell pops and runs before
+// the surrounding code continues. In the interpreter it's a
+// no-op (single-threaded, synchronous bus dispatch — no queue
+// to drain).
+//
+// This example: a producer publishes; a logger subscribes; the
+// producer's body explicitly yields between batches so the
+// logger gets to process each batch in order, instead of all
+// publishes happening first and all logs at the end.
+
+type Tick {
+    n: Int;
+}
+
+locus TickLogger {
+    bus {
+        subscribe "ticks" as on_tick of type Tick;
+    }
+    fn on_tick(t: Tick) {
+        println("logged tick ", t.n);
+    }
+}
+
+locus TickProducer {
+    bus {
+        publish "ticks" of type Tick;
+    }
+    run() {
+        // Without `yield`, all 3 publishes would enqueue first
+        // and all 3 logs would fire at scope-exit drain. With
+        // `yield`, each batch flushes between publishes — same
+        // observable ordering as today, but EXPLICIT about
+        // when the substrate cell boundary is.
+        "ticks" <- Tick { n: 1 };
+        yield;
+        println("--- after first yield ---");
+        "ticks" <- Tick { n: 2 };
+        yield;
+        println("--- after second yield ---");
+        "ticks" <- Tick { n: 3 };
+    }
+}
+
+fn main() {
+    TickLogger { };
+    TickProducer { };
+}
