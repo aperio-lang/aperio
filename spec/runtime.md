@@ -150,15 +150,42 @@ intermediate ground than time does.)
 - **Pinned → any**: same — cross-thread post; pinned doesn't
   block waiting for delivery acknowledgement.
 
-#### Implementation status (m25)
+#### Implementation status (m26)
 
-m25 wires the annotation through parse / typecheck / codegen.
-The class is recognized and stored on `LocusInfo`, but runtime
-semantics are not yet branched on it — current codegen runs
-everything synchronously via nested bus dispatch. Cooperative
-semantics land in m26 (deferred dispatch + scheduler loop on
-the main thread). Pinned threads land in m27 (`pthread_create`
-+ cross-thread mailbox + optional `sched_setaffinity`).
+m25 wired the annotation through parse / typecheck / codegen.
+**m26 ships cooperative semantics: bus dispatch is deferred.**
+
+Each `<-` enqueues `(handler, self, payload_copy)` cells onto a
+program-wide FIFO queue (`@lotus.bus_queue.global`) instead of
+running handlers inline. The scheduler drain loop pops cells
+one at a time and invokes the handler — handler-atomic per
+substrate cell, with cooperative yields BETWEEN cells rather
+than nested call frames. Handlers may publish more events,
+which enqueue more cells; drain continues until the queue is
+empty at pop time.
+
+Drain runs at the start of every `flush_dissolve_frame` —
+before any long-lived locus dissolves — so subscribers process
+pending cells while still alive. v0 limitation: cells enqueued
+DURING a dissolve are leaked (subscriber gone before its
+handler runs). Realistic programs don't publish during
+dissolve.
+
+The C runtime gained the queue surface:
+```
+ptr  lotus_bus_queue_create(void)
+void lotus_bus_queue_enqueue(ptr q, ptr handler, ptr self, ptr payload)
+void lotus_bus_queue_drain(ptr q)
+void lotus_bus_queue_destroy(ptr q)
+```
+m20's "memcpy payload into subscriber's arena" step happens at
+ENQUEUE time (publisher's frame), so the cell's `payload` ptr
+references storage that's valid until the subscriber dissolves.
+
+Pinned threads (m27) get a separate mailbox per pinned locus
+and the post-across-thread path; cooperative-to-cooperative
+within a single thread keeps the simple shared-queue design
+above.
 
 ### Bus message router
 

@@ -526,6 +526,50 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         arena_global.set_initializer(&ptr_t.const_null());
         arena_global.set_linkage(inkwell::module::Linkage::Internal);
 
+        // m26: cooperative scheduler — bus dispatch queue.
+        // declare ptr  @lotus_bus_queue_create()
+        // declare void @lotus_bus_queue_enqueue(ptr q, ptr handler, ptr self, ptr payload)
+        // declare void @lotus_bus_queue_drain(ptr q)
+        // declare void @lotus_bus_queue_destroy(ptr q)
+        let bus_queue_create_ty = ptr_t.fn_type(&[], false);
+        self.module.add_function(
+            "lotus_bus_queue_create",
+            bus_queue_create_ty,
+            None,
+        );
+        let bus_queue_enqueue_ty = void_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bus_queue_enqueue",
+            bus_queue_enqueue_ty,
+            None,
+        );
+        let bus_queue_drain_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bus_queue_drain",
+            bus_queue_drain_ty,
+            None,
+        );
+        let bus_queue_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bus_queue_destroy",
+            bus_queue_destroy_ty,
+            None,
+        );
+
+        // The program-wide bus queue pointer. Initialized in
+        // main's prelude alongside the arena; drained at
+        // strategic points (before each deferred-dissolve flush)
+        // so cooperative subscribers run their handlers before
+        // they themselves dissolve. Destroyed at main exit.
+        let bus_queue_global =
+            self.module
+                .add_global(ptr_t, None, "lotus.bus_queue.global");
+        bus_queue_global.set_initializer(&ptr_t.const_null());
+        bus_queue_global.set_linkage(inkwell::module::Linkage::Internal);
+
         // declare i32 @fflush(ptr)
         //
         // Used by bubble() right before the dprintf-to-stderr so
@@ -782,16 +826,43 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
-        let handler_callee_ty =
-            void_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        // m26: cooperative semantics — instead of invoking the
+        // handler inline (synchronous nested dispatch), enqueue
+        // a (handler, self, payload_copy) cell onto the program-
+        // wide bus queue. The drain loop pops cells and runs
+        // handlers one at a time at strategic scope-exit points
+        // (currently: end of main, before deferred-dissolve
+        // flush). This makes substrate cells real: each handler
+        // invocation is its own atomic unit, with cooperative
+        // yields between them rather than nested call frames.
+        let queue_global = self
+            .module
+            .get_global("lotus.bus_queue.global")
+            .expect("bus queue global declared");
+        let queue_ptr = self
+            .builder
+            .build_load(ptr_t, queue_global.as_pointer_value(), "queue.cur")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let enqueue_fn = self
+            .module
+            .get_function("lotus_bus_queue_enqueue")
+            .expect("lotus_bus_queue_enqueue declared");
         self.builder
-            .build_indirect_call(
-                handler_callee_ty,
-                handler,
-                &[entry_self.into(), copy_ptr.into()],
-                "handler.call",
+            .build_call(
+                enqueue_fn,
+                &[
+                    queue_ptr.into(),
+                    handler.into(),
+                    entry_self.into(),
+                    copy_ptr.into(),
+                ],
+                "bus.enqueue",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Silence the unused-binding warning for the now-unused
+        // handler_callee_ty (kept around in case we want to
+        // re-introduce a sync path for pinned cross-thread).
+        let _ = void_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.builder
             .build_unconditional_branch(inc_bb)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
@@ -875,7 +946,85 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// dissolve calls in reverse instantiation order. Called just
     /// before the body's final `ret` so the alloca slots are still
     /// live when their drain/dissolve methods read self.X.
+    /// Emit a call to drain the cooperative-scheduler bus queue.
+    /// Pops every enqueued (handler, self, payload) cell and
+    /// invokes the handler. Handlers may enqueue more cells —
+    /// the drain loop in the C runtime continues until the
+    /// queue is empty at pop time. Called at the start of every
+    /// `flush_dissolve_frame` so cooperative subscribers process
+    /// pending cells BEFORE they themselves dissolve.
+    fn emit_bus_drain(&mut self) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let queue_global = self
+            .module
+            .get_global("lotus.bus_queue.global")
+            .expect("bus queue global declared");
+        let queue_ptr = self
+            .builder
+            .build_load(
+                ptr_t,
+                queue_global.as_pointer_value(),
+                "queue.cur",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let drain_fn = self
+            .module
+            .get_function("lotus_bus_queue_drain")
+            .expect("lotus_bus_queue_drain declared");
+        self.builder
+            .build_call(
+                drain_fn,
+                &[queue_ptr.into()],
+                "bus.queue.drain",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Emit a call to destroy the bus queue. Used at every
+    /// main-exit point so the queue tears down cleanly. Cells
+    /// enqueued AFTER the last drain (e.g. by code in a
+    /// dissolve method that publishes after its own subscribers
+    /// have already dissolved) are leaked here — v0 limitation;
+    /// realistic programs don't publish during dissolve.
+    fn emit_bus_queue_destroy(&mut self) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let queue_global = self
+            .module
+            .get_global("lotus.bus_queue.global")
+            .expect("bus queue global declared");
+        let queue_ptr = self
+            .builder
+            .build_load(
+                ptr_t,
+                queue_global.as_pointer_value(),
+                "queue.destroy.cur",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let destroy_fn = self
+            .module
+            .get_function("lotus_bus_queue_destroy")
+            .expect("lotus_bus_queue_destroy declared");
+        self.builder
+            .build_call(
+                destroy_fn,
+                &[queue_ptr.into()],
+                "bus.queue.destroy.call",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
     fn flush_dissolve_frame(&mut self) -> Result<(), CodegenError> {
+        // m26: drain the bus queue BEFORE dissolves fire, so
+        // every cooperative subscriber gets to process pending
+        // cells while it's still alive. Handlers may publish
+        // more events; the C-side drain loop keeps popping
+        // until the queue is empty at pop time. Anything
+        // enqueued during the dissolves below is leaked (v0
+        // limitation; realistic programs don't publish
+        // during dissolve).
+        self.emit_bus_drain()?;
         let frame = self
             .deferred_dissolves
             .pop()
@@ -1160,6 +1309,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_store(arena_global.as_pointer_value(), arena_ptr)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
+        // m26: spin up the cooperative-scheduler bus queue.
+        // Bus dispatch enqueues here at publish time; the drain
+        // loop pops cells at scope-exit points (currently before
+        // deferred-dissolve flush). Even programs with no bus
+        // subscribes get a queue allocated — costs ~80 bytes;
+        // not worth the conditional-emit complexity to skip it.
+        let queue_create = self
+            .module
+            .get_function("lotus_bus_queue_create")
+            .expect("lotus_bus_queue_create declared");
+        let queue_ptr = self
+            .builder
+            .build_call(queue_create, &[], "bus.queue.init")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("queue_create returns ptr");
+        let queue_global = self
+            .module
+            .get_global("lotus.bus_queue.global")
+            .expect("bus queue global declared");
+        self.builder
+            .build_store(queue_global.as_pointer_value(), queue_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
         let mut scope = Scope::default();
         let end = self.lower_block(&main_decl.body, &mut scope)?;
 
@@ -1176,6 +1350,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // the early-return path emitted in `lower_return` when
             // a user `return n;` from main runs.
             self.emit_arena_destroy()?;
+            self.emit_bus_queue_destroy()?;
             let zero = i32_t.const_int(0, false);
             self.builder
                 .build_return(Some(&zero))
@@ -3223,6 +3398,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // then tear down the arena.
             self.flush_dissolve_frame()?;
             self.emit_arena_destroy()?;
+            self.emit_bus_queue_destroy()?;
             // Re-open an empty frame so the post-flush bookkeeping
             // (popped in lower_program) stays balanced.
             self.push_dissolve_frame();

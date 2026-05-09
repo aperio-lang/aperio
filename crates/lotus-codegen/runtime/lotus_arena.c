@@ -199,3 +199,121 @@ void lotus_arena_destroy(lotus_arena_t *a) {
     if (a->free_list) free(a->free_list);
     free(a);
 }
+
+/*
+ * Cooperative scheduler — bus dispatch queue (m26).
+ *
+ * Per The Design / lotus, every bus dispatch is a substrate
+ * cell. The cooperative scheduler enqueues these cells at
+ * publish time and pops them one at a time at drain time.
+ * Each pop runs the handler to completion (handler-atomic;
+ * cooperative yields BETWEEN cells, not within). Handlers may
+ * publish more events, which enqueue more cells; drain
+ * continues until the queue is empty.
+ *
+ * v0 is single-threaded — one queue, one drain loop, runs at
+ * end of main and at strategic scope-exit points. m27 will
+ * spawn dedicated threads for pinned-class loci, with
+ * cross-thread mailbox post for any-class → pinned dispatch.
+ *
+ * The queue stores (handler, self, payload) triples. The
+ * payload is already in the subscriber's arena (memcpy'd at
+ * enqueue time, per spec/memory.md "A typed message crossing
+ * a locus boundary is a copy, not a pointer."). At drain
+ * time we just call handler(self, payload).
+ */
+
+typedef struct lotus_bus_cell {
+    void *handler;          /* void (*)(void *self, void *payload) */
+    void *self_ptr;         /* subscriber's locus ptr */
+    void *payload;          /* copy in subscriber's arena */
+} lotus_bus_cell_t;
+
+typedef struct lotus_bus_queue {
+    lotus_bus_cell_t *cells;
+    size_t            head;     /* next slot to pop */
+    size_t            tail;     /* next slot to fill */
+    size_t            cap;
+} lotus_bus_queue_t;
+
+#define LOTUS_BUS_QUEUE_INITIAL_CAP 64
+
+lotus_bus_queue_t *lotus_bus_queue_create(void) {
+    lotus_bus_queue_t *q =
+        (lotus_bus_queue_t *)malloc(sizeof(lotus_bus_queue_t));
+    if (!q) return NULL;
+    q->cap   = LOTUS_BUS_QUEUE_INITIAL_CAP;
+    q->cells = (lotus_bus_cell_t *)
+        malloc(q->cap * sizeof(lotus_bus_cell_t));
+    if (!q->cells) {
+        free(q);
+        return NULL;
+    }
+    q->head = 0;
+    q->tail = 0;
+    return q;
+}
+
+/* Enqueue (handler, self, payload). Grows the cell array
+ * geometrically when full; head/tail are monotonic indices
+ * (compacted on grow). v0 keeps it simple — no ring buffer,
+ * no power-of-two mask, just a linear array with grow-on-full
+ * semantics. Trellis-grade workloads typically have queues of
+ * a few hundred cells max; the full memcpy on grow is fine. */
+void lotus_bus_queue_enqueue(lotus_bus_queue_t *q,
+                             void *handler,
+                             void *self_ptr,
+                             void *payload) {
+    if (!q) return;
+    if (q->tail == q->cap) {
+        /* Compact first: slide live cells to the front. */
+        size_t live = q->tail - q->head;
+        if (q->head > 0) {
+            memmove(q->cells, q->cells + q->head,
+                    live * sizeof(lotus_bus_cell_t));
+            q->head = 0;
+            q->tail = live;
+        }
+        if (q->tail == q->cap) {
+            /* Truly full — double the capacity. */
+            size_t new_cap = q->cap * 2;
+            lotus_bus_cell_t *new_cells = (lotus_bus_cell_t *)
+                realloc(q->cells, new_cap * sizeof(lotus_bus_cell_t));
+            if (!new_cells) return;     /* drop on OOM */
+            q->cells = new_cells;
+            q->cap   = new_cap;
+        }
+    }
+    q->cells[q->tail].handler  = handler;
+    q->cells[q->tail].self_ptr = self_ptr;
+    q->cells[q->tail].payload  = payload;
+    q->tail++;
+}
+
+/* Drain the queue: pop cells one at a time and invoke
+ * `handler(self, payload)`. Handlers may enqueue more cells
+ * (cooperative-cooperative bus dispatch is the natural
+ * interleaving — see The Design / lotus, substrate cells).
+ * Loops until the queue is empty AT POP TIME, including any
+ * cells enqueued during the drain itself. */
+typedef void (*lotus_handler_fn)(void *self, void *payload);
+
+void lotus_bus_queue_drain(lotus_bus_queue_t *q) {
+    if (!q) return;
+    while (q->head < q->tail) {
+        lotus_bus_cell_t cell = q->cells[q->head++];
+        ((lotus_handler_fn)cell.handler)(cell.self_ptr, cell.payload);
+    }
+    /* Reset indices so subsequent enqueues start fresh — this
+     * is functionally optional (tail can keep growing), but
+     * makes peek/inspect easier and keeps the working-set
+     * memory smaller across long-running drains. */
+    q->head = 0;
+    q->tail = 0;
+}
+
+void lotus_bus_queue_destroy(lotus_bus_queue_t *q) {
+    if (!q) return;
+    if (q->cells) free(q->cells);
+    free(q);
+}

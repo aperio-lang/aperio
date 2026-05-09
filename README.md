@@ -24,12 +24,14 @@ children with free-list slot reuse, recognition is a documented
 stub behind the same path, and `<-` copies payloads from the
 publisher's arena into the subscriber's arena per
 spec/memory.md, (m24) **match expressions** with Literal /
-Wildcard / Binding patterns, and (m25) **bimodal
-schedule-class annotations** (`: schedule cooperative |
-pinned`) — parses + resolves; runtime semantics in m26
-(cooperative) and m27 (pinned). **20 of 21 examples build to
-native ELF — every single-binary example is a build target.**
-Phase 3 (codegen) is at milestone 25: literals +
+Wildcard / Binding patterns, (m25) **bimodal schedule-class
+annotations** (`: schedule cooperative | pinned`), and (m26)
+**cooperative scheduler semantics** — bus dispatch is deferred
+via a process-wide FIFO queue; cells run between substrate
+yield points instead of nesting in publisher frames; m27 will
+spawn dedicated threads for pinned loci. **20 of 21 examples
+build to native ELF — every single-binary example is a build
+target.** Phase 3 (codegen) is at milestone 26: literals +
 arithmetic, `let`/`let mut` + assignment + compound ops,
 `if`/`else`/`while` + `break`/`continue`, `time::sleep` on
 `CLOCK_MONOTONIC` with EINTR retry, `time::monotonic()` +
@@ -314,7 +316,7 @@ Per the delivery plan:
   Region allocator + cooperative scheduler are the remaining
   Phase 2 deep-pushes.
 - **Phase 3** — Codegen in Rust targeting LLVM. *In progress;
-  milestone 25 of N complete.* Working subset: literals, arithmetic,
+  milestone 26 of N complete.* Working subset: literals, arithmetic,
   `let`/`let mut` + assignment + compound ops, mixed-type println,
   if/else/while + break/continue, `time::sleep` + `time::monotonic`
   on `CLOCK_MONOTONIC` with EINTR retry, Duration / Decimal /
@@ -339,16 +341,17 @@ Per the delivery plan:
   publisher / subscriber arenas as the spec requires,
   (m24) **match expressions** with Literal / Wildcard / Binding
   patterns (Tuple / Constructor + guards remain
-  interpreter-only), and (m25) **schedule-class annotations** —
-  bimodal `: schedule cooperative | pinned` (no third "greedy"
-  class — would be a bimodality violation; cooperative already
-  gives handler-atomicity, anything beyond that means owning
-  your own thread = pinned). Parses and resolves; m26
-  introduces cooperative semantics (deferred bus dispatch); m27
-  spawns pinned threads. **20 of 21 example projects compile to
-  native ELF — every single-binary example.** Only
-  `trellis-pair` (cross-process bus + entry-point selection)
-  remains, gated on substantial new infrastructure.
+  interpreter-only), (m25) **bimodal schedule-class annotations**
+  (`: schedule cooperative | pinned` — no third "greedy" class
+  per bimodality), and (m26) **cooperative scheduler semantics**:
+  bus dispatch is deferred via a process-wide FIFO queue; cells
+  run between substrate yield points instead of nesting in
+  publisher frames. Spec-aligned per
+  `spec/runtime.md::Schedule classes`; m27 ships pinned threads.
+  **20 of 21 example projects compile to native ELF — every
+  single-binary example.** Only `trellis-pair` (cross-process
+  bus + entry-point selection) remains, gated on substantial
+  new infrastructure.
 - **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
   Phase 3.
 - **Phase 5** — Toolchain. Overlaps Phase 3–4.

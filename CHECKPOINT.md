@@ -1,14 +1,15 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 25 (schedule-class
-annotation infrastructure) on top of m24 (`match` expressions)
-and the m19→m23 region-allocator arc. **20 of 21 examples build
-to native ELF — every single-binary example, including
-`14-projection-classes`, `15-match`, and `16-schedule-classes`
-(m25 smoke test).** Only `trellis-pair` (multi-binary,
-cross-process bus) remains, gated on substantial new
-infrastructure.
+new session. State as of codegen milestone 26 (cooperative
+scheduler semantics — bus dispatch is deferred; cells run
+through a process-wide FIFO queue drained between substrate-
+cell yield points) on top of m25 (bimodal schedule-class
+annotation), m24 (`match` expressions), and the m19→m23
+region-allocator arc. **20 of 21 examples build to native ELF —
+every single-binary example.** Only `trellis-pair`
+(multi-binary, cross-process bus) remains, gated on
+substantial new infrastructure.
 
 **Schedule-class arc opened.** Per The Design / lotus, schedule
 class is to execution what projection class is to memory —
@@ -76,6 +77,24 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 17 of 18 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 26** (cooperative scheduler semantics) —
+  complete. Bus dispatch is now deferred: each `<-` enqueues
+  `(handler, self, payload_copy)` cells onto a program-wide
+  FIFO queue (`@lotus.bus_queue.global`) instead of running
+  handlers inline. The C-runtime drain loop pops cells one at
+  a time and invokes the handler — handler-atomic per substrate
+  cell, with cooperative yields between cells rather than
+  nested call frames. Handlers may publish more events; drain
+  continues until empty. Drain runs at the start of every
+  `flush_dissolve_frame` so cooperative subscribers process
+  pending cells before they themselves dissolve. v0 limitation:
+  cells enqueued during dissolves are leaked (subscriber gone).
+  trellis-demo + 05-bus output unchanged from sync-nested days
+  — interleaving naturally produces the same observable order
+  for these examples (kernel multipliers all 1.0; 05-bus is a
+  linear two-stage chain). Spec/runtime.md updated;
+  spec-aligned per "cooperative yield points: between handler
+  invocations, between lifecycle transitions, on bus dispatch."
 - **Phase 3 milestone 25** (schedule-class annotation
   infrastructure, bimodal) — complete. New keywords
   `schedule`, `cooperative`, `pinned` in lexer (no `greedy` —
@@ -164,17 +183,14 @@ Phase status:
   handles stay in parent.children (for `for child in
   self.children`) but the parent's later cascade skips
   already-dissolved children.
-- **Phase 3 next** — m26 (cooperative scheduler semantics):
-  deferred bus dispatch + scheduler loop on the main thread;
-  cooperative loci yield between substrate cells; greedy loci
-  stay on the synchronous path (= today's behavior). This is
-  where trellis-demo's output may shift (sync nested →
-  deferred FIFO interleaves Books / Kernel / Intent
-  differently). Then m27 (pinned threads): pthread_create per
-  pinned locus; cross-thread bus mailbox; thread-local arena
-  pointer. After that arc: `trellis-pair` (cross-process bus +
-  entry-point selection) becomes the natural exercise of the
-  full multi-scheduler runtime.
+- **Phase 3 next** — m27 (pinned threads): pthread_create per
+  pinned locus; cross-thread bus mailbox (the post-and-continue
+  side of the spec's "any → pinned" rule); optional
+  `sched_setaffinity` for explicit core pinning. After that
+  arc: `trellis-pair` (cross-process bus + entry-point
+  selection) becomes the natural exercise of the full multi-
+  scheduler runtime — substrate is finally complete enough
+  that the application stops being aspirational.
 
 ## Transport layering (decided 2026-05-08)
 
@@ -290,7 +306,7 @@ m24 Codegen milestone 24: match expressions                    (bb948c6)
                             typecheck
                           + examples/15-match
 m25 Codegen milestone 25: schedule-class annotation infra      (bbe2731 +
-                                                                this commit)
+                                                                763edf8)
                           ⇒ `: schedule cooperative | pinned`
                             parses, typechecks, resolves on
                             LocusInfo; default cooperative; no
@@ -298,6 +314,13 @@ m25 Codegen milestone 25: schedule-class annotation infra      (bbe2731 +
                             Bimodal-only: greedy dropped on
                             review as a bimodality violation.
                           + examples/16-schedule-classes
+m26 Codegen milestone 26: cooperative scheduler semantics      (this commit)
+                          ⇒ bus dispatch deferred via process-
+                            wide FIFO queue (lotus_bus_queue_*);
+                            drain runs at flush_dissolve_frame
+                            entry so subscribers process cells
+                            before they dissolve; cells enqueued
+                            during dissolves are leaked (v0)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
