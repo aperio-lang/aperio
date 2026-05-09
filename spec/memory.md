@@ -530,6 +530,30 @@ m20 deliberately keeps free fns + main on the program-wide arena
 class — chunked-class per-coordinatee sub-regions land in m22,
 the recognition-class fixed pool in m23.
 
+**m49 closes the free-fn gap.** Every non-main free fn now takes
+an implicit `__caller_arena: ptr` first param at the LLVM ABI.
+At body entry the callee opens a subregion of `__caller_arena`
+via `lotus_arena_create_subregion(__caller_arena)`; the body's
+allocations route through that subregion (a new tier between
+`current_self`'s arena and `arena.global` in the codegen-side
+allocation routing). At return, the body branches to a unified
+`fn.exit` epilogue that deep-copies the return value into
+`__caller_arena` (identity for value types; `lotus_str_clone`
+for String; recursive walk for Tuple), destroys the subregion
+wholesale, and emits `build_return`. `main` keeps the
+program-wide `arena.global` it always had — it's the single fn
+without a caller. Heap-typed returns of Array, TypeRef-struct,
+or has-payload-Enum are rejected at v0.1 — none currently
+appear as free-fn returns; ship as a follow-up when a workload
+demands. This delivers the spec's "every free function has its
+own implicit locus" memory boundary at the codegen substrate.
+Bound handles in free fn bodies still attach to the enclosing
+deferred-dissolve frame (lifecycle parity with main and lifecycle
+methods); the implicit-locus *handle-rooting* semantic — fn
+return waits for in-fn-bound children to dissolve as if the fn
+were itself a locus — remains a future-work item, not exercised
+by any current example.
+
 ### Per-projection-class arena strategies (m22 + m23)
 
 Each locus's projection class is resolved at codegen-declare

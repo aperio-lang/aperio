@@ -1,7 +1,24 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **enums-complete**: a session arc
+in a new session. State as of **m49: free-fn implicit-locus
+arenas**: every non-main free fn now opens a per-call subregion
+of its caller's arena at body entry; body allocations route
+through it; heap-typed return values are deep-copied into the
+caller's arena (`lotus_str_clone` for String, recursive walk
+for Tuple, identity for value types) before the subregion is
+wholesale-freed; `main` keeps `arena.global` as the single
+caller-less fn. Closes the m20 deferral that kept all free-fn
+allocations leaking into a program-wide arena until process
+exit; spec/memory.md "Free `fn` functions" boundary is now
+enforced at the codegen substrate. Interpreter unchanged
+(Rust ownership already handles lifetimes correctly). Heap
+returns of Array / TypeRef-struct / has-payload-Enum reject
+at v0.1 — none currently appear as free-fn returns; ship when
+a workload demands. New `examples/46-fn-arenas` exercises
+String + Tuple deep-copy in a loop.
+
+State before that was **enums-complete**: a session arc
 that started with no-payload tagged unions (m47) and finished
 with full-fidelity payload-bearing variants. Surface coverage:
 `type X = enum { A, B(Int), C(Decimal, String) };` declares any
@@ -112,7 +129,7 @@ post-m46 hardening — `emit_locus_arena_destroy` now calls
 `lotus_bus_quarantine_self(self_ptr)` before destroying the
 arena, mirroring the m41b deregistration path so a stale
 entries-vec entry can never direct dispatch into freed
-memory after dissolution. **48 of 49 examples build to
+memory after dissolution. **49 of 50 examples build to
 native ELF — every single-binary example.** Only
 `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -171,7 +188,7 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 48 of 49 example
+- **Phase 2 v0** (interpreter + bus router) — 49 of 50 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
 - **Enums arc complete** (m47 base + m47-followups + m47-payloads
@@ -257,6 +274,61 @@ Phase status:
   Event mixing no-payload Halt, single-arg Tick, multi-arg
   Trade(Decimal, Int); exercises match, direct println,
   deep ==).
+
+- **Phase 3 milestone 49** (free-fn implicit-locus arenas) —
+  complete. Closes the m20 deferral that kept all free-fn
+  allocations on the program-wide `arena.global` until process
+  exit. Per spec/memory.md "Free `fn` functions" §, every free
+  function should have its own implicit locus — m20 punted on
+  the per-call arena, m49 ships it. Codegen-only (the
+  interpreter relies on Rust ownership and is unaffected). Each
+  non-main free fn now takes an implicit `__caller_arena: ptr`
+  first param at the LLVM ABI; at body entry the callee opens
+  a subregion of `__caller_arena` via
+  `lotus_arena_create_subregion`, stores the handle in a
+  fn-local alloca, and `current_arena_ptr` falls through to it
+  (a new tier between `current_self`'s arena and `arena.global`,
+  the latter now reachable only from `main`'s body). Body
+  allocations route through the subregion; on every `return`
+  the body branches to a unified `fn.exit` epilogue that
+  deep-copies the return value into `__caller_arena`, destroys
+  the subregion wholesale, and emits `build_return`. Refactor
+  routes Stmt::Return through the exit block via a ret-value
+  alloca + br instead of inline build_return so the destroy +
+  copy never duplicate at every return site. Lifecycle methods
+  (mode, run, accept, drain, dissolve, on_failure, bus
+  handlers) keep their direct build_return path — they don't
+  own a subregion (they run *as the locus*) and `lower_return`
+  picks the path by checking whether `current_user_fn_exit_bb`
+  is set. Deep-copy is a small recursive helper:
+  `emit_return_value_deep_copy(value, ty, dest_arena)` — value
+  types (Int / Float / Bool / Decimal-i128 / Time / Duration /
+  no-payload-Enum) identity; String calls a new
+  `lotus_str_clone(arena, src)` C-runtime helper (sibling of
+  `lotus_str_concat` minus the right operand); Tuple allocates
+  a fresh storage struct in dest_arena and recursively copies
+  each field (so a `(Int, String)` return deep-copies the
+  String buffer too). Heap returns of Array, TypeRef-struct, or
+  has-payload-Enum reject for v0.1 — none currently appear as
+  free-fn returns; ship as a follow-up when a workload demands.
+  `main` keeps its existing `arena.global` setup unchanged.
+  Bound handles in free fn bodies still attach to the enclosing
+  deferred-dissolve frame (lifecycle parity with main); the
+  full implicit-locus *handle-rooting* semantic — fn return
+  waits for in-fn-bound children to dissolve as if the fn were
+  a locus — remains future-work, not exercised by any current
+  example. New `examples/46-fn-arenas/` exercises the path:
+  a `decorate(name, n) -> String` that allocates two intermediate
+  concats inside the subregion called in a `for i in 1..=5`
+  loop, plus a `pair(a, b) -> (Int, String)` exercising
+  recursive deep-copy through a tuple. Both backends produce
+  byte-identical output. Existing examples 27-strings,
+  26-tuples, 09-functions, 23-ranges, 24-default-params,
+  28-to-string, 29-helpers, 21-arrays, 13-decimal-and-exit,
+  43-enums all still pass parity (their free-fn returns now
+  route through the new code path; the surface output is
+  unchanged because parity was always defined at stdout, not at
+  arena residency). All 91 unit tests still pass.
 
 - **Phase 3 milestone 48** (Decimal fixed-point) — complete.
   v0 stored Decimal as a String (interpreter) / f64 (codegen) and
@@ -1895,8 +1967,14 @@ ephemeral cascade — design needed before lowering.
 - Recognition-class real bitmap-pool (currently chunked-
   equivalent stub per spec/memory.md). Workload-pending.
 - Decimal precision tightening (printf %g vs Display).
-- Free-fn implicit-locus arenas (spec is fuzzy on
-  return-value-copy semantics).
+- Free-fn implicit-locus arenas: per-call subregion +
+  return-value deep-copy shipped in m49. Remaining gap is
+  the *handle-rooting* half of the spec — fn return waits
+  for in-fn-bound children to dissolve as if the fn were a
+  locus. No current example exercises bound handles inside
+  a free fn; defer until one does. Heap-typed returns of
+  Array / TypeRef-struct / has-payload-Enum also defer
+  pending workload (none in current corpus).
 - Cells enqueued during dissolves are leaked (m26 v0
   limit). Realistic programs don't publish during dissolve;
   fix would be a drain-loop-until-empty wrapper around the
@@ -2065,6 +2143,9 @@ rm examples/40-pinned-duration/main
 cargo run --bin lotus -- build examples/41-closure-accumulator/main.lt
 ./examples/41-closure-accumulator/main   # sum(self.delta) running total trips band of 100 at 4th cell; quarantined
 rm examples/41-closure-accumulator/main
+cargo run --bin lotus -- build examples/46-fn-arenas/main.lt
+./examples/46-fn-arenas/main             # m49: per-call subregion + return-copy; [tick:1..5] + sum=42 / label=[sum:42]
+rm examples/46-fn-arenas/main
 ```
 
-If all forty-five work, the checkpoint is intact.
+If all of these work, the checkpoint is intact.
