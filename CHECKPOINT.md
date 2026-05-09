@@ -1,11 +1,12 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of m34 (default param values on locus `fn`
-methods) — the surface-completeness arc that started after the
-m28 scheduler shipped. Substrate arc: m19→m23 (region allocator
-with rich/chunked/recognition + per-locus arenas + bus copy),
-m24 (`match`), m25 (bimodal schedule-class annotation), m26
+new session. State as of m35 (tuples — values + numeric field
+access + flat destructure + tuple patterns in match) — the
+surface-completeness arc that started after the m28 scheduler
+shipped. Substrate arc: m19→m23 (region allocator with
+rich/chunked/recognition + per-locus arenas + bus copy), m24
+(`match`), m25 (bimodal schedule-class annotation), m26
 (cooperative scheduler — deferred bus + drain loop), m26b
 (explicit `yield`), m27 (pinned threads, run-only), m28a (full
 pinned lifecycle), m28b (cross-thread bus mailboxes), m28c
@@ -15,9 +16,13 @@ for-over-array), m30b (indexed local-array assignment), m31
 (integer ranges as for-iterators), m32 (default param values
 on free fns), m33 (multi-file `import` resolution; std/* skipped
 as built-ins), m34 (default param values on locus `fn`
-methods; bus-handlers + modes still reject). **29 of 30
-examples build to native ELF — every single-binary example.**
-Only `trellis-pair` (multi-binary, cross-process bus) remains.
+methods; bus-handlers + modes still reject), m35 (tuples
+— anonymous heterogeneous records of fixed arity ≥ 2, with
+`(a, b)` literals, `t.0` / `t.1` numeric field access, `let
+(a, b) = pair;` destructure, and tuple patterns in match
+arms). **30 of 31 examples build to native ELF — every
+single-binary example.** Only `trellis-pair` (multi-binary,
+cross-process bus) remains.
 
 **The bimodal scheduler is fully complete.** Cooperative loci
 yield between substrate cells via the inline-payload deferred
@@ -74,9 +79,35 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 29 of 30 example
+- **Phase 2 v0** (interpreter + bus router) — 30 of 31 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 35** (tuples — values + patterns +
+  destructure) — complete. Tuples are anonymous
+  heterogeneous records of fixed arity ≥ 2, lowered as
+  pointers to arena-backed anonymous LLVM structs. New
+  surface: tuple literal `(a, b)`, numeric field access
+  `t.0` / `t.1`, flat `let (a, b) = pair;` destructure, and
+  tuple patterns in match arms (sub-patterns: Wildcard,
+  Binding, Literal). Tuple types in fn signatures including
+  return position — multi-value return without forcing the
+  caller to invent a one-off `type` decl. Empty tuple `()`
+  rejected per the user's lock-in (no unit-typed surface in
+  v0); nested tuple sub-patterns deferred until a workload
+  asks. AST gained `Stmt::LetTuple` as a sibling of
+  `Stmt::Let`; parser peeks `LParen` after `let mut?` to
+  disambiguate. Numeric tuple-field access lands by
+  extending parse_postfix to accept an IntLit after `.`
+  (digit string stored as the field name) and routing
+  through tuple-shaped receivers in codegen / typecheck /
+  interpreter. Match-arm refactor: `binding: Option<...>` →
+  `bindings: Vec<...>` so tuple patterns can introduce
+  multiple bindings; literal-EQ comparison extracted to
+  `lower_match_eq_cmp` for shared dispatch. New
+  `examples/26-tuples/` exercises divmod returning `(Int,
+  Int)`, let destructure, numeric field access, and a
+  classify(x, y) match against a (sign(x), sign(y))-shaped
+  tuple.
 - **Phase 3 milestone 34** (default param values on locus `fn`
   methods) — complete. Locus methods called via
   `self.method(...)` now support default param values
@@ -589,6 +620,23 @@ m33fix m33 fix: skip std/* imports during file resolution      (2358ea3)
                             (toolchain handles time::* as
                             built-ins) instead of trying to load
                             on-disk source. Fixed regression.
+m35    m35: tuples — values + patterns + destructure          (4e0a19b)
+                          ⇒ LotusType::Tuple(Vec<LotusType>);
+                            tuple literal `(a, b)` lowers to
+                            arena-backed anonymous struct alloc;
+                            numeric field access `t.0` / `t.1`
+                            via parse_postfix IntLit-after-dot
+                            extension; flat let destructure via
+                            new Stmt::LetTuple variant; tuple
+                            patterns in match arms with sub-
+                            patterns Wildcard / Binding / Literal
+                            (acc-AND-merged). Empty tuple `()`
+                            rejected (no unit-typed surface);
+                            nested tuple sub-patterns deferred.
+                            Match-arm code refactored to a Vec
+                            of bindings; literal-EQ comparison
+                            extracted to lower_match_eq_cmp.
+                          + examples/26-tuples
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -647,6 +695,10 @@ m7 builds on the struct ABI.
 | Default fn param values (free fns; suffix-only rule) | ✅ | ✅ |
 | Default values on locus methods (non-bus, non-mode) | ✅ | ✅ |
 | `import "..."` resolution (multi-file projects) | ✅ | ✅ |
+| Tuple literals `(a, b)` + tuple types `(T1, T2)` | ✅ | ✅ |
+| Tuple numeric field access (`t.0`, `t.1`) | ✅ | ✅ |
+| Flat `let (a, b) = pair;` destructure | ✅ | ✅ |
+| Tuple patterns in match (Wildcard / Binding / Literal subs) | ✅ | ✅ |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
 | Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
@@ -766,6 +818,7 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
+4e0a19b m35: tuples — values + patterns + destructure
 1a01f40 CHECKPOINT.md: align ahead-count with new origin/master tip
 2358ea3 m33 fix: skip std/* imports during file resolution
 315ad4d m34: default param values on locus fn methods
@@ -812,9 +865,10 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-8 commits ahead of origin/master at checkpoint time (origin
+10 commits ahead of origin/master at checkpoint time (origin
 moved up to a5fc8bd / the prior session's tip; this session
-shipped m30 → m34 + the std/* import-resolution fix).
+shipped m30 → m34 + the std/* import-resolution fix, then
+m35 for tuples).
 
 ## Next steps in priority order
 
@@ -860,8 +914,10 @@ ladder. Two pieces:
 
 **Polish (any time):**
 
-- Tuple / Constructor patterns in match (needs tuple values
-  in codegen first)
+- Constructor patterns in match (enum variants need a real
+  enum-value representation first; struct-by-name was the v0
+  shape but no example exercised it). Tuple patterns shipped
+  in m35.
 - Default param values on bus-subscribed handlers + mode methods
   (locus `fn` methods called via `self.method(...)` work as of
   m34; bus dispatch is fixed-arity at the C-runtime level so
@@ -990,6 +1046,9 @@ rm examples/24-default-params/main
 cargo run --bin lotus -- build examples/25-imports/main.lt
 ./examples/25-imports/main               # multi-file: types.lt + notional.lt + main.lt → "GOOG notional = 17050"
 rm examples/25-imports/main
+cargo run --bin lotus -- build examples/26-tuples/main.lt
+./examples/26-tuples/main                # divmod / let-destructure / numeric field access / classify match
+rm examples/26-tuples/main
 ```
 
-If all twenty-nine work, the checkpoint is intact.
+If all thirty work, the checkpoint is intact.
