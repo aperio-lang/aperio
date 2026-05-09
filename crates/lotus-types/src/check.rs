@@ -801,7 +801,31 @@ impl<'a> Checker<'a> {
                     Ty::Unknown
                 }
             }
-            Expr::Path(_) | Expr::Path2 { .. } => Ty::Unknown,
+            Expr::Path(qn) => {
+                // m47-followup: 2-segment path may be an enum
+                // variant construction (`EnumName::VariantName`).
+                // Resolve to the enum type so let-bindings,
+                // tuple/array literals, and struct fields can
+                // unify against the declared shape rather than
+                // falling through to Unknown (which made `let x:
+                // Color = Color::Red;` fail with `expected Color,
+                // got ?`).
+                if qn.segments.len() == 2 {
+                    let enum_name = &qn.segments[0].name;
+                    let variant_name = &qn.segments[1].name;
+                    if let Some(TopSymbol::Type(TypeInfo {
+                        kind: TypeKind::Enum(variants),
+                        ..
+                    })) = self.top.symbols.get(enum_name)
+                    {
+                        if variants.iter().any(|v| v.name == *variant_name) {
+                            return Ty::Named(enum_name.clone());
+                        }
+                    }
+                }
+                Ty::Unknown
+            }
+            Expr::Path2 { .. } => Ty::Unknown,
             Expr::KwSelf(span) => {
                 if self.current_locus.is_none() {
                     self.diags.push(Diag::ty(
