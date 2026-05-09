@@ -766,6 +766,52 @@ impl Interpreter {
                 self.read_field(&r, &name.name)
             }
             Expr::Index { receiver, index, .. } => {
+                // m36: range-indexed receiver does string slicing
+                // (interpreter parity with codegen). Today only
+                // String supports slicing — Array slicing would
+                // need a length-aware slice value the v0
+                // representation doesn't carry. Inclusive range
+                // bumps `hi` by 1 to match exclusive-clamp logic.
+                if let Expr::Range { lo, hi, inclusive, .. } = index.as_ref() {
+                    let r = self.eval_expr(receiver)?;
+                    let s = match &r {
+                        Value::String(s) => s.clone(),
+                        other => {
+                            return Err(Signal::Error(format!(
+                                "range slicing only supported on String; \
+                                 got {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    let lo_v = self.eval_expr(lo)?;
+                    let hi_v = self.eval_expr(hi)?;
+                    let lo_i = match lo_v {
+                        Value::Int(n) => n,
+                        other => {
+                            return Err(Signal::Error(format!(
+                                "string slice lo bound must be Int; got {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    let hi_i = match hi_v {
+                        Value::Int(n) => n,
+                        other => {
+                            return Err(Signal::Error(format!(
+                                "string slice hi bound must be Int; got {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    let n = s.len() as i64;
+                    let lo_c = lo_i.max(0).min(n);
+                    let hi_excl = if *inclusive { hi_i + 1 } else { hi_i };
+                    let hi_c = hi_excl.max(lo_c).min(n);
+                    return Ok(Value::String(
+                        s[lo_c as usize..hi_c as usize].to_string(),
+                    ));
+                }
                 let r = self.eval_expr(receiver)?;
                 let i = self.eval_expr(index)?;
                 read_index(&r, &i).map_err(Signal::Error)

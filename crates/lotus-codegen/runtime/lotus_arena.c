@@ -587,3 +587,62 @@ void lotus_set_core_affinity(unsigned long tid, int core) {
  * declares `bus subscribe`; the codegen branches on that at
  * compile time (m28b).
  */
+
+/*
+ * String helpers (m36).
+ *
+ * Strings in the codegen are NUL-terminated byte arrays. A
+ * literal lives as a module-global; a concat / slice result
+ * lives in an arena, owned by the caller's locus. All string
+ * ops preserve the "value is a pointer" shape — Codegen's
+ * LotusType::String maps to a basic ptr_t at the LLVM level
+ * regardless of provenance.
+ *
+ * Lifetimes follow the spec/memory.md region rule: results land
+ * in whatever arena the caller passes (their current locus's
+ * arena, or the program-wide arena in `main` and free fns).
+ * No per-string free; the arena's wholesale destroy reclaims
+ * everything together.
+ */
+char *lotus_str_concat(lotus_arena_t *a, const char *l, const char *r) {
+    size_t lL = strlen(l);
+    size_t lR = strlen(r);
+    char *out = (char *)lotus_arena_alloc(a, lL + lR + 1, 1);
+    if (!out) return NULL;
+    memcpy(out, l, lL);
+    memcpy(out + lL, r, lR);
+    out[lL + lR] = '\0';
+    return out;
+}
+
+int lotus_str_eq(const char *l, const char *r) {
+    return strcmp(l, r) == 0 ? 1 : 0;
+}
+
+int64_t lotus_str_len(const char *s) {
+    return (int64_t)strlen(s);
+}
+
+/*
+ * Substring `s[lo..hi]` with exclusive `hi`. Bounds clamp so
+ * out-of-range indices produce a (possibly empty) string rather
+ * than crashing — matches the interpreter and avoids a forced
+ * runtime panic for off-by-one mistakes. Result is a fresh
+ * arena-owned NUL-terminated copy.
+ */
+char *lotus_str_slice(lotus_arena_t *a, const char *s,
+                      int64_t lo, int64_t hi) {
+    int64_t n = (int64_t)strlen(s);
+    if (lo < 0) lo = 0;
+    if (lo > n) lo = n;
+    if (hi < lo) hi = lo;
+    if (hi > n) hi = n;
+    int64_t len = hi - lo;
+    char *out = (char *)lotus_arena_alloc(a, (size_t)len + 1, 1);
+    if (!out) return NULL;
+    if (len > 0) {
+        memcpy(out, s + lo, (size_t)len);
+    }
+    out[len] = '\0';
+    return out;
+}

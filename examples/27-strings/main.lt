@@ -1,0 +1,76 @@
+// 27-strings — string ops: concat, equality, length, slicing.
+//
+// Strings in v0 are NUL-terminated byte arrays — opaque to
+// user code, lifetime-bound to the arena where they were
+// produced. Literals are static; concat / slice results land
+// in the caller's current arena (their locus's, or the
+// program-wide arena from main / free fns) so wholesale-free
+// at locus dissolution still cleans them up.
+//
+// What this exercises:
+//   - `s + t` — concatenation; result in current arena
+//   - `s == t` / `s != t` — strcmp-backed equality
+//   - `len(s)` — byte length
+//   - `s[lo..hi]` — exclusive slice
+//   - `s[lo..=hi]` — inclusive slice
+//
+// Slicing bounds are CLAMPED rather than panicking. An
+// out-of-range hi or a negative lo produce a (possibly
+// empty) substring — same shape interpreters and codegen
+// both implement, so flex programs run identically. This
+// matches the substrate ethos of "best-effort, predictable"
+// over panic-on-error.
+
+fn shout(name: String) -> String {
+    return "Hello, " + name + "!";
+}
+
+fn first_word(s: String) -> String {
+    // Find the first space and slice up to it. v0 has no
+    // index-of helper yet, so we walk byte-by-byte. (When a
+    // workload demands it, lotus_str_find lands as a sibling
+    // helper to lotus_str_slice / lotus_str_len.)
+    let mut i = 0;
+    let n = len(s);
+    while i < n {
+        let c = s[i..i+1];
+        if c == " " {
+            return s[0..i];
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    // 1. Concatenation.
+    println(shout("world"));
+    println(shout("alice"));
+
+    // 2. Equality.
+    let greeting = "hi";
+    if greeting == "hi" {
+        println("greeting matched");
+    }
+    if greeting != "bye" {
+        println("not bye");
+    }
+
+    // 3. Length.
+    println("len(\"lotus\") = ", len("lotus"));
+    println("len(\"\") = ", len(""));
+
+    // 4. Slicing — exclusive + inclusive.
+    let s = "lotus-lang";
+    println("s[0..5] = ", s[0..5]);
+    println("s[6..=9] = ", s[6..=9]);
+    println("s[6..len(s)] = ", s[6..len(s)]);
+
+    // 5. Out-of-range bounds clamp instead of panic.
+    println("s[5..100] = ", s[5..100]);
+    println("s[20..30] = '", s[20..30], "'");
+
+    // 6. Composition: first_word (uses len + slice + ==).
+    println("first_word = ", first_word("the quick brown fox"));
+    println("first_word = ", first_word("hello"));
+}

@@ -561,6 +561,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_arena_destroy", arena_destroy_ty, None);
 
+        // m36: string runtime helpers. Each takes a `ptr` for the
+        // destination arena (where the result lives) plus the
+        // operands; results are NUL-terminated buffers owned by
+        // the caller's arena. `lotus_str_eq` returns i32 0/1 we
+        // truncate to i1; `lotus_str_len` returns i64 directly.
+        // declare ptr @lotus_str_concat(ptr arena, ptr a, ptr b)
+        // declare i32 @lotus_str_eq(ptr a, ptr b)
+        // declare i64 @lotus_str_len(ptr s)
+        // declare ptr @lotus_str_slice(ptr arena, ptr s, i64 lo, i64 hi)
+        let str_concat_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_str_concat", str_concat_ty, None);
+        let i32_t_local = self.context.i32_type();
+        let str_eq_ty =
+            i32_t_local.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module.add_function("lotus_str_eq", str_eq_ty, None);
+        let str_len_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function("lotus_str_len", str_len_ty, None);
+        let str_slice_ty = ptr_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i64_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_str_slice", str_slice_ty, None);
+
         // The single program-wide arena pointer. Initialized in
         // the prelude of main; consulted by every arena-allocated
         // user-type literal and ClosureViolation. m20 makes this
@@ -3513,6 +3539,55 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(BlockEnd::Open)
     }
 
+    /// m36: lower a `len(x)` builtin call. v0 supports two
+    /// argument shapes: a String (calls `lotus_str_len` for an
+    /// O(strlen) length count) and a fixed-size Array (compile-
+    /// time N from `LotusType::Array(_, N)`). Returns Int.
+    /// Tuples / TypeRef receivers are deliberately rejected —
+    /// no use case asks for tuple-arity at runtime, and structs
+    /// have a fixed field set known at the type level.
+    fn lower_len_builtin(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "`len` expects exactly 1 argument, got {}",
+                args.len()
+            )));
+        }
+        let (v, ty) = self.lower_expr(&args[0], scope)?;
+        match ty {
+            LotusType::String => {
+                let len_fn = self
+                    .module
+                    .get_function("lotus_str_len")
+                    .expect("lotus_str_len declared");
+                let val = self
+                    .builder
+                    .build_call(
+                        len_fn,
+                        &[v.into_pointer_value().into()],
+                        "str.len",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_str_len returns i64");
+                Ok((val, LotusType::Int))
+            }
+            LotusType::Array(_, n) => {
+                let val = self.context.i64_type().const_int(n, true);
+                Ok((val.into(), LotusType::Int))
+            }
+            other => Err(CodegenError::Unsupported(format!(
+                "`len` not supported for argument type {:?}",
+                other
+            ))),
+        }
+    }
+
     /// Build the equality comparison used by Literal patterns
     /// (top-level and tuple sub-pattern). Int / Duration / Bool
     /// use integer EQ; Float / Decimal use ordered float EQ. Other
@@ -4700,6 +4775,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.lower_unop(*op, v, &t)
             }
             Expr::Call { callee, args, .. } => match callee.as_ref() {
+                Expr::Ident(i) if i.name == "len" => {
+                    self.lower_len_builtin(args, scope)
+                }
                 Expr::Ident(i) if self.user_fns.contains_key(&i.name) => {
                     let result =
                         self.lower_user_fn_call(i.name.as_str(), args, scope)?;
@@ -4876,6 +4954,62 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok((tup_ptr.into(), LotusType::Tuple(elem_tys)))
             }
             Expr::Index { receiver, index, .. } => {
+                // m36: range-indexed receivers do slicing, not
+                // single-element indexing. Today only String
+                // supports slicing — arrays return a fixed-size
+                // sub-array would need a length field the v0
+                // representation doesn't carry. Inclusive range
+                // (`s[lo..=hi]`) maps to lotus_str_slice with hi+1
+                // since the helper takes exclusive `hi`.
+                if let Expr::Range { lo, hi, inclusive, .. } = index.as_ref() {
+                    let (recv_val, recv_ty) = self.lower_expr(receiver, scope)?;
+                    if !matches!(recv_ty, LotusType::String) {
+                        return Err(CodegenError::Unsupported(format!(
+                            "range slicing only supported on String in v0, \
+                             not {:?}",
+                            recv_ty
+                        )));
+                    }
+                    let (lo_v, lo_t) = self.lower_expr(lo, scope)?;
+                    let (hi_v, hi_t) = self.lower_expr(hi, scope)?;
+                    if lo_t != LotusType::Int || hi_t != LotusType::Int {
+                        return Err(CodegenError::Unsupported(format!(
+                            "string slice bounds must be Int; got \
+                             {:?}..{:?}",
+                            lo_t, hi_t
+                        )));
+                    }
+                    let hi_final = if *inclusive {
+                        let one = self.context.i64_type().const_int(1, true);
+                        self.builder
+                            .build_int_add(hi_v.into_int_value(), one, "hi.incl")
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    } else {
+                        hi_v.into_int_value()
+                    };
+                    let arena_ptr = self.current_arena_ptr()?;
+                    let slice_fn = self
+                        .module
+                        .get_function("lotus_str_slice")
+                        .expect("lotus_str_slice declared");
+                    let v = self
+                        .builder
+                        .build_call(
+                            slice_fn,
+                            &[
+                                arena_ptr.into(),
+                                recv_val.into_pointer_value().into(),
+                                lo_v.into_int_value().into(),
+                                hi_final.into(),
+                            ],
+                            "str.slice",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("lotus_str_slice returns ptr");
+                    return Ok((v, LotusType::String));
+                }
                 let (recv_val, recv_ty) = self.lower_expr(receiver, scope)?;
                 let (idx_val, idx_ty) = self.lower_expr(index, scope)?;
                 if idx_ty != LotusType::Int {
@@ -5154,6 +5288,73 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_or(lv.into_int_value(), rv.into_int_value(), "or")
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok((v.into(), LotusType::Bool))
+            }
+            // m36: String concatenation. The result lives in the
+            // current arena (caller's locus or program-wide); the
+            // C runtime helper memcpy's both operands into a fresh
+            // NUL-terminated buffer.
+            (BinOp::Add, LotusType::String) => {
+                let arena_ptr = self.current_arena_ptr()?;
+                let concat_fn = self
+                    .module
+                    .get_function("lotus_str_concat")
+                    .expect("lotus_str_concat declared");
+                let v = self
+                    .builder
+                    .build_call(
+                        concat_fn,
+                        &[
+                            arena_ptr.into(),
+                            lv.into_pointer_value().into(),
+                            rv.into_pointer_value().into(),
+                        ],
+                        "str.concat",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_str_concat returns ptr");
+                Ok((v, LotusType::String))
+            }
+            // m36: String equality / inequality via strcmp wrapper.
+            // The C helper returns i32 0/1; we truncate to i1.
+            (BinOp::Eq | BinOp::NotEq, LotusType::String) => {
+                let eq_fn = self
+                    .module
+                    .get_function("lotus_str_eq")
+                    .expect("lotus_str_eq declared");
+                let raw = self
+                    .builder
+                    .build_call(
+                        eq_fn,
+                        &[
+                            lv.into_pointer_value().into(),
+                            rv.into_pointer_value().into(),
+                        ],
+                        "str.eq",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_str_eq returns i32");
+                let one = self.context.i32_type().const_int(1, false);
+                let is_eq = self
+                    .builder
+                    .build_int_compare(
+                        IP::EQ,
+                        raw.into_int_value(),
+                        one,
+                        "str.eq.bool",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let result = if matches!(op, BinOp::NotEq) {
+                    self.builder
+                        .build_not(is_eq, "str.neq")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                } else {
+                    is_eq
+                };
+                Ok((result.into(), LotusType::Bool))
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "binop {:?} on {:?}",

@@ -32,6 +32,30 @@ pub fn install_builtins(env: &crate::env::Env) {
             func: Rc::new(builtin_println),
         }),
     );
+    env.define(
+        "len",
+        Value::Builtin(BuiltinRef {
+            name: "len",
+            func: Rc::new(builtin_len),
+        }),
+    );
+}
+
+fn builtin_len(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "`len` expects exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
+    match &args[0] {
+        Value::String(s) => Ok(Value::Int(s.len() as i64)),
+        Value::Array(a) => Ok(Value::Int(a.borrow().len() as i64)),
+        other => Err(format!(
+            "`len` not supported for {}",
+            other.type_name()
+        )),
+    }
 }
 
 fn builtin_print(args: &[Value]) -> Result<Value, String> {
