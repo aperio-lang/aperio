@@ -5292,10 +5292,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     // If pattern carries arg sub-patterns, load
-                    // payload fields and bind each Binding sub-
-                    // pattern. Wildcard skips. Other sub-pattern
-                    // forms (Literal / Tuple / nested Constructor)
-                    // aren't supported at v0.1.
+                    // payload fields. Wildcard skips, Binding
+                    // pushes a binding, Literal AND-extends the
+                    // tag-eq cond with a field-vs-literal compare
+                    // (so `Event::Tick(0) -> ...` only matches
+                    // when the payload's first field equals 0).
+                    // Other sub-pattern forms (Tuple / nested
+                    // Constructor) aren't lowered at v0.1.
+                    let mut acc_cond = cond;
                     if !args.is_empty() {
                         let enum_ptr = scrutinee_val.into_pointer_value();
                         let fields = self
@@ -5307,10 +5311,49 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     let (val, ty) = fields[j].clone();
                                     bindings.push((ident.name.clone(), val, ty));
                                 }
+                                Pattern::Literal(lit, span) => {
+                                    let (lit_val, lit_ty) = self.lower_expr(
+                                        &Expr::Literal(lit.clone(), *span),
+                                        scope,
+                                    )?;
+                                    let (field_val, field_ty) = fields[j].clone();
+                                    if lit_ty != field_ty {
+                                        return Err(CodegenError::Unsupported(
+                                            format!(
+                                                "constructor pattern arg {} \
+                                                 literal type {:?} doesn't \
+                                                 match payload field type {:?}",
+                                                j, lit_ty, field_ty
+                                            ),
+                                        ));
+                                    }
+                                    let sub_cond = self.lower_match_eq_cmp(
+                                        field_val,
+                                        lit_val,
+                                        &field_ty,
+                                        &format!(
+                                            "match.arm{}.enum.{}.field{}.cmp",
+                                            i, variant_name, j
+                                        ),
+                                    )?;
+                                    acc_cond = self
+                                        .builder
+                                        .build_and(
+                                            acc_cond,
+                                            sub_cond,
+                                            &format!(
+                                                "match.arm{}.enum.{}.acc",
+                                                i, variant_name
+                                            ),
+                                        )
+                                        .map_err(|e| {
+                                            CodegenError::LlvmEmit(e.to_string())
+                                        })?;
+                                }
                                 _ => {
                                     return Err(CodegenError::Unsupported(
                                         "constructor pattern arg must be a \
-                                         binding or `_` at v0.1"
+                                         binding, `_`, or literal at v0.1"
                                             .into(),
                                     ));
                                 }
@@ -5318,7 +5361,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         }
                     }
                     self.builder
-                        .build_conditional_branch(cond, pattern_target, next_bb)
+                        .build_conditional_branch(acc_cond, pattern_target, next_bb)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
             }

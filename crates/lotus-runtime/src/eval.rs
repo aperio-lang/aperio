@@ -2392,6 +2392,11 @@ fn pattern_match(
                                 bindings
                                     .insert(ident.name.clone(), val.clone());
                             }
+                            Pattern::Literal(lit, _) => {
+                                if !literal_matches(lit, val) {
+                                    return false;
+                                }
+                            }
                             _ => return false,
                         }
                     }
