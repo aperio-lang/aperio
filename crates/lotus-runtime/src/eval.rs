@@ -2475,6 +2475,23 @@ fn monotonic_ns_now() -> i64 {
 }
 
 fn approx_pass(l: &Value, r: &Value, tol: &Value) -> Result<bool, String> {
+    // Decimal: compare via exact i128 mantissa arithmetic.
+    if let (Value::Decimal(a), Value::Decimal(b), Value::Decimal(t)) =
+        (l, r, tol)
+    {
+        let diff = DecimalVal::sub(*a, *b);
+        let abs = DecimalVal {
+            mantissa: diff.mantissa.abs(),
+            scale: diff.scale,
+        };
+        return Ok(DecimalVal::cmp(abs, *t) != std::cmp::Ordering::Greater);
+    }
+    // Duration: compare via i64 ns.
+    if let (Value::Duration(a), Value::Duration(b), Value::Duration(t)) =
+        (l, r, tol)
+    {
+        return Ok((*a - *b).abs() <= *t);
+    }
     let (la, ra, ta) = match (l, r, tol) {
         (Value::Int(a), Value::Int(b), Value::Int(t)) => (*a as f64, *b as f64, *t as f64),
         (Value::Int(a), Value::Int(b), Value::Float(t)) => (*a as f64, *b as f64, *t),
@@ -2729,19 +2746,5 @@ fn reduction(v: &Value, op: BinOp) -> Result<Value, String> {
 }
 
 fn approx(l: &Value, r: &Value, tol: &Value) -> Result<Value, String> {
-    let (la, ra, ta) = match (l, r, tol) {
-        (Value::Int(a), Value::Int(b), Value::Int(t)) => (*a as f64, *b as f64, *t as f64),
-        (Value::Int(a), Value::Int(b), Value::Float(t)) => (*a as f64, *b as f64, *t),
-        (Value::Float(a), Value::Float(b), Value::Int(t)) => (*a, *b, *t as f64),
-        (Value::Float(a), Value::Float(b), Value::Float(t)) => (*a, *b, *t),
-        _ => {
-            return Err(format!(
-                "~~ expects numeric operands; got {} ~~ {} within {}",
-                l.type_name(),
-                r.type_name(),
-                tol.type_name()
-            ))
-        }
-    };
-    Ok(Value::Bool((la - ra).abs() <= ta))
+    approx_pass(l, r, tol).map(Value::Bool)
 }
