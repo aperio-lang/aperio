@@ -1473,12 +1473,23 @@ fn parse_decimal(s: &str) -> Option<f64> {
 }
 
 fn fmt_decimal(f: f64) -> String {
-    // v0: format without the `d` suffix — the suffix is part
-    // of literal syntax, not the value's printed form. Matches
-    // how Decimal literals are stored by the lexer (`1.0`, not
-    // `1.0d`). Precision is not yet shopspring/decimal-grade;
-    // milestone 3 swaps the internal store.
-    format!("{}", f)
+    // Match codegen's printf("%g", ...) behavior: at most 6
+    // fractional digits, trailing zeros + dangling `.` stripped.
+    // This masks the f64 dust that bubbles up through arithmetic
+    // (`0.1 - 0.05 = 0.04999999999999716` becomes `0.05`) so
+    // interpreter output matches the codegen path. lotus's
+    // Decimal is f64-backed for v0; once we swap in a real
+    // arbitrary-precision library, this function goes away.
+    //
+    // Format without the trailing `d` suffix — the suffix is
+    // part of literal syntax, not the value's printed form.
+    let s = format!("{:.6}", f);
+    if s.contains('.') {
+        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+        trimmed.to_string()
+    } else {
+        s
+    }
 }
 
 fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
