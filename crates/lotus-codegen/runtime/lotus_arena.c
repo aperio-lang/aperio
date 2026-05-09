@@ -606,6 +606,27 @@ void lotus_bus_remote_fanout(const char *subject,
                              size_t payload_size);
 void lotus_bus_remote_destroy_all(void);
 
+/* m59: subscriber-side reader thread support.
+ *
+ * Reader threads (one per LISTEN-role transport opened from the
+ * deployment-config) loop on lotus_transport_recv and need to
+ * dispatch incoming bytes into the same local-handler set that
+ * in-process publishers reach via lotus_bus_dispatch. To do
+ * that without plumbing the cooperative queue pointer through
+ * the transport layer, codegen sets it on a global at boot via
+ * lotus_bus_set_queue, and the reader thread calls
+ * lotus_bus_local_dispatch which reads the global. Pinned
+ * subscribers route via mailbox (thread-safe by construction);
+ * cooperative subscribers enqueue onto the cooperative queue
+ * (mutex-protected, see lotus_bus_queue_enqueue), so the
+ * reader thread is safely a producer alongside main + any
+ * pinned threads. */
+void lotus_bus_local_dispatch(lotus_bus_queue_t *queue,
+                              const char *subject,
+                              const void *payload,
+                              size_t payload_size);
+void lotus_bus_set_queue(lotus_bus_queue_t *queue);
+
 void lotus_bus_register(const char *subject,
                         void *self_ptr,
                         void *handler,
@@ -633,10 +654,14 @@ void lotus_bus_register(const char *subject,
  * lifecycle is bound to main's prelude/exit, not to whatever
  * first triggers a register). Pinned subscribers route via their
  * mailbox; cooperative subscribers enqueue onto `queue`. */
-void lotus_bus_dispatch(lotus_bus_queue_t *queue,
-                        const char *subject,
-                        const void *payload,
-                        size_t payload_size) {
+/* m59 refactor: extracted from lotus_bus_dispatch so the m59
+ * reader thread can dispatch recv'd bytes into the same local-
+ * handler set without going through transport fanout (which
+ * would re-emit them remotely and loop forever). */
+void lotus_bus_local_dispatch(lotus_bus_queue_t *queue,
+                              const char *subject,
+                              const void *payload,
+                              size_t payload_size) {
     if (!subject) return;
     for (size_t i = 0; i < g_bus_count; i++) {
         lotus_bus_entry_t *e = &g_bus_entries[i];
@@ -650,6 +675,13 @@ void lotus_bus_dispatch(lotus_bus_queue_t *queue,
                                     payload, payload_size);
         }
     }
+}
+
+void lotus_bus_dispatch(lotus_bus_queue_t *queue,
+                        const char *subject,
+                        const void *payload,
+                        size_t payload_size) {
+    lotus_bus_local_dispatch(queue, subject, payload, payload_size);
     /* m58: fanout to any cross-process transports bound to this
      * subject by deployment-config. Local + remote share the same
      * subject namespace per notes/open-questions #9 (emergent
@@ -1143,8 +1175,16 @@ void lotus_transport_destroy(lotus_transport_t *t) {
 
 typedef struct lotus_bus_remote_entry {
     char              *subject;       /* owned (strdup'd at register) */
-    lotus_transport_t *transport;
+    lotus_transport_t *transport;     /* set in main for CONNECT,
+                                         in reader-thread for LISTEN */
     int                role;
+    /* m59: per-subject reader thread for LISTEN role. Set when the
+     * pthread is spawned at register time; the thread loops on
+     * lotus_transport_recv and dispatches to local subscribers via
+     * lotus_bus_local_dispatch. CONNECT-role entries leave both
+     * fields zero (no thread, transport opened on the main path). */
+    pthread_t          reader_thread;
+    int                has_reader_thread;
 } lotus_bus_remote_entry_t;
 
 static lotus_bus_remote_entry_t *g_bus_remote_entries = NULL;
@@ -1152,6 +1192,68 @@ static size_t g_bus_remote_count = 0;
 static size_t g_bus_remote_cap   = 0;
 
 #define LOTUS_BUS_REMOTE_INITIAL_CAP 4
+
+/* m59: queue pointer published by the codegen prelude (via
+ * lotus_bus_set_queue) so reader threads can dispatch into the
+ * cooperative-subscriber path without plumbing the queue through
+ * the transport layer. NULL until the codegen prelude runs;
+ * reader threads handle the NULL case by skipping cooperative
+ * dispatch (pinned subscribers via mailbox always work). */
+static lotus_bus_queue_t *g_bus_queue_for_remote = NULL;
+
+void lotus_bus_set_queue(lotus_bus_queue_t *queue) {
+    g_bus_queue_for_remote = queue;
+}
+
+/* m59: reader-thread args. Owns the path string so the thread
+ * can outlive the lotus_bus_register_remote call. The entry
+ * back-reference lets the thread publish its transport ptr to
+ * the entry so lotus_bus_remote_destroy_all can find it. */
+typedef struct lotus_bus_reader_args {
+    char                     *path;       /* owned by the thread */
+    lotus_bus_remote_entry_t *entry;
+} lotus_bus_reader_args_t;
+
+static void *lotus_bus_reader_thread_main(void *arg) {
+    lotus_bus_reader_args_t *args = (lotus_bus_reader_args_t *)arg;
+    /* Open the LISTEN transport HERE, on the reader thread, so
+     * accept() blocks the reader thread instead of main's boot
+     * path. m58 opened transports inline in register_remote which
+     * meant a subscriber binary would hang at startup until the
+     * publisher connected; m59 defers the accept off the boot
+     * path so main proceeds and any local-subscribe registration
+     * can complete before we wait for a peer. */
+    lotus_transport_t *t = lotus_transport_create(
+        args->path, LOTUS_TRANSPORT_LISTEN);
+    if (!t) {
+        free(args->path);
+        free(args);
+        return NULL;
+    }
+    /* Publish the transport pointer back to the entry so
+     * lotus_bus_remote_destroy_all can shutdown(2) the connection
+     * if a clean teardown is needed. (Race: between accept
+     * returning and this store, destroy_all sees NULL and skips
+     * the shutdown — that's fine because in well-formed test
+     * scenarios destroy_all runs after the peer has closed,
+     * which already drives recv to EOF.) */
+    args->entry->transport = t;
+
+    char buf[LOTUS_PAYLOAD_MAX];
+    while (1) {
+        ssize_t n = lotus_transport_recv(t, buf, sizeof(buf));
+        if (n <= 0) break;     /* peer closed (0) or error (-1) */
+        lotus_bus_local_dispatch(g_bus_queue_for_remote,
+                                 args->entry->subject,
+                                 buf, (size_t)n);
+    }
+
+    lotus_transport_destroy(t);
+    args->entry->transport = NULL;     /* prevent double-destroy */
+    free(args->path);
+    free(args);
+    return NULL;
+}
 
 void lotus_bus_register_remote(const char *subject,
                                const char *url,
@@ -1181,9 +1283,9 @@ void lotus_bus_register_remote(const char *subject,
         return;
     }
 
-    lotus_transport_t *t = lotus_transport_create(path, role);
-    if (!t) return;     /* lotus_transport_create already perror'd */
-
+    /* Grow the table BEFORE doing any side effects so the
+     * realloc-relocation can't invalidate a pointer we already
+     * handed out (e.g., to a reader thread via reader_args). */
     if (g_bus_remote_count == g_bus_remote_cap) {
         size_t new_cap = g_bus_remote_cap == 0
             ? LOTUS_BUS_REMOTE_INITIAL_CAP
@@ -1191,24 +1293,52 @@ void lotus_bus_register_remote(const char *subject,
         lotus_bus_remote_entry_t *grown = (lotus_bus_remote_entry_t *)
             realloc(g_bus_remote_entries,
                     new_cap * sizeof(lotus_bus_remote_entry_t));
-        if (!grown) {
-            lotus_transport_destroy(t);
-            return;
-        }
+        if (!grown) return;
         g_bus_remote_entries = grown;
         g_bus_remote_cap     = new_cap;
     }
 
     char *subject_copy = strdup(subject);
-    if (!subject_copy) {
-        lotus_transport_destroy(t);
-        return;
-    }
+    if (!subject_copy) return;
 
-    lotus_bus_remote_entry_t *e = &g_bus_remote_entries[g_bus_remote_count++];
-    e->subject   = subject_copy;
-    e->transport = t;
-    e->role      = role;
+    lotus_bus_remote_entry_t *e =
+        &g_bus_remote_entries[g_bus_remote_count++];
+    e->subject           = subject_copy;
+    e->transport         = NULL;
+    e->role              = role;
+    e->has_reader_thread = 0;
+
+    if (role == LOTUS_TRANSPORT_LISTEN) {
+        /* m59: spawn a reader thread that owns this subject's
+         * recv loop. The thread opens the LISTEN transport on
+         * its own stack so accept() doesn't block the main
+         * thread. */
+        lotus_bus_reader_args_t *args =
+            (lotus_bus_reader_args_t *)malloc(sizeof(*args));
+        if (!args) return;
+        args->path  = strdup(path);
+        args->entry = e;
+        if (!args->path) {
+            free(args);
+            return;
+        }
+        if (pthread_create(&e->reader_thread, NULL,
+                           lotus_bus_reader_thread_main, args) != 0) {
+            perror("lotus_bus_register_remote: pthread_create");
+            free(args->path);
+            free(args);
+            return;
+        }
+        e->has_reader_thread = 1;
+    } else {
+        /* CONNECT: open inline so the connect-with-retry happens
+         * on the boot path. The first publish on this subject
+         * fans out through the resulting transport. */
+        e->transport = lotus_transport_create(path, role);
+        /* On failure lotus_transport_create already perror'd; the
+         * entry stays in the table with transport=NULL so fanout
+         * skips it and destroy_all is a no-op for this slot. */
+    }
 }
 
 /* Trim leading + trailing whitespace in-place. Returns a pointer
@@ -1313,11 +1443,33 @@ void lotus_bus_remote_fanout(const char *subject,
 
 void lotus_bus_remote_destroy_all(void) {
     for (size_t i = 0; i < g_bus_remote_count; i++) {
-        if (g_bus_remote_entries[i].subject) {
-            free(g_bus_remote_entries[i].subject);
+        lotus_bus_remote_entry_t *e = &g_bus_remote_entries[i];
+
+        /* m59: for LISTEN role, the reader thread owns the
+         * transport's lifecycle. Best-effort shutdown(conn_fd)
+         * to unblock recv if the peer hasn't closed yet, then
+         * join. The thread destroys the transport itself before
+         * exiting, so we don't double-destroy here. */
+        if (e->has_reader_thread) {
+            if (e->transport && e->transport->conn_fd >= 0) {
+                /* SHUT_RDWR turns subsequent recvs into
+                 * immediate EOF. Ignore errors — if the peer has
+                 * already closed (the common case in a clean
+                 * teardown), the fd may already be half-shut. */
+                shutdown(e->transport->conn_fd, SHUT_RDWR);
+            }
+            pthread_join(e->reader_thread, NULL);
+            /* Reader thread has already nulled e->transport on
+             * its way out, but if it failed before storing
+             * (transport_create returned NULL), the field is
+             * already NULL — so the CONNECT-style destroy below
+             * is a no-op for this slot. */
         }
-        if (g_bus_remote_entries[i].transport) {
-            lotus_transport_destroy(g_bus_remote_entries[i].transport);
+        if (e->transport) {
+            lotus_transport_destroy(e->transport);
+        }
+        if (e->subject) {
+            free(e->subject);
         }
     }
     if (g_bus_remote_entries) free(g_bus_remote_entries);

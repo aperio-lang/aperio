@@ -1,7 +1,45 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m58: deployment-config subject
+in a new session. State as of **m59: subscriber-side reader
+thread** — third substrate piece of the cross-process bus
+arc. Closes the receive half: when a deployment-config entry
+declares `role=listen`, the runtime spawns a per-subject
+pthread that opens the LISTEN-role transport ON THAT THREAD
+(so accept() blocks the reader, not main's boot path), loops
+on `lotus_transport_recv`, and dispatches the recv'd bytes
+into local subscribers via a new `lotus_bus_local_dispatch`
+helper extracted from `lotus_bus_dispatch` (so the call
+doesn't recursively trigger remote fanout, which would loop
+forever). Reader threads are joined at
+`lotus_bus_remote_destroy_all` after a best-effort
+`shutdown(conn_fd, SHUT_RDWR)` — natural EOF (peer-close)
+drives thread exit in well-formed teardown. The codegen
+prelude gains one call: `lotus_bus_set_queue(queue_ptr)` after
+`bus.queue.init`, before `bus.load_config` — publishes the
+cooperative queue pointer to the C runtime so reader threads
+can dispatch into the same handler set in-process publishers
+reach. Wire format stays **raw struct bytes** at v0.1: same
+arch + same compiler version means identical layout on both
+sides, which is correct for the trellis-pair scope. The
+field-by-field little-endian serializer (defending against
+padding drift across binary versions, enabling heterogeneous
+hosts) is deferred to m60 — this is now bundled with the
+multi-binary build orchestration. The m59 integration test
+in `crates/lotus-codegen/tests/bus_subscriber.rs` builds two
+**lotus** binaries from inline sources (one subscriber, one
+publisher), wires them via opposite-role configs to the same
+unix socket, and asserts the subscriber's stdout contains the
+publisher's printed Ping value end-to-end (`subscriber got
+n=4702394921427289928`). Stable across 5 sequential runs at
+~730ms each. The cross-process bus loop is now closed: a
+publish on a wired subject reaches in-process subscribers AND
+all CONNECT-role transports (m58); recv'd bytes from any
+LISTEN-role transport flow into in-process handlers (m59).
+101 tests pass (was 100; +1 from bus_subscriber.rs); 54
+example builds unaffected; existing bus examples (05-bus,
+19-pinned-bus, trellis-demo) rebuild + run with byte-identical
+output. State before that was **m58: deployment-config subject
 binding** — second substrate piece of the cross-process bus
 arc. Wires m57's `lotus_transport_*` surface to the source
 language without coupling source to deployment topology
@@ -2289,55 +2327,57 @@ capacity ceiling — the m45 quickfix `× 32` multiplier is gone.
 
 ### RESUME HERE (next session)
 
-**Start with m59: subscriber-side reader thread + per-payload
-serializer.** Third session of the cross-process bus arc. m57
-shipped the kernel transport (AF_UNIX SOCK_SEQPACKET); m58
-shipped publisher-side fanout via deployment-config (subject →
-url:role binding parsed from `LOTUS_BUS_CONFIG`, dispatched
-via `lotus_bus_remote_fanout`). m59 closes the loop on the
-receive side: when a config entry is `role=listen`, the
-runtime needs a per-subject reader thread that loops `recv()`
-and dispatches the bytes into the local handler the same way
-in-process publishes do. Two parts:
+**Start with m60: multi-binary build orchestration + per-payload
+serializer + trellis-pair.** Final session of the cross-process
+bus arc. The receive/send loop is closed (m57+m58+m59); what's
+left is the production-readiness layer that makes
+`examples/trellis-pair/` the v1 acceptance test it's supposed
+to be. Three threads:
 
-(a) **Reader thread.** On `lotus_bus_register_remote` with
-LISTEN role, spawn a pthread whose body is essentially:
-`while (true) { ssize_t n = lotus_transport_recv(t, buf, cap);
-if (n <= 0) break; lotus_bus_local_dispatch(subject, buf, n); }`
-where `lotus_bus_local_dispatch` is a new helper extracting
-the existing dispatch's local-fanout loop (today inlined in
-`lotus_bus_dispatch`). Thread joins at `lotus_bus_router_destroy`.
-Open question: thread vs `select()` loop on a single dispatcher
-thread — threads are simpler at v0.1; select scales better.
-Probably ship threads, defer select.
+(a) **Per-payload serializer.** Currently
+`lotus_bus_dispatch` and the m59 reader thread pass raw struct
+bytes between processes — works on same arch + same compiler
+version (which is the trellis-pair scope), fragile across
+binary versions where LLVM padding can drift. Codegen-emit a
+per-payload-type `__serialize_<TypeName>(struct *, void *buf,
+size_t cap)` and `__deserialize_<TypeName>(void *buf, size_t
+n, struct *out)`. v0.1: field-by-field write little-endian
+fixed-width per scalar; length-prefixed Strings; nested
+struct fields recurse. Call sites: serialize on the publisher
+in `lotus_bus_remote_fanout` before send; deserialize on the
+subscriber inside the reader thread before
+`lotus_bus_local_dispatch`. Schema versioning (per-type
+fingerprint, mismatch detection) deferred to v0.2 +
+notes/open-questions #13.
 
-(b) **Per-payload serializer.** Currently
-`lotus_bus_dispatch` hands `bus_dispatch` raw struct bytes —
-on the same architecture this just works (memcpy). Across
-processes, layout drift (padding, endianness on heterogeneous
-hosts) breaks it. Codegen-emit a per-payload-type
-`__serialize_<TypeName>(struct *, void *buf, size_t cap)` and
-matching `__deserialize_<TypeName>(void *buf, size_t n,
-struct *out)` and call them at the transport boundary. v0.1:
-field-by-field write little-endian fixed-width per scalar +
-length-prefixed Strings. Defer schema versioning to m60+.
-notes/open-questions #10 already locks "receiver's arena gets
-a fresh copy of the payload struct" as the contract.
+(b) **Multi-binary build orchestration.** `lotus build` today
+takes one `.lt` entry file and emits one binary. trellis-pair
+needs two binaries (analyst + executor) sharing a `shared.lt`
+type module. Either: (1) `lotus build` accepts a list of
+entries (ergonomically: a `Lotus.toml`-like manifest listing
+binaries + their entrypoints + their bus configs); or (2) a
+small shell wrapper / Makefile pattern. (1) feels more
+substrate-aligned. Concrete deliverable: `lotus build
+--manifest examples/trellis-pair/Lotus.toml` produces
+`analyst` and `executor` binaries side-by-side with their
+per-binary bus configs.
 
-Test target: end-to-end two-binary lotus example. Two
-binaries built from one source file via separate `fn main()`
-selectors (or two source files), each with its own bus config
-naming opposite roles. Publisher sends 3 Pings; subscriber
-prints 3 lines. Same source, different deployment.
+(c) **trellis-pair end-to-end test.** With (a) and (b) in
+place, the CHECKPOINT verify recipe gains a line that builds
+the manifest, runs the two binaries with a deployment-config
+that wires their subjects together, and asserts the same
+trellis-demo behavior playing out across two processes.
+Actually flips trellis-pair from "stub" to v1 acceptance gate.
 
 The cross-process bus arc was chosen as the next multi-session
 commitment per The Design's delivery-lotus framing: it's the
 substrate-root layer of the v1 trajectory, the runtime/stdlib
 split is locked (m56), and the design questions for #8/#9/#10
 are resolved. Memory note holds: trellis-pair is the
-acceptance test, not the development driver — m59 ships
+acceptance test, not the development driver — m60 ships
 because the substrate needs it, not to make trellis-pair
-pass.
+pass; trellis-pair just happens to be the natural test that
+exercises the assembled substrate.
 
 ### Cross-process bus arc (substrate, ~3-4 sessions)
 
@@ -2355,15 +2395,22 @@ pass.
   (lotus publisher → unix socket → m57 driver listener,
   byte-exact round-trip + local-also-fired + no-config
   regression check).
-- **m59 Subscriber-side reader thread + per-payload serializer**
-  — LISTEN-role binding spawns a per-subject pthread that
-  recv-loops and dispatches into local handlers; codegen emits
-  serialize/deserialize per payload type. Closes the receive
-  half of the cross-process bus.
-- **m60 Multi-binary build orchestration + trellis-pair** —
-  `lotus build` emits a binary plus a manifest of publishes/
-  subscribes; deployment config knits binaries together;
-  trellis-pair runs end-to-end across two processes.
+- **m59 Subscriber-side reader thread — DONE** —
+  LISTEN-role binding spawns a per-subject pthread that opens
+  the transport on its own stack (so accept() doesn't block
+  main's boot), loops `lotus_transport_recv`, and dispatches
+  via the new `lotus_bus_local_dispatch` helper. Thread joins
+  at `lotus_bus_remote_destroy_all`. Verified via
+  `crates/lotus-codegen/tests/bus_subscriber.rs` (two-lotus-
+  binary end-to-end: publisher → unix socket → subscriber's
+  reader thread → cooperative queue → Sub.on_evt → stdout).
+  Wire format stays raw struct bytes at v0.1; serializer is
+  m60 territory.
+- **m60 Per-payload serializer + multi-binary build
+  orchestration + trellis-pair** — codegen-emitted
+  serialize/deserialize per payload type for layout
+  robustness; `lotus build --manifest` for two-binary builds;
+  trellis-pair flips from stub to v1 acceptance gate.
 
 ### Other multi-session arcs (no current commitment)
 
@@ -2426,18 +2473,20 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 100 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 101 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
-listener + connector subprocesses, m58 added two more under
+listener + connector subprocesses; m58 added two more under
 tests/bus_config.rs that route a lotus publisher's bus dispatch
-through a unix socket to the m57 driver).
+through a unix socket to the m57 driver; m59 added one more under
+tests/bus_subscriber.rs that runs the full two-lotus-binary
+publisher → reader-thread → cooperative-queue → handler path).
 
 ## How to verify the checkpoint
 
 ```
 cd ~/code/lotus-lang
-cargo test --workspace --tests           # 100 passed
+cargo test --workspace --tests           # 101 passed
 cargo run --bin lotus -- run examples/trellis-demo/main.lt
 cargo run --bin lotus -- build examples/hello-world/main.lt
 ./examples/hello-world/main              # prints "hello, world"

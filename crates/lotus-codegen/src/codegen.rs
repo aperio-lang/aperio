@@ -1026,6 +1026,25 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let getenv_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module.add_function("getenv", getenv_ty, None);
 
+        // m59: subscriber-side reader threads need access to the
+        // cooperative bus queue to dispatch incoming bytes into
+        // the local handler set. The codegen-emitted main prelude
+        // publishes the queue pointer to the C runtime via
+        // lotus_bus_set_queue right after lotus_bus_queue_create
+        // succeeds; the reader thread uses it to call
+        // lotus_bus_local_dispatch on each recv. Setter form
+        // (rather than passing the queue through register_remote)
+        // keeps register_remote's signature stable across
+        // milestones and matches the pattern of bus_dispatch
+        // taking the queue as an explicit parameter.
+        // declare void @lotus_bus_set_queue(ptr queue)
+        let bus_set_queue_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bus_set_queue",
+            bus_set_queue_ty,
+            None,
+        );
+
         // m28c: optional CPU-core affinity. Pinned loci that
         // declare `: schedule pinned(core = N)` emit a call to
         // this helper right after pthread_create — it wraps
@@ -1661,6 +1680,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("bus queue global declared");
         self.builder
             .build_store(queue_global.as_pointer_value(), queue_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // m59: publish the queue pointer to the C runtime so
+        // subscriber-side reader threads (spawned by
+        // lotus_bus_register_remote when a config entry's role
+        // is `listen`) can dispatch recv'd bytes into the local
+        // handler set via lotus_bus_local_dispatch. Has to happen
+        // BEFORE lotus_bus_load_config below so that any reader
+        // threads spawned by load_config see the queue pointer
+        // rather than a NULL.
+        let set_queue_fn = self
+            .module
+            .get_function("lotus_bus_set_queue")
+            .expect("lotus_bus_set_queue declared");
+        self.builder
+            .build_call(
+                set_queue_fn,
+                &[queue_ptr.into()],
+                "bus.set_queue",
+            )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         // m58: load the deployment-config map (subject -> transport

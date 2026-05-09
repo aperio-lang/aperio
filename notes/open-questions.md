@@ -91,8 +91,11 @@ when the type-system / operational-semantics docs are drafted.
    parses `$LOTUS_BUS_CONFIG` at boot via
    `lotus_bus_load_config`, registering each `subject=url:role`
    line through `lotus_bus_register_remote`. Publisher-side
-   fanout is wired into `lotus_bus_dispatch`; subscriber-side
-   reader-thread + per-payload serializer is m59.
+   fanout is wired into `lotus_bus_dispatch`. m59 ships the
+   subscriber side: LISTEN-role registration spawns a per-
+   subject pthread that owns recv-loop + local dispatch, so
+   the cross-process bus is now bidirectional end-to-end.
+   Per-payload serializer + multi-binary orchestration is m60.
 
 9. **What happens if the same subject is declared by two loci in
    the same binary?** Compile error or runtime fan-out?
