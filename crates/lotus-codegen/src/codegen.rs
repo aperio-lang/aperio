@@ -354,17 +354,26 @@ struct LocusInfo<'ctx> {
     /// Closure declarations on this locus that fire at the
     /// dissolve epoch (the default). v0 codegen lowers ONLY
     /// dissolve-epoch closures; tick / duration / birth / explicit
-    /// epochs are typechecked but rejected at lowering time. Each
-    /// element is a `(name, ClosureAssertion)` pair carried over
-    /// from the AST so the synthetic `__closures` fn body can
-    /// re-lower the assertion expressions.
-    closures: Vec<(String, ClosureAssertion)>,
-    /// Synthetic `<Locus>.__closures(self_ptr, parent_self_or_null,
-    /// on_failure_fn_or_null)` fn that evaluates every
-    /// dissolve-epoch closure. None when `closures` is empty —
-    /// saves the indirect call when the locus has nothing to
-    /// check. Called between drain() and dissolve() per F.4 + F.9.
-    closures_fn: Option<FunctionValue<'ctx>>,
+    /// epochs are typechecked; Birth + Dissolve lower (m39),
+    /// Tick / Duration / Explicit still reject pending the
+    /// runtime epoch engine. Each element is `(name, assertion,
+    /// epoch)` carried over from the AST so the synthetic
+    /// closure-eval fns can re-lower the assertion expressions
+    /// and the synthesis pass can partition by epoch.
+    closures: Vec<(String, ClosureAssertion, EpochSpec)>,
+    /// Synthetic `<Locus>.__birth_closures(self_ptr,
+    /// parent_self_or_null, on_failure_fn_or_null)` fn that
+    /// evaluates every birth-epoch closure right after birth()
+    /// returns. None when no birth-epoch closures exist.
+    birth_closures_fn: Option<FunctionValue<'ctx>>,
+    /// Synthetic `<Locus>.__dissolve_closures(self_ptr,
+    /// parent_self_or_null, on_failure_fn_or_null)` fn that
+    /// evaluates every dissolve-epoch closure between drain()
+    /// and dissolve() per F.4 + F.9. None when no dissolve-epoch
+    /// closures exist. (Pre-m39 spelling: `closures_fn`. Renamed
+    /// at m39 when birth-epoch shipped so each epoch's fn has
+    /// an unambiguous slot.)
+    dissolve_closures_fn: Option<FunctionValue<'ctx>>,
     /// `on_failure(child: ChildL, err: ClosureViolation)` handler
     /// declared on this locus, if any. Each parent has at most
     /// one handler (per FailureDecl AST shape); the handler's
@@ -1351,7 +1360,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
-                if let Some(closures_fn) = info.closures_fn {
+                if let Some(closures_fn) = info.dissolve_closures_fn {
                     let (parent_self, handler_ptr) =
                         self.resolve_failure_route(&locus_name);
                     self.builder
@@ -1362,7 +1371,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 parent_self.into(),
                                 handler_ptr.into(),
                             ],
-                            &format!("{}.__closures.call", locus_name),
+                            &format!(
+                                "{}.__dissolve_closures.call",
+                                locus_name
+                            ),
                         )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
@@ -2101,7 +2113,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 user_methods: BTreeMap::new(),
                 subscriptions: Vec::new(),
                 closures: Vec::new(),
-                closures_fn: None,
+                birth_closures_fn: None,
+                dissolve_closures_fn: None,
                 failure_handler: None,
                 children_field_idx,
                 child_count_field_idx,
@@ -2140,7 +2153,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let mut user_methods: BTreeMap<String, FunctionValue<'ctx>> =
             BTreeMap::new();
         let mut subscriptions: Vec<(String, String)> = Vec::new();
-        let mut closures: Vec<(String, ClosureAssertion)> = Vec::new();
+        let mut closures: Vec<(String, ClosureAssertion, EpochSpec)> =
+            Vec::new();
         let mut failure_handler: Option<(String, FunctionValue<'ctx>)> = None;
 
         // Pre-collect bus-handler method names so we can reject
@@ -2335,27 +2349,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     user_methods.insert(fd.name.name.clone(), func);
                 }
                 LocusMember::Closure(c) => {
-                    // Reject non-default-epoch closures at codegen
-                    // v0; only the dissolve-epoch closures lower to
-                    // a synthetic __closures fn fired between drain
-                    // and dissolve. Tick / duration / birth /
-                    // explicit epochs need the runtime epoch
-                    // engine.
-                    let mut explicit_epoch = false;
+                    // m39: Birth + Dissolve epochs lower (each into
+                    // its own synthetic eval fn). Tick / Duration /
+                    // Explicit still reject — they need the runtime
+                    // epoch engine. Default (no epoch clause) =
+                    // Dissolve, matching pre-m39 semantics.
+                    let mut epoch = EpochSpec::Dissolve;
                     for clause in &c.clauses {
                         match clause {
-                            ClosureClause::Epoch(EpochSpec::Dissolve) => {
-                                explicit_epoch = true;
-                            }
-                            ClosureClause::Epoch(_) => {
-                                return Err(CodegenError::Unsupported(
-                                    format!(
-                                        "closure `{}` on `{}`: only \
-                                         dissolve-epoch closures are \
-                                         lowered in codegen v0",
-                                        c.name.name, l.name.name
-                                    ),
-                                ));
+                            ClosureClause::Epoch(spec) => {
+                                match spec {
+                                    EpochSpec::Birth | EpochSpec::Dissolve => {
+                                        epoch = spec.clone();
+                                    }
+                                    other => {
+                                        return Err(CodegenError::Unsupported(
+                                            format!(
+                                                "closure `{}` on `{}`: \
+                                                 epoch {:?} not yet \
+                                                 lowered (codegen v0 \
+                                                 covers Birth + \
+                                                 Dissolve)",
+                                                c.name.name,
+                                                l.name.name,
+                                                other
+                                            ),
+                                        ));
+                                    }
+                                }
                             }
                             ClosureClause::PersistsThrough(_)
                             | ClosureClause::ResetsOn(_) => {
@@ -2365,8 +2386,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             }
                         }
                     }
-                    let _ = explicit_epoch;
-                    closures.push((c.name.name.clone(), c.assertion.clone()));
+                    closures.push((
+                        c.name.name.clone(),
+                        c.assertion.clone(),
+                        epoch,
+                    ));
                 }
                 LocusMember::Failure(fd) => {
                     // on_failure(child: ChildL, err: ClosureViolation)
@@ -2484,23 +2508,38 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
         }
 
-        // If this locus has any dissolve-epoch closures, declare
-        // its synthetic __closures fn here so call sites in
-        // lower_locus_instantiation / flush_dissolve_frame can
-        // resolve it. Sig: (self_ptr, parent_self_or_null,
-        // on_failure_fn_or_null) — call sites pass the parent's
-        // self + on_failure fn ptr if the parent has a matching
-        // handler, else null/null. Body lowered in pass C.
-        let closures_fn = if !closures.is_empty() {
+        // m39: declare per-epoch synthetic eval fns. Each has the
+        // same signature — `(self_ptr, parent_self_or_null,
+        // on_failure_fn_or_null)` — but lowers a different subset
+        // of the closure list. Call sites pass the parent's self +
+        // on_failure fn ptr if the parent has a matching handler,
+        // else null/null. Bodies lowered in pass C.
+        let has_birth = closures
+            .iter()
+            .any(|(_, _, ep)| matches!(ep, EpochSpec::Birth));
+        let has_dissolve = closures
+            .iter()
+            .any(|(_, _, ep)| matches!(ep, EpochSpec::Dissolve));
+        let make_eval_fn = |name: &str| {
             let fn_ty = void_t.fn_type(
                 &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
                 false,
             );
-            Some(self.module.add_function(
-                &format!("{}.__closures", l.name.name),
-                fn_ty,
-                None,
-            ))
+            self.module.add_function(name, fn_ty, None)
+        };
+        let birth_closures_fn = if has_birth {
+            Some(make_eval_fn(&format!(
+                "{}.__birth_closures",
+                l.name.name
+            )))
+        } else {
+            None
+        };
+        let dissolve_closures_fn = if has_dissolve {
+            Some(make_eval_fn(&format!(
+                "{}.__dissolve_closures",
+                l.name.name
+            )))
         } else {
             None
         };
@@ -2516,7 +2555,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         info.user_methods = user_methods;
         info.subscriptions = subscriptions;
         info.closures = closures;
-        info.closures_fn = closures_fn;
+        info.birth_closures_fn = birth_closures_fn;
+        info.dissolve_closures_fn = dissolve_closures_fn;
         info.failure_handler = failure_handler;
         Ok(())
     }
@@ -2695,25 +2735,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.current_self = None;
         }
 
-        // Synthetic __closures fn: evaluate every dissolve-epoch
-        // closure assertion in declaration order. Each assertion
-        // computes |left - right| <= tolerance; on fail, write a
-        // ClosureViolation report to stderr (fd 2 via dprintf) and
-        // exit non-zero. Pass paths flow through silently.
-        if !info.closures.is_empty() {
-            let func = info
-                .closures_fn
-                .expect("closures non-empty implies closures_fn declared");
+        // Synthetic __birth_closures + __dissolve_closures fns:
+        // each evaluates every closure assertion in its epoch in
+        // declaration order. Each assertion computes |left -
+        // right| <= tolerance; on fail, write a ClosureViolation
+        // report to stderr (fd 2 via dprintf) and exit non-zero,
+        // OR route to the parent's on_failure if the call site
+        // passed a non-null handler. Pass paths flow through
+        // silently. Same body shape per epoch — only the closure
+        // subset differs — so we use a small helper closure.
+        for epoch in [EpochSpec::Birth, EpochSpec::Dissolve].iter() {
+            let fn_slot = match epoch {
+                EpochSpec::Birth => info.birth_closures_fn,
+                EpochSpec::Dissolve => info.dissolve_closures_fn,
+                _ => None,
+            };
+            let func = match fn_slot {
+                Some(f) => f,
+                None => continue,
+            };
             let entry = self.context.append_basic_block(func, "entry");
             self.builder.position_at_end(entry);
             let self_ptr = func
                 .get_nth_param(0)
                 .expect("self_ptr param")
                 .into_pointer_value();
-            // arg 1: parent_self_or_null; arg 2: on_failure fn ptr
-            // or null. Both nullable — call sites that have no
-            // matching parent handler pass null/null and the fail
-            // path falls back to dprintf+exit.
             let parent_self_arg = func
                 .get_nth_param(1)
                 .expect("parent_self_or_null param")
@@ -2733,7 +2779,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.loops.clear();
             self.push_dissolve_frame();
 
-            for (cname, assertion) in &info.closures {
+            for (cname, assertion, c_epoch) in &info.closures {
+                if c_epoch != epoch {
+                    continue;
+                }
                 self.lower_closure_check(
                     &l.name.name,
                     cname,
@@ -6524,7 +6573,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     locus_name
                 )));
             }
-            if info.closures_fn.is_some() {
+            if info.birth_closures_fn.is_some()
+                || info.dissolve_closures_fn.is_some()
+            {
                 return Err(CodegenError::Unsupported(format!(
                     "pinned locus `{}` declares closures; cross-thread closure \
                      routing not yet supported",
@@ -6783,19 +6834,48 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             return Ok(self_ptr);
         }
 
-        for kind in &["birth", "run"] {
-            if let Some(method) = info.methods.get(kind) {
-                self.builder
-                    .build_call(
-                        *method,
-                        &[self_ptr.into()],
-                        &format!("{}.{}.call", locus_name, kind),
-                    )
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-            }
+        // m39: birth-epoch closures fire right after birth()
+        // returns. We emit birth() + __birth_closures + run() in
+        // sequence — the closure check sits between birth (which
+        // initializes state) and run (which depends on that
+        // state's invariants). If birth violates and the parent
+        // has a matching on_failure handler, that handler runs;
+        // otherwise the runtime exits with a diagnostic.
+        if let Some(birth_fn) = info.methods.get("birth") {
+            self.builder
+                .build_call(
+                    *birth_fn,
+                    &[self_ptr.into()],
+                    &format!("{}.birth.call", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        if let Some(birth_closures_fn) = info.birth_closures_fn {
+            let (parent_self, handler_ptr) =
+                self.resolve_failure_route(&locus_name);
+            self.builder
+                .build_call(
+                    birth_closures_fn,
+                    &[
+                        self_ptr.into(),
+                        parent_self.into(),
+                        handler_ptr.into(),
+                    ],
+                    &format!("{}.__birth_closures.call", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        if let Some(run_fn) = info.methods.get("run") {
+            self.builder
+                .build_call(
+                    *run_fn,
+                    &[self_ptr.into()],
+                    &format!("{}.run.call", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
         if !is_long_lived {
-            // drain → __closures → dissolve. Mirrors the
+            // drain → __dissolve_closures → dissolve. Mirrors the
             // interpreter ordering in eval.rs::dissolve_locus:
             // drain body fires first, then dissolve-epoch closures
             // are evaluated, then the user's dissolve() body.
@@ -6808,7 +6888,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }
-            if let Some(closures_fn) = info.closures_fn {
+            if let Some(closures_fn) = info.dissolve_closures_fn {
                 let (parent_self, handler_ptr) =
                     self.resolve_failure_route(&locus_name);
                 self.builder
@@ -6819,7 +6899,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             parent_self.into(),
                             handler_ptr.into(),
                         ],
-                        &format!("{}.__closures.call", locus_name),
+                        &format!(
+                            "{}.__dissolve_closures.call",
+                            locus_name
+                        ),
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }

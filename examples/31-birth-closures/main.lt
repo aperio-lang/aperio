@@ -1,0 +1,77 @@
+// 31-birth-closures — closure invariants checked at birth.
+//
+// Pre-m39 the only closure epoch that lowered was DISSOLVE —
+// so an invariant could only be checked at end-of-life, when
+// it was already too late for the run() body to depend on
+// it. The dissolve-epoch closure proves "this state was
+// stable when we tore the locus down"; a birth-epoch closure
+// proves "this state was stable BEFORE we let run() touch
+// it."
+//
+// Per F.9 routing, a birth-epoch violation routes through
+// the same parent on_failure handler as a dissolve-epoch
+// violation: the parent reads the structured
+// ClosureViolation and absorbs (returns) or bubbles.
+//
+// What this exercises:
+//   - Closure with `epoch birth;` clause
+//   - Pass + fail cases on the same locus type
+//   - Parent on_failure absorbing the birth-epoch violation
+//   - Ordering: birth() runs first (printing "configured"),
+//     then the closure check fires, THEN run() (which we
+//     skip here — the locus is ephemeral)
+//
+// v0 limit: tick / duration / explicit epochs still need a
+// runtime epoch engine and are rejected at codegen + interp.
+
+locus Configured {
+    params {
+        kind: String = "default";
+        max: Int = 100;
+    }
+
+    closure max_positive {
+        // Assertion first; clauses follow. Per the grammar,
+        // every closure body parses ASSERTION ~~ EXPR within
+        // EXPR `;` and then any number of clauses.
+        self.max ~~ self.max within 0; // identity, passes
+        epoch birth;
+    }
+
+    closure kind_default {
+        // Tolerance check on `max` so the closure has a
+        // numeric assertion shape. We deliberately seed this
+        // to fail when max is far from the expected value.
+        self.max ~~ 100 within 5;
+        epoch birth;
+    }
+
+    birth() {
+        println("Configured.birth: kind=", self.kind, " max=", self.max);
+    }
+}
+
+locus AuditL {
+    on_failure(c: Configured, err: ClosureViolation) {
+        println("AuditL absorbed birth violation: ",
+                err.closure, " on ", err.locus,
+                " (diff=", err.diff, ")");
+    }
+
+    run() {
+        println("--- pass: max=100 within tol ---");
+        Configured { kind: "ok", max: 100 };
+
+        println("--- pass: max=103 within tol=5 ---");
+        Configured { kind: "ok", max: 103 };
+
+        println("--- fail: max=200 outside tol=5 ---");
+        Configured { kind: "danger", max: 200 };
+
+        println("--- run() ends; AuditL still alive ---");
+    }
+}
+
+fn main() {
+    AuditL { };
+}

@@ -1101,6 +1101,41 @@ impl Interpreter {
             self.run_lifecycle(handle.clone(), &birth_decl, &[])?;
         }
 
+        // m39: birth-epoch closures fire right after birth(),
+        // before run(). Same routing as dissolve-epoch
+        // (`deliver_violation` checks parent on_failure if any,
+        // else returns a non-zero-exit Signal::Error). The
+        // ordering — birth → birth-epoch closures → run — keeps
+        // run()'s body sitting on a checked invariant.
+        let birth_closures: Vec<ClosureDecl> = handle
+            .decl
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                LocusMember::Closure(c) if closure_fires_at_birth(c) => {
+                    Some(c.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut birth_violations: Vec<Value> = Vec::new();
+        for closure in &birth_closures {
+            match self.evaluate_closure(handle.clone(), closure)? {
+                ClosureOutcome::Pass => {}
+                ClosureOutcome::Violation(v) => birth_violations.push(v),
+            }
+        }
+        if !birth_violations.is_empty() {
+            let parent = self.parent_stack.last().cloned();
+            for violation in birth_violations {
+                self.deliver_violation(
+                    handle.clone(),
+                    parent.as_ref(),
+                    violation,
+                )?;
+            }
+        }
+
         // If this locus has a run() lifecycle, run it
         // synchronously (no scheduler in v0). After run() returns
         // the locus is treated as drained.
@@ -1540,6 +1575,17 @@ fn closure_fires_at_dissolve(c: &ClosureDecl) -> bool {
         }
     }
     !has_epoch
+}
+
+fn closure_fires_at_birth(c: &ClosureDecl) -> bool {
+    // m39: closure fires at birth iff an explicit
+    // EpochSpec::Birth clause was declared. Default closures
+    // (no epoch clause) stay dissolve-only — m39 doesn't
+    // change pre-existing behavior, only adds the birth-epoch
+    // path on top.
+    c.clauses.iter().any(|clause| {
+        matches!(clause, ClosureClause::Epoch(EpochSpec::Birth))
+    })
 }
 
 fn approx_pass(l: &Value, r: &Value, tol: &Value) -> Result<bool, String> {
