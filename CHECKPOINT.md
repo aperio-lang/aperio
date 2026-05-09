@@ -20,7 +20,7 @@ pinned(core = N)` for `pthread_setaffinity_np` core pinning),
 m29 (match arm guards — `pat if cond -> body` lowering with
 binding installed for the guard expr to reference), m30
 (fixed-size arrays — `[T; N]` literal, `arr[i]` indexing,
-`for x in arr` iteration, arena-backed storage). **27 of 28
+`for x in arr` iteration, arena-backed storage). **28 of 29
 examples build to native ELF — every single-binary example.**
 Only `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -505,7 +505,7 @@ m30b   m30 follow-up: indexed local-array assignment           (78ea6e7)
                           + examples/22-moving-average (real
                             flex: bus-driven sliding-window
                             mean over a [Int; 4] state array)
-m31    m31: integer ranges in for-loop iterators               (pending)
+m31    m31: integer ranges in for-loop iterators               (2e7cb06)
                           ⇒ Expr::Range { lo, hi, inclusive }
                             in AST; parser tail-attaches at
                             lowest precedence; for-stmt
@@ -513,6 +513,13 @@ m31    m31: integer ranges in for-loop iterators               (pending)
                             case Range as a counted loop; range
                             outside iterator position rejects
                           + examples/23-ranges
+m32    m32: default fn param values (free fns)                 (pending)
+                          ⇒ Defaults must form a suffix; caller
+                            may omit trailing args; default expr
+                            evaluates at the call site in the
+                            caller's scope. Locus methods still
+                            reject — m32 is free-fn-only.
+                          + examples/24-default-params
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -568,6 +575,8 @@ m7 builds on the struct ABI.
 | `for x in arr` over fixed-size arrays | ✅ | ✅ |
 | Indexed local-array assignment `arr[i] = v` | ✅ | ✅ |
 | `for i in lo..hi` / `lo..=hi` range loops | ✅ | ✅ |
+| Default fn param values (free fns; suffix-only rule) | ✅ | ✅ |
+| Default values on locus methods | ✅ | — |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
 | Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
@@ -721,7 +730,7 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-87 commits ahead of origin/master at checkpoint time.
+88 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
@@ -769,8 +778,10 @@ ladder. Two pieces:
 
 - Tuple / Constructor patterns in match (needs tuple values
   in codegen first)
-- Default param values on user fns (already in AST; declare
-  time rejects today)
+- Default param values on locus methods (free fns work as of
+  m32; locus methods need a richer dispatch plumb because
+  bus-dispatch / mode-dispatch / `self.method()` calls all
+  have different arity stories)
 - Recovery primitives execution (restart / quarantine /
   reorganize — interpreter parses, neither runs)
 - Recognition-class real bitmap-pool (currently chunked-
@@ -888,6 +899,9 @@ rm examples/22-moving-average/main
 cargo run --bin lotus -- build examples/23-ranges/main.lt
 ./examples/23-ranges/main                # triangular(10)=45, factorial(5)=120, factorial(7)=5040, square>50 at i=8
 rm examples/23-ranges/main
+cargo run --bin lotus -- build examples/24-default-params/main.lt
+./examples/24-default-params/main        # greet/pow with omitted trailing args
+rm examples/24-default-params/main
 ```
 
-If all twenty-seven work, the checkpoint is intact.
+If all twenty-eight work, the checkpoint is intact.

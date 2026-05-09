@@ -295,6 +295,12 @@ struct BusState<'ctx> {
 struct FnSig<'ctx> {
     func: FunctionValue<'ctx>,
     params: Vec<LotusType>,
+    /// Per-param default-value expression. Same length as
+    /// `params`. `None` = required arg; `Some(expr)` = caller can
+    /// omit and the default will be evaluated at the call site.
+    /// Defaults must form a suffix (typecheck-validated at fn
+    /// declaration), so callers omit a contiguous tail.
+    defaults: Vec<Option<Expr>>,
     /// `None` = void (no return type in the lotus declaration).
     ret: Option<LotusType>,
 }
@@ -2169,8 +2175,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     for p in &fd.params {
                         if p.default.is_some() {
                             return Err(CodegenError::Unsupported(format!(
-                                "locus `{}` method `{}` param `{}` default \
-                                 values not yet lowered",
+                                "locus `{}` method `{}` param `{}`: default \
+                                 values on locus methods aren't lowered yet \
+                                 (free fns support them as of m32)",
                                 l.name.name, fd.name.name, p.name.name
                             )));
                         }
@@ -2788,16 +2795,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let mut param_tys = Vec::with_capacity(f.params.len());
         let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum> =
             Vec::with_capacity(f.params.len());
+        let mut defaults: Vec<Option<Expr>> = Vec::with_capacity(f.params.len());
+        let mut seen_default = false;
         for p in &f.params {
             if p.default.is_some() {
+                seen_default = true;
+            } else if seen_default {
+                // Suffix-only rule: a non-defaulted param can't
+                // follow a defaulted one. Otherwise the
+                // omit-trailing-args ABI breaks down — the caller
+                // can't tell which positional slot they're filling.
                 return Err(CodegenError::Unsupported(format!(
-                    "fn `{}` param `{}` default values not yet lowered",
+                    "fn `{}`: required param `{}` follows a defaulted \
+                     param; defaults must form a suffix",
                     f.name.name, p.name.name
                 )));
             }
             let lt = self.type_expr_to_lotus(&p.ty)?;
             llvm_param_tys.push(self.llvm_basic_type(&lt).into());
             param_tys.push(lt);
+            defaults.push(p.default.clone());
         }
         let ret_ty = match &f.ret {
             Some(t) => Some(self.type_expr_to_lotus(t)?),
@@ -2833,6 +2850,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             FnSig {
                 func,
                 params: param_tys,
+                defaults,
                 ret: ret_ty,
             },
         );
@@ -2912,18 +2930,39 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .ok_or_else(|| {
                 CodegenError::Unsupported(format!("call to unknown fn `{}`", name))
             })?;
-        if args.len() != sig.params.len() {
+        if args.len() > sig.params.len() {
             return Err(CodegenError::Unsupported(format!(
-                "fn `{}` expects {} args, got {}",
+                "fn `{}` expects at most {} args, got {}",
                 name,
                 sig.params.len(),
                 args.len()
             )));
         }
+        // Verify each missing positional slot has a default.
+        for (i, default) in sig.defaults.iter().enumerate() {
+            if i >= args.len() && default.is_none() {
+                return Err(CodegenError::Unsupported(format!(
+                    "fn `{}`: required param at position {} not \
+                     provided (only {} args given)",
+                    name,
+                    i,
+                    args.len()
+                )));
+            }
+        }
         let mut llvm_args: Vec<BasicMetadataValueEnum> =
-            Vec::with_capacity(args.len());
-        for (i, a) in args.iter().enumerate() {
-            let (v, ty) = self.lower_expr(a, scope)?;
+            Vec::with_capacity(sig.params.len());
+        for i in 0..sig.params.len() {
+            let (v, ty) = if i < args.len() {
+                self.lower_expr(&args[i], scope)?
+            } else {
+                // Default expressions evaluate at the call site.
+                // For const/literal defaults that's a constant; for
+                // arbitrary expressions they execute in the caller's
+                // scope (matching the interpreter's semantics).
+                let default = sig.defaults[i].as_ref().expect("checked above");
+                self.lower_expr(default, scope)?
+            };
             if ty != sig.params[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "fn `{}` arg {} type mismatch: expected {:?}, got {:?}",

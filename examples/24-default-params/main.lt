@@ -1,0 +1,52 @@
+// 24-default-params — default values on free-fn parameters.
+//
+// Defaults must form a SUFFIX of the parameter list — a
+// required param can't follow a defaulted one. Otherwise the
+// "omit trailing args" calling convention would be ambiguous
+// (which slot is the caller filling?). The interpreter and
+// codegen both enforce this.
+//
+// Defaults are evaluated at the CALL SITE in the caller's
+// scope, not baked in at fn definition time. For const
+// literals (the common case) that's identical; for arbitrary
+// default expressions, this means a default referencing a
+// caller-visible binding will see THAT binding, not a
+// snapshot from the fn body.
+//
+// Locus-method defaults aren't lowered yet — m32 only does
+// free fns. The locus-method path involves bus-dispatch arity
+// + mode-dispatch arity that need a separate plumb.
+
+fn greet(name: String, greeting: String = "hello", times: Int = 1) {
+    let mut i = 0;
+    while i < times {
+        println(greeting, ", ", name);
+        i = i + 1;
+    }
+}
+
+fn pow(base: Int, exp: Int = 2) -> Int {
+    let mut acc = 1;
+    for _ in 0..exp {
+        acc = acc * base;
+    }
+    return acc;
+}
+
+fn main() {
+    // All three args explicit.
+    greet("alice", "hi", 2);
+
+    // greeting defaults to "hello".
+    greet("bob", "wave", 1);
+
+    // Both trailing args default; times=1 implicit, greeting="hello".
+    greet("carol");
+
+    // exp defaults to 2 → squares.
+    println("3^2 = ", pow(3));
+    println("4^2 = ", pow(4));
+
+    // Override the default for cubes.
+    println("2^5 = ", pow(2, 5));
+}

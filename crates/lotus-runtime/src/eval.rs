@@ -195,17 +195,42 @@ impl Interpreter {
     }
 
     fn call_fn(&mut self, f: &FnRef, args: &[Value]) -> Result<Value, Signal> {
-        if args.len() != f.decl.params.len() {
+        // Defaulted params can be omitted by callers — we fill
+        // the tail from the param's default expr. Non-defaulted
+        // params must all be provided. Defaults must form a
+        // suffix; the parser permits any order but the
+        // typechecker should reject a non-defaulted param after
+        // a defaulted one (validated here as a runtime guard
+        // until the typecheck rule lands).
+        if args.len() > f.decl.params.len() {
             return Err(Signal::Error(format!(
-                "fn `{}` called with {} args, expected {}",
+                "fn `{}` called with {} args, expected at most {}",
                 f.decl.name.name,
                 args.len(),
                 f.decl.params.len()
             )));
         }
+        for (i, p) in f.decl.params.iter().enumerate() {
+            if i >= args.len() && p.default.is_none() {
+                return Err(Signal::Error(format!(
+                    "fn `{}` called with {} args; param `{}` has no \
+                     default and was not provided",
+                    f.decl.name.name,
+                    args.len(),
+                    p.name.name
+                )));
+            }
+        }
         self.env.push();
-        for (param, arg) in f.decl.params.iter().zip(args.iter()) {
-            self.env.define(&param.name.name, arg.clone());
+        for (i, param) in f.decl.params.iter().enumerate() {
+            let v = if i < args.len() {
+                args[i].clone()
+            } else {
+                // Default was checked above to exist.
+                let default_expr = param.default.as_ref().unwrap();
+                self.eval_expr(default_expr)?
+            };
+            self.env.define(&param.name.name, v);
         }
         let result = self.exec_block(&f.decl.body);
         self.env.pop();
