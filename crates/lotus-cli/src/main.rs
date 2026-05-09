@@ -171,8 +171,15 @@ fn parse_with_imports(
             }
         };
         // Follow imports relative to THIS file's directory.
+        // Imports beginning with `std/` are stdlib namespace
+        // markers — the toolchain handles `time::sleep`,
+        // `time::monotonic`, etc. as built-ins, so there's no
+        // on-disk source to load. Silently skip those.
         let dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
         for imp in &program.imports {
+            if imp.path.starts_with("std/") || imp.path == "std" {
+                continue;
+            }
             let mut p = dir.clone();
             p.push(format!("{}.lt", imp.path));
             stack.push(p);
