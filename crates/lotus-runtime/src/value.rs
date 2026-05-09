@@ -66,6 +66,12 @@ pub struct LocusHandle {
     /// no-op and the violation falls through to the parent's
     /// collapse path.
     pub restart_count: Rc<std::cell::Cell<i64>>,
+    /// m41: sticky quarantine flag set by the
+    /// `quarantine(child)` recovery primitive. Once set,
+    /// `run()` is skipped on this locus; drain / dissolve
+    /// still fire (cleanup is unconditional). Bus-dispatch
+    /// gating waits on m41b.
+    pub quarantined: Rc<std::cell::Cell<bool>>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,57 @@
+// 33-quarantine — F.9 quarantine recovery primitive.
+//
+// Where m40's `restart(c)` is "give birth another shot",
+// m41's `quarantine(c)` is "this locus's invariants don't
+// hold and we don't want to keep running it." Quarantine
+// is sticky — once set in on_failure, the locus's run()
+// is skipped; drain / dissolve still fire as cleanup.
+// Bus-dispatch gating (quarantined subscribers don't
+// receive messages) waits on m41b — for v0, quarantine
+// is just a "don't enter run()" gate.
+//
+// The two recovery primitives form a small response menu:
+//   restart(c) — try once more with a fresh attempt
+//   quarantine(c) — stop trying; mark the locus as inactive
+// The parent picks per-violation. Either or neither can
+// fire; both can fire (quarantine wins; restart's re-run
+// then sees the quarantined flag and skips its run()
+// branch on the way back up).
+
+locus Worker {
+    params {
+        valid: Int = 0;
+    }
+
+    closure must_be_valid {
+        self.valid ~~ 1 within 0;
+        epoch birth;
+    }
+
+    run() {
+        // run() body intentionally noisy so we can see
+        // whether it fires when quarantined.
+        println("Worker.run: valid=", self.valid);
+    }
+}
+
+locus Coordinator {
+    on_failure(w: Worker, err: ClosureViolation) {
+        println("Coordinator: ", err.locus, " failed ",
+                err.closure, " — quarantining");
+        quarantine(w);
+    }
+
+    run() {
+        println("--- valid=1: closure passes, run() fires ---");
+        Worker { valid: 1 };
+
+        println("--- valid=0: closure fails, quarantine, run() skipped ---");
+        Worker { valid: 0 };
+
+        println("--- run() ends ---");
+    }
+}
+
+fn main() {
+    Coordinator { };
+}

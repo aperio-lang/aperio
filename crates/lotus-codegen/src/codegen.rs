@@ -408,6 +408,13 @@ struct LocusInfo<'ctx> {
     /// birth() + birth-epoch closures. Cap is 2 attempts per
     /// locus lifetime (v0 default).
     restart_count_field_idx: u32,
+    /// m41: index of the synthetic `__quarantined: i64` flag.
+    /// Always present (zero-init at instantiation). The
+    /// `quarantine(child)` recovery primitive sets it to 1; the
+    /// lifecycle dispatch in `lower_locus_instantiation` reads
+    /// it after birth() + __birth_closures and skips `run()`
+    /// if set. Drain / dissolve still fire unconditionally.
+    quarantined_field_idx: u32,
     /// Index of the synthetic `__mailbox: ptr` field carrying this
     /// locus's `lotus_mailbox_t*`. Only set for pinned-class loci
     /// that declare `bus subscribe` — those need a per-locus
@@ -2117,6 +2124,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let restart_count_field_idx = idx;
         llvm_field_tys.push(i64_t_struct.into());
         idx += 1;
+        // m41: synthetic `__quarantined: i64` flag, always
+        // appended to every locus struct. Zero-initialized at
+        // instantiation; set to 1 by the `quarantine(child)`
+        // recovery primitive. The post-`__birth_closures`
+        // dispatch in lower_locus_instantiation reads it and
+        // skips `run()` if set. Drain / dissolve still fire
+        // (those are cleanup, unconditional). Bus dispatch
+        // gating waits on a C-runtime change with a fixed-offset
+        // load — for now, quarantined loci still receive bus
+        // messages but don't enter run().
+        let quarantined_field_idx = idx;
+        llvm_field_tys.push(i64_t_struct.into());
+        idx += 1;
         let _ = idx;
 
         let struct_ty = self
@@ -2142,6 +2162,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 child_count_field_idx,
                 arena_field_idx,
                 restart_count_field_idx,
+                quarantined_field_idx,
                 mailbox_field_idx,
                 projection_class,
                 schedule_class,
@@ -3512,6 +3533,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 match op {
                     RecoveryOp::Bubble => self.lower_bubble_call(args, scope),
                     RecoveryOp::Restart => self.lower_restart_call(args, scope),
+                    RecoveryOp::Quarantine => {
+                        self.lower_quarantine_call(args, scope)
+                    }
                     other => Err(CodegenError::Unsupported(format!(
                         "recovery op {:?} not lowered",
                         other
@@ -6441,6 +6465,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder
             .build_store(rc_ptr, zero)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // m41: zero-init the synthetic __quarantined flag.
+        let q_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.quarantined_field_idx,
+                &format!("{}.__quarantined.ptr", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(q_ptr, zero)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         // F.7 ordering: if we're inside a parent locus's lifecycle
         // method AND the parent has an accept(child: ThisLocus) that
@@ -6911,7 +6948,44 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
+        // m41: gate run() on __quarantined. If a parent's
+        // on_failure called quarantine(self) during the birth-
+        // closure check above, the flag is now set and we skip
+        // run() entirely. Drain / dissolve still fire below.
         if let Some(run_fn) = info.methods.get("run") {
+            let i64_t = self.context.i64_type();
+            let q_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    info.quarantined_field_idx,
+                    &format!("{}.run.quarantined.ptr", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let q_val = self
+                .builder
+                .build_load(i64_t, q_ptr, "run.quarantined")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let zero = i64_t.const_int(0, false);
+            let active = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    q_val.into_int_value(),
+                    zero,
+                    "run.active",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let func = self.current_fn.expect("current_fn set");
+            let run_bb =
+                self.context.append_basic_block(func, "run.do");
+            let after_run_bb =
+                self.context.append_basic_block(func, "run.after");
+            self.builder
+                .build_conditional_branch(active, run_bb, after_run_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(run_bb);
             self.builder
                 .build_call(
                     *run_fn,
@@ -6919,6 +6993,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("{}.run.call", locus_name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_unconditional_branch(after_run_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(after_run_bb);
         }
         if !is_long_lived {
             // drain → __dissolve_closures → dissolve. Mirrors the
@@ -7613,6 +7691,56 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         self.builder
             .build_store(rc_ptr, next)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(BlockEnd::Open)
+    }
+
+    /// m41: lower a `quarantine(child);` recovery call. Sets
+    /// child.__quarantined = 1. The lifecycle dispatch in
+    /// lower_locus_instantiation reads the flag after birth +
+    /// __birth_closures and skips run() if set; drain / dissolve
+    /// still fire (cleanup is unconditional). Repeat calls are
+    /// idempotent — the flag stays at 1 once set.
+    fn lower_quarantine_call(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "quarantine() takes exactly one argument, got {}",
+                args.len()
+            )));
+        }
+        let (val, ty) = self.lower_expr(&args[0], scope)?;
+        let locus_name = match &ty {
+            LotusType::LocusRef(n) => n.clone(),
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "quarantine() requires a locus reference; got {:?}",
+                    other
+                )));
+            }
+        };
+        let info = self
+            .user_loci
+            .get(&locus_name)
+            .cloned()
+            .expect("LocusRef points to a declared locus");
+        let child_ptr = val.into_pointer_value();
+        let i64_t = self.context.i64_type();
+        let q_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                child_ptr,
+                info.quarantined_field_idx,
+                "quarantine.flag.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let one = i64_t.const_int(1, false);
+        self.builder
+            .build_store(q_ptr, one)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(BlockEnd::Open)
     }

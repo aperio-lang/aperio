@@ -465,8 +465,31 @@ impl Interpreter {
                             ))),
                         }
                     }
+                    // m41: quarantine(c) sets a sticky flag on the
+                    // target locus. lower_locus_instantiation
+                    // / instantiate_locus check the flag before
+                    // entering run(); drain / dissolve still
+                    // fire as cleanup. Bus-dispatch gating waits
+                    // on m41b.
+                    RecoveryOp::Quarantine => {
+                        let target = arg_vs.into_iter().next().ok_or_else(|| {
+                            Signal::Error(
+                                "quarantine() takes one locus argument".into(),
+                            )
+                        })?;
+                        match target {
+                            Value::Locus(handle) => {
+                                handle.quarantined.set(true);
+                                Ok(())
+                            }
+                            other => Err(Signal::Error(format!(
+                                "quarantine() expects a locus argument; got {}",
+                                other.type_name()
+                            ))),
+                        }
+                    }
                     // restart_in_place / drain / dissolve /
-                    // quarantine / reorganize: parsed for surface
+                    // reorganize: parsed for surface
                     // completeness; full semantics land with later
                     // milestones.
                     _ => Ok(()),
@@ -1096,6 +1119,7 @@ impl Interpreter {
             decl: decl.clone(),
             dissolved: Rc::new(std::cell::Cell::new(false)),
             restart_count: Rc::new(std::cell::Cell::new(0)),
+            quarantined: Rc::new(std::cell::Cell::new(false)),
         };
 
         // Register every bus subscription on the router.
@@ -1196,8 +1220,14 @@ impl Interpreter {
         // If this locus has a run() lifecycle, run it
         // synchronously (no scheduler in v0). After run() returns
         // the locus is treated as drained.
-        if let Some(run_decl) = lookup_lifecycle(&decl, LifecycleKind::Run) {
-            self.run_lifecycle(handle.clone(), &run_decl, &[])?;
+        // m41: skip run() if a parent's on_failure quarantined
+        // this locus during the birth-closure check above.
+        if !handle.quarantined.get() {
+            if let Some(run_decl) =
+                lookup_lifecycle(&decl, LifecycleKind::Run)
+            {
+                self.run_lifecycle(handle.clone(), &run_decl, &[])?;
+            }
         }
 
         // Dissolve discipline (F.9): a locus is "ephemeral" if
