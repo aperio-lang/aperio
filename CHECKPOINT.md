@@ -1,8 +1,27 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m52: in-loop drain after each
-dissolve** — closes the m26 v0 limitation that cells enqueued
+in a new session. State as of **m53: free-fn implicit-locus
+handle-rooting** — closes the second half of spec/memory.md
+"Free `fn` functions": "the function returns when (a) body's
+last statement completes, AND (b) all children of the implicit
+locus have dissolved." m49 shipped (a) for the arena boundary;
+m53 ships (b). `flush_dissolve_frame` is now hoisted into
+`emit_fn_exit_epilogue` (called once per fn at the unified
+exit block), so every return path — open-end, `return;`,
+`return v;` — uniformly drains the bus queue and dissolves any
+long-lived loci bound in the fn body before the fn returns.
+Pre-m53 the typed-return path silently popped the frame
+without flushing, leaking handles past return; m51's
+non-leaf-return regression test would have masked this since
+the leaks weren't visible at stdout. New
+`examples/49-fn-handle-rooting` exercises the fix: a
+`make_pair(n) -> Int` binds Watcher (subscribes "evt") and
+Pulse (publishes "evt" in birth), the publish enqueues a cell
+for Watcher, the fn return triggers flush which drains (firing
+Watcher.on_evt) and dissolves both. Both backends produce
+identical output. State before that was **m52: in-loop drain
+after each dissolve** — closes the m26 v0 limitation that cells enqueued
 during a dissolve method's execution were leaked at main-exit
 queue teardown. `flush_dissolve_frame_kind` now drains the
 cooperative bus queue AFTER each iteration of the dissolve
@@ -169,7 +188,7 @@ post-m46 hardening — `emit_locus_arena_destroy` now calls
 `lotus_bus_quarantine_self(self_ptr)` before destroying the
 arena, mirroring the m41b deregistration path so a stale
 entries-vec entry can never direct dispatch into freed
-memory after dissolution. **52 of 53 examples build to
+memory after dissolution. **53 of 54 examples build to
 native ELF — every single-binary example.** Only
 `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -228,7 +247,7 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 52 of 53 example
+- **Phase 2 v0** (interpreter + bus router) — 53 of 54 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
 - **Enums arc complete** (m47 base + m47-followups + m47-payloads
@@ -314,6 +333,39 @@ Phase status:
   Event mixing no-payload Halt, single-arg Tick, multi-arg
   Trade(Decimal, Int); exercises match, direct println,
   deep ==).
+
+- **Phase 3 milestone 53** (free-fn handle-rooting) —
+  complete. Closes the second clause of spec/memory.md "Free
+  `fn` functions": fn return waits for in-fn-bound children
+  to dissolve. m49 shipped the arena half; m53 ships the
+  lifecycle half. `flush_dissolve_frame` is hoisted from the
+  body-fall-through arm of `lower_user_fn_body` into
+  `emit_fn_exit_epilogue`, so every exit path (open-end,
+  `return;`, `return v;`) goes through one uniform flush.
+  The flush emits `lotus_bus_queue_drain` first (so cells
+  enqueued by the fn body's loci during their birth() get
+  dispatched while subscribers are still alive), then walks
+  the deferred-dissolve frame in reverse — for each long-
+  lived locus: optional pinned-thread join + mailbox shutdown,
+  then drain method, dissolve_closures fn, dissolve method,
+  bus deregister, arena destroy. Pre-m53 the typed-return
+  path silently popped the frame, leaking the loci. m51's
+  46/47 fn-arena examples didn't catch it because their free
+  fns don't bind long-lived loci. New
+  `examples/49-fn-handle-rooting/`: `make_pair(n) -> Int`
+  binds Watcher (subscribes "evt") and Pulse (publishes
+  "evt" at birth); Pulse's birth-publish enqueues a cell for
+  Watcher; the typed-return triggers flush at fn.exit which
+  drains the cell (Watcher prints "watcher got: 42") and
+  dissolves both loci before the fn returns. Both backends
+  produce byte-identical output. 96 unit tests pass; 53
+  examples build native; same 11 known scheduler-ordering
+  diffs as pre-m53. With m53 the free-fn-implicit-locus arc
+  (m49 + m51 + m53) is fully spec-aligned: arena owns body
+  allocations + heap-typed return-copies; lifecycle waits on
+  bound children. The `LocusRef` return case stays rejected
+  (locus references shouldn't cross arena boundaries — pass
+  via bus instead).
 
 - **Phase 3 milestone 52** (in-loop drain after each dissolve) —
   complete. Closes the m26 v0 limitation: cells enqueued by a
@@ -2105,14 +2157,14 @@ ephemeral cascade — design needed before lowering.
 - Recognition-class real bitmap-pool (currently chunked-
   equivalent stub per spec/memory.md). Workload-pending.
 - Decimal precision tightening (printf %g vs Display).
-- Free-fn implicit-locus arenas: per-call subregion +
-  return-value deep-copy shipped in m49 (value types +
-  String + Tuple); m51 closed the remaining type matrix
-  (Array / TypeRef-struct / has-payload-Enum). Only
-  remaining gap is the *handle-rooting* half of the spec —
-  fn return waits for in-fn-bound children to dissolve as
-  if the fn were a locus. No current example exercises
-  bound handles inside a free fn; defer until one does.
+- Free-fn implicit-locus arenas: arena boundary shipped in
+  m49 (value types + String + Tuple); m51 closed the
+  remaining type matrix (Array / TypeRef-struct /
+  has-payload-Enum); m53 closed the handle-rooting half
+  (fn return waits for in-fn-bound children to dissolve).
+  The arc is fully spec-aligned modulo the LocusRef return
+  case which stays rejected by design (locus references
+  shouldn't cross arena boundaries — pass via bus).
 - Cells enqueued during dissolves: shipped in m52. The
   in-loop drain after each iteration of the dissolve loop
   catches publishes from any dissolve method while
@@ -2292,6 +2344,9 @@ rm examples/47-fn-arenas-extras/main
 cargo run --bin lotus -- build examples/48-publish-during-dissolve/main.lt
 ./examples/48-publish-during-dissolve/main   # m52: dissolve-time publish dispatched via in-loop drain
 rm examples/48-publish-during-dissolve/main
+cargo run --bin lotus -- build examples/49-fn-handle-rooting/main.lt
+./examples/49-fn-handle-rooting/main         # m53: handles bound in a returning free fn drain + dissolve at fn.exit
+rm examples/49-fn-handle-rooting/main
 ```
 
 If all of these work, the checkpoint is intact.
