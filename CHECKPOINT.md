@@ -1548,6 +1548,9 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
+0ff7794 Substrate session: bus router rewrite + pinned-duration + sum accumulators
+47f9792 CHECKPOINT.md: correct ahead-count to 15
+8c45f8c CHECKPOINT.md: m45 + bus-cap follow-up refresh
 fc72504 m45 follow-up: bus.entries cap × 32 for multi-instance subs
 01f4e69 m45: restart_in_place recovery primitive
 d4367c1 CHECKPOINT.md: m43 + m44 closure-epoch refresh
@@ -1619,10 +1622,10 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-15 commits ahead of origin/master at last commit; this
-session has 3 additional uncommitted milestones in working
-tree: (a) m45-followup-2 bus router proper-fix, (b) m43-followup
-pinned-duration wrapper, (c) m46 closure accumulators. The F.9
+16 commits ahead of origin/master at checkpoint time. The
+most recent commit (0ff7794) bundled this session's three
+substrate fixes in one: m45-followup-2 bus router proper-fix,
+m43-followup pinned-duration wrapper, m46 closure accumulators. The F.9
 substrate stays closure-epoch-complete (all 5 epochs: Birth +
 Dissolve + Tick + Duration + Explicit) on both cooperative AND
 pinned dispatch paths AND has both restart variants AND has the
