@@ -65,9 +65,10 @@ Phase status:
 ## Codegen milestone arc (Phase 3 progress)
 
 Each milestone below is one focused commit + a CHECKPOINT/README
-refresh. The arc moved fast in 2026-05-08 — nine milestones
-landed in one session — but each load-bearing piece was
-intentionally narrow:
+refresh. The arc moved fast: nineteen milestones (m0–m18)
+landed across two sessions in 2026-05-08, taking the codegen
+path from "no-op stub" to "every single-binary example is a
+build target." Each load-bearing piece was intentionally narrow:
 
 ```
 m0  Phase 3 milestone 0: lotus build → native ELF via LLVM      (77b977f)
