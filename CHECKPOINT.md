@@ -1,8 +1,20 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m50: immutable-binding
-enforcement**: `let x = 0; x = 1;` is now the compile-time
+in a new session. State as of **m51: free-fn return-copy
+completion** — extends m49's deep-copy to the three branches
+left as `Unsupported`: Array (recursive walk over elements),
+TypeRef-struct (walk over declared fields by struct slot, with
+recursion through heap-typed fields like String), and
+has-payload-Enum (switch-on-tag with per-variant alloc + payload
+field deep-copy + PHI join). Free-fn return-copy is now
+type-complete: every LotusType except `LocusRef` (which by design
+shouldn't cross arena boundaries — pass via bus instead) is
+supported. New `examples/47-fn-arenas-extras` exercises all three
+paths: a `[Int; 4]` returner, a `Point { x, y, label: String }`
+returner (recursion through the String field), and a
+`Result::Ok(Int) / Result::Err(String)` returner. State before
+that was **m50: immutable-binding enforcement**: `let x = 0; x = 1;` is now the compile-time
 error spec/types.md "Mutability" + design-rationale §E always
 said it should be. The typechecker tracks `is_mut` on every
 local symbol — `let mut` propagates true, plain `let`
@@ -142,7 +154,7 @@ post-m46 hardening — `emit_locus_arena_destroy` now calls
 `lotus_bus_quarantine_self(self_ptr)` before destroying the
 arena, mirroring the m41b deregistration path so a stale
 entries-vec entry can never direct dispatch into freed
-memory after dissolution. **49 of 50 examples build to
+memory after dissolution. **51 of 52 examples build to
 native ELF — every single-binary example.** Only
 `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -201,7 +213,7 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 49 of 50 example
+- **Phase 2 v0** (interpreter + bus router) — 51 of 52 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
 - **Enums arc complete** (m47 base + m47-followups + m47-payloads
@@ -287,6 +299,38 @@ Phase status:
   Event mixing no-payload Halt, single-arg Tick, multi-arg
   Trade(Decimal, Int); exercises match, direct println,
   deep ==).
+
+- **Phase 3 milestone 51** (free-fn return-copy completion) —
+  complete. Closes the three "Unsupported" branches m49 left in
+  `emit_return_value_deep_copy`: Array, TypeRef-struct, and
+  has-payload-Enum. Each is a recursive walk on the lotus type
+  structure that allocates a fresh storage value in the
+  caller's arena, copies each component (recursing through any
+  heap-typed sub-component — e.g. a String field inside a
+  returned struct), and returns the new pointer. Array case
+  uses `llvm_array_storage_type` to size the alloc + GEP each
+  slot. TypeRef-struct case looks up `TypeInfo` from
+  `user_types`, walks `field_order`, and copies each field by
+  struct slot index. Has-payload-Enum case is the most
+  involved: a new `emit_enum_payload_deep_copy` helper that
+  loads the tag, switches into per-variant blocks, calls
+  `load_enum_payload_fields` to read each field's value, deep-
+  copies each one through `emit_return_value_deep_copy`, then
+  calls `lower_enum_variant_alloc` (with
+  `current_arena_override = Some(dest_arena)` so the new enum
+  storage struct lands in the caller's arena, not the fn
+  subregion), and PHI-joins the per-variant pointers in a
+  `cont` block. Default switch case is unreachable in
+  well-typed programs but emits a null PHI incoming to keep
+  IR well-formed. The only remaining LotusType not supported
+  for free-fn return is `LocusRef` — by design those shouldn't
+  cross arena boundaries (pass via bus). New
+  `examples/47-fn-arenas-extras/` exercises all three paths
+  end-to-end (`[Int; 4]` array, `Point` struct with String
+  field, `Result::Ok / Result::Err` enum), with byte-identical
+  interpreter / codegen output. 51 of 52 examples build native
+  + same 11 known scheduler-ordering diffs as pre-m51. 96
+  workspace tests pass.
 
 - **Phase 3 milestone 50** (immutable-binding enforcement) —
   complete. Closes notes/open-questions #23, the documented
@@ -2016,13 +2060,13 @@ ephemeral cascade — design needed before lowering.
   equivalent stub per spec/memory.md). Workload-pending.
 - Decimal precision tightening (printf %g vs Display).
 - Free-fn implicit-locus arenas: per-call subregion +
-  return-value deep-copy shipped in m49. Remaining gap is
-  the *handle-rooting* half of the spec — fn return waits
-  for in-fn-bound children to dissolve as if the fn were a
-  locus. No current example exercises bound handles inside
-  a free fn; defer until one does. Heap-typed returns of
-  Array / TypeRef-struct / has-payload-Enum also defer
-  pending workload (none in current corpus).
+  return-value deep-copy shipped in m49 (value types +
+  String + Tuple); m51 closed the remaining type matrix
+  (Array / TypeRef-struct / has-payload-Enum). Only
+  remaining gap is the *handle-rooting* half of the spec —
+  fn return waits for in-fn-bound children to dissolve as
+  if the fn were a locus. No current example exercises
+  bound handles inside a free fn; defer until one does.
 - Cells enqueued during dissolves are leaked (m26 v0
   limit). Realistic programs don't publish during dissolve;
   fix would be a drain-loop-until-empty wrapper around the
@@ -2194,6 +2238,9 @@ rm examples/41-closure-accumulator/main
 cargo run --bin lotus -- build examples/46-fn-arenas/main.lt
 ./examples/46-fn-arenas/main             # m49: per-call subregion + return-copy; [tick:1..5] + sum=42 / label=[sum:42]
 rm examples/46-fn-arenas/main
+cargo run --bin lotus -- build examples/47-fn-arenas-extras/main.lt
+./examples/47-fn-arenas-extras/main      # m51: deep-copy across Array / Struct / has-payload-Enum returns
+rm examples/47-fn-arenas-extras/main
 ```
 
 If all of these work, the checkpoint is intact.
