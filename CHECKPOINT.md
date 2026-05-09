@@ -112,7 +112,7 @@ post-m46 hardening — `emit_locus_arena_destroy` now calls
 `lotus_bus_quarantine_self(self_ptr)` before destroying the
 arena, mirroring the m41b deregistration path so a stale
 entries-vec entry can never direct dispatch into freed
-memory after dissolution. **45 of 46 examples build to
+memory after dissolution. **48 of 49 examples build to
 native ELF — every single-binary example.** Only
 `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -171,7 +171,7 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 45 of 46 example
+- **Phase 2 v0** (interpreter + bus router) — 48 of 49 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
 - **Enums arc complete** (m47 base + m47-followups + m47-payloads
@@ -185,11 +185,12 @@ Phase status:
   - Construction: `X::A` for no-args (parsed as `Expr::Path`),
     `X::B(7)` for with-args (parsed as `Expr::Call` with the
     Path as callee).
-  - Match: bare `X::A -> ...` and arg-binding `X::B(n) -> ...`
-    constructor patterns; payload bindings name local values
-    inside the arm body. Guards on payload bindings work (`X::B(n)
-    if n > 10 -> ...`). Match exhaustiveness checks variant
-    coverage.
+  - Match: bare `X::A -> ...`, arg-binding `X::B(n) -> ...`,
+    AND literal sub-patterns `X::B(0) -> ...` (specific-value
+    arm before a generic catch-all). Payload bindings name local
+    values inside the arm body. Guards on payload bindings work
+    (`X::B(n) if n > 10 -> ...`). Match exhaustiveness checks
+    variant coverage.
   - Equality: `==` / `!=` are deep — tag-equality gate then
     per-variant per-field comparison; `Result::Ok(1) ==
     Result::Ok(2)` correctly returns false in both backends. v0.1
@@ -301,6 +302,22 @@ Phase status:
   ~10^19 cleanly through mul/div; per-value-scale operands
   pushing past that would need wider intermediates which v0.1
   defers.
+
+  Decimal+Duration parity follow-ups landed as small
+  per-feature commits alongside the enums arc:
+  - `%` operator on Decimal in both backends (mantissa
+    int-mod after scale-align in the interpreter; direct
+    `build_int_signed_rem` on the i128 in codegen).
+  - `~~ within` accepts Decimal AND Duration in the
+    interpreter (`approx_pass` does exact i128 mantissa
+    sub/abs/cmp for Decimal and i64-ns arithmetic for
+    Duration; previously only Int/Float).
+  - Decimal + Duration literal patterns parse in `match`
+    arms (`match x { 1.0d -> ..., 100ms -> ..., _ -> ..., }`);
+    `literal_matches` resolves Decimal via DecimalVal::parse +
+    DecimalVal::eq so source-spelling differences in scale
+    don't disagree.
+
 - **Phase 3 milestone 47** (enums — tagged union + match) —
   complete. v0.1 ships no-payload variants only; payload-bearing
   variant decls are rejected upstream at typecheck/codegen

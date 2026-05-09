@@ -40,10 +40,21 @@ per-locus mutex+condvar mailboxes carrying inline payloads,
 with coordinated shutdown via shutdown-flag-then-join, and
 (m28c) **`pinned(core = N)` CPU affinity** — pinned loci
 optionally bind their thread to a specific logical CPU via
-`pthread_setaffinity_np`. **29 of 30 examples build to native
+`pthread_setaffinity_np`. **48 of 49 examples build to native
 ELF — every single-binary example is a build target.** Phase 3
-(codegen) is at milestone 33:
-literals +
+(codegen) is past milestone 48: substrate parity now covers
+the full F.9 closure-epoch matrix (Birth + Dissolve + Tick +
+Duration + Explicit) with `sum` / `count` / `mean` accumulators
+and `restart` / `restart_in_place` / `quarantine` recovery,
+exact i128 fixed-point Decimal arithmetic in both backends
+(m48), and full-fidelity tagged-union enums with payload
+variants — including deep `==`, payload-rendering `println`
+/ `to_string`, bus dispatch carrying enum values, literal
+sub-patterns in match arms, and per-enum representation that
+keeps no-payload enums as i32 tags while has-payload enums
+become arena-allocated `{ i32 tag, [N x i8] body }` storage
+pointers. Detailed per-milestone history lives in
+`CHECKPOINT.md`. The codegen toolchain also covers literals +
 arithmetic, `let`/`let mut` + assignment + compound ops,
 `if`/`else`/`while` + `break`/`continue`, `time::sleep` on
 `CLOCK_MONOTONIC` with EINTR retry, `time::monotonic()` +
@@ -55,16 +66,17 @@ locus → LLVM struct, lifecycle methods take `self_ptr`,
 child birth), **`drain()` / `dissolve()` lifecycle methods**
 with F.4 depth-first cascade (children dissolve before parent),
 **user-defined `type` declarations** (struct literals + GEP
-field access), and the **bus router** (one global subscription
-table per program; long-lived loci with `bus subscribe`
-defer drain/dissolve to enclosing-scope exit so they outlive
-synchronous publishes).
+field access), and the **bus router** (heap-grown C-runtime
+dynamic vec backing subscriptions; long-lived loci with `bus
+subscribe` defer drain/dissolve to enclosing-scope exit so they
+outlive synchronous publishes).
 
 Phase 0 (spec stabilization + example ladder) and Phase 1
 (compiler frontend: lex / parse / typecheck) are complete. The
 v0 runtime (Phase 2 first cut) is a tree-walking interpreter
-that executes 16 of 17 example projects end-to-end, including
-the trellis-demo pipeline. The bus router has a Transport
+that executes 48 of 49 example projects end-to-end (only
+multi-binary trellis-pair waits on cross-process bus),
+including the trellis-demo pipeline. The bus router has a Transport
 trait with two implementations (sync dispatch, LMAX-style ring
 buffer); the typechecker enforces the framework's distinctive
 primitives (F.8 contract compatibility, closure cycle
@@ -231,6 +243,22 @@ examples/
                           access; substrate for the bus router
   13-decimal-and-exit/    Decimal type + arithmetic + return-from-main
                           mapping to process exit code
+  14–42/                  control flow, arrays, ranges, tuples,
+                          strings, scheduler classes, pinned threads,
+                          F.9 closure epochs (birth / dissolve / tick
+                          / duration / explicit), recovery primitives
+                          (restart / restart_in_place / quarantine),
+                          accumulators (sum / count / mean), bus
+                          (cooperative + pinned + multi-instance)
+  43-enums/               m47: tagged-union enums; pure no-payload
+                          variants represented as i32 tags with
+                          variant-coverage exhaustiveness in match
+  44-decimal-exact/       m48: exact i128-backed Decimal arithmetic;
+                          1d/3d → 0.333333333 across both backends
+  45-enum-payloads/       m47-payloads: payload-bearing enum variants
+                          with bindings + literal sub-patterns,
+                          deep ==, payload-rendering println /
+                          to_string, bus dispatch
   trellis-demo/           full producer→analyst→executor→logger
                           pipeline as one process; F.4 program-end
                           dissolve fires the analyst's audit closure
@@ -243,7 +271,7 @@ examples/
 notes/
   open-questions.md       deferred decisions and future directions
 
-crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-18)
+crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0–48 + enums-payloads + Decimal fixed-point)
   lotus-syntax/           lexer + parser + AST + diagnostics
   lotus-types/            symbol resolution + type checker (F.8,
                           field strictness, closure cycle, match
