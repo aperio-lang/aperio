@@ -1,9 +1,11 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of m39 (birth-epoch closures — F.9
-substrate deepening) — surface-completeness arc through m38,
-then the substrate-foundation arc opened with m39. Substrate arc: m19→m23 (region allocator with
+new session. State as of m40 (restart recovery primitive — F.9
+response half) — surface-completeness arc through m38, then the
+substrate-foundation arc opened with m39 (trigger half: birth-
+epoch closures) and m40 (response half: restart with cap-2
+default). Substrate arc: m19→m23 (region allocator with
 rich/chunked/recognition + per-locus arenas + bus copy), m24
 (`match`), m25 (bimodal schedule-class annotation), m26
 (cooperative scheduler — deferred bus + drain loop), m26b
@@ -27,9 +29,13 @@ matches println formatting), m38 (stdlib helpers — `min` /
 `max` / `abs` across numeric types, plus `starts_with` /
 `contains` for String predicates), m39 (birth-epoch
 closures — F.9 invariants checked right after `birth()`
-returns, before `run()` runs). **35 of 36 examples build
-to native ELF — every single-binary example.** Only
-`trellis-pair` (multi-binary, cross-process bus) remains.
+returns, before `run()` runs), m40 (restart recovery
+primitive — `restart(child);` from inside `on_failure`
+bumps a per-locus counter; within cap the runtime re-runs
+birth + birth-epoch closures on the same memory). **36 of
+37 examples build to native ELF — every single-binary
+example.** Only `trellis-pair` (multi-binary, cross-process
+bus) remains.
 
 **The bimodal scheduler is fully complete.** Cooperative loci
 yield between substrate cells via the inline-payload deferred
@@ -86,9 +92,42 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 35 of 36 example
+- **Phase 2 v0** (interpreter + bus router) — 36 of 37 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 40** (restart recovery primitive — F.9
+  response half) — complete. m39 delivered the trigger half
+  (birth-epoch closures detect violations); m40 delivers the
+  response half. From inside `on_failure`, the parent calls
+  `restart(child);` to bump a per-locus retry counter; if
+  the new count is within the v0 cap (2 attempts per locus
+  lifetime), the runtime re-runs `birth()` + the entire
+  birth-epoch closure sequence on the SAME memory.
+  Semantics: "give birth another shot" — the locus's state
+  at the start of the second attempt is whatever the first
+  attempt left it in. Past the cap, `restart()` still bumps
+  the counter (observable) but the runtime skips the
+  re-run; the violation falls through to the parent's
+  collapse path. Cap is design-time-parameterized at 2 by
+  default per user framing; could become a per-locus
+  annotation later. Runtime cost: one i64 load + add +
+  store per `restart()` call, no hot-path branch when
+  restart isn't used.
+  Codegen: synthetic `__restart_count: i64` field on every
+  locus struct, zero-init at instantiation;
+  `lower_closure_check` extended with an epoch parameter so
+  the birth-epoch path captures pre/post counts around the
+  on_failure call, conditionally branching to a `rerun_bb`
+  that calls `birth()` + recursively calls
+  `__birth_closures` + `ret void`.
+  Interpreter: `LocusHandle` gains a
+  `restart_count: Rc<Cell<i64>>`; `RecoveryOp::Restart`
+  bumps it unconditionally; `instantiate_locus`'s
+  birth-epoch evaluation rewritten as a depth-bounded loop
+  that re-runs birth + closures on bumped-within-cap.
+  New `examples/32-restart/`. With m39 + m40, the F.9
+  invariant-and-repair pair is now substrate-complete for
+  the birth + dissolve epochs.
 - **Phase 3 milestone 39** (birth-epoch closures — F.9
   substrate deepening) — complete. Pre-m39 only
   dissolve-epoch closures lowered, so invariants could
@@ -808,6 +847,23 @@ m39    m39: birth-epoch closures (substrate F.9 deepening)    (cba1e96)
                             closure_fires_at_birth + birth-
                             eval block in instantiate_locus.
                           + examples/31-birth-closures
+m40    m40: restart recovery primitive (F.9 response half)    (eab0f96)
+                          ⇒ Synthetic __restart_count i64
+                            field on every locus struct, zero-
+                            init at instantiation. restart(c)
+                            bumps it via GEP+load+add+store.
+                            lower_closure_check extended with
+                            epoch param: birth-epoch captures
+                            pre/post counts around on_failure
+                            call, branches to rerun_bb on
+                            bumped-within-cap (2). rerun_bb
+                            calls birth() + recursive
+                            __birth_closures + ret void.
+                            Interpreter mirrors via
+                            LocusHandle.restart_count +
+                            depth-bounded loop in
+                            instantiate_locus.
+                          + examples/32-restart
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -877,6 +933,7 @@ m7 builds on the struct ABI.
 | `min(a, b)` / `max(a, b)` / `abs(x)` for numeric types | ✅ | ✅ |
 | `starts_with(s, p)` / `contains(s, sub)` for String | ✅ | ✅ |
 | Birth-epoch closures (F.9 invariants checked after `birth()`) | ✅ | ✅ |
+| `restart(child)` recovery (cap-2 birth re-run) | ✅ | ✅ |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
 | Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
@@ -996,6 +1053,8 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
+eab0f96 m40: restart recovery primitive (F.9 response half)
+eada334 CHECKPOINT.md: m39 birth-epoch closures refresh
 cba1e96 m39: birth-epoch closures (substrate F.9 deepening)
 c1184dc CHECKPOINT.md: m38 + bus aggregator example refresh
 f90c8b4 examples/30-stats: bus aggregator combining recent surface
@@ -1051,14 +1110,14 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-19 commits ahead of origin/master at checkpoint time (origin
+21 commits ahead of origin/master at checkpoint time (origin
 moved up to a5fc8bd / the prior session's tip; this session
 shipped m30 → m34 + the std/* import-resolution fix, then
 m35 for tuples, m36 for string ops, m37 for to_string, m38
 for stdlib helpers, plus a bus-aggregator flex app, then
-m39 for birth-epoch closures — the first step into
-substrate-foundation work after the surface-completeness
-arc).
+m39 for birth-epoch closures and m40 for restart recovery —
+the F.9 invariant-and-repair pair now substrate-complete
+for the birth + dissolve epochs).
 
 ## Next steps in priority order
 
@@ -1254,6 +1313,9 @@ rm examples/30-stats/main
 cargo run --bin lotus -- build examples/31-birth-closures/main.lt
 ./examples/31-birth-closures/main        # configured locus with birth-epoch closures: pass/pass/fail absorbed by AuditL
 rm examples/31-birth-closures/main
+cargo run --bin lotus -- build examples/32-restart/main.lt
+./examples/32-restart/main               # restart cap-2: target=2 succeeds via 1 retry; target=1 no retry; target=4 hits cap and falls through
+rm examples/32-restart/main
 ```
 
-If all thirty-five work, the checkpoint is intact.
+If all thirty-six work, the checkpoint is intact.
