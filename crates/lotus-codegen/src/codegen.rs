@@ -152,6 +152,10 @@ pub fn build_executable(
         deferred_dissolves: Vec::new(),
         in_main: false,
         current_arena_override: None,
+        current_user_fn_caller_arena: None,
+        current_user_fn_arena: None,
+        current_user_fn_exit_bb: None,
+        current_user_fn_ret_alloca: None,
         accumulator_ctx: None,
     };
 
@@ -302,6 +306,21 @@ struct Cx<'ctx, 'p> {
     /// rather than the parent's. Restored after the field-init
     /// loop completes.
     current_arena_override: Option<PointerValue<'ctx>>,
+    /// m49: free-fn implicit-locus arenas. Set during a non-main
+    /// free fn body lowering. `caller_arena_alloca` holds the
+    /// implicit `__caller_arena: ptr` first param (the arena that
+    /// owns the call site). `fn_arena_alloca` holds the per-call
+    /// subregion of caller_arena that the fn body's allocations
+    /// route through (fallback in `current_arena_ptr`). `exit_bb`
+    /// is the unified return-epilogue block: every `return` stores
+    /// its value to `ret_alloca` (if non-void) and br's here; the
+    /// epilogue deep-copies the value into caller_arena, destroys
+    /// the subregion, and emits `build_return`. Refactor avoids
+    /// duplicating destroy/copy at every return site.
+    current_user_fn_caller_arena: Option<PointerValue<'ctx>>,
+    current_user_fn_arena: Option<PointerValue<'ctx>>,
+    current_user_fn_exit_bb: Option<inkwell::basic_block::BasicBlock<'ctx>>,
+    current_user_fn_ret_alloca: Option<PointerValue<'ctx>>,
     /// m46: closure-accumulator substitution context. Set by
     /// `lower_closure_check` right before lowering the assertion
     /// expressions; cleared after. When set, `lower_expr`'s Call
@@ -793,6 +812,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ptr_t.fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function("lotus_str_concat", str_concat_ty, None);
+        // m49: deep-copy String into the destination arena. Used at
+        // free-fn return boundaries — the body's per-call subregion
+        // is about to be destroyed, so any String the body returns
+        // gets cloned into the caller's arena first.
+        // declare ptr @lotus_str_clone(ptr arena, ptr s)
+        let str_clone_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_str_clone", str_clone_ty, None);
         let i32_t_local = self.context.i32_type();
         let str_eq_ty =
             i32_t_local.fn_type(&[ptr_t.into(), ptr_t.into()], false);
@@ -3619,8 +3647,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let mut param_tys = Vec::with_capacity(f.params.len());
+        let ptr_t_for_caller_arena =
+            self.context.ptr_type(AddressSpace::default());
         let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum> =
-            Vec::with_capacity(f.params.len());
+            Vec::with_capacity(f.params.len() + 1);
+        // m49: implicit `__caller_arena: ptr` first param. Caller
+        // passes their `current_arena_ptr()`; callee opens a
+        // subregion of it at body entry. `params` / `defaults` /
+        // user-visible arity stays unchanged — this is purely an
+        // ABI-level implicit prefix.
+        llvm_param_tys.push(ptr_t_for_caller_arena.into());
         let mut defaults: Vec<Option<Expr>> = Vec::with_capacity(f.params.len());
         let mut seen_default = false;
         for p in &f.params {
@@ -3704,6 +3740,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// Lower a user fn's body. Each declared param is materialized
     /// as an alloca in the entry block so reads through `Ident`
     /// see the value-stored slot exactly the way `let`-bindings do.
+    ///
+    /// m49: every non-main free fn has an implicit `__caller_arena:
+    /// ptr` first param at the LLVM ABI. The body opens a subregion
+    /// of that arena so its allocations route through a per-call
+    /// region that gets wholesale-freed at fn return. Heap-typed
+    /// return values are deep-copied into `__caller_arena` before
+    /// the subregion is destroyed. All `return` statements branch
+    /// to a unified `fn.exit` epilogue block to avoid duplicating
+    /// the destroy + copy at every return site.
     fn lower_user_fn_body(&mut self, f: &FnDecl) -> Result<(), CodegenError> {
         let sig = self
             .user_fns
@@ -3719,12 +3764,79 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.loops.clear();
         self.push_dissolve_frame();
 
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        // m49: implicit __caller_arena param materializes into a
+        // local alloca first, before any user code runs. The
+        // alloca is what the deep-copy epilogue reads back —
+        // reading the LLVM param directly would also work since
+        // params are SSA values that live for the whole fn, but
+        // going through an alloca keeps the IR shape uniform with
+        // every other binding the body sees.
+        let caller_arena_alloca = self
+            .builder
+            .build_alloca(ptr_t, "__caller_arena.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let caller_arena_param = func
+            .get_nth_param(0)
+            .expect("implicit __caller_arena param at slot 0");
+        self.builder
+            .build_store(caller_arena_alloca, caller_arena_param)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // m49: open a subregion of caller_arena. The body's
+        // allocations route through this. Stored in an alloca so
+        // `current_arena_ptr` can re-load it when subregion-only
+        // routing is required (the alloca survives across blocks).
+        let subregion_create = self
+            .module
+            .get_function("lotus_arena_create_subregion")
+            .expect("lotus_arena_create_subregion declared");
+        let fn_arena_ptr = self
+            .builder
+            .build_call(
+                subregion_create,
+                &[caller_arena_param.into()],
+                "fn.arena.create",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("subregion_create returns ptr");
+        let fn_arena_alloca = self
+            .builder
+            .build_alloca(ptr_t, "fn.arena.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(fn_arena_alloca, fn_arena_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // m49: ret-value alloca (only for typed returns) + unified
+        // fn.exit block. Every `return e;` stores into ret_alloca
+        // and br's to fn.exit; void returns just br. The exit
+        // epilogue runs the deep-copy + arena_destroy + ret.
+        let ret_alloca = match &sig.ret {
+            None => None,
+            Some(ret_ty) => {
+                let alloca = self.alloca_for(ret_ty, "fn.ret.slot")?;
+                Some(alloca)
+            }
+        };
+        let exit_bb = self.context.append_basic_block(func, "fn.exit");
+
+        self.current_user_fn_caller_arena = Some(caller_arena_alloca);
+        self.current_user_fn_arena = Some(fn_arena_alloca);
+        self.current_user_fn_exit_bb = Some(exit_bb);
+        self.current_user_fn_ret_alloca = ret_alloca;
+
         let mut scope = Scope::default();
         for (i, p) in f.params.iter().enumerate() {
             let lt = sig.params[i].clone();
             let alloca = self.alloca_for(&lt, &p.name.name)?;
+            // Declared params are at LLVM slot i+1 (slot 0 is the
+            // implicit __caller_arena).
             let v = func
-                .get_nth_param(i as u32)
+                .get_nth_param(i as u32 + 1)
                 .expect("param index in range");
             self.builder
                 .build_store(alloca, v)
@@ -3737,8 +3849,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.flush_dissolve_frame()?;
             match &sig.ret {
                 None => {
+                    // Void fall-through: br to exit; epilogue
+                    // builds `ret void`.
                     self.builder
-                        .build_return(None)
+                        .build_unconditional_branch(exit_bb)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
                 Some(_) => {
@@ -3752,9 +3866,250 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             let _ = self.deferred_dissolves.pop();
         }
 
+        // m49: emit the fn.exit epilogue. Position there, do the
+        // deep-copy of ret_alloca → caller_arena (only for heap
+        // types), destroy the subregion, build_return.
+        self.emit_fn_exit_epilogue(&sig)?;
+
+        self.current_user_fn_caller_arena = None;
+        self.current_user_fn_arena = None;
+        self.current_user_fn_exit_bb = None;
+        self.current_user_fn_ret_alloca = None;
         self.current_fn = None;
         self.current_user_fn_ret = None;
         Ok(())
+    }
+
+    /// m49: emit the unified return epilogue at `fn.exit` for the
+    /// fn currently being lowered. Positioned at the exit block
+    /// on entry; on return, the block is closed by `build_return`.
+    /// For typed-return fns, `ret_alloca` is read, deep-copied
+    /// into `caller_arena`, then returned. For void fns, just
+    /// destroy the subregion and `ret void`.
+    fn emit_fn_exit_epilogue(
+        &mut self,
+        sig: &FnSig<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let exit_bb = self
+            .current_user_fn_exit_bb
+            .expect("exit_bb set during fn body lowering");
+        self.builder.position_at_end(exit_bb);
+
+        let caller_arena_alloca = self
+            .current_user_fn_caller_arena
+            .expect("caller_arena_alloca set during fn body lowering");
+        let fn_arena_alloca = self
+            .current_user_fn_arena
+            .expect("fn_arena_alloca set during fn body lowering");
+
+        let copied_ret: Option<BasicValueEnum<'ctx>> = match &sig.ret {
+            None => None,
+            Some(ret_ty) => {
+                let ret_alloca = self
+                    .current_user_fn_ret_alloca
+                    .expect("ret_alloca set when ret type is Some");
+                let llvm_ret_ty = self.llvm_basic_type(ret_ty);
+                let raw_ret = self
+                    .builder
+                    .build_load(llvm_ret_ty, ret_alloca, "fn.ret.load")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let dest_arena = self
+                    .builder
+                    .build_load(ptr_t, caller_arena_alloca, "caller_arena.load")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_pointer_value();
+                let copied = self.emit_return_value_deep_copy(
+                    raw_ret, ret_ty, dest_arena,
+                )?;
+                Some(copied)
+            }
+        };
+
+        // Destroy the per-call subregion AFTER the deep-copy so the
+        // copy reads from valid memory. The subregion's chunk list
+        // gets wholesale-freed; nothing in caller_arena is touched.
+        let arena_destroy = self
+            .module
+            .get_function("lotus_arena_destroy")
+            .expect("lotus_arena_destroy declared");
+        let fn_arena_loaded = self
+            .builder
+            .build_load(ptr_t, fn_arena_alloca, "fn.arena.load")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_call(
+                arena_destroy,
+                &[fn_arena_loaded.into()],
+                "fn.arena.destroy",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        match copied_ret {
+            None => {
+                self.builder
+                    .build_return(None)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+            Some(v) => {
+                self.builder
+                    .build_return(Some(&v))
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// m49: deep-copy a fn's return value from the per-call
+    /// subregion into the caller's arena. Recursive on the lotus
+    /// type structure. Value types (Int/Float/Bool/Decimal-i128/
+    /// Time/Duration/no-payload-Enum) are pure SSA — identity copy.
+    /// String calls `lotus_str_clone(dest, src)`. Tuple allocates
+    /// a fresh storage struct in `dest_arena` and recursively
+    /// copies each field. Other heap-typed returns (Array,
+    /// TypeRef, has-payload-Enum) reject for v0.1 — none currently
+    /// appear as free-fn returns; ship as a follow-up when a
+    /// workload demands.
+    fn emit_return_value_deep_copy(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        ty: &LotusType,
+        dest_arena: PointerValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match ty {
+            LotusType::Int
+            | LotusType::Float
+            | LotusType::Bool
+            | LotusType::Decimal
+            | LotusType::Time
+            | LotusType::Duration => Ok(value),
+            LotusType::Enum(name) => {
+                let has_payload = self
+                    .user_enums
+                    .get(name.as_str())
+                    .map(|i| i.has_payload)
+                    .unwrap_or(false);
+                if has_payload {
+                    Err(CodegenError::Unsupported(format!(
+                        "free-fn return of has-payload enum `{}` \
+                         not yet supported (m49 v0.1; deep-copy of \
+                         enum payload deferred until a workload \
+                         demands)",
+                        name
+                    )))
+                } else {
+                    Ok(value)
+                }
+            }
+            LotusType::String => {
+                let f = self
+                    .module
+                    .get_function("lotus_str_clone")
+                    .expect("lotus_str_clone declared");
+                let res = self
+                    .builder
+                    .build_call(
+                        f,
+                        &[dest_arena.into(), value.into_pointer_value().into()],
+                        "fn.ret.str.clone",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_str_clone returns ptr");
+                Ok(res)
+            }
+            LotusType::Tuple(elem_tys) => {
+                // Allocate a fresh tuple-storage struct in
+                // dest_arena, then recursively deep-copy each
+                // element. Layout matches Expr::Tuple lowering so
+                // tup.0 / tup.1 reads work identically on the
+                // returned tuple.
+                let storage_ty = self.llvm_tuple_storage_type(elem_tys);
+                let bytes = storage_ty
+                    .size_of()
+                    .expect("tuple storage type has known size");
+                let alloc_fn = self
+                    .module
+                    .get_function("lotus_arena_alloc")
+                    .expect("lotus_arena_alloc declared");
+                let i64_t = self.context.i64_type();
+                let new_tup = self
+                    .builder
+                    .build_call(
+                        alloc_fn,
+                        &[
+                            dest_arena.into(),
+                            bytes.into(),
+                            i64_t.const_int(8, false).into(),
+                        ],
+                        "fn.ret.tuple.alloc",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("arena_alloc returns ptr")
+                    .into_pointer_value();
+                let i32_t = self.context.i32_type();
+                let src_ptr = value.into_pointer_value();
+                for (i, elem_ty) in elem_tys.iter().enumerate() {
+                    let src_slot = unsafe {
+                        self.builder
+                            .build_gep(
+                                storage_ty,
+                                src_ptr,
+                                &[
+                                    i32_t.const_int(0, false),
+                                    i32_t.const_int(i as u64, false),
+                                ],
+                                &format!("fn.ret.tup.src.slot{}", i),
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?
+                    };
+                    let llvm_elem_ty = self.llvm_basic_type(elem_ty);
+                    let elem_val = self
+                        .builder
+                        .build_load(
+                            llvm_elem_ty,
+                            src_slot,
+                            &format!("fn.ret.tup.src.load{}", i),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let copied = self.emit_return_value_deep_copy(
+                        elem_val, elem_ty, dest_arena,
+                    )?;
+                    let dst_slot = unsafe {
+                        self.builder
+                            .build_gep(
+                                storage_ty,
+                                new_tup,
+                                &[
+                                    i32_t.const_int(0, false),
+                                    i32_t.const_int(i as u64, false),
+                                ],
+                                &format!("fn.ret.tup.dst.slot{}", i),
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?
+                    };
+                    self.builder
+                        .build_store(dst_slot, copied)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                Ok(new_tup.into())
+            }
+            LotusType::Array(_, _)
+            | LotusType::TypeRef(_)
+            | LotusType::LocusRef(_) => Err(CodegenError::Unsupported(format!(
+                "free-fn return of type {:?} not yet supported \
+                 (m49 v0.1; deep-copy deferred until a workload \
+                 demands)",
+                ty
+            ))),
+        }
     }
 
     /// Emit a call to a user-defined fn. Returns the lowered value
@@ -3794,8 +4149,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )));
             }
         }
+        // m49: prepend the caller's current arena as the implicit
+        // `__caller_arena` first arg. The callee opens a subregion
+        // of this at body entry; its body's allocations route
+        // through that subregion, and any heap-typed return value
+        // gets deep-copied back into this arena before the
+        // subregion is destroyed. Captured here BEFORE we lower
+        // the user-visible args because lowering them is allowed
+        // to allocate (e.g. building a string) and we want the
+        // arena snapshot to be the call site's arena, not whatever
+        // intermediate state the arg-lowering walks into.
+        let caller_arena_at_call = self.current_arena_ptr()?;
         let mut llvm_args: Vec<BasicMetadataValueEnum> =
-            Vec::with_capacity(sig.params.len());
+            Vec::with_capacity(sig.params.len() + 1);
+        llvm_args.push(caller_arena_at_call.into());
         for i in 0..sig.params.len() {
             let (v, ty) = if i < args.len() {
                 self.lower_expr(&args[i], scope)?
@@ -5989,11 +6356,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 "`return` outside a user fn".to_string(),
             )
         })?;
+        // m49: when lowering a *free fn* body, `return` stores
+        // into the fn's ret_alloca (if typed) and br's to fn.exit
+        // so the unified epilogue runs (deep-copy + subregion
+        // destroy). Direct `build_return` here would skip both.
+        // Lifecycle methods (mode, run, accept, ...) set
+        // `current_user_fn_ret` but not `current_user_fn_exit_bb`
+        // — they don't own a per-call subregion, so `return` from
+        // them stays a direct build_return as before.
+        let in_free_fn = self.current_user_fn_exit_bb.is_some();
         match (expr, ret_ty) {
             (None, None) => {
-                self.builder
-                    .build_return(None)
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                if in_free_fn {
+                    let exit_bb = self.current_user_fn_exit_bb.unwrap();
+                    self.builder
+                        .build_unconditional_branch(exit_bb)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                } else {
+                    self.builder
+                        .build_return(None)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
             }
             (Some(e), Some(declared_ty)) => {
                 let (v, got_ty) = self.lower_expr(e, scope)?;
@@ -6003,9 +6386,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         declared_ty, got_ty
                     )));
                 }
-                self.builder
-                    .build_return(Some(&v))
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                if in_free_fn {
+                    let ret_alloca = self
+                        .current_user_fn_ret_alloca
+                        .expect("ret_alloca set when ret type is Some in free fn");
+                    self.builder
+                        .build_store(ret_alloca, v)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let exit_bb = self.current_user_fn_exit_bb.unwrap();
+                    self.builder
+                        .build_unconditional_branch(exit_bb)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                } else {
+                    self.builder
+                        .build_return(Some(&v))
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
             }
             (None, Some(declared)) => {
                 return Err(CodegenError::Unsupported(format!(
@@ -10902,6 +11298,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             let arena_ptr = self
                 .builder
                 .build_load(ptr_t, arena_field_ptr, "self.__arena")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            return Ok(arena_ptr.into_pointer_value());
+        }
+        // m49: when lowering a non-main free fn body, allocations
+        // route through the per-call subregion (held in
+        // current_user_fn_arena's alloca) instead of the program-
+        // wide arena.global. arena.global remains the fallback for
+        // main only — main's body sets `in_main` and never touches
+        // current_user_fn_arena.
+        if let Some(fn_arena_alloca) = self.current_user_fn_arena {
+            let arena_ptr = self
+                .builder
+                .build_load(ptr_t, fn_arena_alloca, "fn.arena.cur")
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             return Ok(arena_ptr.into_pointer_value());
         }

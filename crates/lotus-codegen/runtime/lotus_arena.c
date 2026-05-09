@@ -722,6 +722,22 @@ int lotus_str_eq(const char *l, const char *r) {
     return strcmp(l, r) == 0 ? 1 : 0;
 }
 
+/* m49: deep-copy a string into the destination arena. Used at
+ * free-fn return boundaries: the body's subregion is about to be
+ * destroyed, so any String the body returns gets cloned into the
+ * caller's arena first. The returned pointer outlives the
+ * subregion destroy. Same shape as concat with a NULL right side
+ * — kept as a separate symbol so the call-site IR is one helper
+ * call, not a concat-with-empty-literal dance. */
+char *lotus_str_clone(lotus_arena_t *a, const char *s) {
+    size_t n = strlen(s);
+    char *out = (char *)lotus_arena_alloc(a, n + 1, 1);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
 int64_t lotus_str_len(const char *s) {
     return (int64_t)strlen(s);
 }

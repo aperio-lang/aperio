@@ -1,0 +1,66 @@
+// 46-fn-arenas — m49: free-fn implicit-locus arenas.
+//
+// Pre-m49 every free-fn allocation lived in the program-wide
+// arena.global and was reclaimed only at process exit. A loop
+// that called a String-returning helper N times kept N copies
+// of the rendered string alive forever — fine for a short
+// `lotus build && ./main`, ruinous for any long-running
+// program.
+//
+// m49 makes every non-main free fn open a per-call subregion
+// of the caller's arena at body entry. Body allocations route
+// through that subregion. Heap-typed return values are deep-
+// copied into the caller's arena before the subregion is
+// destroyed, so they outlive the call. Stack-flat values
+// (Int / Float / Bool / Decimal-i128 / Time / Duration /
+// no-payload-Enum) skip the copy — they're already in
+// registers across the call boundary.
+//
+// This example exercises the code path: a `decorate` helper
+// that builds a fresh String per call (concat-driven, so the
+// body genuinely allocates inside the subregion) gets called
+// in a loop. After m49 the subregion is wholesale-freed at
+// each return; only the deep-copied final String survives in
+// main's arena. Pre-m49 every intermediate concat product
+// would have been retained until process exit.
+//
+// Functional output is the same on both backends — the win is
+// invisible at the print layer (it's a memory-shape change).
+// What this example tests is that the deep-copy path is
+// correct: if the subregion-destroy ran *before* the copy, or
+// if the copy missed a tuple field, the final printed value
+// would be garbage on the codegen path. Parity with the
+// interpreter (which uses Rust ownership and is unaffected by
+// m49) catches that class of bug immediately.
+
+fn decorate(name: String, n: Int) -> String {
+    // Two concat allocations land in the per-call subregion.
+    // Only the final result needs to survive past the return —
+    // m49's deep-copy handles that, the rest get wholesale-
+    // freed when the subregion is destroyed.
+    return "[" + name + ":" + to_string(n) + "]";
+}
+
+fn pair(a: Int, b: Int) -> (Int, String) {
+    // Tuple return: storage struct allocated in the subregion
+    // first, then deep-copied into the caller's arena field-
+    // by-field. The String field itself recurses through
+    // emit_return_value_deep_copy so its buffer also lands in
+    // the caller's arena.
+    return (a + b, decorate("sum", a + b));
+}
+
+fn main() {
+    // Loop the helper enough times that pre-m49 you'd notice
+    // the leak under valgrind. Functional output stays small
+    // so the example reads cleanly.
+    for i in 1..=5 {
+        let s: String = decorate("tick", i);
+        println(s);
+    }
+
+    // Tuple with a String inside — recursive deep-copy.
+    let (sum, label) = pair(10, 32);
+    println("sum = ", sum);
+    println("label = ", label);
+}
