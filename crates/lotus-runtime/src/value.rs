@@ -36,14 +36,18 @@ pub enum Value {
         name: String,
         fields: Rc<RefCell<BTreeMap<String, Value>>>,
     },
-    /// m47: enum variant value. v0.1 supports no-payload variants
-    /// only. Codegen represents this as an i32 tag; the interpreter
-    /// keeps both names so error messages and match-pattern checks
-    /// can match by name without needing a separate enum-decl
-    /// registry walk.
+    /// m47 + payloads: enum variant value. The variant carries
+    /// its payload field values in declaration order; an empty
+    /// `payload` Vec covers the no-payload case. Codegen
+    /// represents this as either an i32 tag (no-payload-only
+    /// enums) or a pointer to `{i32, [N x i8]}` storage; the
+    /// interpreter keeps the pair of names + the payload list
+    /// so pattern-binding fields and identity comparisons work
+    /// without consulting a separate enum-decl registry walk.
     EnumVariant {
         enum_name: String,
         variant_name: String,
+        payload: Vec<Value>,
     },
     /// A live locus instance. Holds its state and a shared
     /// reference to its declaration so methods can be invoked
@@ -192,8 +196,14 @@ impl Value {
                     .collect();
                 format!("{} {{ {} }}", name, parts.join(", "))
             }
-            Value::EnumVariant { enum_name, variant_name } => {
-                format!("{}::{}", enum_name, variant_name)
+            Value::EnumVariant { enum_name, variant_name, payload } => {
+                if payload.is_empty() {
+                    format!("{}::{}", enum_name, variant_name)
+                } else {
+                    let parts: Vec<String> =
+                        payload.iter().map(|v| v.display()).collect();
+                    format!("{}::{}({})", enum_name, variant_name, parts.join(", "))
+                }
             }
             Value::Locus(h) => format!("<locus {}>", h.name),
             Value::Fn(_) => "<fn>".to_string(),

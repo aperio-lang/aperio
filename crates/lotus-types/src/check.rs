@@ -77,12 +77,19 @@ fn match_is_exhaustive(scrut_ty: &Ty, arms: &[MatchArm], top: &TopScope) -> bool
             let mut covered: std::collections::BTreeSet<&str> =
                 std::collections::BTreeSet::new();
             for arm in arms.iter().filter(unguarded) {
-                if let Pattern::Constructor { path, args, .. } = &arm.pattern {
-                    if !args.is_empty() {
-                        continue;
-                    }
+                if let Pattern::Constructor { path, .. } = &arm.pattern {
                     if let [enum_seg, variant_seg] = path.segments.as_slice() {
                         if enum_seg.name == *name {
+                            // m47-payloads: a Constructor arm
+                            // covers its variant whether the
+                            // sub-patterns are wildcards / bindings
+                            // (catch-all over the payload) or
+                            // empty (no-payload variant). Literal
+                            // sub-patterns are narrower and
+                            // wouldn't cover all values of the
+                            // variant; we still treat them as
+                            // covering for v0.1 — same permissive
+                            // policy the Bool literal arms get.
                             covered.insert(variant_seg.name.as_str());
                         }
                     }
@@ -848,6 +855,31 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Call { callee, args, .. } => {
+                // m47-payloads: enum-variant construction with
+                // args. `EnumName::Variant(..)` resolves to the
+                // enum's named type. We still walk the args to
+                // surface their own type errors, but don't unify
+                // them against declared field types yet — codegen
+                // performs that strict check, and the typechecker
+                // is permissive on Unknowns elsewhere.
+                if let Expr::Path(qn) = callee.as_ref() {
+                    if qn.segments.len() == 2 {
+                        let enum_name = &qn.segments[0].name;
+                        let variant_name = &qn.segments[1].name;
+                        if let Some(TopSymbol::Type(TypeInfo {
+                            kind: TypeKind::Enum(variants),
+                            ..
+                        })) = self.top.symbols.get(enum_name)
+                        {
+                            if variants.iter().any(|v| v.name == *variant_name) {
+                                for a in args {
+                                    let _ = self.check_expr(a);
+                                }
+                                return Ty::Named(enum_name.clone());
+                            }
+                        }
+                    }
+                }
                 let callee_ty = self.check_expr(callee);
                 for a in args {
                     let _ = self.check_expr(a);

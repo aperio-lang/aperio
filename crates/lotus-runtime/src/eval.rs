@@ -829,19 +829,35 @@ impl Interpreter {
                         return Ok(v);
                     }
                 }
-                // m47: 2-segment path may be an enum variant
-                // construction (`EnumName::VariantName`). v0.1
-                // payloadless variants only — codegen rejects
-                // payload-bearing decls upstream, so `variants`
-                // here is already validated; we just look up
-                // the name and return a tagged Value.
+                // m47 + payloads: 2-segment path may be an enum
+                // variant construction (`EnumName::VariantName`).
+                // Path-form (no parens) is the no-payload case;
+                // payload-bearing variants reach this arm only
+                // if their declared field count is zero, in
+                // which case the construction has no args. With
+                // args, the parser produces Expr::Call with this
+                // Path as the callee — handled in the Call arm.
                 if let [enum_name, variant_name] = segs.as_slice() {
                     if let Some(t) = self.types.get(*enum_name) {
                         if let TypeDeclBody::Enum(variants) = &t.body {
-                            if variants.iter().any(|v| v.name.name == *variant_name) {
+                            if let Some(v) = variants
+                                .iter()
+                                .find(|v| v.name.name == *variant_name)
+                            {
+                                if !v.fields.is_empty() {
+                                    return Err(Signal::Error(format!(
+                                        "{}::{} expects {} arg(s); use `{}::{}(...)`",
+                                        enum_name,
+                                        variant_name,
+                                        v.fields.len(),
+                                        enum_name,
+                                        variant_name,
+                                    )));
+                                }
                                 return Ok(Value::EnumVariant {
                                     enum_name: (*enum_name).to_string(),
                                     variant_name: (*variant_name).to_string(),
+                                    payload: Vec::new(),
                                 });
                             }
                             return Err(Signal::Error(format!(
@@ -883,6 +899,47 @@ impl Interpreter {
                 eval_unop(*op, &v).map_err(Signal::Error)
             }
             Expr::Call { callee, args, .. } => {
+                // m47-payloads: detect enum variant construction
+                // with args — `EnumName::Variant(arg0, ...)`. The
+                // callee's Path is a 2-segment qualified name; if
+                // the first segment names a declared enum and the
+                // second matches one of its variants, evaluate
+                // each arg and assemble Value::EnumVariant with
+                // the payload.
+                if let Expr::Path(qn) = callee.as_ref() {
+                    if qn.segments.len() == 2 {
+                        let enum_name = &qn.segments[0].name;
+                        let variant_name = &qn.segments[1].name;
+                        if let Some(t) = self.types.get(enum_name) {
+                            if let TypeDeclBody::Enum(variants) = &t.body {
+                                if let Some(v) = variants
+                                    .iter()
+                                    .find(|v| v.name.name == *variant_name)
+                                {
+                                    if v.fields.len() != args.len() {
+                                        return Err(Signal::Error(format!(
+                                            "{}::{} expects {} arg(s), got {}",
+                                            enum_name,
+                                            variant_name,
+                                            v.fields.len(),
+                                            args.len()
+                                        )));
+                                    }
+                                    let mut payload: Vec<Value> =
+                                        Vec::with_capacity(args.len());
+                                    for a in args {
+                                        payload.push(self.eval_expr(a)?);
+                                    }
+                                    return Ok(Value::EnumVariant {
+                                        enum_name: enum_name.clone(),
+                                        variant_name: variant_name.clone(),
+                                        payload,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 // m46-vocab: count() / mean(x) accumulator
                 // builtins. Inside a closure assertion (ctx set),
                 // each routes to the next accumulator slot:
@@ -2297,26 +2354,49 @@ fn pattern_match(
             _ => false,
         },
         Pattern::Constructor { path, args, .. } => {
-            // v0.1: empty-args only. Two cases:
+            // m47 + payloads:
             //   - 1-segment path matches struct values by name
-            //     (legacy behavior).
+            //     (no args supported there yet).
             //   - 2-segment path `EnumName::VariantName` matches
-            //     enum variant values by both names. Codegen
-            //     enforces no-payload variants upstream.
-            if !args.is_empty() {
-                return false;
-            }
+            //     enum variant values; if args are present they
+            //     bind / wildcard the payload fields in
+            //     declaration order. v0.1 sub-patterns are
+            //     Wildcard / Binding only.
             let segs: Vec<&str> =
                 path.segments.iter().map(|s| s.name.as_str()).collect();
             match (segs.as_slice(), val) {
-                ([single], Value::Struct { name, .. }) => *single == name,
+                ([single], Value::Struct { name, .. }) if args.is_empty() => {
+                    *single == name
+                }
                 (
                     [enum_name, variant_name],
                     Value::EnumVariant {
                         enum_name: en,
                         variant_name: vn,
+                        payload,
                     },
-                ) => *enum_name == en && *variant_name == vn,
+                ) => {
+                    if !(*enum_name == en && *variant_name == vn) {
+                        return false;
+                    }
+                    if args.is_empty() {
+                        return true;
+                    }
+                    if args.len() != payload.len() {
+                        return false;
+                    }
+                    for (sub, val) in args.iter().zip(payload.iter()) {
+                        match sub {
+                            Pattern::Wildcard(_) => {}
+                            Pattern::Binding(ident) => {
+                                bindings
+                                    .insert(ident.name.clone(), val.clone());
+                            }
+                            _ => return false,
+                        }
+                    }
+                    true
+                }
                 _ => false,
             }
         }
@@ -2702,9 +2782,27 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Duration(a), Value::Duration(b)) => a == b,
         (Value::Time(a), Value::Time(b)) => a == b,
         (
-            Value::EnumVariant { enum_name: ea, variant_name: va },
-            Value::EnumVariant { enum_name: eb, variant_name: vb },
-        ) => ea == eb && va == vb,
+            Value::EnumVariant {
+                enum_name: ea,
+                variant_name: va,
+                payload: pa,
+            },
+            Value::EnumVariant {
+                enum_name: eb,
+                variant_name: vb,
+                payload: pb,
+            },
+        ) => {
+            // Tag identity first; then deep-equal payloads.
+            // Codegen v0.1 only compares tags (no payload eq);
+            // interpreter going further is fine — programs that
+            // need parity should match-bind the payload and
+            // compare fields explicitly.
+            ea == eb
+                && va == vb
+                && pa.len() == pb.len()
+                && pa.iter().zip(pb.iter()).all(|(x, y)| values_equal(x, y))
+        }
         (Value::Nil, Value::Nil) => true,
         (Value::Unit, Value::Unit) => true,
         _ => false,

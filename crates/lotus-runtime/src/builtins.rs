@@ -217,8 +217,14 @@ fn builtin_to_string(args: &[Value]) -> Result<Value, String> {
         Value::Duration(ns) => format!("{}ns", ns),
         Value::String(s) => s.clone(),
         Value::Time(s) => s.clone(),
-        Value::EnumVariant { enum_name, variant_name } => {
-            format!("{}::{}", enum_name, variant_name)
+        Value::EnumVariant { enum_name, variant_name, payload } => {
+            if payload.is_empty() {
+                format!("{}::{}", enum_name, variant_name)
+            } else {
+                let parts: Vec<String> =
+                    payload.iter().map(|v| v.display()).collect();
+                format!("{}::{}({})", enum_name, variant_name, parts.join(", "))
+            }
         }
         other => {
             return Err(format!(

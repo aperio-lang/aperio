@@ -1,0 +1,65 @@
+// 45-enum-payloads — m47 payloads: variants carry data.
+//
+// m47 (43-enums) shipped no-payload tagged unions. m47-payloads
+// extends every layer of the toolchain so a variant can carry an
+// ordered list of typed fields:
+//
+//   type Result = enum { Ok(Int), Err(String) };
+//   let r = Result::Ok(42);
+//   match r {
+//       Result::Ok(n)    -> println("ok: ", n),
+//       Result::Err(msg) -> println("err: ", msg),
+//   }
+//
+// Codegen represents has-payload enums as a pointer to a unified
+// `{ i32 tag, [N x i8] body }` storage struct sized to the
+// largest variant's payload. Construction allocates in the
+// current arena, writes the tag at slot 0, and packs the
+// payload fields into the body. Pattern matching loads the tag
+// through the pointer, compares to the variant's index, and on
+// match reads each field back out at its offset for the
+// pattern's bindings. Pure no-payload enums (like `Light` in
+// 43-enums) keep the value-semantics i32 representation —
+// representation is per-enum, decided when the decl is
+// registered.
+//
+// Interpreter mirrors the surface: Value::EnumVariant carries a
+// `payload: Vec<Value>`. Construction evaluates each arg in
+// order; pattern bindings read the payload positions back. The
+// two backends print identically.
+
+type Event = enum {
+    Tick(Int),
+    Trade(Decimal, Int),
+    Halt,
+};
+
+type Result = enum {
+    Ok(Int),
+    Err(String),
+};
+
+fn handle(e: Event) {
+    match e {
+        Event::Tick(n)            -> println("tick #", n),
+        Event::Trade(price, size) -> println("trade ", size, " @ ", price),
+        Event::Halt               -> println("halt"),
+    }
+}
+
+fn report(r: Result) {
+    match r {
+        Result::Ok(n)    -> println("ok: ", n),
+        Result::Err(msg) -> println("err: ", msg),
+    }
+}
+
+fn main() {
+    handle(Event::Tick(7));
+    handle(Event::Trade(99.95d, 100));
+    handle(Event::Halt);
+    handle(Event::Trade(0.001d, 1));
+
+    report(Result::Ok(42));
+    report(Result::Err("bad input"));
+}
