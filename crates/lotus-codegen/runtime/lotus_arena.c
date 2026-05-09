@@ -317,3 +317,34 @@ void lotus_bus_queue_destroy(lotus_bus_queue_t *q) {
     if (q->cells) free(q->cells);
     free(q);
 }
+
+/*
+ * Pinned-thread entry helper (m27).
+ *
+ * pthread_create takes `void *(*)(void *)`, but a lotus locus's
+ * run() lifecycle method has signature `void (*)(void *self)`.
+ * lotus_thread_entry adapts between the two: the codegen
+ * arena-allocates a `(fn, self_ptr)` tuple, hands its address
+ * to pthread_create as the start argument, and we cast it back
+ * here to invoke the locus's run() on the new thread. The
+ * tuple itself is in the parent's arena and freed when the
+ * parent dissolves; there's no per-thread lifetime concern
+ * since the thread is joined before the parent's arena tears
+ * down (per m27's deferred-thread-joins frame).
+ *
+ * v0 scope: pinned loci can declare ONLY run(). Birth / drain /
+ * dissolve / bus subscribe / publish all wait on m28 (full
+ * pinned lifecycle + cross-thread mailbox). The wrapper
+ * therefore doesn't have to know about those; it just calls
+ * the one method we know exists.
+ */
+typedef struct lotus_thread_args {
+    void (*fn)(void *);
+    void  *self_ptr;
+} lotus_thread_args_t;
+
+void *lotus_thread_entry(void *raw_args) {
+    lotus_thread_args_t *args = (lotus_thread_args_t *)raw_args;
+    args->fn(args->self_ptr);
+    return NULL;
+}

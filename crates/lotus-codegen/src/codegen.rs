@@ -171,6 +171,15 @@ pub fn build_executable(
         .arg(&obj_path)
         .arg(&runtime_c_path)
         .arg("-O2")
+        // m27: pinned-class loci spawn pthreads via the
+        // pthread_create / pthread_join externs declared in
+        // codegen. Linker needs -lpthread to satisfy them. Link
+        // unconditionally — the dependency is small and trying
+        // to gate it on "did this program declare any pinned
+        // loci?" would entangle the codegen pass with the link
+        // step. Cost: one extra dynamic dependency in the
+        // resulting binary.
+        .arg("-lpthread")
         .arg("-o")
         .arg(output_path)
         .status()
@@ -240,7 +249,14 @@ struct Cx<'ctx, 'p> {
     /// inside that body are pushed here instead of dissolving
     /// immediately, then drained + dissolved in reverse order at
     /// scope exit so they outlive synchronous publishes.
-    deferred_dissolves: Vec<Vec<(PointerValue<'ctx>, String)>>,
+    /// Each entry is `(self_ptr, locus_name, thread_id_alloca)`.
+    /// If `thread_id_alloca` is Some, the locus is pinned (m27)
+    /// and the flush emits a `pthread_join(load thread_id_alloca)`
+    /// before the rest of the dissolve sequence; pthread_join
+    /// blocks until the pinned thread's run() returns. Cooperative
+    /// long-lived loci have None.
+    deferred_dissolves:
+        Vec<Vec<(PointerValue<'ctx>, String, Option<PointerValue<'ctx>>)>>,
     /// True while lowering the body of `main`. `return` is treated
     /// as an exit-code return (truncated to i32) when this is set,
     /// rather than the user-fn `current_user_fn_ret` path.
@@ -569,6 +585,33 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .add_global(ptr_t, None, "lotus.bus_queue.global");
         bus_queue_global.set_initializer(&ptr_t.const_null());
         bus_queue_global.set_linkage(inkwell::module::Linkage::Internal);
+
+        // m27: pthread externs for pinned-class loci.
+        // declare i32 @pthread_create(ptr thread, ptr attr, ptr start, ptr arg)
+        // declare i32 @pthread_join(i64 thread, ptr retval)
+        // pthread_t is `unsigned long` on Linux x86-64 — i64.
+        // (If lotus ever targets a platform with a different
+        // pthread_t representation, this hardcoded width will
+        // need to grow into a target-specific selector.)
+        let pthread_create_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module
+            .add_function("pthread_create", pthread_create_ty, None);
+        let pthread_join_ty =
+            i32_t.fn_type(&[i64_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("pthread_join", pthread_join_ty, None);
+
+        // m27: lotus_thread_entry is the C-runtime adapter that
+        // bridges pthread_create's `void *(*)(void *)` signature
+        // to a locus's `void run(void *self)`. Declared as an
+        // extern so the codegen pass can hand its address to
+        // pthread_create at pinned-instantiation time.
+        let thread_entry_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_thread_entry", thread_entry_ty, None);
 
         // declare i32 @fflush(ptr)
         //
@@ -1029,12 +1072,37 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .deferred_dissolves
             .pop()
             .expect("flush without matching push");
-        for (self_ptr, locus_name) in frame.into_iter().rev() {
+        for (self_ptr, locus_name, thread_id_alloca) in frame.into_iter().rev() {
             let info = self
                 .user_loci
                 .get(&locus_name)
                 .cloned()
                 .expect("deferred locus declared");
+            // m27: pinned loci — pthread_join before dissolve so
+            // the pinned thread's run() has finished before we
+            // free its arena. The thread_id alloca lives in the
+            // enclosing fn's frame; load it just before passing
+            // to pthread_join.
+            if let Some(tid_slot) = thread_id_alloca {
+                let i64_t = self.context.i64_type();
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                let tid = self
+                    .builder
+                    .build_load(i64_t, tid_slot, "pinned.tid")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let null_retval = ptr_t.const_null();
+                let join_fn = self
+                    .module
+                    .get_function("pthread_join")
+                    .expect("pthread_join declared");
+                self.builder
+                    .build_call(
+                        join_fn,
+                        &[tid.into(), null_retval.into()],
+                        &format!("{}.pthread_join", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
             // drain → __closures → dissolve, mirroring the
             // ephemeral-locus ordering. Long-lived loci dissolve
             // here at scope-exit; the cascade itself ran each
@@ -4720,6 +4788,135 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // cascade still fires depth-first when those scope-exit
         // calls run.
         let is_long_lived = !info.subscriptions.is_empty();
+        let is_pinned =
+            matches!(info.schedule_class, ScheduleClass::Pinned);
+
+        // m27: pinned-class loci spawn a pthread for run() and
+        // defer pthread_join + arena destroy to scope exit.
+        // v0 scope: pinned must declare ONLY `run()` — no other
+        // lifecycle methods, no bus subscribe/publish. Cross-
+        // thread mailbox + full lifecycle on pinned thread land
+        // in m28. We validate here so the failure mode is a
+        // clear codegen error rather than a silent wrong-thread
+        // execution.
+        if is_pinned {
+            let ptr_t = self.context.ptr_type(AddressSpace::default());
+            let has_run = info.methods.contains_key("run");
+            let other_methods = ["birth", "accept", "drain", "dissolve"]
+                .iter()
+                .any(|k| info.methods.contains_key(*k));
+            if !has_run {
+                return Err(CodegenError::Unsupported(format!(
+                    "pinned locus `{}` requires `run()`; v0 m27 only \
+                     supports run-only pinned loci",
+                    locus_name
+                )));
+            }
+            if other_methods || is_long_lived {
+                return Err(CodegenError::Unsupported(format!(
+                    "pinned locus `{}` declares lifecycle methods or bus \
+                     subscriptions beyond run(); v0 m27 only supports \
+                     run-only pinned loci. Full pinned lifecycle + cross-\
+                     thread bus mailbox land in m28.",
+                    locus_name
+                )));
+            }
+            if info.closures_fn.is_some() {
+                return Err(CodegenError::Unsupported(format!(
+                    "pinned locus `{}` declares closures; v0 m27 doesn't \
+                     route closure violations across threads",
+                    locus_name
+                )));
+            }
+
+            let i64_t = self.context.i64_type();
+            // Allocate a thread_args struct (fn ptr + self_ptr)
+            // in the enclosing arena. lifecycle: lives until the
+            // enclosing locus's arena dies, which is bounded
+            // below by pthread_join (which runs before the
+            // enclosing arena destroy in flush_dissolve_frame).
+            let args_struct_ty = self.context.struct_type(
+                &[ptr_t.into(), ptr_t.into()],
+                false,
+            );
+            let args_size = args_struct_ty
+                .size_of()
+                .expect("thread args struct has known size");
+            let args_ptr =
+                self.arena_alloc(args_size, "pinned.args.alloc")?;
+            let run_fn = info.methods.get("run").copied().unwrap();
+            let run_fn_ptr =
+                run_fn.as_global_value().as_pointer_value();
+            // args_struct.fn = run_fn
+            let fn_slot = self
+                .builder
+                .build_struct_gep(
+                    args_struct_ty,
+                    args_ptr,
+                    0,
+                    "pinned.args.fn",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(fn_slot, run_fn_ptr)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // args_struct.self = self_ptr
+            let self_slot = self
+                .builder
+                .build_struct_gep(
+                    args_struct_ty,
+                    args_ptr,
+                    1,
+                    "pinned.args.self",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(self_slot, self_ptr)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // pthread_t alloca in the enclosing fn frame
+            let tid_alloca = self
+                .builder
+                .build_alloca(i64_t, &format!("{}.tid", locus_name))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // Find lotus_thread_entry as a fn pointer
+            let entry_fn_ptr = self
+                .module
+                .get_function("lotus_thread_entry")
+                .expect("lotus_thread_entry declared")
+                .as_global_value()
+                .as_pointer_value();
+            let null_attr = ptr_t.const_null();
+            let create_fn = self
+                .module
+                .get_function("pthread_create")
+                .expect("pthread_create declared");
+            self.builder
+                .build_call(
+                    create_fn,
+                    &[
+                        tid_alloca.into(),
+                        null_attr.into(),
+                        entry_fn_ptr.into(),
+                        args_ptr.into(),
+                    ],
+                    &format!("{}.pthread_create", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+            // Defer pthread_join + arena destroy to scope exit.
+            if let Some(top) = self.deferred_dissolves.last_mut() {
+                top.push((self_ptr, locus_name.to_string(), Some(tid_alloca)));
+            } else {
+                return Err(CodegenError::Unsupported(format!(
+                    "pinned locus `{}` instantiated outside any tracked \
+                     scope (no deferred-dissolve frame)",
+                    locus_name
+                )));
+            }
+
+            return Ok(self_ptr);
+        }
+
         for kind in &["birth", "run"] {
             if let Some(method) = info.methods.get(kind) {
                 self.builder
@@ -4776,7 +4973,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // payload copies it received — goes here.
             self.emit_locus_arena_destroy(&info, self_ptr, locus_name)?;
         } else if let Some(top) = self.deferred_dissolves.last_mut() {
-            top.push((self_ptr, locus_name.to_string()));
+            top.push((self_ptr, locus_name.to_string(), None));
         } else {
             // Should be unreachable: every fn body / lifecycle
             // body opens a frame in lower_program/method body

@@ -1,12 +1,14 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 26b (explicit `yield`
-primitive) on top of m26 (cooperative scheduler semantics — bus
-dispatch deferred via FIFO queue), m25 (bimodal schedule-class
+new session. State as of codegen milestone 27 (pinned threads —
+run-only): pinned-class loci spawn a pthread at instantiation;
+their `run()` body executes on that thread; deferred
+`pthread_join` at scope exit. On top of m26b (`yield`), m26
+(cooperative scheduler semantics), m25 (bimodal schedule-class
 annotation), m24 (`match` expressions), and the m19→m23
-region-allocator arc. **21 of 22 examples build to native ELF —
-every single-binary example.** Only `trellis-pair`
+region-allocator arc. **21 of 22 examples build to native ELF
+— every single-binary example.** Only `trellis-pair`
 (multi-binary, cross-process bus) remains, gated on
 substantial new infrastructure.
 
@@ -76,6 +78,26 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 17 of 18 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 27** (pinned threads, run-only) —
+  complete. Pinned-class loci spawn a real pthread at
+  instantiation: codegen arena-allocates a `(run_fn, self_ptr)`
+  tuple, calls `pthread_create` with the C-runtime adapter
+  `lotus_thread_entry` as the start routine, and defers
+  `pthread_join` to the deferred-dissolve flush via a new
+  optional `thread_id_alloca` field on frame entries (parallel
+  to cooperative long-lived's None-tagged entries). pthread_join
+  blocks until run() returns; arena destroy follows.
+  Linker now passes `-lpthread` unconditionally. v0 m27 scope:
+  pinned loci can declare ONLY `run()` — no birth/drain/dissolve,
+  no bus subscribe/publish. Codegen errors clearly otherwise.
+  Full pinned lifecycle on the pinned thread + cross-thread
+  bus mailbox (the "any → pinned" post-and-continue side of
+  cross-class semantics) wait on m28.
+  `examples/16-schedule-classes/` updated to actually exercise
+  the new substrate: PinnedWorker.run() does a 50ms
+  `time::sleep` so the main thread's println races deterministically.
+  Output ordering "cooperative ... / main: spawned both / pinned
+  ran on its own pthread" demonstrates the parallelism.
 - **Phase 3 milestone 26b** (explicit `yield` primitive) —
   complete. `yield` lifted from reserved keyword to a real
   statement. Codegen lowers `yield;` to a call to
@@ -194,14 +216,15 @@ Phase status:
   handles stay in parent.children (for `for child in
   self.children`) but the parent's later cascade skips
   already-dissolved children.
-- **Phase 3 next** — m27 (pinned threads): pthread_create per
-  pinned locus; cross-thread bus mailbox (the post-and-continue
-  side of the spec's "any → pinned" rule); optional
-  `sched_setaffinity` for explicit core pinning. After that
-  arc: `trellis-pair` (cross-process bus + entry-point
-  selection) becomes the natural exercise of the full multi-
-  scheduler runtime — substrate is finally complete enough
-  that the application stops being aspirational.
+- **Phase 3 next** — m28 (pinned full lifecycle + cross-thread
+  bus mailbox): allow pinned loci to declare birth/drain/
+  dissolve (all running on the pinned thread) and bus
+  subscribe/publish (cross-thread post-and-continue mailbox per
+  spec's "any → pinned" cross-class rule). After that:
+  `trellis-pair` (cross-process bus + entry-point selection)
+  becomes the natural exercise of the full multi-scheduler
+  runtime. Optional `sched_setaffinity(core=N)` syntax for
+  explicit core pinning is a small later add-on.
 
 ## Transport layering (decided 2026-05-08)
 
@@ -332,11 +355,18 @@ m26 Codegen milestone 26: cooperative scheduler semantics      (9c0ba40)
                             entry so subscribers process cells
                             before they dissolve; cells enqueued
                             during dissolves are leaked (v0)
-m26b Codegen milestone 26b: explicit `yield` primitive         (this commit)
+m26b Codegen milestone 26b: explicit `yield` primitive         (6760a44)
                           ⇒ yield lifted from reserved to real;
                             codegen lowers to lotus_bus_queue_drain;
                             interpreter no-op
                           + examples/17-yield
+m27 Codegen milestone 27: pinned threads (run-only)            (this commit)
+                          ⇒ pthread_create at pinned instantiation;
+                            run() executes on its own thread;
+                            deferred pthread_join at scope exit;
+                            -lpthread linked unconditionally;
+                            v0 scope: pinned loci must be run-only
+                            (no other lifecycle, no bus)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,

@@ -150,26 +150,26 @@ intermediate ground than time does.)
 - **Pinned → any**: same — cross-thread post; pinned doesn't
   block waiting for delivery acknowledgement.
 
-#### Implementation status (m26)
+#### Implementation status (m26 + m27)
 
 m25 wired the annotation through parse / typecheck / codegen.
-**m26 ships cooperative semantics: bus dispatch is deferred.**
+**m26 ships cooperative semantics; m27 ships pinned threads.**
 
-Each `<-` enqueues `(handler, self, payload_copy)` cells onto a
-program-wide FIFO queue (`@lotus.bus_queue.global`) instead of
-running handlers inline. The scheduler drain loop pops cells
-one at a time and invokes the handler — handler-atomic per
-substrate cell, with cooperative yields BETWEEN cells rather
-than nested call frames. Handlers may publish more events,
-which enqueue more cells; drain continues until the queue is
-empty at pop time.
+**m26 (cooperative):** Each `<-` enqueues `(handler, self,
+payload_copy)` cells onto a program-wide FIFO queue
+(`@lotus.bus_queue.global`) instead of running handlers
+inline. The scheduler drain loop pops cells one at a time
+and invokes the handler — handler-atomic per substrate cell,
+with cooperative yields BETWEEN cells rather than nested call
+frames. Handlers may publish more events; drain continues
+until empty.
 
 Drain runs at the start of every `flush_dissolve_frame` —
 before any long-lived locus dissolves — so subscribers process
-pending cells while still alive. v0 limitation: cells enqueued
-DURING a dissolve are leaked (subscriber gone before its
-handler runs). Realistic programs don't publish during
-dissolve.
+pending cells while still alive. Plus an explicit `yield;`
+statement (m26b) drains at user-placed points inside long
+internal loops. v0 limitation: cells enqueued DURING a
+dissolve are leaked.
 
 The C runtime gained the queue surface:
 ```
@@ -179,13 +179,32 @@ void lotus_bus_queue_drain(ptr q)
 void lotus_bus_queue_destroy(ptr q)
 ```
 m20's "memcpy payload into subscriber's arena" step happens at
-ENQUEUE time (publisher's frame), so the cell's `payload` ptr
-references storage that's valid until the subscriber dissolves.
+ENQUEUE time (publisher's frame).
 
-Pinned threads (m27) get a separate mailbox per pinned locus
-and the post-across-thread path; cooperative-to-cooperative
-within a single thread keeps the simple shared-queue design
-above.
+**m27 (pinned threads):** Pinned-class loci spawn a pthread at
+instantiation; the locus's `run()` body executes on that
+thread. Main thread continues. At scope exit (deferred-
+dissolve flush), `pthread_join` blocks until the pinned
+thread's `run()` returns, then the locus's arena is destroyed
+wholesale.
+
+The C runtime gained `lotus_thread_entry`, a small adapter
+that bridges pthread_create's `void *(*)(void *)` signature to
+a locus's `void run(void *self)`. Codegen arena-allocates a
+`(fn, self_ptr)` tuple, hands it to pthread_create, and
+defers `pthread_join` to the deferred-dissolve flush via a
+new optional `thread_id_alloca` field on each frame entry.
+
+v0 m27 scope: pinned loci can declare ONLY `run()` — no
+birth/drain/dissolve, no bus subscribe/publish. Codegen errors
+clearly if those are present. Full pinned lifecycle (birth /
+drain / dissolve all on the pinned thread) plus cross-thread
+bus mailbox (the post-and-continue side of "any → pinned" in
+the cross-class semantics) wait on m28.
+
+Linker dependency: clang invocation now passes `-lpthread`
+unconditionally; small fixed cost in the resulting binary
+(libpthread is on every modern Linux).
 
 ### Bus message router
 

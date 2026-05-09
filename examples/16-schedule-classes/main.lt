@@ -20,11 +20,16 @@
 // cooperative scheduler entirely. The place you go when you
 // leave is your own thread. That's pinned.
 //
-// m25 wires the annotation through parse + resolve. m26 will
-// ship cooperative semantics (deferred bus dispatch + scheduler
-// loop); m27 will spawn dedicated threads for pinned loci.
-// Today: parses + resolves; behaves identically to today's
-// synchronous-everywhere runtime.
+// m27 ships pinned threads (this example actually demonstrates
+// the new substrate): PinnedWorker spawns a pthread at
+// instantiation; its run() body executes on that thread; main
+// thread continues; main joins the pinned thread at scope exit.
+// The 50ms sleep on the pinned thread + main-thread println
+// makes the ordering deterministic.
+//
+// v0 scope: pinned loci can declare ONLY run() — no bus, no
+// other lifecycle methods. Full pinned lifecycle + cross-
+// thread bus mailbox land in m28.
 
 locus CooperativeWorker : schedule cooperative {
     run() {
@@ -34,11 +39,17 @@ locus CooperativeWorker : schedule cooperative {
 
 locus PinnedWorker : schedule pinned {
     run() {
-        println("pinned: owns its thread; in v0 still on main");
+        // Sleep so the main-thread println races us and lands
+        // first deterministically. Without this, the print
+        // order would be non-deterministic — pinned really
+        // runs in parallel.
+        time::sleep(50ms);
+        println("pinned: ran on its own pthread");
     }
 }
 
 fn main() {
-    CooperativeWorker { };
     PinnedWorker { };
+    CooperativeWorker { };
+    println("main: spawned both; will join pinned at scope exit");
 }

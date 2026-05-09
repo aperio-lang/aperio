@@ -30,10 +30,13 @@ annotations** (`: schedule cooperative | pinned`), (m26)
 via a process-wide FIFO queue; cells run between substrate
 yield points instead of nesting in publisher frames, and (m26b)
 **explicit `yield`** as the user-placed cell boundary for
-long-internal-loop bodies; m27 will spawn dedicated threads for
-pinned loci. **21 of 22 examples build to native ELF — every
-single-binary example is a build target.** Phase 3 (codegen) is
-at milestone 26b: literals +
+long-internal-loop bodies, and (m27) **pinned threads** —
+pinned-class loci spawn a real pthread at instantiation, with
+deferred `pthread_join` at scope exit (v0: run-only loci; full
+lifecycle + cross-thread bus mailbox in m28). **21 of 22
+examples build to native ELF — every single-binary example is
+a build target.** Phase 3 (codegen) is at milestone 27:
+literals +
 arithmetic, `let`/`let mut` + assignment + compound ops,
 `if`/`else`/`while` + `break`/`continue`, `time::sleep` on
 `CLOCK_MONOTONIC` with EINTR retry, `time::monotonic()` +
@@ -318,7 +321,7 @@ Per the delivery plan:
   Region allocator + cooperative scheduler are the remaining
   Phase 2 deep-pushes.
 - **Phase 3** — Codegen in Rust targeting LLVM. *In progress;
-  milestone 26b of N complete.* Working subset: literals, arithmetic,
+  milestone 27 of N complete.* Working subset: literals, arithmetic,
   `let`/`let mut` + assignment + compound ops, mixed-type println,
   if/else/while + break/continue, `time::sleep` + `time::monotonic`
   on `CLOCK_MONOTONIC` with EINTR retry, Duration / Decimal /
@@ -348,11 +351,15 @@ Per the delivery plan:
   per bimodality), (m26) **cooperative scheduler semantics** —
   bus dispatch is deferred via a process-wide FIFO queue; cells
   run between substrate yield points instead of nesting in
-  publisher frames, and (m26b) **explicit `yield`** as the rare
+  publisher frames, (m26b) **explicit `yield`** as the rare
   user-placed substrate cell boundary for long-internal-loop
-  bodies. Spec-aligned per `spec/runtime.md::Schedule classes`;
-  m27 ships pinned threads. **21 of 22 example projects compile
-  to native ELF — every single-binary example.** Only
+  bodies, and (m27) **pinned threads** — pinned-class loci spawn
+  a real pthread at instantiation; deferred `pthread_join` at
+  scope exit (v0: run-only; full lifecycle + cross-thread bus
+  mailbox in m28). Spec-aligned per
+  `spec/runtime.md::Schedule classes`. **21 of 22 example
+  projects compile to native ELF — every single-binary
+  example.** Only
   `trellis-pair` (cross-process bus + entry-point selection)
   remains, gated on substantial new infrastructure.
 - **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
