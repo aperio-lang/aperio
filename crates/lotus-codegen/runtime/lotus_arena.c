@@ -392,16 +392,171 @@ void lotus_bus_queue_destroy(lotus_bus_queue_t *q) {
 }
 
 /*
- * Pinned-thread entry (m28a).
+ * Per-pinned-locus mailbox (m28b stage 2).
+ *
+ * Each pinned locus that declares `bus subscribe` gets its own
+ * mailbox: same cell shape as the global queue, plus a condvar
+ * + shutdown flag. Cross-thread publishers (cooperative or
+ * pinned) call lotus_mailbox_post to drop a cell into the
+ * subscriber's mailbox; the pinned thread's main loop calls
+ * lotus_mailbox_drain_one to pull one cell at a time, copy
+ * its inline payload into the locus's arena, and invoke the
+ * handler — handler-atomic per substrate cell, just like the
+ * cooperative drain.
+ *
+ * post → broadcasts the not_empty condvar so a thread waiting
+ * in drain_one wakes up.
+ *
+ * drain_one blocks on the condvar until either:
+ *   - a cell arrives (returns 1 after invoking the handler), or
+ *   - shutdown is signaled and the queue is empty (returns 0).
+ *
+ * shutdown sets the flag + broadcasts so all waiters return.
+ * The pinned thread observes return=0, breaks its loop, runs
+ * its drain/dissolve, and exits — main thread then joins.
+ *
+ * Per The Design / lotus, this is the canonical "any → pinned"
+ * bus path: publisher and subscriber sit in different layers
+ * of the lotus, the cost lives at the boundary (the mailbox
+ * lock + the inline payload's two memcpy's), and each arena
+ * stays single-threaded territory.
+ */
+
+typedef struct lotus_mailbox {
+    lotus_bus_cell_t *cells;
+    size_t            head;
+    size_t            tail;
+    size_t            cap;
+    int               shutdown;
+    pthread_mutex_t   lock;
+    pthread_cond_t    not_empty;
+} lotus_mailbox_t;
+
+#define LOTUS_MAILBOX_INITIAL_CAP 64
+
+lotus_mailbox_t *lotus_mailbox_create(void) {
+    lotus_mailbox_t *mb =
+        (lotus_mailbox_t *)malloc(sizeof(lotus_mailbox_t));
+    if (!mb) return NULL;
+    mb->cap   = LOTUS_MAILBOX_INITIAL_CAP;
+    mb->cells = (lotus_bus_cell_t *)
+        malloc(mb->cap * sizeof(lotus_bus_cell_t));
+    if (!mb->cells) {
+        free(mb);
+        return NULL;
+    }
+    mb->head     = 0;
+    mb->tail     = 0;
+    mb->shutdown = 0;
+    pthread_mutex_init(&mb->lock, NULL);
+    pthread_cond_init(&mb->not_empty, NULL);
+    return mb;
+}
+
+void lotus_mailbox_post(lotus_mailbox_t *mb,
+                        void *handler,
+                        void *self_ptr,
+                        const void *payload_src,
+                        size_t payload_size) {
+    if (!mb) return;
+    if (payload_size > LOTUS_PAYLOAD_MAX) {
+        return;     /* v0 limit */
+    }
+    pthread_mutex_lock(&mb->lock);
+    if (mb->tail == mb->cap) {
+        size_t live = mb->tail - mb->head;
+        if (mb->head > 0) {
+            memmove(mb->cells, mb->cells + mb->head,
+                    live * sizeof(lotus_bus_cell_t));
+            mb->head = 0;
+            mb->tail = live;
+        }
+        if (mb->tail == mb->cap) {
+            size_t new_cap = mb->cap * 2;
+            lotus_bus_cell_t *new_cells = (lotus_bus_cell_t *)
+                realloc(mb->cells, new_cap * sizeof(lotus_bus_cell_t));
+            if (!new_cells) {
+                pthread_mutex_unlock(&mb->lock);
+                return;
+            }
+            mb->cells = new_cells;
+            mb->cap   = new_cap;
+        }
+    }
+    lotus_bus_cell_t *slot = &mb->cells[mb->tail++];
+    slot->handler      = handler;
+    slot->self_ptr     = self_ptr;
+    slot->payload_size = payload_size;
+    if (payload_size > 0 && payload_src) {
+        memcpy(slot->payload_inline, payload_src, payload_size);
+    }
+    pthread_cond_broadcast(&mb->not_empty);
+    pthread_mutex_unlock(&mb->lock);
+}
+
+int lotus_mailbox_drain_one(lotus_mailbox_t *mb) {
+    if (!mb) return 0;
+    pthread_mutex_lock(&mb->lock);
+    while (mb->head >= mb->tail && !mb->shutdown) {
+        pthread_cond_wait(&mb->not_empty, &mb->lock);
+    }
+    if (mb->head >= mb->tail) {
+        /* shutdown with empty queue */
+        mb->head = 0;
+        mb->tail = 0;
+        pthread_mutex_unlock(&mb->lock);
+        return 0;
+    }
+    lotus_bus_cell_t cell_copy = mb->cells[mb->head++];
+    if (mb->head >= mb->tail) {
+        mb->head = 0;
+        mb->tail = 0;
+    }
+    pthread_mutex_unlock(&mb->lock);
+
+    void *payload_in_arena = NULL;
+    if (cell_copy.payload_size > 0) {
+        lotus_arena_t *sub_arena =
+            *(lotus_arena_t **)cell_copy.self_ptr;
+        payload_in_arena = lotus_arena_alloc(
+            sub_arena, cell_copy.payload_size, 8);
+        if (payload_in_arena) {
+            memcpy(payload_in_arena,
+                   cell_copy.payload_inline,
+                   cell_copy.payload_size);
+        }
+    }
+    ((lotus_handler_fn)cell_copy.handler)(
+        cell_copy.self_ptr, payload_in_arena);
+    return 1;
+}
+
+void lotus_mailbox_shutdown(lotus_mailbox_t *mb) {
+    if (!mb) return;
+    pthread_mutex_lock(&mb->lock);
+    mb->shutdown = 1;
+    pthread_cond_broadcast(&mb->not_empty);
+    pthread_mutex_unlock(&mb->lock);
+}
+
+void lotus_mailbox_destroy(lotus_mailbox_t *mb) {
+    if (!mb) return;
+    pthread_cond_destroy(&mb->not_empty);
+    pthread_mutex_destroy(&mb->lock);
+    if (mb->cells) free(mb->cells);
+    free(mb);
+}
+
+/*
+ * Pinned-thread entry (m28a + m28b).
  *
  * The C-runtime adapter `lotus_thread_entry` is gone — m28a
  * synthesizes a per-locus `__pinned_main_<LocusName>` LLVM
  * function whose signature is exactly pthread's `void *(*)(void *)`.
  * That function takes self_ptr as its sole argument and runs
- * birth → run → drain → dissolve in sequence (each only if the
- * locus declared it) before returning NULL. Codegen passes that
- * function directly to pthread_create, with self_ptr as the arg.
- *
- * Bus subscribe / publish on pinned loci still wait on m28b
- * (cross-thread mailbox).
+ * birth → run → (mailbox loop) → drain → dissolve in sequence
+ * (each only if the locus declared it) before returning NULL.
+ * The mailbox loop is included only when the pinned locus
+ * declares `bus subscribe`; the codegen branches on that at
+ * compile time (m28b).
  */

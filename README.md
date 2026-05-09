@@ -30,13 +30,17 @@ annotations** (`: schedule cooperative | pinned`), (m26)
 via a process-wide FIFO queue; cells run between substrate
 yield points instead of nesting in publisher frames, and (m26b)
 **explicit `yield`** as the user-placed cell boundary for
-long-internal-loop bodies, and (m27 + m28a) **pinned threads
-with full lifecycle** — pinned-class loci spawn a real pthread
-at instantiation; the locus's full declared lifecycle (birth /
-run / drain / dissolve) executes on that thread in order, with
-deferred `pthread_join` at scope exit. **22 of 23 examples
-build to native ELF — every single-binary example is a build
-target.** Phase 3 (codegen) is at milestone 28a:
+long-internal-loop bodies, (m27 + m28a) **pinned threads with
+full lifecycle** — pinned-class loci spawn a real pthread at
+instantiation; the locus's full declared lifecycle (birth /
+run / drain / dissolve) executes on that thread in order, and
+(m28b) **cross-thread bus mailboxes** — pinned loci can
+subscribe and publish; cells route between threads via
+per-locus mutex+condvar mailboxes carrying inline payloads,
+with coordinated shutdown via shutdown-flag-then-join.
+**23 of 24 examples build to native ELF — every single-binary
+example is a build target.** Phase 3 (codegen) is at milestone
+28b:
 literals +
 arithmetic, `let`/`let mut` + assignment + compound ops,
 `if`/`else`/`while` + `break`/`continue`, `time::sleep` on
@@ -272,11 +276,11 @@ crates/                   (Phase 1 + 2 v0 + Phase 3 milestones 0-18)
                           object file (m19 substrate).
 ```
 
-Example ladder: 23 projects from hello-world → trellis-pair;
-~950 lines of source + ~1,400+ lines of README walk-throughs.
-91 tests across the workspace; 22 of 23 projects run end-to-end
+Example ladder: 24 projects from hello-world → trellis-pair;
+~1,000 lines of source + ~1,400+ lines of README walk-throughs.
+91 tests across the workspace; 23 of 24 projects run end-to-end
 under `lotus run` (only multi-binary trellis-pair waits on the
-cross-process bus). **22 of 23 projects** also build to native
+cross-process bus). **23 of 24 projects** also build to native
 ELF via `lotus build` — every single-binary example. Only
 `trellis-pair` (cross-process bus + entry-point selection) is
 not a build target.
@@ -322,7 +326,7 @@ Per the delivery plan:
   Region allocator + cooperative scheduler are the remaining
   Phase 2 deep-pushes.
 - **Phase 3** — Codegen in Rust targeting LLVM. *In progress;
-  milestone 28a of N complete.* Working subset: literals, arithmetic,
+  milestone 28b of N complete.* Working subset: literals, arithmetic,
   `let`/`let mut` + assignment + compound ops, mixed-type println,
   if/else/while + break/continue, `time::sleep` + `time::monotonic`
   on `CLOCK_MONOTONIC` with EINTR retry, Duration / Decimal /
@@ -354,15 +358,21 @@ Per the delivery plan:
   run between substrate yield points instead of nesting in
   publisher frames, (m26b) **explicit `yield`** as the rare
   user-placed substrate cell boundary for long-internal-loop
-  bodies, and (m27 + m28a) **pinned threads with full lifecycle**
-  — pinned-class loci spawn a real pthread at instantiation; the
+  bodies, (m27 + m28a) **pinned threads with full lifecycle** —
+  pinned-class loci spawn a real pthread at instantiation; the
   full declared lifecycle (birth → run → drain → dissolve, each
   only if declared) executes on that thread, in order; deferred
-  `pthread_join` at scope exit. Cross-thread bus mailbox waits on
-  m28b. Spec-aligned per `spec/runtime.md::Schedule classes`.
-  **22 of 23 example projects compile to native ELF — every
-  single-binary example.** Only `trellis-pair` (cross-process
-  bus + entry-point selection) remains, gated on substantial new
+  `pthread_join` at scope exit, and (m28b) **cross-thread bus
+  mailboxes** — pinned loci can subscribe and publish; bus
+  dispatch routes cells via per-locus mutex+condvar mailboxes
+  with inline payloads (handler runs on the pinned thread,
+  publisher unaffected); coordinated shutdown via
+  shutdown-flag-then-join. The substrate cost lives at the
+  layer boundary, not inside either layer's arena. Spec-aligned
+  per `spec/runtime.md::Schedule classes`. **23 of 24 example
+  projects compile to native ELF — every single-binary
+  example.** Only `trellis-pair` (cross-process bus +
+  entry-point selection) remains, gated on substantial new
   infrastructure.
 - **Phase 4** — Stdlib v0 in lotus + Rust FFI shims. Overlaps
   Phase 3.

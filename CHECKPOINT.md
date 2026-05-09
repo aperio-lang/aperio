@@ -1,17 +1,19 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 28a (pinned threads —
-full lifecycle on the pinned thread). The full substrate arc
-landed across this session: m19→m23 (region allocator with
-rich/chunked/recognition strategies + per-locus arenas + bus
-copy semantics), m24 (`match` codegen), m25 (bimodal schedule-
-class annotation), m26 (cooperative scheduler semantics —
-deferred bus dispatch + drain loop), m26b (explicit `yield`),
-m27 (pinned-thread spawning via pthread_create, run-only),
-m28a (full pinned lifecycle — birth/run/drain/dissolve all on
-the pinned thread, via synthesized per-locus
-`__pinned_main_<Locus>`). **22 of 23 examples build to native
+new session. State as of codegen milestone 28b (cross-thread
+bus mailboxes). The full substrate arc landed across this
+session: m19→m23 (region allocator with rich/chunked/recognition
+strategies + per-locus arenas + bus copy semantics), m24
+(`match` codegen), m25 (bimodal schedule-class annotation),
+m26 (cooperative scheduler semantics — deferred bus dispatch +
+drain loop), m26b (explicit `yield`), m27 (pinned-thread
+spawning via pthread_create, run-only), m28a (full pinned
+lifecycle — birth/run/drain/dissolve all on the pinned thread),
+m28b (cross-thread bus mailboxes — pinned loci can subscribe
+and publish; cells route via per-locus mutex+condvar mailboxes
+with inline payloads; coordinated shutdown via
+shutdown-flag-then-join). **23 of 24 examples build to native
 ELF — every single-binary example.** Only `trellis-pair`
 (multi-binary, cross-process bus) remains.
 
@@ -62,9 +64,36 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 18 of 19 example
+- **Phase 2 v0** (interpreter + bus router) — 19 of 20 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 28b** (cross-thread bus mailboxes) —
+  complete. Pinned loci can now declare `bus subscribe` and
+  publish to cross-thread subjects; the gate is fully lifted
+  (only `accept()` and closures remain pinned-incompatible —
+  both require cross-thread cascade/violation routing that's
+  separate from the mailbox post-and-continue m28b
+  delivers). Stage 1 refactored bus queue cells to carry
+  inline payloads (with a `pthread_mutex_t`) so the queue is
+  the single point of cross-thread synchronization — each
+  per-locus arena stays single-threaded territory. Stage 2
+  added `lotus_mailbox_t` (a bounded ring buffer with
+  mutex+condvar+shutdown flag), grew the bus entry struct
+  to `{subject, self, handler, mailbox}`, taught
+  `bus_dispatch` to route by `entry.mailbox`
+  (null → cooperative global queue; non-null → pinned
+  mailbox), and grew the synthesized
+  `__pinned_main_<Locus>` body with a mailbox loop between
+  `run()` and `drain()`. Coordinated shutdown:
+  deferred-dissolve flush calls `lotus_mailbox_shutdown` →
+  pthread_join → arena/mailbox destroy. Per The Design /
+  lotus, the substrate cost lives at the layer boundary
+  (the mailbox lock + the inline payload's two memcpy's),
+  not inside either layer's arena. Bimodality holds. New
+  `examples/19-pinned-bus/` exercises a cooperative
+  publisher feeding a pinned subscriber across threads.
+  v0 limit: payloads above 512 bytes drop silently;
+  trellis-grade typed messages are well under this.
 - **Phase 3 milestone 28a** (pinned full lifecycle on the pinned
   thread) — complete. m27's "run-only" gate is lifted: pinned
   loci can now declare birth / run / drain / dissolve, and the
@@ -225,22 +254,15 @@ Phase status:
   handles stay in parent.children (for `for child in
   self.children`) but the parent's later cascade skips
   already-dissolved children.
-- **Phase 3 next** — m28b (cross-thread bus mailbox): the other
-  half of the bimodal cut. Pinned loci can declare bus
-  subscribe / publish; cross-thread dispatch routes via a
-  per-pinned-locus mailbox (bounded ring buffer, mutex +
-  condvar) instead of the cooperative global queue. Decided
-  shape: each mailbox slot carries an inline `[u8; PAYLOAD_MAX]`,
-  publisher memcpy's into the slot at post time, pinned thread
-  copies out into its own arena before invoking the handler —
-  two memcpy's per cross-thread cell, but both arenas stay
-  single-threaded (the lock lives at the boundary, not inside
-  either layer). Per The Design / lotus, the substrate cost
-  belongs at the layer boundary. After m28b: `trellis-pair`
-  (cross-process bus + entry-point selection) becomes the
-  natural exercise of the full multi-scheduler runtime.
-  Optional `sched_setaffinity(core=N)` syntax for explicit
-  core pinning is a small later add-on.
+- **Phase 3 next** — `trellis-pair` (multi-binary, cross-process
+  bus + entry-point selection). The substrate is now in good
+  shape; trellis-pair is the natural exercise of the full
+  multi-scheduler runtime. Two pieces: `lotus build --bin
+  <locus>` for entry-point selection, and a cross-process bus
+  transport (decided last session: shared-memory ring buffer,
+  per the runtime/stdlib transport split documented below).
+  Optional `sched_setaffinity(core=N)` syntax for explicit core
+  pinning is a small later add-on.
 
 ## Transport layering (decided 2026-05-08)
 
@@ -383,7 +405,7 @@ m27 Codegen milestone 27: pinned threads (run-only)            (cc57ee4)
                             -lpthread linked unconditionally;
                             v0 scope: pinned loci must be run-only
                             (no other lifecycle, no bus)
-m28a Codegen milestone 28a: pinned full lifecycle              (pending)
+m28a Codegen milestone 28a: pinned full lifecycle              (c70b551)
                           ⇒ pinned loci can declare birth/run/
                             drain/dissolve, all run on the pinned
                             thread in order; synthesized per-locus
@@ -393,6 +415,24 @@ m28a Codegen milestone 28a: pinned full lifecycle              (pending)
                             drain/dissolve for pinned entries
                             (already ran on the thread)
                           + examples/18-pinned-lifecycle
+m28b/1 m28b stage 1: inline-payload bus queue + mutex          (8f8d20d)
+                          ⇒ queue cells carry [u8; 512] inline
+                            payload; pthread_mutex_t guards cell
+                            array; drain copies inline →
+                            subscriber arena before invoking
+                            handler. Prereq for cross-thread
+                            bus: queue is the single sync point;
+                            arenas stay single-threaded.
+m28b/2 m28b stage 2: per-pinned mailbox + dispatch routing     (pending)
+                          ⇒ lotus_mailbox_t (mutex+condvar+
+                            shutdown flag); bus entry grows
+                            mailbox field; dispatch routes by
+                            entry.mailbox null/non-null;
+                            synthesized __pinned_main_<Locus>
+                            grows mailbox loop between run()
+                            and drain(); coordinated shutdown
+                            via shutdown-flag-then-join
+                          + examples/19-pinned-bus
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -448,7 +488,7 @@ m7 builds on the struct ABI.
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
 | Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
 | Pinned threads (full lifecycle: birth/run/drain/dissolve) | — | ✅ |
-| Pinned + cross-thread bus mailbox | — | — (m28b) |
+| Pinned + cross-thread bus mailbox | — | ✅ |
 | Region allocator — per-locus arenas, bus copy semantics | — | ✅ |
 | Region allocator — chunked sub-regions + free-list | — | ✅ |
 | Region allocator — recognition bitmap-pool | — | — (chunked-equivalent stub) |
@@ -563,7 +603,9 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
-(pending) Codegen milestone 28a: pinned full lifecycle on the pinned thread
+(pending) Codegen milestone 28b stage 2: per-pinned mailbox + dispatch routing
+8f8d20d m28b stage 1: inline-payload bus queue + mutex
+c70b551 Codegen milestone 28a: pinned full lifecycle on the pinned thread
 1cb4aaa CHECKPOINT.md: session-resume reference
 cc57ee4 Codegen milestone 27: pinned threads (run-only)
 6760a44 m26b: explicit `yield` primitive
@@ -592,7 +634,7 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-74 commits ahead of origin/master at checkpoint time.
+76 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
@@ -747,6 +789,9 @@ rm examples/17-yield/main
 cargo run --bin lotus -- build examples/18-pinned-lifecycle/main.lt
 ./examples/18-pinned-lifecycle/main      # main: spawned + pinned.birth/run/drain/dissolve on pinned thread
 rm examples/18-pinned-lifecycle/main
+cargo run --bin lotus -- build examples/19-pinned-bus/main.lt
+./examples/19-pinned-bus/main            # cooperative publisher feeds 3 ticks to pinned subscriber
+rm examples/19-pinned-bus/main
 ```
 
-If all twenty-two work, the checkpoint is intact.
+If all twenty-three work, the checkpoint is intact.

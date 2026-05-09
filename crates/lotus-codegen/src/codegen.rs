@@ -370,6 +370,15 @@ struct LocusInfo<'ctx> {
     /// the dispatch fn doesn't know which locus type its
     /// self_ptr came from).
     arena_field_idx: u32,
+    /// Index of the synthetic `__mailbox: ptr` field carrying this
+    /// locus's `lotus_mailbox_t*`. Only set for pinned-class loci
+    /// that declare `bus subscribe` — those need a per-locus
+    /// mailbox so cross-thread publishers can post cells without
+    /// touching the pinned thread's arena directly. None for every
+    /// other locus (cooperative loci route through the global
+    /// queue; pinned loci without subscriptions don't need a
+    /// mailbox at all). m28b stage 2.
+    mailbox_field_idx: Option<u32>,
     /// Per-spec projection class. Resolved at declare-locus-struct
     /// time from the `LocusAnnotation::Projection` annotation, or
     /// (per spec/memory.md) defaults to chunked if the locus
@@ -581,6 +590,44 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             None,
         );
 
+        // m28b stage 2: per-pinned-locus mailbox surface.
+        // declare ptr  @lotus_mailbox_create()
+        // declare void @lotus_mailbox_post(ptr mb, ptr handler, ptr self,
+        //                                  ptr payload_src, i64 payload_size)
+        // declare i32  @lotus_mailbox_drain_one(ptr mb)
+        // declare void @lotus_mailbox_shutdown(ptr mb)
+        // declare void @lotus_mailbox_destroy(ptr mb)
+        let mailbox_create_ty = ptr_t.fn_type(&[], false);
+        self.module
+            .add_function("lotus_mailbox_create", mailbox_create_ty, None);
+        let mailbox_post_ty = void_t.fn_type(
+            &[
+                ptr_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+                i64_t.into(),
+            ],
+            false,
+        );
+        self.module
+            .add_function("lotus_mailbox_post", mailbox_post_ty, None);
+        let mailbox_drain_one_ty = i32_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_mailbox_drain_one",
+            mailbox_drain_one_ty,
+            None,
+        );
+        let mailbox_shutdown_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_mailbox_shutdown",
+            mailbox_shutdown_ty,
+            None,
+        );
+        let mailbox_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_mailbox_destroy", mailbox_destroy_ty, None);
+
         // The program-wide bus queue pointer. Initialized in
         // main's prelude alongside the arena; drained at
         // strategic points (before each deferred-dissolve flush)
@@ -642,12 +689,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     }
 
     /// LLVM struct type for one entry in the bus subscription
-    /// table: `{ ptr subject, ptr self, ptr handler }`. With LLVM
-    /// 18 opaque pointers the per-element type only matters for
+    /// table: `{ ptr subject, ptr self, ptr handler, ptr mailbox }`.
+    /// `mailbox` is null for cooperative subscribers (route to
+    /// global queue) and a `lotus_mailbox_t*` for pinned
+    /// subscribers (route to that locus's mailbox). With LLVM 18
+    /// opaque pointers the per-element type only matters for
     /// allocation + GEP indexing.
     fn bus_entry_type(&self) -> inkwell::types::StructType<'ctx> {
         let ptr_t = self.context.ptr_type(AddressSpace::default());
-        self.context.struct_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false)
+        self.context.struct_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        )
     }
 
     /// Emit the bus subscription table + counter + dispatch fn.
@@ -701,6 +754,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.context.append_basic_block(dispatch_fn, "loop.check");
         let call_bb =
             self.context.append_basic_block(dispatch_fn, "loop.call");
+        let post_bb =
+            self.context.append_basic_block(dispatch_fn, "loop.post");
+        let enqueue_bb =
+            self.context.append_basic_block(dispatch_fn, "loop.enqueue");
         let inc_bb = self.context.append_basic_block(dispatch_fn, "loop.inc");
         let done_bb = self.context.append_basic_block(dispatch_fn, "done");
 
@@ -832,16 +889,75 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("size param")
             .into_int_value();
 
-        // m28b stage 1: enqueue with INLINE payload. The cell
-        // memcpy's the publisher's bytes into its own buffer; the
-        // subscriber-arena copy happens on the SUBSCRIBER thread
-        // at drain time (which is where it has to be — the
-        // subscriber's arena is single-threaded territory). This
-        // is the prerequisite for cross-thread bus: the queue is
-        // now the only point of cross-thread synchronization, the
-        // arenas stay lock-free, and per-spec/memory.md "every
-        // boundary copies" still holds (just with two memcpy's
-        // per cell instead of one).
+        // m28b stage 2: load entry.mailbox. If null, route this
+        // cell to the global cooperative queue (handler runs on
+        // the cooperative thread). If non-null, post to the
+        // pinned subscriber's mailbox (handler runs on its pinned
+        // thread). The publisher doesn't care which kind of
+        // subscriber it's hitting — the subscriber's registration
+        // determined that at instantiation time.
+        let mailbox_slot_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    entries_global.as_pointer_value(),
+                    &[i64_t.const_int(0, false), i, i32_t.const_int(3, false)],
+                    "entry.mailbox.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let mailbox = self
+            .builder
+            .build_load(ptr_t, mailbox_slot_ptr, "entry.mailbox")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let mailbox_int = self
+            .builder
+            .build_ptr_to_int(mailbox, i64_t, "mailbox.as.int")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let mailbox_nonnull = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                mailbox_int,
+                i64_t.const_int(0, false),
+                "mailbox.nonnull",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(mailbox_nonnull, post_bb, enqueue_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // post_bb: cross-thread mailbox post. lotus_mailbox_post
+        // memcpy's payload_src into the mailbox cell's inline
+        // buffer + signals the pinned thread's condvar.
+        self.builder.position_at_end(post_bb);
+        let post_fn = self
+            .module
+            .get_function("lotus_mailbox_post")
+            .expect("lotus_mailbox_post declared");
+        self.builder
+            .build_call(
+                post_fn,
+                &[
+                    mailbox.into(),
+                    handler.into(),
+                    entry_self.into(),
+                    payload_param.into(),
+                    size_param.into(),
+                ],
+                "bus.mailbox.post",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(inc_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // enqueue_bb: cooperative subscriber. Same path as m28b
+        // stage 1 — enqueue (handler, self, payload_src, size)
+        // onto the program-wide bus queue. Drain on the cooperative
+        // thread copies inline → subscriber's arena before invoke.
+        self.builder.position_at_end(enqueue_bb);
         let queue_global = self
             .module
             .get_global("lotus.bus_queue.global")
@@ -1039,18 +1155,51 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .get(&locus_name)
                 .cloned()
                 .expect("deferred locus declared");
-            // m28a: pinned loci — pthread_join blocks until the
-            // pinned thread's full lifecycle (birth → run → drain →
-            // dissolve, all run on the pinned thread inside its
-            // synthesized __pinned_main_<Locus>) has finished.
-            // The main thread's only remaining work for a pinned
-            // entry is the join and the arena_destroy; drain /
-            // closures / dissolve are SKIPPED here because they
-            // already ran on the pinned thread.
+            // m28a + m28b: pinned loci — pthread_join blocks until
+            // the pinned thread's full lifecycle (birth → run →
+            // mailbox loop (if subscriptions) → drain → dissolve)
+            // has finished. The main thread's only remaining work
+            // for a pinned entry is signaling shutdown to the
+            // mailbox (so the pinned thread breaks out of its
+            // mailbox loop), the join, and the arena_destroy;
+            // drain / closures / dissolve are SKIPPED on the main
+            // side because they already ran on the pinned thread.
             let is_pinned_entry = thread_id_alloca.is_some();
             if let Some(tid_slot) = thread_id_alloca {
                 let i64_t = self.context.i64_type();
                 let ptr_t = self.context.ptr_type(AddressSpace::default());
+                // m28b: signal mailbox shutdown if the pinned
+                // locus has one. The shutdown call wakes any
+                // thread blocked in lotus_mailbox_drain_one's
+                // condvar wait, with shutdown=1, so it returns 0
+                // and the pinned thread proceeds to drain/dissolve.
+                if let Some(mb_idx) = info.mailbox_field_idx {
+                    let mb_slot = self
+                        .builder
+                        .build_struct_gep(
+                            info.struct_ty,
+                            self_ptr,
+                            mb_idx,
+                            &format!("{}.__mailbox.flush", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let mb = self
+                        .builder
+                        .build_load(ptr_t, mb_slot, "mailbox.shutdown.load")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_pointer_value();
+                    let shutdown_fn = self
+                        .module
+                        .get_function("lotus_mailbox_shutdown")
+                        .expect("lotus_mailbox_shutdown declared");
+                    self.builder
+                        .build_call(
+                            shutdown_fn,
+                            &[mb.into()],
+                            &format!("{}.mailbox.shutdown", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
                 let tid = self
                     .builder
                     .build_load(i64_t, tid_slot, "pinned.tid")
@@ -1067,6 +1216,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         &format!("{}.pthread_join", locus_name),
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                // After join, destroy the mailbox.
+                if let Some(mb_idx) = info.mailbox_field_idx {
+                    let mb_slot = self
+                        .builder
+                        .build_struct_gep(
+                            info.struct_ty,
+                            self_ptr,
+                            mb_idx,
+                            &format!("{}.__mailbox.destroy", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let mb = self
+                        .builder
+                        .build_load(ptr_t, mb_slot, "mailbox.destroy.load")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_pointer_value();
+                    let destroy_fn = self
+                        .module
+                        .get_function("lotus_mailbox_destroy")
+                        .expect("lotus_mailbox_destroy declared");
+                    self.builder
+                        .build_call(
+                            destroy_fn,
+                            &[mb.into()],
+                            &format!("{}.mailbox.destroy.call", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
             }
             if !is_pinned_entry {
                 // Cooperative long-lived: drain → __closures →
@@ -1118,21 +1295,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     }
 
     /// Emit a single subscription registration:
-    ///   bus.entries[bus.count] = { subject_str, self_ptr, handler_fn }
+    ///   bus.entries[bus.count] = { subject_str, self_ptr, handler_fn, mailbox_or_null }
     ///   bus.count += 1
     /// Called once per `bus subscribe` declaration when its locus
     /// is instantiated.
+    /// `mailbox_or_null` is `Some(mb_ptr)` for pinned subscribers
+    /// (cells routed to that locus's mailbox) and `None` for
+    /// cooperative subscribers (cells routed to the global queue).
     fn emit_bus_register(
         &mut self,
         subject: &str,
         self_ptr: PointerValue<'ctx>,
         handler_fn: FunctionValue<'ctx>,
+        mailbox_or_null: Option<PointerValue<'ctx>>,
     ) -> Result<(), CodegenError> {
         let bus = self
             .bus_state
             .expect("subscriptions registered ⇒ bus_state initialized");
         let i32_t = self.context.i32_type();
         let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
         let entry_ty = self.bus_entry_type();
         let table_ty = entry_ty.array_type(bus.capacity as u32);
 
@@ -1185,6 +1367,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         };
         self.builder
             .build_store(handler_slot, handler_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // entries[count].mailbox = mailbox_or_null
+        let mailbox_slot = unsafe {
+            self.builder
+                .build_gep(
+                    table_ty,
+                    bus.entries.as_pointer_value(),
+                    &[i64_t.const_int(0, false), count, i32_t.const_int(3, false)],
+                    "reg.mailbox.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let mailbox_val = mailbox_or_null
+            .unwrap_or_else(|| ptr_t.const_null());
+        self.builder
+            .build_store(mailbox_slot, mailbox_val)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         // bus.count = count + 1
         let next = self
@@ -1738,6 +1936,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         } else {
             (None, None)
         };
+
+        // m28b stage 2: pinned-class loci that declare bus
+        // subscriptions get a synthetic `__mailbox: ptr` field.
+        // The mailbox is allocated at instantiation and stored in
+        // this slot so all three sites that need it can reach it
+        // via self_ptr: subscribe registration (main thread),
+        // synthesized thread_main's mailbox loop (pinned thread),
+        // and the deferred-dissolve flush (main thread, signals
+        // shutdown before pthread_join). Cooperative loci and
+        // pinned loci without subscriptions don't need this.
+        let has_subscribe = matches!(schedule_class, ScheduleClass::Pinned)
+            && l.members.iter().any(|m| match m {
+                LocusMember::Bus(b) => b.members.iter().any(|bm| {
+                    matches!(bm, BusMember::Subscribe { .. })
+                }),
+                _ => false,
+            });
+        let mailbox_field_idx = if has_subscribe {
+            let i = idx;
+            llvm_field_tys.push(ptr_t.into());
+            idx += 1;
+            Some(i)
+        } else {
+            None
+        };
         let _ = idx;
 
         let struct_ty = self
@@ -1761,6 +1984,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 children_field_idx,
                 child_count_field_idx,
                 arena_field_idx,
+                mailbox_field_idx,
                 projection_class,
                 schedule_class,
             },
@@ -4726,19 +4950,28 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // subscribes to (rare but legal). For each declared
         // `bus subscribe "S" as h ...`: append (S, self_ptr,
         // <Locus>.h) into the global bus table.
-        for (subject, handler_name) in &info.subscriptions {
-            let handler_fn = info
-                .user_methods
-                .get(handler_name)
-                .copied()
-                .ok_or_else(|| {
-                    CodegenError::Unsupported(format!(
-                        "locus `{}` subscribes to `{}` with handler `{}` \
-                         but no such method declared",
-                        locus_name, subject, handler_name
-                    ))
-                })?;
-            self.emit_bus_register(subject, self_ptr, handler_fn)?;
+        // For pinned-with-subscriptions loci we'll call this loop
+        // again BELOW (after the mailbox alloca), passing the
+        // mailbox pointer; cooperative loci register here with
+        // mailbox = None (route through the global queue).
+        let pinned_subscriptions =
+            matches!(info.schedule_class, ScheduleClass::Pinned)
+                && !info.subscriptions.is_empty();
+        if !pinned_subscriptions {
+            for (subject, handler_name) in &info.subscriptions {
+                let handler_fn = info
+                    .user_methods
+                    .get(handler_name)
+                    .copied()
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "locus `{}` subscribes to `{}` with handler `{}` \
+                             but no such method declared",
+                            locus_name, subject, handler_name
+                        ))
+                    })?;
+                self.emit_bus_register(subject, self_ptr, handler_fn, None)?;
+            }
         }
 
         // Fire birth → run in order. drain → dissolve are deferred
@@ -4759,51 +4992,110 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let is_pinned =
             matches!(info.schedule_class, ScheduleClass::Pinned);
 
-        // m28a: pinned-class loci spawn a pthread that runs
-        // birth → run → drain → dissolve in sequence on its own
-        // thread, then exits. Main thread joins at scope exit
-        // (deferred_dissolves frame) before destroying the locus's
-        // arena. We synthesize a per-locus thread_main whose
-        // signature matches pthread's start-routine contract
-        // exactly (`ptr (ptr)`), so pthread_create gets a direct
-        // function pointer with self_ptr as its argument — no C
-        // adapter, no args struct.
+        // m28a + m28b: pinned-class loci spawn a pthread that runs
+        // the locus's full lifecycle on its own thread:
+        //   birth → run → (mailbox loop, if subscriptions) → drain → dissolve
+        // Main thread joins at scope exit (deferred_dissolves
+        // frame) before destroying the locus's arena. We synthesize
+        // a per-locus thread_main whose signature matches pthread's
+        // start-routine contract exactly (`ptr (ptr)`), so
+        // pthread_create gets a direct function pointer with
+        // self_ptr as its argument — no C adapter, no args struct.
         //
-        // Still gated for m28a: accept (children of pinned), bus
-        // subscriptions / publishes, closures. Bus subscribe/publish
-        // land in m28b (cross-thread mailbox); accept on pinned
-        // would cross-class-cascade dissolve which needs m28b's
-        // shutdown coordination machinery.
+        // m28b: when the locus declares bus subscriptions, the
+        // synthesized thread_main includes a mailbox loop after
+        // run() — the pinned thread blocks in
+        // lotus_mailbox_drain_one until cells arrive, processes
+        // them one at a time (handler-atomic per substrate cell),
+        // and exits the loop only when shutdown is signaled. The
+        // mailbox itself is allocated at instantiation time and
+        // stored in the locus's __mailbox field so the dispatch
+        // path (which only sees the table-recorded mailbox ptr)
+        // and the deferred-dissolve flush (which signals
+        // shutdown) can both reach it.
+        //
+        // Still gated: accept (children of pinned would need
+        // cross-thread cascade-dissolve coordination which adds
+        // significant complexity beyond m28b), closures.
         if is_pinned {
             let ptr_t = self.context.ptr_type(AddressSpace::default());
             if info.methods.contains_key("accept") {
                 return Err(CodegenError::Unsupported(format!(
                     "pinned locus `{}` declares `accept()`; pinned coordinators \
-                     wait on m28b's cross-thread shutdown coordination",
-                    locus_name
-                )));
-            }
-            if is_long_lived {
-                return Err(CodegenError::Unsupported(format!(
-                    "pinned locus `{}` declares bus subscriptions; cross-thread \
-                     bus mailbox lands in m28b",
+                     wait on a future cross-thread cascade-dissolve milestone",
                     locus_name
                 )));
             }
             if info.closures_fn.is_some() {
                 return Err(CodegenError::Unsupported(format!(
                     "pinned locus `{}` declares closures; cross-thread closure \
-                     routing waits on m28b",
+                     routing not yet supported",
                     locus_name
                 )));
             }
 
             let i64_t = self.context.i64_type();
+            let i32_t = self.context.i32_type();
+
+            // m28b: if the locus subscribes, allocate its mailbox
+            // and store the pointer in the locus's __mailbox slot.
+            // Then register all subscriptions with that mailbox so
+            // bus dispatch routes cells here instead of to the
+            // global queue.
+            let mailbox_ptr_opt: Option<PointerValue<'ctx>> =
+                if let Some(mb_idx) = info.mailbox_field_idx {
+                    let create_fn = self
+                        .module
+                        .get_function("lotus_mailbox_create")
+                        .expect("lotus_mailbox_create declared");
+                    let mb_ptr = self
+                        .builder
+                        .build_call(
+                            create_fn,
+                            &[],
+                            &format!("{}.mailbox.create", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("lotus_mailbox_create returns ptr")
+                        .into_pointer_value();
+                    let mb_slot = self
+                        .builder
+                        .build_struct_gep(
+                            info.struct_ty,
+                            self_ptr,
+                            mb_idx,
+                            &format!("{}.__mailbox.ptr", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(mb_slot, mb_ptr)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    for (subject, handler_name) in &info.subscriptions {
+                        let handler_fn = info
+                            .user_methods
+                            .get(handler_name)
+                            .copied()
+                            .ok_or_else(|| {
+                                CodegenError::Unsupported(format!(
+                                    "locus `{}` subscribes to `{}` with handler \
+                                     `{}` but no such method declared",
+                                    locus_name, subject, handler_name
+                                ))
+                            })?;
+                        self.emit_bus_register(
+                            subject, self_ptr, handler_fn, Some(mb_ptr),
+                        )?;
+                    }
+                    Some(mb_ptr)
+                } else {
+                    None
+                };
 
             // Synthesize __pinned_main_<LocusName>(self_ptr) -> ptr.
-            // Body calls birth → run → drain → dissolve in order;
-            // each only if the locus declared it. Returns null
-            // (pthread start-routine return value is unused).
+            // Body: birth → run → (mailbox loop if subscriptions) →
+            // drain → dissolve, returning null.
             let saved_block = self
                 .builder
                 .get_insert_block()
@@ -4821,7 +5113,85 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.builder.position_at_end(entry_bb);
             let thread_self =
                 thread_main.get_nth_param(0).unwrap().into_pointer_value();
-            for kind in &["birth", "run", "drain", "dissolve"] {
+            for kind in &["birth", "run"] {
+                if let Some(method) = info.methods.get(*kind) {
+                    self.builder
+                        .build_call(
+                            *method,
+                            &[thread_self.into()],
+                            &format!(
+                                "{}.{}.thread_call",
+                                locus_name, kind
+                            ),
+                        )
+                        .map_err(|e| {
+                            CodegenError::LlvmEmit(e.to_string())
+                        })?;
+                }
+            }
+            // m28b: mailbox loop. Reload the mailbox ptr from the
+            // locus's __mailbox slot (we're on the pinned thread,
+            // not the main thread, so we can't capture mailbox_ptr
+            // from the enclosing build context — re-derive it from
+            // self_ptr). Loop calls lotus_mailbox_drain_one, which
+            // returns 0 on shutdown-empty; break the loop and run
+            // drain/dissolve.
+            if let Some(mb_idx) = info.mailbox_field_idx {
+                let mb_slot_in_thread = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        thread_self,
+                        mb_idx,
+                        "thread.mailbox.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let mb_in_thread = self
+                    .builder
+                    .build_load(ptr_t, mb_slot_in_thread, "thread.mailbox")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_pointer_value();
+                let drain_one_fn = self
+                    .module
+                    .get_function("lotus_mailbox_drain_one")
+                    .expect("lotus_mailbox_drain_one declared");
+                let loop_header =
+                    self.context.append_basic_block(thread_main, "mb.header");
+                let loop_after =
+                    self.context.append_basic_block(thread_main, "mb.after");
+                self.builder
+                    .build_unconditional_branch(loop_header)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(loop_header);
+                let drained = self
+                    .builder
+                    .build_call(
+                        drain_one_fn,
+                        &[mb_in_thread.into()],
+                        "mb.drain.one",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_mailbox_drain_one returns i32")
+                    .into_int_value();
+                let keep_going = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        drained,
+                        i32_t.const_int(0, false),
+                        "mb.keep.going",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_conditional_branch(
+                        keep_going, loop_header, loop_after,
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(loop_after);
+            }
+            for kind in &["drain", "dissolve"] {
                 if let Some(method) = info.methods.get(*kind) {
                     self.builder
                         .build_call(
@@ -4868,13 +5238,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("{}.pthread_create", locus_name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let _ = mailbox_ptr_opt;
 
             // Defer pthread_join + arena destroy to scope exit.
             // flush_dissolve_frame skips drain/dissolve for pinned
             // entries — those already ran on the pinned thread
             // before it returned (and pthread_join blocks until
-            // that return). All that's left for the main thread
-            // is the join + arena_destroy.
+            // that return). For pinned-with-subscriptions, the
+            // flush ALSO signals the mailbox shutdown before
+            // joining, so the pinned thread breaks out of its
+            // mailbox loop and proceeds to drain/dissolve.
             if let Some(top) = self.deferred_dissolves.last_mut() {
                 top.push((self_ptr, locus_name.to_string(), Some(tid_alloca)));
             } else {

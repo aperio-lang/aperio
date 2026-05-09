@@ -150,12 +150,14 @@ intermediate ground than time does.)
 - **Pinned → any**: same — cross-thread post; pinned doesn't
   block waiting for delivery acknowledgement.
 
-#### Implementation status (m26 + m27 + m28a)
+#### Implementation status (m26 + m27 + m28a + m28b)
 
 m25 wired the annotation through parse / typecheck / codegen.
 **m26 ships cooperative semantics; m27 ships pinned threads
-(run-only); m28a lifts pinned to full lifecycle (birth / run /
-drain / dissolve all on the pinned thread).**
+(run-only); m28a lifts pinned to full lifecycle; m28b lights up
+cross-thread bus mailboxes — pinned loci can subscribe and
+publish, with cells routed across threads via per-locus
+mailboxes.**
 
 **m26 (cooperative):** Each `<-` enqueues `(handler, self,
 payload_copy)` cells onto a program-wide FIFO queue
@@ -202,13 +204,63 @@ adapter, no thread_args struct. The synthesized body simply
 calls each declared lifecycle method in sequence, then
 returns null.
 
-m28a scope (still gated): pinned loci cannot declare
-`accept()` (children of pinned would need cross-thread
-shutdown coordination), bus subscribe / publish (cross-thread
-mailbox), or closures. Codegen errors clearly if those are
-present. Cross-thread bus mailbox (the post-and-continue side
-of "any → pinned" in the cross-class semantics) waits on
-m28b.
+**m28b stage 1 (inline-payload queue):** Bus queue cells now
+carry an inline `[u8; 512]` payload buffer (with `pthread_mutex_t`
+guarding the cell array) instead of a pointer to subscriber-arena
+memory. The publisher memcpy's into the cell at enqueue; the
+drain (running on the subscriber's thread) memcpy's from the
+cell into the subscriber's arena before invoking the handler.
+This makes the queue the single point of cross-thread
+synchronization: each per-locus arena stays single-threaded
+territory, the boundary between layers is where the lock lives.
+Per spec/memory.md, "every locus boundary copies the payload"
+still holds — just with two memcpy's per cell instead of one.
+
+**m28b stage 2 (cross-thread mailboxes):** Each pinned locus
+that declares `bus subscribe` allocates its own
+`lotus_mailbox_t` at instantiation: a bounded ring buffer with
+`pthread_mutex_t` + `pthread_cond_t` + a shutdown flag, sharing
+the same inline-payload cell shape as the global queue. The
+locus's struct grows a `__mailbox: ptr` field to hold it.
+
+The bus entry table grows from `{subject, self, handler}` to
+`{subject, self, handler, mailbox}`. Cooperative subscribers
+register with `mailbox = NULL`; pinned subscribers register
+with their mailbox pointer. At dispatch time, the `bus_dispatch`
+fn loads `entry.mailbox` and branches: null → enqueue on the
+global cooperative queue (handler runs on the cooperative
+thread); non-null → `lotus_mailbox_post` on the pinned
+subscriber's mailbox (handler runs on the pinned thread).
+
+The synthesized `__pinned_main_<Locus>` body grows a mailbox
+loop between `run()` and `drain()`: it calls
+`lotus_mailbox_drain_one`, which blocks on the condvar until
+either a cell arrives (returns 1, after dispatching the
+handler) or shutdown is signaled with empty queue (returns 0,
+breaking the loop). Pending cells flush before the loop
+returns 0 even after shutdown — the order check is "queue
+empty AND shutdown."
+
+Coordinated shutdown: at the deferred-dissolve flush, the main
+thread calls `lotus_mailbox_shutdown` on the pinned locus's
+mailbox (sets the flag + broadcasts the condvar), then
+`pthread_join`. The pinned thread observes the empty+shutdown
+condition, breaks its loop, runs `drain()` and `dissolve()`,
+and exits — main joins, then destroys the mailbox and the
+arena.
+
+Per The Design / lotus, this is the canonical "any → pinned"
+bus path: publisher and subscriber sit in different layers of
+the lotus, the substrate cost lives at the layer boundary
+(the mailbox lock + the inline payload's two memcpy's), and
+each arena stays single-threaded territory. Bimodality holds.
+
+Still gated: pinned loci cannot declare `accept()` (children
+of pinned would need cross-thread cascade-dissolve
+coordination, which is meaningful new infrastructure beyond
+m28b's mailbox post-and-continue) or closures (cross-thread
+violation routing). Codegen errors clearly if those are
+present.
 
 Linker dependency: clang invocation now passes `-lpthread`
 unconditionally; small fixed cost in the resulting binary

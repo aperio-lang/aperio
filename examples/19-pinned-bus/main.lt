@@ -1,0 +1,79 @@
+// 19-pinned-bus — cross-thread bus: cooperative publisher,
+// pinned subscriber.
+//
+// The pinned subscriber gets its own per-locus mailbox: a
+// bounded ring buffer guarded by a mutex + condvar. When
+// the cooperative publisher's `<-` runs, the bus dispatch
+// path notices the subscriber's registration carries a
+// mailbox pointer, copies the typed payload INLINE into a
+// mailbox slot, and broadcasts the condvar. The pinned
+// thread's main loop is sitting in lotus_mailbox_drain_one,
+// blocked on the condvar; it wakes, pops the cell, copies
+// the payload from the inline slot into ITS OWN arena, and
+// invokes the handler.
+//
+// Per The Design / lotus, this is the canonical "any →
+// pinned" bus path: publisher and subscriber sit in
+// different layers of the lotus, the substrate cost lives
+// at the layer boundary (the mailbox lock + the inline
+// payload's two memcpy's), and each arena stays single-
+// threaded territory. Bimodality holds: cooperative on one
+// side, pinned on the other, no third "shared-arena" mode.
+//
+// Coordinated shutdown: at scope exit (main returning),
+// the deferred-dissolve flush signals shutdown on the
+// pinned subscriber's mailbox; the pinned thread observes
+// drain_one == 0, breaks its loop, runs drain/dissolve, and
+// exits. Main joins the pthread before destroying the
+// pinned arena.
+
+type Tick {
+    n: Int;
+    label: String;
+}
+
+locus PinnedSubscriber : schedule pinned {
+    bus {
+        subscribe "tick" as on_tick of type Tick;
+    }
+
+    birth() {
+        println("pinned subscriber: birth on pinned thread");
+    }
+
+    fn on_tick(t: Tick) {
+        println("pinned subscriber: got tick #", t.n, " (", t.label, ")");
+    }
+
+    dissolve() {
+        println("pinned subscriber: dissolve on pinned thread");
+    }
+}
+
+locus Publisher {
+    bus {
+        publish "tick" of type Tick;
+    }
+
+    birth() {
+        "tick" <- Tick { n: 1, label: "first" };
+        "tick" <- Tick { n: 2, label: "second" };
+        "tick" <- Tick { n: 3, label: "third" };
+    }
+}
+
+fn main() {
+    PinnedSubscriber { };
+    Publisher { };
+
+    // Give the pinned thread a moment to drain the mailbox
+    // BEFORE main returns (the deferred-dissolve flush will
+    // signal shutdown). Without this, the shutdown signal
+    // can race past unprocessed cells (we still drain
+    // them — pending cells flush before the loop returns 0
+    // — but a tiny sleep here makes the output ordering
+    // deterministic vs main's println).
+    time::sleep(20ms);
+
+    println("main: returning; pinned subscriber will drain + dissolve");
+}
