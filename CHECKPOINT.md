@@ -1180,16 +1180,16 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-25 commits ahead of origin/master at checkpoint time (origin
-moved up to a5fc8bd / the prior session's tip; this session
-shipped m30 → m34 + the std/* import-resolution fix, then
-m35 for tuples, m36 for string ops, m37 for to_string, m38
-for stdlib helpers, plus a bus-aggregator flex app, then
-m39 for birth-epoch closures, m40 for restart recovery,
-m41 for quarantine, and m41b for bus-dispatch quarantine
-gating — the F.9 substrate now has both invariant-detection
-and the restart/quarantine response menu, with quarantine
-substrate-complete across run() + bus dispatch).
+5 commits ahead of origin/master at checkpoint time
+(origin moved up to 0128f56 / m40 CP refresh during the
+session). This session shipped m30 → m34 + the std/*
+import-resolution fix, m35 tuples, m36 string ops, m37
+to_string, m38 stdlib helpers + bus-aggregator flex app,
+m39 birth-epoch closures, m40 restart recovery, m41
+quarantine + m41b bus-dispatch quarantine gating — the
+F.9 substrate now has both invariant-detection and the
+restart/quarantine response menu, with quarantine
+substrate-complete across run() + bus dispatch.
 
 ## Next steps in priority order
 
