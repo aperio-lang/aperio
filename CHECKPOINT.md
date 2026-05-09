@@ -8,6 +8,13 @@ example is a build target.** Only `trellis-pair` (multi-binary,
 cross-process bus) remains, gated on substantial new
 infrastructure.
 
+Two design decisions also landed this session, not yet in code:
+the runtime/stdlib split for bus transports (kernel primitives in
+runtime; protocols in stdlib) and the observation that
+producer/consumer cardinality on a subject is emergent from
+locus connectivity, not a transport configuration. Both
+documented below in their own sections.
+
 This is part of the alpha-conjecture program (see
 `~/notes/alpha-conjecture/CLAUDE.md`). Lotus is the language-substrate
 arm — a programming language whose primitives are the framework's
@@ -56,11 +63,65 @@ Phase status:
   parent.children (for `for child in self.children`) but the
   parent's later cascade skips already-dissolved children.
 - **Phase 3 next** — `trellis-pair` (cross-process bus +
-  entry-point selection) is the last example. Big infra: shared-
-  memory ring buffer / NATS bridge transport, multi-binary build
-  with `--bin <locus>` selection. Beyond the example ladder:
-  region allocator + cooperative scheduler are the deferred
-  Phase-2 deep-pushes.
+  entry-point selection) is the last example. Pending: pick a
+  same-host transport (shared-memory ring buffer most prod-
+  shaped, Unix socket simplest, TCP for cross-host) and add
+  `lotus build --bin <locus>` entry-point selection. Beyond
+  the example ladder: region allocator + cooperative scheduler
+  are the deferred Phase-2 deep-pushes.
+
+## Transport layering (decided 2026-05-08)
+
+Runtime / stdlib split for bus transports:
+
+- **Runtime owns kernel-level IO primitives** + thin `Transport`
+  adapters that wrap them: shared memory (`shm_open` + `mmap` +
+  atomic indices), Unix domain sockets (`AF_UNIX`), TCP/UDP
+  (`AF_INET` + multicast). Direct syscall plumbing wired into
+  the bus router. `io_uring` / `epoll` / `kqueue` integration
+  also lives here when the cooperative scheduler lands.
+- **Stdlib owns protocols on top of those primitives**:
+  `std::bus::nats` (NATS frames over TCP), `std::bus::mqtt`,
+  `std::bus::http_sse`, `std::bus::grpc`. TLS lives in
+  stdlib too (`std::tls`); serialization (json/protobuf/msgpack)
+  in `std::encoding`.
+
+This matches `spec/runtime.md`'s "transport-agnostic" framing —
+runtime defines the `Adapter` interface, specific protocols
+plug in from stdlib. The new clarification is that the runtime
+*also* directly exposes the kernel primitives those protocols
+need, rather than forcing every adapter to vendor its own
+syscall wrappers.
+
+## Producer/consumer cardinality is emergent (insight, 2026-05-08)
+
+The standard MPSC / SPSC / SPMC / MPMC taxonomy doesn't
+describe a transport configuration — it describes
+**locus connectivity** on a subject. Count the loci with
+`publish "X"` and the loci with `subscribe "X"` at link time:
+
+| Publishers on X | Subscribers on X | Required machinery |
+|---|---|---|
+| 1 | 1 | SPSC — wait-free, no claim ticket |
+| 1 | N | SPMC — Disruptor's natural shape |
+| N | 1 | MPSC — fan-in queue with producer claim |
+| N | N | MPMC — atomics on both sides |
+
+In trellis-demo all subjects are SPSC / SPMC; **no MPMC
+machinery needed**. That's a real speedup vs a uniform
+"every subject is MPMC" runtime — SPSC rings are 5-10x faster
+than MPMC ones.
+
+The current `BusRouter` doesn't exploit this — it's uniform
+MPMC-shaped. When the substrate gets more serious, per-subject
+specialization is exactly the kind of optimization the
+framework's coordination primitives unlock that a general
+pub-sub library can't: **the locus surface carries the shape
+information; the substrate gets to specialize.** Connects to
+F.14 (three-way interface: locus + parent + contract) — the
+contract surface declares data flow shape; bus declarations
+declare connectivity shape; together that's enough to pick
+the cheapest correct primitive.
 
 ## Codegen milestone arc (Phase 3 progress)
 
