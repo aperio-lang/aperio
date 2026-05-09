@@ -2628,6 +2628,21 @@ fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         (Div, Value::Decimal(a), Value::Decimal(b)) => {
             DecimalVal::div(*a, *b).map(Value::Decimal)
         }
+        (Mod, Value::Decimal(a), Value::Decimal(b)) => {
+            if b.mantissa == 0 {
+                return Err("decimal modulo by zero".to_string());
+            }
+            // Align both mantissas to a common scale, then
+            // integer-mod the aligned mantissas. Result keeps
+            // the shared scale — same recipe as `add` / `sub`.
+            let scale = a.scale.max(b.scale);
+            let am = a.mantissa * 10i128.pow(scale - a.scale);
+            let bm = b.mantissa * 10i128.pow(scale - b.scale);
+            Ok(Value::Decimal(DecimalVal {
+                mantissa: am % bm,
+                scale,
+            }))
+        }
         (Lt | Gt | LtEq | GtEq, Value::Decimal(a), Value::Decimal(b)) => {
             let ord = DecimalVal::cmp(*a, *b);
             Ok(Value::Bool(match op {

@@ -6469,22 +6469,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let v = v.map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok((v.into(), LotusType::Float))
             }
-            (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, LotusType::Decimal) => {
+            (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod, LotusType::Decimal) => {
                 // m48: Decimal arithmetic on i128 mantissa with
-                // implicit scale 9. Add/Sub: direct i128 ops.
-                // Mul: (a × b) is mantissa scale 18; divide by
-                // 10^9 to bring back to scale 9. Div: scale a's
-                // mantissa up by 10^9 first so (a × 10^9) / b
-                // lands at scale 9. Both mul and div risk i128
-                // overflow on the intermediate product when
-                // operands exceed ~10^19; v0.1 accepts the same
-                // wrap-around policy as Int multiplication.
+                // implicit scale 9. Add/Sub/Mod: direct i128 ops
+                // (the mantissas already share the implicit
+                // scale, so a%b at scale 9 is just `a_m %
+                // b_m` reinterpreted at scale 9). Mul: (a × b)
+                // is mantissa scale 18; divide by 10^9 to bring
+                // back to scale 9. Div: scale a's mantissa up by
+                // 10^9 first so (a × 10^9) / b lands at scale 9.
+                // Mul and div risk i128 overflow on the
+                // intermediate product when operands exceed
+                // ~10^19; v0.1 accepts the same wrap-around
+                // policy as Int multiplication.
                 let l = lv.into_int_value();
                 let r = rv.into_int_value();
                 let pow9 = i128_const(self.context, 1_000_000_000i128);
                 let v = match op {
                     BinOp::Add => self.builder.build_int_add(l, r, "decadd"),
                     BinOp::Sub => self.builder.build_int_sub(l, r, "decsub"),
+                    BinOp::Mod => self.builder.build_int_signed_rem(l, r, "decmod"),
                     BinOp::Mul => {
                         let prod = self
                             .builder
