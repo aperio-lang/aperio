@@ -1679,12 +1679,28 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // The dispatch fn body is generated before any call site
         // can need it; the globals' capacity is baked from the
         // total subscription count across all loci.
-        let total_subs: u64 = self
+        // m45 (companion fix): cap the table at
+        // total_subs × INSTANCES_PER_TYPE so multiple instances
+        // of the same locus type can each register their own
+        // entry without overflowing a per-type-of-1 sized
+        // global. Pre-fix, two instances of a subscribed locus
+        // type → buffer overflow; the workaround was "use
+        // distinct types." 32 is comfortable for v0 (trellis-
+        // demo's hottest subject has 1 publisher / 1 subscriber;
+        // 32 instances per subscription type covers any
+        // reasonable single-process locus topology). Proper
+        // fix is to move bus storage to a C-runtime dynamic
+        // vec so capacity grows on demand — captured in
+        // CHECKPOINT next-steps; this multiplier is the v0
+        // unblock.
+        let decl_subs: u64 = self
             .user_loci
             .values()
             .map(|info| info.subscriptions.len() as u64)
             .sum();
-        if total_subs > 0 {
+        const INSTANCES_PER_TYPE: u64 = 32;
+        let total_subs = decl_subs.saturating_mul(INSTANCES_PER_TYPE);
+        if decl_subs > 0 {
             self.init_bus_state(total_subs)?;
         }
 

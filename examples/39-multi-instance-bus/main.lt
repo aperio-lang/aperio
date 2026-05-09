@@ -1,0 +1,68 @@
+// 39-multi-instance-bus — multiple instances of the same
+// subscribed locus type all receive bus messages.
+//
+// Pre-m45-companion fix: bus.entries was sized at compile
+// time to ONE entry per declared subscription, so two
+// instances of the same locus type would overflow the
+// global at registration. The 34-quarantine-bus example
+// sidestepped this by using two distinct types
+// (FailingWatcher + HealthyWatcher).
+//
+// This example exercises the fix: three instances of one
+// Watcher type all subscribed to the same subject; each
+// receives every published cell; their per-instance state
+// (count) accumulates independently in their own arenas.
+//
+// Per spec/memory.md, payload-copy semantics mean each
+// subscriber gets its own arena-resident copy of every
+// published Sample — three subscribers means three copies
+// per publish, freed wholesale at each subscriber's
+// dissolve.
+
+type Sample {
+    value: Int;
+}
+
+locus Watcher {
+    params {
+        id: Int = 0;
+        count: Int = 0;
+        sum: Int = 0;
+    }
+
+    bus {
+        subscribe "data" as on_sample of type Sample;
+    }
+
+    fn on_sample(s: Sample) {
+        self.count = self.count + 1;
+        self.sum = self.sum + s.value;
+        println("Watcher#", self.id,
+                ": count=", self.count,
+                " sum=", self.sum);
+    }
+}
+
+locus Producer {
+    bus {
+        publish "data" of type Sample;
+    }
+
+    run() {
+        // Three Watcher instances, all subscribed to "data".
+        Watcher { id: 1 };
+        Watcher { id: 2 };
+        Watcher { id: 3 };
+
+        // Each publish reaches all three subscribers.
+        "data" <- Sample { value: 10 };
+        "data" <- Sample { value: 20 };
+        "data" <- Sample { value: 30 };
+
+        println("done");
+    }
+}
+
+fn main() {
+    Producer { };
+}
