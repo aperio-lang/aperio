@@ -1454,7 +1454,7 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-12 commits ahead of origin/master at checkpoint time. This
+15 commits ahead of origin/master at checkpoint time. This
 session shipped m42 + m43 + m44 + m45 (+ a bus.entries
 multi-instance follow-up). The F.9 substrate is now
 closure-epoch-complete (all 5 epochs: Birth + Dissolve +
