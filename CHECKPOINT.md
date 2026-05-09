@@ -2,48 +2,32 @@
 
 **Read this first** if you're picking up the lotus language work in a
 new session. State as of codegen milestone 27 (pinned threads —
-run-only): pinned-class loci spawn a pthread at instantiation;
-their `run()` body executes on that thread; deferred
-`pthread_join` at scope exit. On top of m26b (`yield`), m26
-(cooperative scheduler semantics), m25 (bimodal schedule-class
-annotation), m24 (`match` expressions), and the m19→m23
-region-allocator arc. **21 of 22 examples build to native ELF
-— every single-binary example.** Only `trellis-pair`
-(multi-binary, cross-process bus) remains, gated on
-substantial new infrastructure.
+run-only). The full substrate arc landed across this session:
+m19→m23 (region allocator with rich/chunked/recognition
+strategies + per-locus arenas + bus copy semantics), m24
+(`match` codegen), m25 (bimodal schedule-class annotation),
+m26 (cooperative scheduler semantics — deferred bus dispatch +
+drain loop), m26b (explicit `yield`), m27 (pinned-thread
+spawning via pthread_create). **21 of 22 examples build to
+native ELF — every single-binary example.** Only `trellis-pair`
+(multi-binary, cross-process bus) remains.
 
-**Schedule-class arc opened.** Per The Design / lotus, schedule
-class is to execution what projection class is to memory —
-substrate-invariance applied to time. Kept honestly **bimodal**:
-`: schedule cooperative | pinned`. Either you share a scheduler
-thread (cooperative; handler-atomic; yields between substrate
-cells) or you own one (pinned; own thread; cross-thread mailbox
-posts). No third "greedy" position — cooperative already gives
-handler-level atomicity, and the only thing greedy would add is
-"don't yield between cells either," which means leaving the
-shared scheduler entirely. The place you go when you leave is
-your own thread — that's pinned. m25 wires the surface through
-parse / typecheck / codegen with no runtime branch yet.
-m26 ships cooperative semantics (deferred bus dispatch +
-scheduler loop); m27 ships pinned threads.
+**The Design / lotus is now visible at the codegen substrate.**
+Same source, two execution shapes (cooperative / pinned) and
+three memory shapes (rich / chunked / recognition), all
+expressed as locus annotations. Substrate-invariance applied
+to time was kept honestly **bimodal** — no third "greedy"
+class, since cooperative already guarantees handler-atomicity
+and anything beyond that means leaving the shared scheduler =
+own thread = pinned. (Memory has more genuine intermediate
+ground than time does, so projection class stays three-way.)
 
-Two design decisions landed in the prior session and are now
-guiding the substrate work: the runtime/stdlib split for bus
-transports (kernel primitives in runtime; protocols in stdlib)
-and the observation that producer/consumer cardinality on a
-subject is emergent from locus connectivity, not a transport
-configuration. Both documented below in their own sections.
-
-**Active arc — region allocator (F.3).** The user has signaled
-focus on substrate-level work (deeper locus, away from
-application surface): trellis-pair waits until the language is
-done, since the application will flex the runtime's full
-surface anyway. Per-projection-class arenas are the next
-deep-push. m19 (this commit) replaces libc malloc with a
-lotus-controlled bump allocator wholesale-freed at program
-exit; subsequent milestones will scope arenas to loci (m20),
-add bus copy semantics (m21), and bring chunked + recognition
-strategies online (m22, m23). Task IDs 19–23 track the arc.
+Two prior-session design decisions still drive the bus arc:
+runtime owns kernel-level transports (shared memory / AF_UNIX
+/ TCP / UDP), stdlib owns protocols on top (NATS / MQTT /
+gRPC / TLS); cardinality (SPSC/SPMC/MPSC/MPMC) is emergent
+from locus connectivity at link time, not a runtime config.
+Both documented below.
 
 This is part of the alpha-conjecture program (see
 `~/notes/alpha-conjecture/CLAUDE.md`). Lotus is the language-substrate
@@ -321,7 +305,7 @@ m20 Codegen milestone 20: locus-owned arenas + bus copy        (d511670)
                             (slot 0), lifecycle-bound; bus dispatch
                             copies payloads between publisher /
                             subscriber arenas per spec
-m22 Codegen milestone 22: chunked-class sub-regions            (this commit)
+m22 Codegen milestone 22: chunked-class sub-regions            (010db7a)
                           ⇒ chunked parents allocate accepted
                             children via lotus_arena_create_subregion;
                             free-list bookkeeping reuses slot
@@ -360,7 +344,7 @@ m26b Codegen milestone 26b: explicit `yield` primitive         (6760a44)
                             codegen lowers to lotus_bus_queue_drain;
                             interpreter no-op
                           + examples/17-yield
-m27 Codegen milestone 27: pinned threads (run-only)            (this commit)
+m27 Codegen milestone 27: pinned threads (run-only)            (cc57ee4)
                           ⇒ pthread_create at pinned instantiation;
                             run() executes on its own thread;
                             deferred pthread_join at scope exit;
@@ -418,12 +402,16 @@ m7 builds on the struct ABI.
 | `match` (Literal / Wildcard / Binding patterns) | ✅ | ✅ |
 | `match` (Tuple / Constructor patterns + guards) | ✅ | — |
 | generic `for` (over arrays / ranges) | ✅ | — |
-| Closure runtime (collapse / absorb / bubble) | ✅ | — |
-| Modes as methods | ✅ | — |
-| Recovery primitives (bubble) | ✅ | — |
-| Recovery primitives (restart / quarantine etc.) | parsed | — |
-| Region allocator (per-projection-class arenas) | — | — |
-| Cooperative scheduler | — | — |
+| Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
+| Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
+| Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
+| Pinned threads (`run()`-only) | — | ✅ |
+| Pinned full lifecycle + cross-thread bus mailbox | — | — (m28) |
+| Region allocator — per-locus arenas, bus copy semantics | — | ✅ |
+| Region allocator — chunked sub-regions + free-list | — | ✅ |
+| Region allocator — recognition bitmap-pool | — | — (chunked-equivalent stub) |
+| Recovery primitives (bubble) | ✅ | ✅ |
+| Recovery primitives (restart / quarantine / reorganize) | parsed | — |
 
 ## Locked design commitments (F.1–F.18)
 
@@ -480,15 +468,17 @@ In order:
     ABI is what makes it interesting. Worth a careful read if
     extending codegen.
 13. `crates/lotus-codegen/runtime/lotus_arena.c` — the lotus
-    region allocator (m19). Bundled into the compiler via
-    `include_str!`, written next to each generated `.o` file
-    at link time, compiled + linked into the final binary. The
-    surface every `arena_alloc` call site in codegen.rs targets.
-13. `crates/lotus-cli/src/main.rs` — CLI dispatch (lex / parse /
+    region allocator (m19) AND cooperative scheduler queue (m26)
+    AND pthread adapter (m27). Bundled into the compiler via
+    `include_str!`, written next to each generated `.o` file at
+    link time, compiled + linked into the final binary. The
+    surface every `arena_alloc` / `bus_queue_*` /
+    `lotus_thread_entry` call site in codegen.rs targets.
+14. `crates/lotus-cli/src/main.rs` — CLI dispatch (lex / parse /
     check / run / build).
-14. `~/.claude/plans/witty-foraging-lightning.md` — the original
+15. `~/.claude/plans/witty-foraging-lightning.md` — the original
     delivery plan to team-wide internal v1.0 (~18–30 months total).
-15. `notes/open-questions.md` — tracked deferrals, including the
+16. `notes/open-questions.md` — tracked deferrals, including the
     spec-vs-impl gap on immutable-binding compile-time
     enforcement (§23).
 
@@ -528,93 +518,100 @@ expertise via brain3 (production deployment at the firm,
 brained.dev). The trellis trading system is the natural first
 real-world use case for lotus.
 
-## Recent commit history (last 30, newest first)
+## Recent commit history (newest first)
 
 ```
+cc57ee4 Codegen milestone 27: pinned threads (run-only)
+6760a44 m26b: explicit `yield` primitive
+9c0ba40 Codegen milestone 26: cooperative scheduler semantics
+763edf8 m25 cleanup: drop greedy from schedule classes (bimodality)
+bbe2731 Codegen milestone 25: schedule-class annotation infrastructure
+bb948c6 Codegen milestone 24: match expressions
+010db7a Codegen milestones 22 + 23: per-projection-class arena strategies
+d511670 Codegen milestone 20: locus-owned arenas + bus copy semantics
+ea4892b Codegen milestone 19: region allocator substrate
+79e839c CHECKPOINT.md: capture transport layering + cardinality insight
+b18febb CHECKPOINT.md: update milestone-arc preamble
+601c0b7 CHECKPOINT.md: backfill m18 commit hash
+d48df6b Codegen milestone 18: modes + self.children + for-loops
+4bf84e3 Codegen milestone 17: on_failure routing (absorb / bubble)
+e33e8ee Codegen milestone 16: trellis-demo builds to native ELF
+9bf21c1 Codegen milestone 15: closures (collapse-only path)
+b036c7f Codegen milestones 13 + 14: self.method, Decimal, return-from-main
+5645eaa Codegen milestone 12: bus router lowering
+5cb4882 Codegen milestone 11: user `type` decls + struct literals
+3ba3e05 Codegen milestone 10: drain() / dissolve() lifecycle
 cdd7353 Codegen milestone 9: time::monotonic() + Duration arithmetic
-73d6002 CHECKPOINT.md + README: refresh for milestone 8 (accept lifecycle)
 d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
-7c93f69 CHECKPOINT.md + README: refresh for milestone 7 (locus runtime ABI)
 206fbd0 Codegen milestone 7: locus runtime ABI
-79ae75f CHECKPOINT.md: refresh for milestone 6
 9955bea Codegen milestone 6: multi-fn programs
-29c8bdf README + open-questions: sync to milestone-5 state
-fd53a6d CHECKPOINT.md: refresh for milestone 5
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
-cd01f9a CHECKPOINT.md: refresh for milestone 4
-cae8c9a Codegen milestone 4: if / while / break / continue
-76992f1 CHECKPOINT.md: refresh for milestone 3
-03c2f55 Codegen milestone 3: let mut + assignment
-5224d53 Codegen milestone 2: let + Int/Float arithmetic + comparisons
-5c9b6f7 Codegen milestone 1: Int / Float / Bool params + mixed-type println
-77b977f Phase 3 milestone 0: lotus build → native ELF via LLVM
-4b5b00c Spec sync: F.16 / F.17 / F.18 added; F.8 / F.9 / closure refined
-ed81e56 Match exhaustiveness check at typecheck
-34c188f F.1: self.k_max as computed field on locus values
-6e630e1 Closure-cycle existence check: reject pure-literal assertions
-dd325fe Strict field-access checking + locus/perspective method types
-72c5036 F.8: contract compatibility checked across coordinator/coordinatee
-13ba006 match expressions execute: literals, wildcards, bindings, tuples
-2fe0ca9 Program-end dissolve: long-lived locus closures actually fire
-c3dbe94 F.9 closes: collapse / absorb / bubble — three separate demos
-22c27bf F.9 routing: parent on_failure absorbs ClosureViolation
-c738e9e Closure-test runtime: F.9 collapse vs explosion fires
-efe0358 trellis-demo: full pipeline runs end-to-end + Decimal arithmetic
-bb1910e Bus: Transport trait + SyncDispatch + RingBuffer impls
-ef752d9 v0 bus router: `<-` actually delivers; 05-bus runs end-to-end
-e07b3ce Phase 2 v0: tree-walking interpreter — `lotus run` works
-07c3e58 Phase 1 milestone 2: type checker (resolve + check passes)
-8cc583b v0.1.8: PascalCase predefined types + bus-send `<-` operator
-5a961f0 Phase 1 milestone 1: lex / parse / AST threaded through
 ```
 
-43 commits ahead of origin/master at checkpoint time.
+73 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
-Conceptual locus depth (deepest = substrate-touching, shallowest =
-user-facing). Each is a focused single-commit chunk unless noted.
+Substrate is now in good shape. The remaining v1 work is one
+substantial substrate piece (m28) followed by the application
+exercise (trellis-pair) that proves it. Everything else is
+polish.
 
-**Codegen surface expansion (Tier 4, the LLVM path):**
+**1. m28 — pinned full lifecycle + cross-thread bus mailbox.**
+The other half of the bimodal cut. Pinned loci can today only
+declare `run()`; m28 lifts that restriction. Specifically:
 
-1. **trellis-pair (multi-binary, cross-process bus).** The only
-   remaining example. Requires process-level entry-point
-   selection (one source file compiles to a per-binary entry,
-   e.g. via `--bin analyst`) AND a cross-process bus transport
-   (shared-memory ring buffer or NATS bridge). Both are
-   infra-level pieces deferred from v0 codegen scope.
-2. **Tightening Decimal/Time precision** — the `printf %g` vs
-   Rust `Display` divergence is documented; trellis-grade
-   fixed-point Decimal lands when the substrate cares.
-3. **Region allocator + cooperative scheduler** — the deeper
-   Phase-2 deep-pushes. Region allocator replaces libc malloc
-   for type literals, with per-projection-class arenas (rich /
-   chunked / recognition per F.3). Cooperative scheduler
-   replaces the synchronous-instantiation model with a real
-   BEAM-shaped multi-scheduler runtime so loci with `run()` can
-   yield + resume + receive bus messages out of band.
+- Pinned loci can declare birth / drain / dissolve, all running
+  on the pinned thread.
+- Pinned loci can declare bus subscribe / publish.
+- Cross-thread bus dispatch ("any → pinned" per
+  `spec/runtime.md::Schedule classes`) posts to a per-pinned-
+  locus mailbox via mutex; the pinned-thread event loop polls
+  the mailbox between cells. Pinned → any goes through the
+  existing program-wide queue (drained on main-thread side).
+- Coordinated shutdown: signal pinned thread → drain its
+  mailbox → run its drain/dissolve → pthread_join.
+- Optional: `: schedule pinned(core=N)` syntax for explicit
+  `sched_setaffinity` core pinning.
 
-**Smaller follow-ups available in any commit:**
-- `return n;` from main → process exit code (one-line lowering
-  once the special-cased main path can lift `return`)
-- Default param values on user fns (already in AST; declare time
-  rejects them today)
-- Locus param defaults that aren't literals (current constraint:
-  literal-only at declare time; lift by deferring default eval to
-  the instantiation site through `lower_expr`)
-- Decimal arithmetic (needed for `trellis-demo`)
+This is a meaningful threading milestone with real cross-thread
+synchronization. Worth designing carefully — particularly the
+arena ownership model for cross-thread payload copies. (Today
+m20 memcpy's at enqueue time on the publisher's frame; for
+cross-thread, the publisher writes into the pinned subscriber's
+arena which is otherwise that thread's exclusive territory →
+needs either arena-level locking or a cross-thread bounce
+buffer.)
 
-**Runtime side (Tier 0/1, deferred):**
+**2. trellis-pair** (multi-binary, cross-process bus +
+entry-point selection). The only remaining example in the
+ladder. Two pieces:
+- `lotus build --bin <locus>` entry-point selection
+- Cross-process bus transport. Decided last session:
+  shared-memory ring buffer (most production-shaped; matches
+  the existing in-process LMAX disruptor), per the
+  runtime/stdlib transport split documented above.
 
-- Region allocator (per-projection-class strategies)
-- Cooperative scheduler (BEAM-shaped)
-- Cross-process shared-memory ring buffer (production trellis-pair)
-- Recovery primitives execution (restart / quarantine — needs
-  scheduler + region allocator)
+**Polish (any time):**
 
-**Outstanding deferrals worth tracking:**
+- Match guards (extend m24)
+- Tuple / Constructor patterns in match (needs tuple values
+  in codegen first)
+- Generic `for` over arrays / ranges (needs array literal +
+  range type lowering)
+- Default param values on user fns (already in AST; declare
+  time rejects today)
+- Recovery primitives execution (restart / quarantine /
+  reorganize — interpreter parses, neither runs)
+- Recognition-class real bitmap-pool (currently chunked-
+  equivalent stub per spec/memory.md)
+- Decimal precision tightening (printf %g vs Display)
+- Free-fn implicit-locus arenas (spec is fuzzy on
+  return-value-copy semantics)
 
-- Generic instantiation (record args, no substitution yet)
+**Long-deferred:**
+
+- Generic instantiation (records args, no substitution)
 - Module / import resolution (parsed only)
 - Tree-sitter grammar derivation from EBNF
 - LSP server
@@ -691,6 +688,18 @@ rm examples/03c-closure-bubbled/main
 cargo run --bin lotus -- build examples/04-modes/main.lt
 ./examples/04-modes/main                 # bulk=60, harmonic=3, resolution=30
 rm examples/04-modes/main
+cargo run --bin lotus -- build examples/14-projection-classes/main.lt
+./examples/14-projection-classes/main    # rich/chunked/recognition: total=6
+rm examples/14-projection-classes/main
+cargo run --bin lotus -- build examples/15-match/main.lt
+./examples/15-match/main                 # zero/two/other; status: live/dormant; got value=42
+rm examples/15-match/main
+cargo run --bin lotus -- build examples/16-schedule-classes/main.lt
+./examples/16-schedule-classes/main      # cooperative + main + (50ms) + pinned on its own pthread
+rm examples/16-schedule-classes/main
+cargo run --bin lotus -- build examples/17-yield/main.lt
+./examples/17-yield/main                 # logged tick 1/2/3 with `--- after first/second yield ---`
+rm examples/17-yield/main
 ```
 
-If all twenty work, the checkpoint is intact.
+If all twenty-one work, the checkpoint is intact.
