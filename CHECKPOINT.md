@@ -1,12 +1,15 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 20 (locus-owned arenas
-+ bus copy semantics — every locus carries its own region, freed
-at dissolve; bus dispatch copies payloads between publisher and
-subscriber arenas) on top of milestone 19 (region allocator
-substrate). **17 of 18 examples build to native ELF — every
-single-binary example is a build target.** Only `trellis-pair`
+new session. State as of codegen milestone 23 (recognition-class
+stub) on top of m22 (chunked sub-regions), m20 (locus-owned
+arenas + bus copy), and m19 (arena substrate). The full F.3
+projection-class trio — rich / chunked / recognition — now flows
+through codegen end-to-end; recognition is a documented stub
+treated as chunked at v0 until a workload pushes on the bitmap-
+pool optimization. **18 of 19 examples build to native ELF —
+every single-binary example, including the new
+`14-projection-classes` smoke test.** Only `trellis-pair`
 (multi-binary, cross-process bus) remains, gated on substantial
 new infrastructure.
 
@@ -61,6 +64,20 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 17 of 18 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestones 22 + 23** (per-projection-class arena
+  strategies) — complete. Each locus's projection class
+  resolves from `: projection <class>` annotation or per-spec
+  default rule (chunked if accept declared, rich otherwise) at
+  declare-locus-struct time. m22 wires chunked parents through
+  `lotus_arena_create_subregion`: each accepted child gets a
+  sub-region carved from the parent's bookkeeping space, with
+  slot indices reused via a free-list when children dissolve.
+  m23 lights up the recognition annotation behind the same
+  sub-region path — the pre-allocated bitmap-cell pool
+  optimization is deliberately deferred until a workload
+  exercises it, and that gap is documented in
+  `spec/memory.md`. New `examples/14-projection-classes/`
+  exercises all three classes end-to-end.
 - **Phase 3 milestone 20** (locus-owned arenas + bus copy
   semantics) — complete. Every locus struct now carries a
   synthetic `__arena: ptr` field at struct slot 0; instantiation
@@ -105,15 +122,14 @@ Phase status:
   handles stay in parent.children (for `for child in
   self.children`) but the parent's later cascade skips
   already-dissolved children.
-- **Phase 3 next** — m22 brings chunked-class per-coordinatee
-  sub-regions online (the parent's arena owns sub-regions for
-  each accepted child, freed individually as children dissolve);
-  m23 adds the recognition-class fixed-pool strategy. After
-  that arc: cooperative scheduler (BEAM-shaped). `trellis-pair`
-  (cross-process bus + entry-point selection) is deferred until
-  the substrate is ready — the application is the right
-  exercise of the full runtime, not a target the substrate
-  bends toward.
+- **Phase 3 next** — cooperative scheduler (BEAM-shaped multi-
+  scheduler runtime so loci with `run()` can yield + resume +
+  receive bus messages out of band). Big arc; the natural
+  follow-on after the region-allocator substrate is solid.
+  `trellis-pair` (cross-process bus + entry-point selection)
+  remains deferred until the substrate is ready — the
+  application exercises the full runtime, but the substrate
+  doesn't bend toward it.
 
 ## Transport layering (decided 2026-05-08)
 
@@ -205,11 +221,22 @@ m19 Codegen milestone 19: region allocator substrate           (ea4892b)
                           ⇒ libc malloc removed; lotus_arena_*
                             backs every type-literal + ClosureViolation
                             allocation; same example ladder still passes
-m20 Codegen milestone 20: locus-owned arenas + bus copy        (this commit)
+m20 Codegen milestone 20: locus-owned arenas + bus copy        (d511670)
                           ⇒ __arena field on every locus struct
                             (slot 0), lifecycle-bound; bus dispatch
                             copies payloads between publisher /
                             subscriber arenas per spec
+m22 Codegen milestone 22: chunked-class sub-regions            (this commit)
+                          ⇒ chunked parents allocate accepted
+                            children via lotus_arena_create_subregion;
+                            free-list bookkeeping reuses slot
+                            indices as children dissolve
+m23 Codegen milestone 23: recognition-class stub               (this commit)
+                          ⇒ recognition annotation parses /
+                            resolves / dispatches; behaviorally
+                            equivalent to chunked at v0; bitmap-
+                            pool optimization deliberately deferred
+                          + examples/14-projection-classes
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,

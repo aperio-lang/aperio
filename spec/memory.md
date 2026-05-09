@@ -530,6 +530,56 @@ m20 deliberately keeps free fns + main on the program-wide arena
 class — chunked-class per-coordinatee sub-regions land in m22,
 the recognition-class fixed pool in m23.
 
+### Per-projection-class arena strategies (m22 + m23)
+
+Each locus's projection class is resolved at codegen-declare
+time: from an explicit `: projection rich|chunked|recognition`
+annotation when present, otherwise per the spec/memory.md
+default rule (chunked if the locus declares accept; rich
+otherwise — recognition is explicit-only).
+
+The class drives the *child arena allocation* strategy when this
+locus accepts coordinatees:
+
+- **Rich** parents: each child gets a fresh top-level arena via
+  `lotus_arena_create()`. Independent allocation lifetime;
+  parent does no bookkeeping. v0 default for non-coordinator
+  loci.
+- **Chunked** parents: each accepted child gets a sub-region via
+  `lotus_arena_create_subregion(parent_arena)`. The parent
+  tracks a slot index per child; on child dissolve, the slot
+  returns to a per-arena free-list so peak slot space stays
+  O(concurrent children alive), not O(total children ever
+  accepted). Per F.3.
+- **Recognition** parents: same code path as chunked at
+  v0 — sub-region allocation with free-list bookkeeping. The
+  spec's pre-allocated bitmap-cell pool is a perf optimization
+  (avoids `malloc` per accept) deliberately deferred until a
+  workload exercises it. The annotation parses + resolves +
+  routes correctly; the `Recognition` arm is *behaviorally*
+  equivalent to `Chunked` until the optimization lands. The
+  surface contract (parent owns a pool of fixed-size cells, no
+  dynamic allocation in steady state) is exercised by
+  `examples/14-projection-classes`.
+
+C runtime ABI as of m22:
+
+```
+ptr  lotus_arena_create(void)
+ptr  lotus_arena_create_subregion(ptr parent)   // m22
+ptr  lotus_arena_alloc(ptr arena, i64 size, i64 align)
+void lotus_arena_destroy(ptr arena)             // auto-detects sub-region
+                                                // and returns slot to
+                                                // parent's free-list
+```
+
+`lotus_arena_destroy` is unified across kinds — it inspects the
+arena's optional `parent` pointer and slot, and returns the slot
+to the parent's free-list when present. Callers always emit a
+single destroy call regardless of how the arena was created.
+This keeps the codegen side simple: it doesn't have to remember
+which create variant was used.
+
 ## Future work
 
 - **Hot-load preservation across perspective updates.** When a

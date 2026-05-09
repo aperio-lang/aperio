@@ -354,6 +354,15 @@ struct LocusInfo<'ctx> {
     /// the dispatch fn doesn't know which locus type its
     /// self_ptr came from).
     arena_field_idx: u32,
+    /// Per-spec projection class. Resolved at declare-locus-struct
+    /// time from the `LocusAnnotation::Projection` annotation, or
+    /// (per spec/memory.md) defaults to chunked if the locus
+    /// declares accept, rich otherwise. Used at instantiation
+    /// time to pick the parent's sub-region strategy: a
+    /// chunked-class parent's accepted children call
+    /// `lotus_arena_create_subregion(parent_arena)` instead of
+    /// `lotus_arena_create()` (m22).
+    projection_class: ProjectionClass,
 }
 
 /// Maximum number of children any locus struct's built-in
@@ -482,6 +491,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let arena_create_ty = ptr_t.fn_type(&[], false);
         self.module
             .add_function("lotus_arena_create", arena_create_ty, None);
+        // m22: chunked-class parent calls this when accepting a
+        // child; the child arena registers a slot index in the
+        // parent so destroy can free-list it for reuse.
+        let subregion_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_arena_create_subregion", subregion_ty, None);
         let arena_alloc_ty =
             ptr_t.fn_type(&[ptr_t.into(), i64_t.into(), i64_t.into()], false);
         self.module
@@ -1352,10 +1367,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         &mut self,
         l: &LocusDecl,
     ) -> Result<(), CodegenError> {
-        if !l.annotations.is_empty() {
-            // tier / projection annotations are framework metadata,
-            // not ABI — fine to ignore for codegen.
-        }
+        // Resolve projection class: explicit annotation wins;
+        // otherwise default per spec/memory.md (chunked if
+        // accept declared, rich otherwise — recognition is
+        // explicit-only since N≈100-500 is too aggressive for
+        // implicit choice).
+        let has_accept = l.members.iter().any(|m| {
+            matches!(m, LocusMember::Lifecycle(lc)
+                if matches!(lc.kind, LifecycleKind::Accept))
+        });
+        let projection_class: ProjectionClass = l
+            .annotations
+            .iter()
+            .find_map(|a| match a {
+                LocusAnnotation::Projection(pc) => Some(*pc),
+                _ => None,
+            })
+            .unwrap_or(if has_accept {
+                ProjectionClass::Chunked
+            } else {
+                ProjectionClass::Rich
+            });
 
         // Each locus param must have either a literal default or
         // a typed default expression evaluable at instantiation
@@ -1456,10 +1488,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // children array + counter at the end of the struct so
         // each accept dispatch can record the child's self_ptr
         // for `for child in self.children { ... }` iteration.
-        let has_accept = l.members.iter().any(|m| {
-            matches!(m, LocusMember::Lifecycle(lc)
-                if matches!(lc.kind, LifecycleKind::Accept))
-        });
         let (children_field_idx, child_count_field_idx) = if has_accept {
             let i64_t = self.context.i64_type();
             let arr_ty = ptr_t.array_type(CHILDREN_CAP);
@@ -1496,6 +1524,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 children_field_idx,
                 child_count_field_idx,
                 arena_field_idx,
+                projection_class,
             },
         );
         Ok(())
@@ -3981,17 +4010,96 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // and during its lifecycle method bodies will route
         // through `arena_alloc`, which prefers `current_self`'s
         // arena field over the program global.
-        let arena_create = self
-            .module
-            .get_function("lotus_arena_create")
-            .expect("lotus_arena_create declared");
-        let new_arena = self
-            .builder
-            .build_call(arena_create, &[], &format!("{}.arena", locus_name))
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .expect("arena_create returns ptr");
+        //
+        // m22: if our parent is a chunked-class locus actively
+        // accepting us (current_self set, parent declares
+        // accept(child: ThisLocus), parent.projection_class ==
+        // Chunked), allocate as a sub-region of the parent's
+        // arena rather than a fresh top-level arena. Parent
+        // tracks a slot index for us; on dissolve, our slot
+        // returns to the parent's free-list for reuse.
+        // m22+m23: chunked AND recognition parents both route
+        // accepted children through `lotus_arena_create_subregion`.
+        // For chunked, that's the spec's per-coordinatee
+        // sub-region with free-list bookkeeping. For recognition,
+        // v0 reuses the chunked path as a deliberate stub —
+        // recognition's pre-allocated bitmap pool is a perf
+        // optimization (avoids malloc per accept) that v0 defers
+        // until a workload exercises it. Functionally equivalent
+        // to chunked at this layer; spec/memory.md flags the gap.
+        let parent_subregion_accept = if let Some(cs) = self.current_self.as_ref() {
+            let parent_info = self
+                .user_loci
+                .get(&cs.locus_name)
+                .cloned()
+                .expect("current_self points to a declared locus");
+            let parent_accepts_us = parent_info
+                .accept_param
+                .as_ref()
+                .map(|(_, child_ty)| child_ty == locus_name)
+                .unwrap_or(false);
+            if parent_accepts_us
+                && matches!(
+                    parent_info.projection_class,
+                    ProjectionClass::Chunked | ProjectionClass::Recognition
+                )
+            {
+                Some(cs.self_ptr)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let new_arena = if let Some(parent_self_ptr) = parent_subregion_accept {
+            let parent_info = self
+                .user_loci
+                .get(&self.current_self.as_ref().unwrap().locus_name)
+                .cloned()
+                .expect("parent declared");
+            let arena_field_ptr = self
+                .builder
+                .build_struct_gep(
+                    parent_info.struct_ty,
+                    parent_self_ptr,
+                    parent_info.arena_field_idx,
+                    "parent.__arena.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let parent_arena = self
+                .builder
+                .build_load(
+                    self.context.ptr_type(AddressSpace::default()),
+                    arena_field_ptr,
+                    "parent.__arena",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let subregion_fn = self
+                .module
+                .get_function("lotus_arena_create_subregion")
+                .expect("lotus_arena_create_subregion declared");
+            self.builder
+                .build_call(
+                    subregion_fn,
+                    &[parent_arena.into()],
+                    &format!("{}.arena.sub", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .try_as_basic_value()
+                .left()
+                .expect("subregion_create returns ptr")
+        } else {
+            let arena_create = self
+                .module
+                .get_function("lotus_arena_create")
+                .expect("lotus_arena_create declared");
+            self.builder
+                .build_call(arena_create, &[], &format!("{}.arena", locus_name))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .try_as_basic_value()
+                .left()
+                .expect("arena_create returns ptr")
+        };
         let arena_field = self
             .builder
             .build_struct_gep(
