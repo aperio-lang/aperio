@@ -1,23 +1,33 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 28c (CPU-core
-affinity). The full substrate arc landed across this session:
-m19→m23 (region allocator with rich/chunked/recognition
-strategies + per-locus arenas + bus copy semantics), m24
-(`match` codegen), m25 (bimodal schedule-class annotation), m26
-(cooperative scheduler semantics — deferred bus dispatch + drain
-loop), m26b (explicit `yield`), m27 (pinned-thread spawning via
-pthread_create, run-only), m28a (full pinned lifecycle —
+new session. State as of m29 (match arm guards) — a polish
+follow-up to the m28 scheduler arc. The full substrate arc
+landed: m19→m23 (region allocator with
+rich/chunked/recognition strategies + per-locus arenas + bus
+copy semantics), m24 (`match` codegen), m25 (bimodal
+schedule-class annotation), m26 (cooperative scheduler
+semantics — deferred bus dispatch + drain loop), m26b (explicit
+`yield`), m27 (pinned-thread spawning via pthread_create,
+run-only), m28a (full pinned lifecycle —
 birth/run/drain/dissolve all on the pinned thread), m28b
 (cross-thread bus mailboxes — pinned loci can subscribe and
 publish; cells route via per-locus mutex+condvar mailboxes with
 inline payloads; coordinated shutdown via
 shutdown-flag-then-join), m28c (optional `: schedule
-pinned(core = N)` for `pthread_setaffinity_np` core pinning).
-**24 of 25 examples build to native ELF — every single-binary
-example.** Only `trellis-pair` (multi-binary, cross-process bus)
-remains.
+pinned(core = N)` for `pthread_setaffinity_np` core pinning),
+m29 (match arm guards — `pat if cond -> body` lowering with
+binding installed for the guard expr to reference). **24 of 25
+examples build to native ELF — every single-binary example.**
+Only `trellis-pair` (multi-binary, cross-process bus) remains.
+
+**The bimodal scheduler is fully complete.** Cooperative loci
+yield between substrate cells via the inline-payload deferred
+queue; pinned loci own their thread, run their full lifecycle
+(including subscribed bus handlers via per-locus mailboxes),
+and can pin to a CPU core. Both layers stay arena-lock-free —
+the substrate cost lives at the boundary (the queue/mailbox
+mutex + the cell's two memcpy's).
 
 **The Design / lotus is now visible at the codegen substrate.**
 Same source, two execution shapes (cooperative / pinned) and
@@ -451,7 +461,7 @@ m28b/2 m28b stage 2: per-pinned mailbox + dispatch routing     (fe296ae)
                             and drain(); coordinated shutdown
                             via shutdown-flag-then-join
                           + examples/19-pinned-bus
-m28c   Codegen milestone 28c: pinned(core=N) affinity          (pending)
+m28c   Codegen milestone 28c: pinned(core=N) affinity          (5b10337)
                           ⇒ ScheduleClass::Pinned(Option<i64>);
                             parser optional (core=N); C-side
                             lotus_set_core_affinity wraps
@@ -459,6 +469,12 @@ m28c   Codegen milestone 28c: pinned(core=N) affinity          (pending)
                             calls it after pthread_create when
                             core is set; best-effort fallback
                           + examples/20-pinned-core
+m29    m29: match arm guards in codegen                        (0398d42)
+                          ⇒ pattern → guard_bb (binding install
+                            + guard eval + cond branch) → body;
+                            falls through to next arm on false;
+                            extends m24 surface
+                          + examples/15-match (extended)
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -630,7 +646,9 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
-(pending) Codegen milestone 28c: pinned(core=N) explicit core pinning
+c4ec399 codegen: remove dead `_ =>` arm in lower_stmt
+0398d42 m29: match arm guards in codegen
+5b10337 Codegen milestone 28c: pinned(core=N) CPU-core affinity
 fe296ae m28b stage 2: cross-thread bus mailboxes for pinned loci
 8f8d20d m28b stage 1: inline-payload bus queue + mutex
 c70b551 Codegen milestone 28a: pinned full lifecycle on the pinned thread
@@ -662,7 +680,7 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-77 commits ahead of origin/master at checkpoint time.
+79 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
