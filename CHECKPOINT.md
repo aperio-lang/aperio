@@ -1,9 +1,9 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of m38 (stdlib helpers — min / max / abs
-/ starts_with / contains) — the surface-completeness arc that
-started after the m28 scheduler shipped. Substrate arc: m19→m23 (region allocator with
+new session. State as of m39 (birth-epoch closures — F.9
+substrate deepening) — surface-completeness arc through m38,
+then the substrate-foundation arc opened with m39. Substrate arc: m19→m23 (region allocator with
 rich/chunked/recognition + per-locus arenas + bus copy), m24
 (`match`), m25 (bimodal schedule-class annotation), m26
 (cooperative scheduler — deferred bus + drain loop), m26b
@@ -25,7 +25,9 @@ arms), m36 (string ops — `+` concat, `==`/`!=` equality,
 primitive→String conversion for dynamic composition; output
 matches println formatting), m38 (stdlib helpers — `min` /
 `max` / `abs` across numeric types, plus `starts_with` /
-`contains` for String predicates). **34 of 35 examples build
+`contains` for String predicates), m39 (birth-epoch
+closures — F.9 invariants checked right after `birth()`
+returns, before `run()` runs). **35 of 36 examples build
 to native ELF — every single-binary example.** Only
 `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -84,9 +86,41 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 34 of 35 example
+- **Phase 2 v0** (interpreter + bus router) — 35 of 36 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 39** (birth-epoch closures — F.9
+  substrate deepening) — complete. Pre-m39 only
+  dissolve-epoch closures lowered, so invariants could
+  only be checked at end-of-life; m39 lights up
+  birth-epoch closures: assertions evaluated right after
+  `birth()` returns, before `run()` touches state. Same
+  F.9 routing as dissolve — violation reaches the
+  parent's `on_failure` if matching, else stderr+exit.
+  `LocusInfo.closures` gains an `EpochSpec` tag per entry
+  so the synthesis pass partitions by epoch; `closures_fn`
+  split into `birth_closures_fn` + `dissolve_closures_fn`
+  (renamed from `closures_fn`). Lifecycle dispatch in
+  `lower_locus_instantiation` now sequences birth() →
+  `__birth_closures` → run() (existing drain →
+  `__dissolve_closures` → dissolve still runs at the end).
+  Default closures (no `epoch` clause) stay dissolve-only
+  so no pre-existing example's stdout shifts. Tick /
+  Duration / Explicit still reject with a clear "covers
+  Birth + Dissolve" diagnostic — those need the runtime
+  epoch engine. Interpreter parity via
+  `closure_fires_at_birth` predicate + a birth-eval block
+  in `instantiate_locus`. New
+  `examples/31-birth-closures/`. Why "bottom of the
+  locus-of-design": closures are F.9's first-class
+  invariant primitive; epoch is *when* the invariant is
+  checked. Birth + Dissolve are the two epochs that
+  don't need the runtime epoch engine, so they're the
+  substrate's foundational layer. Recovery primitives
+  (`restart` / `quarantine` / `reorganize`) sit on top —
+  they're the *response* to a violation; m39 delivers
+  the trigger half, recovery is the natural next
+  substrate milestone.
 - **Phase 3 milestone 38** (stdlib helpers — math + string
   predicates) — complete. Five small language-native helpers
   that fill the most-common gaps before deeper-substrate
@@ -758,6 +792,22 @@ m38    m38: stdlib helpers — math + string predicates         (5787acd)
                           + examples/30-stats (bonus —
                             Producer + Aggregator combining
                             m35 → m38 surface)
+m39    m39: birth-epoch closures (substrate F.9 deepening)    (cba1e96)
+                          ⇒ Closures gain a per-entry
+                            EpochSpec tag; closures_fn splits
+                            into birth_closures_fn +
+                            dissolve_closures_fn. Lifecycle
+                            dispatch sequences birth() →
+                            __birth_closures → run(); existing
+                            drain → __dissolve_closures →
+                            dissolve still runs at end.
+                            Default closures stay dissolve-
+                            only (purely additive).
+                            Tick/Duration/Explicit still
+                            reject. Interpreter mirrors via
+                            closure_fires_at_birth + birth-
+                            eval block in instantiate_locus.
+                          + examples/31-birth-closures
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -826,6 +876,7 @@ m7 builds on the struct ABI.
 | `to_string(x)` for primitives → String | ✅ | ✅ |
 | `min(a, b)` / `max(a, b)` / `abs(x)` for numeric types | ✅ | ✅ |
 | `starts_with(s, p)` / `contains(s, sub)` for String | ✅ | ✅ |
+| Birth-epoch closures (F.9 invariants checked after `birth()`) | ✅ | ✅ |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
 | Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
@@ -945,6 +996,8 @@ real-world use case for lotus.
 ## Recent commit history (newest first)
 
 ```
+cba1e96 m39: birth-epoch closures (substrate F.9 deepening)
+c1184dc CHECKPOINT.md: m38 + bus aggregator example refresh
 f90c8b4 examples/30-stats: bus aggregator combining recent surface
 5787acd m38: stdlib helpers — min / max / abs / starts_with / contains
 21ac4a2 CHECKPOINT.md: m36 + m37 string ops refresh
@@ -998,12 +1051,14 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-17 commits ahead of origin/master at checkpoint time (origin
+19 commits ahead of origin/master at checkpoint time (origin
 moved up to a5fc8bd / the prior session's tip; this session
 shipped m30 → m34 + the std/* import-resolution fix, then
 m35 for tuples, m36 for string ops, m37 for to_string, m38
-for stdlib helpers, plus a bus-aggregator flex app combining
-recent surface).
+for stdlib helpers, plus a bus-aggregator flex app, then
+m39 for birth-epoch closures — the first step into
+substrate-foundation work after the surface-completeness
+arc).
 
 ## Next steps in priority order
 
@@ -1196,6 +1251,9 @@ rm examples/29-helpers/main
 cargo run --bin lotus -- build examples/30-stats/main.lt
 ./examples/30-stats/main                 # bus aggregator: 6 samples → running n/sum/min/max/avg lines
 rm examples/30-stats/main
+cargo run --bin lotus -- build examples/31-birth-closures/main.lt
+./examples/31-birth-closures/main        # configured locus with birth-epoch closures: pass/pass/fail absorbed by AuditL
+rm examples/31-birth-closures/main
 ```
 
-If all thirty-four work, the checkpoint is intact.
+If all thirty-five work, the checkpoint is intact.
