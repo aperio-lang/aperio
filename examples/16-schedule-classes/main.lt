@@ -1,0 +1,36 @@
+// 16-schedule-classes — explicit schedule annotations.
+//
+// Per The Design / lotus, schedule class is to execution what
+// projection class is to memory: same source, three runtime
+// shapes. m25 wires the annotation through parse/resolve. m26
+// will branch on it for actual semantics (deferred bus dispatch
+// for cooperative; sync for greedy); m27 will spawn dedicated
+// threads for pinned loci. Today: parses + resolves; behaves
+// identically to today's synchronous-everywhere runtime.
+//
+// Three loci, one per class. Each does a small piece of work
+// and prints which class it's running under.
+
+locus CooperativeWorker : schedule cooperative {
+    run() {
+        println("cooperative: a polite citizen");
+    }
+}
+
+locus GreedyWorker : schedule greedy {
+    run() {
+        println("greedy: runs to completion, no apologies");
+    }
+}
+
+locus PinnedWorker : schedule pinned {
+    run() {
+        println("pinned: owns its thread; in v0 still on main");
+    }
+}
+
+fn main() {
+    CooperativeWorker { };
+    GreedyWorker { };
+    PinnedWorker { };
+}

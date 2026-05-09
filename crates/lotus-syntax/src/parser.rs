@@ -318,9 +318,36 @@ impl Parser {
                 };
                 Ok(LocusAnnotation::Projection(class))
             }
+            TokenKind::Schedule => {
+                self.bump();
+                let class = match self.peek() {
+                    TokenKind::Cooperative => {
+                        self.bump();
+                        ScheduleClass::Cooperative
+                    }
+                    TokenKind::Greedy => {
+                        self.bump();
+                        ScheduleClass::Greedy
+                    }
+                    TokenKind::Pinned => {
+                        self.bump();
+                        ScheduleClass::Pinned
+                    }
+                    other => {
+                        return Err(Diag::parse(
+                            self.peek_token().span,
+                            format!("expected schedule class, got {:?}", other),
+                        ));
+                    }
+                };
+                Ok(LocusAnnotation::Schedule(class))
+            }
             other => Err(Diag::parse(
                 self.peek_token().span,
-                format!("expected tier or projection annotation, got {:?}", other),
+                format!(
+                    "expected tier / projection / schedule annotation, got {:?}",
+                    other
+                ),
             )),
         }
     }

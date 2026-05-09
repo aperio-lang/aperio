@@ -363,6 +363,16 @@ struct LocusInfo<'ctx> {
     /// `lotus_arena_create_subregion(parent_arena)` instead of
     /// `lotus_arena_create()` (m22).
     projection_class: ProjectionClass,
+    /// Per-locus execution strategy (m25). Resolved at declare-
+    /// locus-struct time from the `LocusAnnotation::Schedule`
+    /// annotation, or defaults to `Cooperative`. m25 only stores
+    /// it — no runtime semantics yet (the runtime today is
+    /// effectively greedy-everywhere via synchronous nested
+    /// dispatch). m26 will branch on this to either deferred
+    /// dispatch (cooperative) or sync (greedy); m27 spawns
+    /// dedicated threads for pinned loci.
+    #[allow(dead_code)]
+    schedule_class: ScheduleClass,
 }
 
 /// Maximum number of children any locus struct's built-in
@@ -1389,6 +1399,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 ProjectionClass::Rich
             });
 
+        // m25: schedule class. Default cooperative — even though
+        // current codegen runs everything synchronously (which is
+        // structurally greedy), cooperative is the spec's default
+        // and the natural target for m26. Users who want today's
+        // sync-everywhere semantics LOCKED IN as their design
+        // choice (rather than incidental) can write
+        // `: schedule greedy` explicitly.
+        let schedule_class: ScheduleClass = l
+            .annotations
+            .iter()
+            .find_map(|a| match a {
+                LocusAnnotation::Schedule(sc) => Some(*sc),
+                _ => None,
+            })
+            .unwrap_or(ScheduleClass::Cooperative);
+
         // Each locus param must have either a literal default or
         // a typed default expression evaluable at instantiation
         // time. Scalar literals lock in `DefaultInit::Const` so
@@ -1525,6 +1551,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 child_count_field_idx,
                 arena_field_idx,
                 projection_class,
+                schedule_class,
             },
         );
         Ok(())

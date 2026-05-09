@@ -71,6 +71,17 @@ pub enum TokenKind {
     Chunked,
     Recognition,
 
+    // Keywords — schedule class (m25). Per The Design / lotus,
+    // schedule class is to execution what projection class is to
+    // memory: same source, three runtime shapes. Cooperative is
+    // the default (BEAM-shape; yields at substrate cells); greedy
+    // runs handlers to completion without yielding; pinned owns
+    // its own thread.
+    Schedule,
+    Cooperative,
+    Greedy,
+    Pinned,
+
     // Keywords — closure
     Closure,
     Epoch,
@@ -369,6 +380,12 @@ impl<'a> Lexer<'a> {
             "rich" => TokenKind::Rich,
             "chunked" => TokenKind::Chunked,
             "recognition" => TokenKind::Recognition,
+
+            // Schedule class (m25)
+            "schedule" => TokenKind::Schedule,
+            "cooperative" => TokenKind::Cooperative,
+            "greedy" => TokenKind::Greedy,
+            "pinned" => TokenKind::Pinned,
 
             // Closure
             "closure" => TokenKind::Closure,

@@ -42,8 +42,10 @@ locus_decl        = "locus" , IDENTIFIER , [ locus_annotations ] ,
 locus_annotations = ":" , locus_annotation , { "," , locus_annotation } ;
 locus_annotation  = "tier" , INT_LIT
                   | "projection" , projection_class
+                  | "schedule" , schedule_class
                   ;
 projection_class  = "rich" | "chunked" | "recognition" ;
+schedule_class    = "cooperative" | "greedy" | "pinned" ;
 
 locus_member      = params_block
                   | contract_block

@@ -73,6 +73,12 @@ mode            bulk            harmonic        resolution
 projection      rich            chunked         recognition
 ```
 
+### Schedule-class keywords
+
+```
+schedule        cooperative     greedy          pinned
+```
+
 ### Closure keywords
 
 ```

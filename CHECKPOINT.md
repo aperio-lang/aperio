@@ -1,13 +1,23 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of codegen milestone 24 (`match` expressions
-in codegen) on top of the m19→m23 region-allocator arc. **19 of
-20 examples build to native ELF — every single-binary example,
-including `14-projection-classes` (m22+m23 smoke test) and
-`15-match` (m24 smoke test).** Only `trellis-pair`
-(multi-binary, cross-process bus) remains, gated on substantial
-new infrastructure.
+new session. State as of codegen milestone 25 (schedule-class
+annotation infrastructure) on top of m24 (`match` expressions)
+and the m19→m23 region-allocator arc. **20 of 21 examples build
+to native ELF — every single-binary example, including
+`14-projection-classes`, `15-match`, and `16-schedule-classes`
+(m25 smoke test).** Only `trellis-pair` (multi-binary,
+cross-process bus) remains, gated on substantial new
+infrastructure.
+
+**Schedule-class arc opened.** Per The Design / lotus, schedule
+class is to execution what projection class is to memory: same
+source, three runtime shapes. m25 wires the annotation through
+parse / typecheck / codegen — `: schedule cooperative | greedy
+| pinned`. Runtime semantics not yet branched on it (today's
+sync-everywhere behavior is effectively greedy-everywhere).
+m26 ships cooperative semantics (deferred bus dispatch +
+scheduler loop); m27 ships pinned threads. Default: cooperative.
 
 Two design decisions landed in the prior session and are now
 guiding the substrate work: the runtime/stdlib split for bus
@@ -60,6 +70,21 @@ Phase status:
 - **Phase 2 v0** (interpreter + bus router) — 17 of 18 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 25** (schedule-class annotation
+  infrastructure) — complete. New keywords `schedule`,
+  `cooperative`, `greedy`, `pinned` in lexer; `LocusAnnotation::
+  Schedule(ScheduleClass)` in AST; parser recognizes the
+  `: schedule X` annotation alongside `tier N` and `projection
+  X`; typechecker stores it on `Annotations`; codegen resolves
+  it onto `LocusInfo.schedule_class` (default cooperative).
+  Runtime today still runs everything synchronously — no
+  semantic branch on the class yet. m26 will introduce
+  deferred bus dispatch + a scheduler loop for cooperative
+  loci while keeping greedy loci on the synchronous path; m27
+  spawns dedicated threads for pinned loci. New
+  `examples/16-schedule-classes/` exercises all three classes;
+  spec/runtime.md gets a "Schedule classes" section
+  documenting the surface and the implementation status.
 - **Phase 3 milestone 24** (`match` expressions) — complete.
   Match statements lower to LLVM as a chain of test-blocks +
   body-blocks, falling through to the next arm on mismatch.
@@ -132,14 +157,17 @@ Phase status:
   handles stay in parent.children (for `for child in
   self.children`) but the parent's later cascade skips
   already-dissolved children.
-- **Phase 3 next** — cooperative scheduler (BEAM-shaped multi-
-  scheduler runtime so loci with `run()` can yield + resume +
-  receive bus messages out of band). Big arc; the natural
-  follow-on after the region-allocator substrate is solid.
-  `trellis-pair` (cross-process bus + entry-point selection)
-  remains deferred until the substrate is ready — the
-  application exercises the full runtime, but the substrate
-  doesn't bend toward it.
+- **Phase 3 next** — m26 (cooperative scheduler semantics):
+  deferred bus dispatch + scheduler loop on the main thread;
+  cooperative loci yield between substrate cells; greedy loci
+  stay on the synchronous path (= today's behavior). This is
+  where trellis-demo's output may shift (sync nested →
+  deferred FIFO interleaves Books / Kernel / Intent
+  differently). Then m27 (pinned threads): pthread_create per
+  pinned locus; cross-thread bus mailbox; thread-local arena
+  pointer. After that arc: `trellis-pair` (cross-process bus +
+  entry-point selection) becomes the natural exercise of the
+  full multi-scheduler runtime.
 
 ## Transport layering (decided 2026-05-08)
 
@@ -247,13 +275,19 @@ m23 Codegen milestone 23: recognition-class stub               (010db7a)
                             equivalent to chunked at v0; bitmap-
                             pool optimization deliberately deferred
                           + examples/14-projection-classes
-m24 Codegen milestone 24: match expressions                    (this commit)
+m24 Codegen milestone 24: match expressions                    (bb948c6)
                           ⇒ Literal / Wildcard / Binding patterns
                             in codegen; Tuple / Constructor +
                             guards remain interpreter-only;
                             F.18 exhaustiveness still enforced at
                             typecheck
                           + examples/15-match
+m25 Codegen milestone 25: schedule-class annotation infra      (this commit)
+                          ⇒ `: schedule cooperative | greedy
+                            | pinned` parses, typechecks, resolves
+                            on LocusInfo; default cooperative;
+                            no runtime semantic branch yet
+                          + examples/16-schedule-classes
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,

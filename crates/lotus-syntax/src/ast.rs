@@ -56,6 +56,7 @@ pub struct LocusDecl {
 pub enum LocusAnnotation {
     Tier(i64),
     Projection(ProjectionClass),
+    Schedule(ScheduleClass),
 }
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -63,6 +64,30 @@ pub enum ProjectionClass {
     Rich,
     Chunked,
     Recognition,
+}
+
+/// Per-locus execution strategy. Same source, three runtime
+/// shapes — substrate-invariance applied to time the way
+/// projection class applies it to space.
+///
+/// - `Cooperative`: yields at substrate cells (handler exits,
+///   lifecycle transitions, bus dispatches, `time::sleep`).
+///   Multiple cooperative loci share a scheduler thread. Default.
+/// - `Greedy`: runs handlers to completion without yielding.
+///   While a greedy locus's handler is executing, cooperative
+///   siblings on the same thread wait. Useful for time-bounded
+///   batch work or atomic checkpoints.
+/// - `Pinned`: owns its own OS thread (and optionally a CPU
+///   core). Bus events to/from it cross thread boundaries.
+///   For latency-critical paths.
+///
+/// m25 wires the annotation through parse/resolve. m26 ships
+/// cooperative semantics; m27 ships pinned threads.
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub enum ScheduleClass {
+    Cooperative,
+    Greedy,
+    Pinned,
 }
 
 #[derive(Debug, Clone, PartialEq)]

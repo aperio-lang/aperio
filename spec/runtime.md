@@ -97,6 +97,62 @@ Specifically:
   schedulers, the failure is delivered as a typed bus message
   to the parent's scheduler, which dispatches to `on_failure`.
 
+### Schedule classes (per-locus execution strategy)
+
+Just as **projection class** governs a locus's memory strategy,
+**schedule class** governs its execution strategy. Same source,
+three runtime shapes — substrate-invariance applied to time the
+way projection class applies it to space. Annotation:
+
+```
+locus AnalystL       : schedule cooperative { ... }   // default
+locus BookProducer   : schedule greedy      { ... }
+locus MarketDataIngest : schedule pinned    { ... }
+```
+
+| Class | Yield discipline | Resource |
+|---|---|---|
+| **Cooperative** (default) | Yields at substrate cells: handler exit, lifecycle transition, bus dispatch, `time::sleep`, explicit `yield`. | Shares a scheduler thread with other cooperative loci. |
+| **Greedy** | Runs handlers to completion, no mid-handler yield. While a greedy handler executes, cooperative siblings on the same thread wait. | Shares a scheduler thread (same as cooperative — just doesn't yield). |
+| **Pinned** | No yield; owns its scheduler. Bus events to/from it cross thread boundaries. | Dedicated OS thread, optionally pinned to a CPU core. |
+
+Recognition's "fixed pre-allocated pool, no dynamic alloc in
+steady state" is structurally the same kind of guarantee as
+Pinned's "owns a thread, no scheduling decisions in steady
+state" — both promise the substrate gets out of the way for
+high-intensity workloads.
+
+#### Cross-class semantics
+
+- **Cooperative → cooperative on same scheduler**: handler
+  enqueues; runs at the next substrate cell on the subscriber's
+  scheduler. Sender never blocks on receiver.
+- **Cooperative → greedy on same scheduler**: same — handler
+  enqueues, runs when the greedy locus next yields between
+  handler invocations (greedy yields *between* handlers; just
+  not *within* one).
+- **Any → pinned**: cross-thread post via lock-protected
+  mailbox. Sender never blocks.
+- **Pinned → any**: same — cross-thread post; pinned doesn't
+  block waiting for delivery acknowledgement.
+
+#### Implementation status (m25)
+
+m25 wires the annotation through parse / typecheck / codegen.
+The annotation is recognized and stored on `LocusInfo`, but
+runtime semantics are not yet branched on it — current codegen
+runs everything synchronously (effectively greedy-everywhere
+via synchronous nested bus dispatch). Cooperative semantics
+land in m26 (deferred dispatch + scheduler loop). Pinned
+threads land in m27.
+
+Default class is cooperative — even though the runtime today
+behaves greedily, cooperative is the spec's natural default and
+the right target for m26. Users wanting today's sync-everywhere
+behavior LOCKED IN as a design choice (rather than incidental)
+can write `: schedule greedy` explicitly; that annotation will
+keep its meaning when m26 ships.
+
 ### Bus message router
 
 The runtime's bus is **transport-agnostic**. From the

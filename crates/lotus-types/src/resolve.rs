@@ -124,6 +124,7 @@ fn register_locus(
         match ann {
             LocusAnnotation::Tier(n) => annotations.tier = Some(*n),
             LocusAnnotation::Projection(p) => annotations.projection = Some(*p),
+            LocusAnnotation::Schedule(s) => annotations.schedule = Some(*s),
         }
     }
 

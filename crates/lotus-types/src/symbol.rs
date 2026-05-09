@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use lotus_syntax::ast::{ModeKind, ProjectionClass};
+use lotus_syntax::ast::{ModeKind, ProjectionClass, ScheduleClass};
 use lotus_syntax::Span;
 
 use crate::ty::Ty;
@@ -108,6 +108,7 @@ pub struct BusSubscribeInfo {
 pub struct Annotations {
     pub tier: Option<i64>,
     pub projection: Option<ProjectionClass>,
+    pub schedule: Option<ScheduleClass>,
 }
 
 #[derive(Debug, Clone)]
