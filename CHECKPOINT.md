@@ -1,8 +1,23 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m51: free-fn return-copy
-completion** — extends m49's deep-copy to the three branches
+in a new session. State as of **m52: in-loop drain after each
+dissolve** — closes the m26 v0 limitation that cells enqueued
+during a dissolve method's execution were leaked at main-exit
+queue teardown. `flush_dissolve_frame_kind` now drains the
+cooperative bus queue AFTER each iteration of the dissolve
+loop (in addition to the existing initial drain), so cells
+published by locus N's dissolve method get dispatched to
+still-alive later-iter loci before those loci themselves
+dissolve. The deregister-on-dissolve invariant
+(m45-followup-2) means the drain never targets the
+just-dissolved locus, so the additional drain is safe. New
+`examples/48-publish-during-dissolve` exercises the path: a
+Sender locus publishes "farewell" in its dissolve method, a
+Receiver locus (instantiated first → dissolves last) receives
+it before its own dissolve runs. Both backends produce
+byte-identical output. State before that was **m51: free-fn
+return-copy completion** — extends m49's deep-copy to the three branches
 left as `Unsupported`: Array (recursive walk over elements),
 TypeRef-struct (walk over declared fields by struct slot, with
 recursion through heap-typed fields like String), and
@@ -154,7 +169,7 @@ post-m46 hardening — `emit_locus_arena_destroy` now calls
 `lotus_bus_quarantine_self(self_ptr)` before destroying the
 arena, mirroring the m41b deregistration path so a stale
 entries-vec entry can never direct dispatch into freed
-memory after dissolution. **51 of 52 examples build to
+memory after dissolution. **52 of 53 examples build to
 native ELF — every single-binary example.** Only
 `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -213,7 +228,7 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 51 of 52 example
+- **Phase 2 v0** (interpreter + bus router) — 52 of 53 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
 - **Enums arc complete** (m47 base + m47-followups + m47-payloads
@@ -299,6 +314,37 @@ Phase status:
   Event mixing no-payload Halt, single-arg Tick, multi-arg
   Trade(Decimal, Int); exercises match, direct println,
   deep ==).
+
+- **Phase 3 milestone 52** (in-loop drain after each dissolve) —
+  complete. Closes the m26 v0 limitation: cells enqueued by a
+  dissolve method's bus publishes used to sit in the
+  cooperative queue until `emit_bus_queue_destroy` freed the
+  storage at main exit (CHECKPOINT noted "realistic programs
+  don't publish during dissolve" + "fix would be a
+  drain-loop-until-empty wrapper"). Design call resolved as:
+  drain after EACH iteration of the dissolve loop in
+  `flush_dissolve_frame_kind`, not just at the top. So if
+  locus N's dissolve method publishes, the drain at the end of
+  N's iteration dispatches the cells to still-alive later-iter
+  subscribers before those subscribers themselves dissolve.
+  The deregister-on-dissolve invariant (m45-followup-2)
+  guarantees a cell never targets the just-dissolved locus —
+  by the time N's dissolve method ran, N had already been
+  deregistered, so any subject N publishes to dispatches to
+  the OTHER still-registered subscribers, not back to N. Drain
+  is therefore safe at every iteration. The C-runtime drain
+  loop pops until the queue is empty at pop time, so
+  chain-reactions where a fired handler publishes more cells
+  get caught in the same drain pass. New
+  `examples/48-publish-during-dissolve` exercises it: a Sender
+  locus publishes "farewell" in its dissolve, a Receiver
+  locus (instantiated first → bottom of the deferred-dissolve
+  stack → dissolves last) receives it. The pre-m52 path would
+  have leaked the message; m52 dispatches it. Updated comment
+  on `emit_bus_queue_destroy` to reflect that the queue is
+  expected empty by destroy time. 96 workspace tests still
+  pass; 52 examples build native + same 11 known
+  scheduler-ordering diffs as pre-m52.
 
 - **Phase 3 milestone 51** (free-fn return-copy completion) —
   complete. Closes the three "Unsupported" branches m49 left in
@@ -2067,11 +2113,13 @@ ephemeral cascade — design needed before lowering.
   fn return waits for in-fn-bound children to dissolve as
   if the fn were a locus. No current example exercises
   bound handles inside a free fn; defer until one does.
-- Cells enqueued during dissolves are leaked (m26 v0
-  limit). Realistic programs don't publish during dissolve;
-  fix would be a drain-loop-until-empty wrapper around the
-  flush, but the "subscriber dissolved before its handler
-  fires" ordering question needs a design call first.
+- Cells enqueued during dissolves: shipped in m52. The
+  in-loop drain after each iteration of the dissolve loop
+  catches publishes from any dissolve method while
+  later-iter subscribers are still alive. The ordering
+  question resolved as: drain after each dissolve, not at
+  the top only. The deregister-on-dissolve invariant
+  guarantees cells never target a just-dissolved locus.
 
 **Long-deferred:**
 
@@ -2241,6 +2289,9 @@ rm examples/46-fn-arenas/main
 cargo run --bin lotus -- build examples/47-fn-arenas-extras/main.lt
 ./examples/47-fn-arenas-extras/main      # m51: deep-copy across Array / Struct / has-payload-Enum returns
 rm examples/47-fn-arenas-extras/main
+cargo run --bin lotus -- build examples/48-publish-during-dissolve/main.lt
+./examples/48-publish-during-dissolve/main   # m52: dissolve-time publish dispatched via in-loop drain
+rm examples/48-publish-during-dissolve/main
 ```
 
 If all of these work, the checkpoint is intact.
