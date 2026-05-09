@@ -2653,11 +2653,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum> =
                         Vec::with_capacity(md.params.len() + 1);
                     llvm_param_tys.push(ptr_t.into());
+                    // m54: mode params accept defaults under the
+                    // same suffix-only rule as locus fn methods.
+                    // lower_self_method_call already handles the
+                    // call-site fill-in (it dispatches uniformly
+                    // on Fn / Mode via the program-walk that
+                    // returns a MethodSig), so the only thing
+                    // this declare-side block needs is the
+                    // ordering check.
+                    let mut seen_default = false;
                     for p in &md.params {
                         if p.default.is_some() {
+                            seen_default = true;
+                        } else if seen_default {
                             return Err(CodegenError::Unsupported(format!(
-                                "locus `{}` mode `{}` param `{}` defaults \
-                                 not yet lowered",
+                                "locus `{}` mode `{}`: required param \
+                                 `{}` follows a defaulted param; defaults \
+                                 must form a suffix",
                                 l.name.name, mode_name, p.name.name
                             )));
                         }
