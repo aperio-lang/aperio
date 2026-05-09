@@ -86,8 +86,13 @@ when the type-system / operational-semantics docs are drafted.
    topology — exactly what the abstraction prevents.
    **Substrate progress:** m57 ships the AF_UNIX kernel-level
    transport (`lotus_transport_create / send / recv / destroy`
-   over SOCK_SEQPACKET in the C runtime). Subject→transport
-   binding from deployment-config is m58.
+   over SOCK_SEQPACKET in the C runtime). m58 ships the
+   deployment-config subject→transport binding: the runtime
+   parses `$LOTUS_BUS_CONFIG` at boot via
+   `lotus_bus_load_config`, registering each `subject=url:role`
+   line through `lotus_bus_register_remote`. Publisher-side
+   fanout is wired into `lotus_bus_dispatch`; subscriber-side
+   reader-thread + per-payload serializer is m59.
 
 9. **What happens if the same subject is declared by two loci in
    the same binary?** Compile error or runtime fan-out?

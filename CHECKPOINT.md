@@ -1,18 +1,55 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m57: AF_UNIX transport in the
-C runtime** — first substrate piece of the cross-process bus
-arc. Adds `lotus_transport_create / send / recv / destroy` to
+in a new session. State as of **m58: deployment-config subject
+binding** — second substrate piece of the cross-process bus
+arc. Wires m57's `lotus_transport_*` surface to the source
+language without coupling source to deployment topology
+(notes/open-questions #8). Three additions to
+`crates/lotus-codegen/runtime/lotus_arena.c`:
+(a) `lotus_bus_load_config(path)` parses a tiny line-format
+config file (`subject = url : role` per line, `#` comments,
+whitespace-tolerant) and dispatches to `lotus_bus_register_remote`
+per entry; (b) `lotus_bus_register_remote(subject, url, role)`
+opens a transport via the m57 surface (currently `unix://`
+scheme only — TCP/SHM/etc. grow into the same dispatch later)
+and stashes (subject, transport, role) in a heap-grown
+`g_bus_remote_entries` table; (c) `lotus_bus_remote_fanout` is
+called from `lotus_bus_dispatch` after the existing local
+loop, so a publish on a wired subject reaches BOTH local
+subscribers AND any CONNECT-role transports — local + remote
+share the same subject namespace per
+notes/open-questions #9. `lotus_bus_router_destroy` extends to
+close all remote transports + free the subject-string copies.
+Codegen change is one call in main's prelude:
+`lotus_bus_load_config(getenv("LOTUS_BUS_CONFIG"))` — emitted
+unconditionally (the C-runtime fn no-ops on NULL path), so
+binaries run without the env var set behave byte-identically
+to pre-m58. v0.1 scope is **publisher-side only**: CONNECT-role
+transports fan out at publish time; LISTEN-role
+accept-and-spawn-reader-thread is m59+. The integration test
+in `crates/lotus-codegen/tests/bus_config.rs` proves this
+end-to-end in one process pair: a lotus-built publisher with
+a `Ping{n: 0x4142434445464748}` payload runs under
+`LOTUS_BUS_CONFIG`, its m58 fanout sends the struct bytes
+through a unix socket, and the m57 transport_driver in listen
+role recv's exactly those bytes (asserted i64-LE round-trip +
+local-subscriber-also-fired). A second test asserts the no-config
+path still routes locally (codegen prelude regression check).
+100 tests pass (was 98; +2 from bus_config.rs); 54 example
+builds unaffected. State before that was **m57: AF_UNIX
+transport in the C runtime** — first substrate piece of the
+cross-process bus arc. Adds `lotus_transport_create / send /
+recv / destroy` to
 `crates/lotus-codegen/runtime/lotus_arena.c`: SOCK_SEQPACKET so
 each send shows up as exactly one recv (message boundaries
 preserved, no framing layer needed at this milestone), bind +
 listen + accept on the LISTEN role, connect-with-retry
 (ENOENT/ECONNREFUSED, ~1s ceiling at 5ms backoff) on the
 CONNECT role so the connector can race ahead of the listener
-without an external sync. No codegen wire-up: the surface is
-exposed as stable C-ABI fns that m58's deployment-config
-subject→transport routing will call into. New
+without an external sync. No codegen wire-up at m57: the
+surface is exposed as stable C-ABI fns that m58's deployment-
+config subject→transport routing calls into. New
 `crates/lotus-codegen/tests/transport_driver.c` is a tiny
 harness binary that the new
 `crates/lotus-codegen/tests/transport.rs` integration test
@@ -20,12 +57,8 @@ compiles (clang links driver + lotus_arena.c) and exec's twice
 — once as listener, once as connector — to verify a byte-for-
 byte round-trip across two processes. Two assertions: (a) short
 message round-trip, (b) message-boundary preservation
-(payload with embedded whitespace + trailing newline). 98 tests
-pass (was 96; +2 from transport.rs); 54 example builds
-unaffected. Per the v1-trajectory framing in CHECKPOINT's
-priority list, m58 (deployment-config subject binding) is next;
-trellis-pair stays the v1 acceptance test, not the development
-driver. State before that was **m55 + m56 (design-decision
+(payload with embedded whitespace + trailing newline). State
+before that was **m55 + m56 (design-decision
 substrate cleanup)** — applied The Design's calls on the
 deferred recovery vocabulary, generics direction, and several
 spec-vs-impl drifts. m55: removes `drain` / `dissolve` from
@@ -2256,33 +2289,53 @@ capacity ceiling — the m45 quickfix `× 32` multiplier is gone.
 
 ### RESUME HERE (next session)
 
-**Start with m58: Deployment-config subject binding.** Second
-session of the cross-process bus arc. m57 shipped the
-kernel-level transport (AF_UNIX SOCK_SEQPACKET, four C-ABI
-fns: `lotus_transport_create / send / recv / destroy`) plus a
-two-process integration test; m58 wires that surface to the
-source language. Per notes/open-questions #8, source stays
-transport-agnostic — a startup config (file or CLI flag) maps
-each declared `bus subscribe`/publish subject to a transport
-URL (e.g. `unix:///tmp/lotus-trellis.sock`). Runtime startup
-parses the config and calls `lotus_bus_register_remote`
-(or similar) once per subject so dispatch fans out to the
-local cooperative/pinned subscribers AND any remote transports
-bound to that subject. Open shape questions: config file
-format (TOML vs JSON vs CLI-only), whether transport binding
-happens before or alongside `lotus_bus_register`, and how a
-subject with both local and remote subscribers should fan out
-ordering-wise. Pick a small example as the test — probably a
-two-binary publish/subscribe that doesn't need codegen
-serializer support yet (Int payload only, m59 territory for
-struct payloads).
+**Start with m59: subscriber-side reader thread + per-payload
+serializer.** Third session of the cross-process bus arc. m57
+shipped the kernel transport (AF_UNIX SOCK_SEQPACKET); m58
+shipped publisher-side fanout via deployment-config (subject →
+url:role binding parsed from `LOTUS_BUS_CONFIG`, dispatched
+via `lotus_bus_remote_fanout`). m59 closes the loop on the
+receive side: when a config entry is `role=listen`, the
+runtime needs a per-subject reader thread that loops `recv()`
+and dispatches the bytes into the local handler the same way
+in-process publishes do. Two parts:
+
+(a) **Reader thread.** On `lotus_bus_register_remote` with
+LISTEN role, spawn a pthread whose body is essentially:
+`while (true) { ssize_t n = lotus_transport_recv(t, buf, cap);
+if (n <= 0) break; lotus_bus_local_dispatch(subject, buf, n); }`
+where `lotus_bus_local_dispatch` is a new helper extracting
+the existing dispatch's local-fanout loop (today inlined in
+`lotus_bus_dispatch`). Thread joins at `lotus_bus_router_destroy`.
+Open question: thread vs `select()` loop on a single dispatcher
+thread — threads are simpler at v0.1; select scales better.
+Probably ship threads, defer select.
+
+(b) **Per-payload serializer.** Currently
+`lotus_bus_dispatch` hands `bus_dispatch` raw struct bytes —
+on the same architecture this just works (memcpy). Across
+processes, layout drift (padding, endianness on heterogeneous
+hosts) breaks it. Codegen-emit a per-payload-type
+`__serialize_<TypeName>(struct *, void *buf, size_t cap)` and
+matching `__deserialize_<TypeName>(void *buf, size_t n,
+struct *out)` and call them at the transport boundary. v0.1:
+field-by-field write little-endian fixed-width per scalar +
+length-prefixed Strings. Defer schema versioning to m60+.
+notes/open-questions #10 already locks "receiver's arena gets
+a fresh copy of the payload struct" as the contract.
+
+Test target: end-to-end two-binary lotus example. Two
+binaries built from one source file via separate `fn main()`
+selectors (or two source files), each with its own bus config
+naming opposite roles. Publisher sends 3 Pings; subscriber
+prints 3 lines. Same source, different deployment.
 
 The cross-process bus arc was chosen as the next multi-session
 commitment per The Design's delivery-lotus framing: it's the
 substrate-root layer of the v1 trajectory, the runtime/stdlib
 split is locked (m56), and the design questions for #8/#9/#10
 are resolved. Memory note holds: trellis-pair is the
-acceptance test, not the development driver — m58 ships
+acceptance test, not the development driver — m59 ships
 because the substrate needs it, not to make trellis-pair
 pass.
 
@@ -2293,12 +2346,20 @@ pass.
   protocol layer. Verified via `crates/lotus-codegen/tests/
   transport.rs` (driver + runtime linked into one binary,
   exec'd twice to round-trip a message between processes).
-- **m58 Deployment-config subject binding** — startup config
-  (TOML/JSON) maps subjects → transport URLs; runtime
-  registers each subject's transport at boot.
-- **m59 Per-payload serializer in codegen** — default
-  struct-fields-to-bytes; transport adapter calls it. Cross-
-  process payload semantics from notes/open-questions #10.
+- **m58 Deployment-config subject binding — DONE** —
+  `LOTUS_BUS_CONFIG=<path>` parsed at boot via
+  `lotus_bus_load_config`; `subject=url:role` lines map each
+  subject to a transport. CONNECT-role transports fan out at
+  publish time via `lotus_bus_remote_fanout` after the local
+  loop. Verified via `crates/lotus-codegen/tests/bus_config.rs`
+  (lotus publisher → unix socket → m57 driver listener,
+  byte-exact round-trip + local-also-fired + no-config
+  regression check).
+- **m59 Subscriber-side reader thread + per-payload serializer**
+  — LISTEN-role binding spawns a per-subject pthread that
+  recv-loops and dispatches into local handlers; codegen emits
+  serialize/deserialize per payload type. Closes the receive
+  half of the cross-process bus.
 - **m60 Multi-binary build orchestration + trellis-pair** —
   `lotus build` emits a binary plus a manifest of publishes/
   subscribes; deployment config knits binaries together;
@@ -2365,16 +2426,18 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 98 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 100 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
-listener + connector subprocesses).
+listener + connector subprocesses, m58 added two more under
+tests/bus_config.rs that route a lotus publisher's bus dispatch
+through a unix socket to the m57 driver).
 
 ## How to verify the checkpoint
 
 ```
 cd ~/code/lotus-lang
-cargo test --workspace --tests           # 98 passed
+cargo test --workspace --tests           # 100 passed
 cargo run --bin lotus -- run examples/trellis-demo/main.lt
 cargo run --bin lotus -- build examples/hello-world/main.lt
 ./examples/hello-world/main              # prints "hello, world"

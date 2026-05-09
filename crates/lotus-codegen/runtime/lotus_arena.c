@@ -594,6 +594,18 @@ static size_t             g_bus_cap     = 0;
 
 #define LOTUS_BUS_ROUTER_INITIAL_CAP 16
 
+/* m58: forward-declare the remote-transport fanout hooks defined
+ * at the bottom of this file. Dispatch and router_destroy call
+ * them after the local-table loops so cross-process subscribers
+ * receive the same publishes that local subscribers do. The
+ * remote table and load-config implementation live next to the
+ * AF_UNIX transport section because they're tightly coupled to
+ * lotus_transport_create / send / destroy. */
+void lotus_bus_remote_fanout(const char *subject,
+                             const void *payload,
+                             size_t payload_size);
+void lotus_bus_remote_destroy_all(void);
+
 void lotus_bus_register(const char *subject,
                         void *self_ptr,
                         void *handler,
@@ -638,6 +650,12 @@ void lotus_bus_dispatch(lotus_bus_queue_t *queue,
                                     payload, payload_size);
         }
     }
+    /* m58: fanout to any cross-process transports bound to this
+     * subject by deployment-config. Local + remote share the same
+     * subject namespace per notes/open-questions #9 (emergent
+     * cardinality). When no config has been loaded the table is
+     * empty and this call costs one branch + one length compare. */
+    lotus_bus_remote_fanout(subject, payload, payload_size);
 }
 
 /* m41b semantic: null-out subject for any entry whose self
@@ -656,6 +674,9 @@ void lotus_bus_router_destroy(void) {
     g_bus_entries = NULL;
     g_bus_count   = 0;
     g_bus_cap     = 0;
+    /* m58: also tear down any remote-bound transports the
+     * deployment-config loader opened at boot. */
+    lotus_bus_remote_destroy_all();
 }
 
 /*
@@ -1082,4 +1103,225 @@ void lotus_transport_destroy(lotus_transport_t *t) {
         free(t->path);
     }
     free(t);
+}
+
+/*
+ * m58: deployment-config subject binding.
+ *
+ * Layered on top of the m57 AF_UNIX transport: a startup config
+ * file maps each `bus subscribe` / publish subject to a transport
+ * URL (currently only `unix://<path>`). Source stays transport-
+ * agnostic per notes/open-questions #8 — the binding lives
+ * entirely in deployment-config.
+ *
+ * Codegen emits one call to lotus_bus_load_config in main's
+ * prelude:
+ *
+ *     lotus_bus_load_config(getenv("LOTUS_BUS_CONFIG"));
+ *
+ * If the env var is unset (or the file is unreadable),
+ * lotus_bus_load_config no-ops and the binary behaves as a
+ * single-process program — matches the m45-followup baseline so
+ * existing examples are unaffected.
+ *
+ * Wire format: one entry per line, `subject=url:role`. Comments
+ * begin with '#' and run to end-of-line. Whitespace is trimmed
+ * around all three tokens. role is `listen` or `connect`. The
+ * role is per-binary, per-subject — two binaries on the same
+ * subject must declare opposite roles in their respective configs.
+ *
+ * v0.1 supports CONNECT-side dispatch only: a publisher with a
+ * CONNECT-role binding fans out via lotus_transport_send during
+ * lotus_bus_dispatch. LISTEN-side accept-and-spawn-reader-thread
+ * is m59+ — at this milestone the listener role is exercised by
+ * the m57 transport_driver harness so the full publisher pipeline
+ * can be verified end-to-end without yet wiring receive-side
+ * dispatch. v0.1 also supports exactly one peer per subject; the
+ * fanout cardinality story (multi-peer per subject, multi-subject
+ * per peer) is m60.
+ */
+
+typedef struct lotus_bus_remote_entry {
+    char              *subject;       /* owned (strdup'd at register) */
+    lotus_transport_t *transport;
+    int                role;
+} lotus_bus_remote_entry_t;
+
+static lotus_bus_remote_entry_t *g_bus_remote_entries = NULL;
+static size_t g_bus_remote_count = 0;
+static size_t g_bus_remote_cap   = 0;
+
+#define LOTUS_BUS_REMOTE_INITIAL_CAP 4
+
+void lotus_bus_register_remote(const char *subject,
+                               const char *url,
+                               int role) {
+    if (!subject || !url) {
+        fprintf(stderr,
+                "lotus_bus_register_remote: null subject or url\n");
+        return;
+    }
+    /* v0.1 only handles unix:// URLs; future schemes (tcp://, etc.)
+     * grow into this dispatch. Reject unknown schemes so the user
+     * sees a clear error rather than a confusing transport-create
+     * failure later. */
+    static const char unix_scheme[] = "unix://";
+    size_t scheme_len = sizeof(unix_scheme) - 1;
+    if (strncmp(url, unix_scheme, scheme_len) != 0) {
+        fprintf(stderr,
+                "lotus_bus_register_remote: unsupported URL scheme "
+                "(only unix:// in m58): %s\n",
+                url);
+        return;
+    }
+    const char *path = url + scheme_len;
+    if (*path == '\0') {
+        fprintf(stderr,
+                "lotus_bus_register_remote: empty path in %s\n", url);
+        return;
+    }
+
+    lotus_transport_t *t = lotus_transport_create(path, role);
+    if (!t) return;     /* lotus_transport_create already perror'd */
+
+    if (g_bus_remote_count == g_bus_remote_cap) {
+        size_t new_cap = g_bus_remote_cap == 0
+            ? LOTUS_BUS_REMOTE_INITIAL_CAP
+            : g_bus_remote_cap * 2;
+        lotus_bus_remote_entry_t *grown = (lotus_bus_remote_entry_t *)
+            realloc(g_bus_remote_entries,
+                    new_cap * sizeof(lotus_bus_remote_entry_t));
+        if (!grown) {
+            lotus_transport_destroy(t);
+            return;
+        }
+        g_bus_remote_entries = grown;
+        g_bus_remote_cap     = new_cap;
+    }
+
+    char *subject_copy = strdup(subject);
+    if (!subject_copy) {
+        lotus_transport_destroy(t);
+        return;
+    }
+
+    lotus_bus_remote_entry_t *e = &g_bus_remote_entries[g_bus_remote_count++];
+    e->subject   = subject_copy;
+    e->transport = t;
+    e->role      = role;
+}
+
+/* Trim leading + trailing whitespace in-place. Returns a pointer
+ * into the same buffer; the caller still owns the allocation. */
+static char *lotus__bus_strip(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *end = s + strlen(s);
+    while (end > s) {
+        char c = end[-1];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+        end--;
+    }
+    *end = '\0';
+    return s;
+}
+
+void lotus_bus_load_config(const char *path) {
+    if (!path) return;
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr,
+                "lotus_bus_load_config: cannot open %s: %s\n",
+                path, strerror(errno));
+        return;
+    }
+    char line[1024];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        /* Strip end-of-line comments. */
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *trimmed = lotus__bus_strip(line);
+        if (*trimmed == '\0') continue;
+
+        char *eq = strchr(trimmed, '=');
+        if (!eq) {
+            fprintf(stderr,
+                    "lotus_bus_load_config: %s:%d: missing '=' in '%s'\n",
+                    path, lineno, trimmed);
+            continue;
+        }
+        *eq = '\0';
+        char *subject = lotus__bus_strip(trimmed);
+        char *rest    = lotus__bus_strip(eq + 1);
+
+        /* Split URL and role on the LAST ':'. URLs like
+         * unix:///tmp/foo.sock contain a ':' inside the scheme,
+         * so strrchr (last colon) reliably locates the role
+         * suffix. */
+        char *colon = strrchr(rest, ':');
+        if (!colon || colon == rest) {
+            fprintf(stderr,
+                    "lotus_bus_load_config: %s:%d: missing ':role' "
+                    "suffix on '%s'\n",
+                    path, lineno, rest);
+            continue;
+        }
+        *colon = '\0';
+        char *url      = lotus__bus_strip(rest);
+        char *role_str = lotus__bus_strip(colon + 1);
+
+        int role_val;
+        if (strcmp(role_str, "listen") == 0) {
+            role_val = LOTUS_TRANSPORT_LISTEN;
+        } else if (strcmp(role_str, "connect") == 0) {
+            role_val = LOTUS_TRANSPORT_CONNECT;
+        } else {
+            fprintf(stderr,
+                    "lotus_bus_load_config: %s:%d: unknown role "
+                    "'%s' (expected 'listen' or 'connect')\n",
+                    path, lineno, role_str);
+            continue;
+        }
+        lotus_bus_register_remote(subject, url, role_val);
+    }
+    fclose(fp);
+}
+
+/* Forward-declared at the top of the bus router section so
+ * lotus_bus_dispatch can fan out to remote subscribers without
+ * caring about table layout. */
+void lotus_bus_remote_fanout(const char *subject,
+                             const void *payload,
+                             size_t payload_size) {
+    if (!subject) return;
+    for (size_t i = 0; i < g_bus_remote_count; i++) {
+        lotus_bus_remote_entry_t *e = &g_bus_remote_entries[i];
+        if (!e->subject || !e->transport) continue;
+        if (strcmp(e->subject, subject) != 0) continue;
+        /* CONNECT role only fans out at this milestone. LISTEN
+         * role transports exist on the receive side and are
+         * driven by the (future) reader thread, not by publish-
+         * site dispatch. */
+        if (e->role != LOTUS_TRANSPORT_CONNECT) continue;
+        (void)lotus_transport_send(e->transport, payload, payload_size);
+        /* Errors are logged inside lotus_transport_send; we don't
+         * abort dispatch on transport failure — local subscribers
+         * already received their copy. */
+    }
+}
+
+void lotus_bus_remote_destroy_all(void) {
+    for (size_t i = 0; i < g_bus_remote_count; i++) {
+        if (g_bus_remote_entries[i].subject) {
+            free(g_bus_remote_entries[i].subject);
+        }
+        if (g_bus_remote_entries[i].transport) {
+            lotus_transport_destroy(g_bus_remote_entries[i].transport);
+        }
+    }
+    if (g_bus_remote_entries) free(g_bus_remote_entries);
+    g_bus_remote_entries = NULL;
+    g_bus_remote_count   = 0;
+    g_bus_remote_cap     = 0;
 }

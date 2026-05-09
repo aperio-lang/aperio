@@ -1007,6 +1007,25 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             None,
         );
 
+        // m58: deployment-config subject binding. Codegen emits
+        // a single call in main's prelude:
+        //   lotus_bus_load_config(getenv("LOTUS_BUS_CONFIG"));
+        // The C-runtime fn no-ops when path is NULL, so binaries
+        // run without LOTUS_BUS_CONFIG set behave exactly as
+        // pre-m58. Source-level lotus stays transport-agnostic
+        // per notes/open-questions #8 — the binding lives entirely
+        // in the deployment-config file.
+        // declare void @lotus_bus_load_config(ptr path)
+        // declare ptr  @getenv(ptr name)
+        let bus_load_cfg_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bus_load_config",
+            bus_load_cfg_ty,
+            None,
+        );
+        let getenv_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function("getenv", getenv_ty, None);
+
         // m28c: optional CPU-core affinity. Pinned loci that
         // declare `: schedule pinned(core = N)` emit a call to
         // this helper right after pthread_create — it wraps
@@ -1642,6 +1661,46 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("bus queue global declared");
         self.builder
             .build_store(queue_global.as_pointer_value(), queue_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // m58: load the deployment-config map (subject -> transport
+        // URL + role) from the path in $LOTUS_BUS_CONFIG. Emitted
+        // unconditionally — programs without the env var set hit
+        // the C-runtime's `if (!path) return` early-out and pay one
+        // syscall + one branch at startup. Programs with it set
+        // get their cross-process bus routes opened before any
+        // user code runs (so `<- "subj" | ...` calls reach remote
+        // subscribers from the very first publish).
+        let load_cfg_fn = self
+            .module
+            .get_function("lotus_bus_load_config")
+            .expect("lotus_bus_load_config declared");
+        let getenv_fn = self
+            .module
+            .get_function("getenv")
+            .expect("getenv declared");
+        let env_var_name = self
+            .builder
+            .build_global_string_ptr("LOTUS_BUS_CONFIG", "lotus.bus_config.envname")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
+        let cfg_path_ptr = self
+            .builder
+            .build_call(
+                getenv_fn,
+                &[env_var_name.into()],
+                "lotus.bus_config.path",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("getenv returns ptr");
+        self.builder
+            .build_call(
+                load_cfg_fn,
+                &[cfg_path_ptr.into()],
+                "lotus.bus_config.load",
+            )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         let mut scope = Scope::default();
