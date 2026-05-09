@@ -61,6 +61,13 @@ enum LotusType {
     /// like `Greeting { text: "hi", ... }` and for field access on
     /// values bound from those literals.
     TypeRef(String),
+    /// Fixed-size array `[T; N]`. Represented at runtime as a
+    /// pointer to an LLVM `[N x T]` value living in the enclosing
+    /// arena (allocated at literal-creation time, freed wholesale
+    /// with the locus). v0 is fixed-size only; growable arrays
+    /// would need a length field + reallocation policy that the
+    /// region allocator's bump-list shape doesn't fit cleanly.
+    Array(Box<LotusType>, u64),
 }
 
 /// Did the last lowered statement leave the current basic block
@@ -1687,6 +1694,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )))
                 }
             }
+            TypeExpr::Array { elem, size, .. } => {
+                let elem_ty = self.type_expr_to_lotus(elem)?;
+                let n = match size {
+                    Some(Expr::Literal(Literal::Int(n), _)) if *n > 0 => *n as u64,
+                    Some(_) => {
+                        return Err(CodegenError::Unsupported(
+                            "array size must be a positive integer literal in v0"
+                                .into(),
+                        ));
+                    }
+                    None => {
+                        return Err(CodegenError::Unsupported(
+                            "unsized arrays not supported in v0; use [T; N]".into(),
+                        ));
+                    }
+                };
+                Ok(LotusType::Array(Box::new(elem_ty), n))
+            }
             other => Err(CodegenError::Unsupported(format!(
                 "type form {:?} in signature",
                 std::mem::discriminant(other)
@@ -2172,7 +2197,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 LotusType::String
                                 | LotusType::Time
                                 | LotusType::LocusRef(_)
-                                | LotusType::TypeRef(_) => self
+                                | LotusType::TypeRef(_)
+                                | LotusType::Array(_, _) => self
                                     .context
                                     .ptr_type(AddressSpace::default())
                                     .fn_type(&llvm_param_tys, false),
@@ -2310,7 +2336,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 LotusType::String
                                 | LotusType::Time
                                 | LotusType::LocusRef(_)
-                                | LotusType::TypeRef(_) => self
+                                | LotusType::TypeRef(_)
+                                | LotusType::Array(_, _) => self
                                     .context
                                     .ptr_type(AddressSpace::default())
                                     .fn_type(&llvm_param_tys, false),
@@ -2790,7 +2817,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some(LotusType::String)
             | Some(LotusType::Time)
             | Some(LotusType::LocusRef(_))
-            | Some(LotusType::TypeRef(_)) => self
+            | Some(LotusType::TypeRef(_))
+            | Some(LotusType::Array(_, _)) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .fn_type(&llvm_param_tys, false),
@@ -3528,18 +3556,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         body: &Block,
         scope: &mut Scope<'ctx>,
     ) -> Result<BlockEnd, CodegenError> {
-        // Pattern-match on `self.children` as the iter. Other
-        // iterators (arrays, ranges, etc.) need a richer
-        // collection ABI — out of v0 scope.
+        // Two iterator shapes today: `self.children` (built-in
+        // fixed-cap array on accept-declaring loci) and arbitrary
+        // expressions of LotusType::Array. Range / iterator-trait
+        // shapes wait on later milestones.
         let is_self_children = matches!(iter, Expr::Field { receiver, name, .. }
             if matches!(receiver.as_ref(), Expr::KwSelf(_))
                 && name.name == "children");
         if !is_self_children {
-            return Err(CodegenError::Unsupported(format!(
-                "for-loop iterator `{:?}`: codegen v0 only supports \
-                 `for X in self.children`",
-                std::mem::discriminant(iter)
-            )));
+            return self.lower_for_array(var_name, iter, body, scope);
         }
         let cs = self.current_self.as_ref().cloned().ok_or_else(|| {
             CodegenError::Unsupported(
@@ -3704,6 +3729,136 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(BlockEnd::Open)
     }
 
+    /// `for x in arr` over a LotusType::Array iterator. Iterates
+    /// 0..N where N is the array's static size, GEPs each slot,
+    /// loads it, binds it as `x` for the body.
+    fn lower_for_array(
+        &mut self,
+        var_name: &Ident,
+        iter: &Expr,
+        body: &Block,
+        scope: &mut Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        let (arr_val, arr_ty) = self.lower_expr(iter, scope)?;
+        let (elem_ty, n) = match arr_ty {
+            LotusType::Array(elem, n) => (*elem, n),
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "for-loop iterator must be an array (got {:?})",
+                    other
+                )));
+            }
+        };
+        let arr_ptr = arr_val.into_pointer_value();
+
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let storage_ty = self.llvm_array_storage_type(&elem_ty, n);
+        let elem_llvm = self.llvm_basic_type(&elem_ty);
+
+        let func = self
+            .current_fn
+            .expect("current_fn set while lowering a for");
+        let header_bb = self.context.append_basic_block(func, "for.arr.cond");
+        let body_bb = self.context.append_basic_block(func, "for.arr.body");
+        let inc_bb = self.context.append_basic_block(func, "for.arr.inc");
+        let exit_bb = self.context.append_basic_block(func, "for.arr.end");
+
+        let i_slot = self
+            .builder
+            .build_alloca(i64_t, "for.arr.i.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(i_slot, i64_t.const_int(0, false))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(header_bb);
+        let i = self
+            .builder
+            .build_load(i64_t, i_slot, "for.arr.i")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let in_range = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::ULT,
+                i,
+                i64_t.const_int(n, false),
+                "for.arr.in.range",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(in_range, body_bb, exit_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(body_bb);
+        let slot_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    storage_ty,
+                    arr_ptr,
+                    &[i32_t.const_int(0, false), i],
+                    "for.arr.slot.ptr",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let elem_val = self
+            .builder
+            .build_load(elem_llvm, slot_ptr, "for.arr.elem")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let local_slot = self.alloca_for(&elem_ty, &var_name.name)?;
+        self.builder
+            .build_store(local_slot, elem_val)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let prev = scope.locals.insert(
+            var_name.name.clone(),
+            (local_slot, elem_ty.clone()),
+        );
+        self.loops.push(LoopFrame {
+            continue_bb: inc_bb,
+            break_bb: exit_bb,
+        });
+        let body_end = self.lower_block(body, scope)?;
+        self.loops.pop();
+        if body_end == BlockEnd::Open {
+            self.builder
+                .build_unconditional_branch(inc_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        if let Some(prev) = prev {
+            scope.locals.insert(var_name.name.clone(), prev);
+        } else {
+            scope.locals.remove(&var_name.name);
+        }
+
+        self.builder.position_at_end(inc_bb);
+        let i_now = self
+            .builder
+            .build_load(i64_t, i_slot, "for.arr.i.now")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let i_next = self
+            .builder
+            .build_int_add(
+                i_now,
+                i64_t.const_int(1, false),
+                "for.arr.i.next",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(i_slot, i_next)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(header_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(exit_bb);
+        Ok(BlockEnd::Open)
+    }
+
     fn lower_break(&mut self) -> Result<BlockEnd, CodegenError> {
         let frame = self.loops.last().copied().ok_or_else(|| {
             CodegenError::Unsupported("`break` outside a loop".to_string())
@@ -3833,7 +3988,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             LotusType::String
             | LotusType::Time
             | LotusType::LocusRef(_)
-            | LotusType::TypeRef(_) => self
+            | LotusType::TypeRef(_)
+            | LotusType::Array(_, _) => self
                 .builder
                 .build_alloca(self.context.ptr_type(AddressSpace::default()), name)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
@@ -4080,6 +4236,112 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let ptr = self.lower_user_type_instantiation(&name, inits, scope)?;
                 Ok((ptr.into(), LotusType::TypeRef(name)))
             }
+            Expr::Array(parts, _) => {
+                // Lower an array literal `[a, b, c]` into an arena
+                // allocation of size N * sizeof(elem). Element types
+                // come from the first element; subsequent elements
+                // are typechecked already so we only verify the
+                // first dictates the type. Empty arrays would need
+                // an ascription to know the element type — reject
+                // them in v0.
+                if parts.is_empty() {
+                    return Err(CodegenError::Unsupported(
+                        "empty array literal needs a type ascription \
+                         (not yet supported in v0)"
+                            .into(),
+                    ));
+                }
+                let mut elem_vals: Vec<BasicValueEnum<'ctx>> =
+                    Vec::with_capacity(parts.len());
+                let mut elem_ty: Option<LotusType> = None;
+                for p in parts {
+                    let (v, t) = self.lower_expr(p, scope)?;
+                    if let Some(prev) = &elem_ty {
+                        if prev != &t {
+                            return Err(CodegenError::Unsupported(format!(
+                                "array literal mixes element types \
+                                 ({:?} and {:?})",
+                                prev, t
+                            )));
+                        }
+                    } else {
+                        elem_ty = Some(t);
+                    }
+                    elem_vals.push(v);
+                }
+                let elem_ty = elem_ty.expect("non-empty array has a type");
+                let n = elem_vals.len() as u64;
+                let i32_t = self.context.i32_type();
+                let arr_ty = self.llvm_array_storage_type(&elem_ty, n);
+                let bytes = arr_ty
+                    .size_of()
+                    .expect("array storage type has known size");
+                let arr_ptr =
+                    self.arena_alloc(bytes, "array.literal.alloc")?;
+                for (i, v) in elem_vals.iter().enumerate() {
+                    let slot = unsafe {
+                        self.builder
+                            .build_gep(
+                                arr_ty,
+                                arr_ptr,
+                                &[
+                                    i32_t.const_int(0, false),
+                                    i32_t.const_int(i as u64, false),
+                                ],
+                                &format!("array.lit.slot{}", i),
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?
+                    };
+                    self.builder
+                        .build_store(slot, *v)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                Ok((arr_ptr.into(), LotusType::Array(Box::new(elem_ty), n)))
+            }
+            Expr::Index { receiver, index, .. } => {
+                let (recv_val, recv_ty) = self.lower_expr(receiver, scope)?;
+                let (idx_val, idx_ty) = self.lower_expr(index, scope)?;
+                if idx_ty != LotusType::Int {
+                    return Err(CodegenError::Unsupported(format!(
+                        "array index must be Int, got {:?}",
+                        idx_ty
+                    )));
+                }
+                match recv_ty {
+                    LotusType::Array(elem_ty, n) => {
+                        let i32_t = self.context.i32_type();
+                        let arr_ty = self.llvm_array_storage_type(&elem_ty, n);
+                        let recv_ptr = recv_val.into_pointer_value();
+                        let slot = unsafe {
+                            self.builder
+                                .build_gep(
+                                    arr_ty,
+                                    recv_ptr,
+                                    &[
+                                        i32_t.const_int(0, false),
+                                        idx_val.into_int_value(),
+                                    ],
+                                    "array.index.slot",
+                                )
+                                .map_err(|e| {
+                                    CodegenError::LlvmEmit(e.to_string())
+                                })?
+                        };
+                        let elem_llvm = self.llvm_basic_type(&elem_ty);
+                        let loaded = self
+                            .builder
+                            .build_load(elem_llvm, slot, "array.index.load")
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        Ok((loaded, *elem_ty))
+                    }
+                    other => Err(CodegenError::Unsupported(format!(
+                        "indexing a non-array value (type {:?})",
+                        other
+                    ))),
+                }
+            }
             _ => Err(CodegenError::Unsupported(format!(
                 "expression form {:?}",
                 std::mem::discriminant(e)
@@ -4134,9 +4396,28 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             LotusType::String
             | LotusType::Time
             | LotusType::LocusRef(_)
-            | LotusType::TypeRef(_) => {
+            | LotusType::TypeRef(_)
+            | LotusType::Array(_, _) => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
+        }
+    }
+
+    /// LLVM `[N x T]` for the element type + size of an Array
+    /// LotusType. Used at array-literal allocation time + at GEP
+    /// time when indexing or iterating.
+    fn llvm_array_storage_type(
+        &self,
+        elem: &LotusType,
+        n: u64,
+    ) -> inkwell::types::ArrayType<'ctx> {
+        match self.llvm_basic_type(elem) {
+            inkwell::types::BasicTypeEnum::IntType(t) => t.array_type(n as u32),
+            inkwell::types::BasicTypeEnum::FloatType(t) => t.array_type(n as u32),
+            inkwell::types::BasicTypeEnum::PointerType(t) => t.array_type(n as u32),
+            inkwell::types::BasicTypeEnum::StructType(t) => t.array_type(n as u32),
+            inkwell::types::BasicTypeEnum::ArrayType(t) => t.array_type(n as u32),
+            inkwell::types::BasicTypeEnum::VectorType(t) => t.array_type(n as u32),
         }
     }
 
@@ -4412,6 +4693,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                          print individual fields instead",
                         name
                     )));
+                }
+                LotusType::Array(_, _) => {
+                    return Err(CodegenError::Unsupported(
+                        "println of an array — print individual \
+                         elements via indexing or iteration".into(),
+                    ));
                 }
             }
         }

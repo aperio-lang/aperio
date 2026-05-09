@@ -1,0 +1,54 @@
+// 21-arrays — fixed-size array literals + indexing + for-over-array.
+//
+// v0 codegen: arrays are `[T; N]` where N is a compile-time
+// integer literal. Element type is inferred from the literal's
+// first element. The array storage lives in the enclosing
+// arena (so a free fn's array dies when main's program-wide
+// arena tears down; a locus-method's array dies with the
+// locus). No growable / no resizing — the spec's region
+// allocator is wholesale-free, not per-object free, so a
+// dynamic Vec would need either reallocation under a separate
+// growth policy or a fundamentally different lifetime story.
+// Fixed-size locks down the surface; dynamic arrays land
+// later when the workload demands.
+//
+// What this exercises:
+//   - Array literal `[1, 2, 3, ...]`
+//   - Array indexing `arr[i]`
+//   - `for x in arr { ... }` iteration
+//   - Mixing reads, indexing, and a running accumulator
+//
+// Per The Design / lotus, this fills out the basic data-shape
+// surface so substrate-flexing apps (priority queues, moving
+// averages, pipeline aggregators) can be expressed without
+// resorting to ad-hoc field-by-field unrolling.
+
+fn sum_of(xs: [Int; 5]) -> Int {
+    let mut total = 0;
+    for x in xs {
+        total = total + x;
+    }
+    return total;
+}
+
+fn dot(a: [Int; 4], b: [Int; 4]) -> Int {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < 4 {
+        acc = acc + a[i] * b[i];
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() {
+    let nums = [10, 20, 30, 40, 50];
+    println("first  = ", nums[0]);
+    println("third  = ", nums[2]);
+    println("last   = ", nums[4]);
+    println("sum    = ", sum_of(nums));
+
+    let xs = [1, 2, 3, 4];
+    let ys = [5, 6, 7, 8];
+    println("dot    = ", dot(xs, ys));
+}

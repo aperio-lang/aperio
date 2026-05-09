@@ -1,8 +1,9 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work in a
-new session. State as of m29 (match arm guards) — a polish
-follow-up to the m28 scheduler arc. The full substrate arc
+new session. State as of m30 (fixed-size arrays + for-over-array)
+— a surface-completeness pass following the m28 scheduler arc and
+the m29 match-guards polish. The full substrate arc
 landed: m19→m23 (region allocator with
 rich/chunked/recognition strategies + per-locus arenas + bus
 copy semantics), m24 (`match` codegen), m25 (bimodal
@@ -17,7 +18,9 @@ inline payloads; coordinated shutdown via
 shutdown-flag-then-join), m28c (optional `: schedule
 pinned(core = N)` for `pthread_setaffinity_np` core pinning),
 m29 (match arm guards — `pat if cond -> body` lowering with
-binding installed for the guard expr to reference). **24 of 25
+binding installed for the guard expr to reference), m30
+(fixed-size arrays — `[T; N]` literal, `arr[i]` indexing,
+`for x in arr` iteration, arena-backed storage). **25 of 26
 examples build to native ELF — every single-binary example.**
 Only `trellis-pair` (multi-binary, cross-process bus) remains.
 
@@ -76,9 +79,22 @@ greeting from child: yo
 Phase status:
 - **Phase 0** (spec stabilization) — complete
 - **Phase 1** (lex / parse / typecheck) — complete; F.1–F.18 enforced
-- **Phase 2 v0** (interpreter + bus router) — 20 of 21 example
+- **Phase 2 v0** (interpreter + bus router) — 21 of 22 example
   projects execute end-to-end via `lotus run` (only multi-binary
   trellis-pair waits on cross-process bus)
+- **Phase 3 milestone 30** (arrays) — complete. New
+  `LotusType::Array(elem, N)`; fixed-size `[T; N]` lowers to
+  arena-allocated `[N x T]` storage. `arr[i]` indexing, `for x
+  in arr` iteration, and arrays-as-fn-params all work; element
+  type is inferred from the literal's first element. Empty
+  array literals + variable-size arrays remain rejected (need
+  a type ascription / element-type carrier the literal-only
+  path doesn't carry). Per The Design / lotus, the arena's
+  wholesale-free shape is the reason arrays are fixed-size in
+  v0: dynamic Vec would need either reallocation under a
+  separate growth policy or a fundamentally different lifetime
+  story. New `examples/21-arrays/` covers indexing, for-loop,
+  and arrays as fn parameters.
 - **Phase 3 milestone 28c** (pinned CPU-core affinity) —
   complete. `: schedule pinned(core = N)` syntax parses through
   to a `pthread_setaffinity_np` call right after pthread_create.
@@ -475,6 +491,13 @@ m29    m29: match arm guards in codegen                        (0398d42)
                             falls through to next arm on false;
                             extends m24 surface
                           + examples/15-match (extended)
+m30    m30: arrays — literal + indexing + for-over-array       (pending)
+                          ⇒ LotusType::Array(elem, N); fixed-
+                            size [T; N] only; arena-backed
+                            storage; arr[i] indexing; for x in
+                            arr lowers to indexed loop; arrays
+                            pass through fn params (as ptrs)
+                          + examples/21-arrays
 ```
 
 The architectural pivots are **m7** (locus → LLVM struct,
@@ -526,7 +549,9 @@ m7 builds on the struct ABI.
 | `match` (Literal / Wildcard / Binding patterns) | ✅ | ✅ |
 | `match` arm guards (`pat if cond -> body`) | ✅ | ✅ |
 | `match` (Tuple / Constructor patterns) | ✅ | — |
-| generic `for` (over arrays / ranges) | ✅ | — |
+| Array literals `[T; N]` + indexing | ✅ | ✅ |
+| `for x in arr` over fixed-size arrays | ✅ | ✅ |
+| generic `for` (over ranges) | ✅ | — |
 | Schedule-class annotation (`: schedule cooperative \| pinned`) | — | ✅ (resolved on LocusInfo) |
 | Cooperative scheduler (deferred bus + drain loop) | — | ✅ |
 | Explicit `yield` primitive | ✅ (no-op) | ✅ (drains queue) |
@@ -680,7 +705,7 @@ d5afffd Codegen milestone 8: accept() lifecycle + parent-child wiring
 929efa2 Codegen milestone 5: time::sleep on CLOCK_MONOTONIC
 ```
 
-84 commits ahead of origin/master at checkpoint time.
+85 commits ahead of origin/master at checkpoint time.
 
 ## Next steps in priority order
 
@@ -728,7 +753,7 @@ ladder. Two pieces:
 
 - Tuple / Constructor patterns in match (needs tuple values
   in codegen first)
-- Generic `for` over arrays / ranges (needs array literal +
+- Generic `for` over ranges (arrays now lower; ranges need a
   range type lowering)
 - Default param values on user fns (already in AST; declare
   time rejects today)
@@ -840,6 +865,9 @@ rm examples/19-pinned-bus/main
 cargo run --bin lotus -- build examples/20-pinned-core/main.lt
 ./examples/20-pinned-core/main           # two pinned workers on cores 0 and 1 (best-effort)
 rm examples/20-pinned-core/main
+cargo run --bin lotus -- build examples/21-arrays/main.lt
+./examples/21-arrays/main                # nums[i] reads + sum_of + dot product over [Int; N]
+rm examples/21-arrays/main
 ```
 
-If all twenty-four work, the checkpoint is intact.
+If all twenty-five work, the checkpoint is intact.
