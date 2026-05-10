@@ -3086,6 +3086,41 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )))
                 }
             }
+            // m83: path-qualified stdlib type — `std::io::tcp::Stream`
+            // in a fn signature / locus param. Same path → mangled
+            // name table the struct-literal lowering uses; resolves
+            // to the bundled-stdlib locus's LocusRef. Without this,
+            // `fn(std::io::tcp::Stream)` would parse but fail in
+            // type_expr_to_lotus when building the FnPtr's arg
+            // tys. Generic-arg paths over stdlib types are not
+            // a v0 concern (no generic stdlib loci yet).
+            TypeExpr::Named { path, generic_args, .. }
+                if generic_args.is_empty() && path.segments.len() > 1 =>
+            {
+                let segs: Vec<&str> = path
+                    .segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let mangled = stdlib_locus_for_path(&segs).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "qualified type `{}` not in stdlib path-renames table",
+                        segs.join("::")
+                    ))
+                })?;
+                if self.user_loci.contains_key(mangled) {
+                    Ok(LotusType::LocusRef(mangled.to_string()))
+                } else {
+                    Err(CodegenError::Unsupported(format!(
+                        "qualified type `{}` (mangled `{}`) declared in stdlib \
+                         path-renames table but not registered in user_loci yet \
+                         — sequencing issue: type_expr_to_lotus called before \
+                         locus pass A1 populated this locus",
+                        segs.join("::"),
+                        mangled,
+                    )))
+                }
+            }
             // m61: generic instantiation in type position. Mangle
             // (template, args) to a flat name and look it up; the
             // monomorphization pass in lower_program (A0b) will
@@ -7434,6 +7469,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             // discard return value.
                             let _ = self
                                 .lower_generic_fn_call(name, args, scope)?;
+                        } else if let Some((slot_ptr, LotusType::FnPtr {
+                            args: arg_tys,
+                            ret: ret_ty,
+                        })) = scope.locals.get(name).cloned()
+                        {
+                            // m83: local-variable fn-pointer call.
+                            // `on_conn(s)` inside a fn whose param
+                            // is `on_conn: fn(Stream)`. Load the
+                            // pointer value from its slot and
+                            // indirect-call through the shared
+                            // m80 helper. Statement position:
+                            // discard any return value.
+                            let ptr_t = self
+                                .context
+                                .ptr_type(AddressSpace::default());
+                            let fn_value_ptr = self
+                                .builder
+                                .build_load(ptr_t, slot_ptr, name)
+                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                                .into_pointer_value();
+                            let _ = self.emit_fnptr_indirect_call(
+                                fn_value_ptr,
+                                &arg_tys,
+                                ret_ty.as_deref(),
+                                args,
+                                scope,
+                                name,
+                            )?;
                         } else {
                             self.lower_print_call(name, args, scope)?;
                         }
@@ -10123,6 +10186,50 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         CodegenError::Unsupported(format!(
                             "generic fn `{}` returns no value but is \
                              used in expression position",
+                            i.name
+                        ))
+                    })
+                }
+                // m83: local-variable fn-pointer call in expression
+                // position. Mirrors the statement-position arm above
+                // but keeps the call result. A non-value-returning
+                // FnPtr in expression position is an error (you can't
+                // bind void to a let).
+                Expr::Ident(i)
+                    if matches!(
+                        scope.locals.get(&i.name).map(|(_, t)| t),
+                        Some(LotusType::FnPtr { .. })
+                    ) =>
+                {
+                    let (slot_ptr, fn_ty) = scope
+                        .locals
+                        .get(&i.name)
+                        .cloned()
+                        .expect("matched FnPtr above");
+                    let (arg_tys, ret_ty) = match fn_ty {
+                        LotusType::FnPtr { args, ret } => (args, ret),
+                        _ => unreachable!(),
+                    };
+                    let ptr_t = self
+                        .context
+                        .ptr_type(AddressSpace::default());
+                    let fn_value_ptr = self
+                        .builder
+                        .build_load(ptr_t, slot_ptr, &i.name)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_pointer_value();
+                    let result = self.emit_fnptr_indirect_call(
+                        fn_value_ptr,
+                        &arg_tys,
+                        ret_ty.as_deref(),
+                        args,
+                        scope,
+                        &i.name,
+                    )?;
+                    result.ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "fn-pointer `{}` returns no value but is used \
+                             in expression position",
                             i.name
                         ))
                     })
@@ -13882,6 +13989,101 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// Lower `receiver.method_name(args)` where `receiver` is any
     /// expression yielding a LocusRef value (typically a
     /// let-binding to a locus literal, a fn parameter of locus
+    /// m83: shared indirect-call lowering for fn-pointer values.
+    /// Used by both `lower_self_method_call` (when a self-field
+    /// of FnPtr type is invoked) and the bare-name call dispatch
+    /// (when a local variable of FnPtr type is invoked, e.g.
+    /// `on_conn(s)` inside `__handle_one_connection`). Encodes
+    /// the m80/m49 calling convention: every user free fn has an
+    /// implicit `__caller_arena: ptr` first param, so the indirect
+    /// call must prepend the caller's arena before the user-visible
+    /// args. Type-checks each arg against the FnPtr's declared
+    /// arg_tys; rejects arity mismatches. `ret_ty.is_none()`
+    /// signals void-returning — the caller should treat that as
+    /// "no value produced".
+    fn emit_fnptr_indirect_call(
+        &mut self,
+        fn_value_ptr: PointerValue<'ctx>,
+        arg_tys: &[LotusType],
+        ret_ty: Option<&LotusType>,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        callee_label: &str,
+    ) -> Result<Option<(BasicValueEnum<'ctx>, LotusType)>, CodegenError> {
+        if args.len() != arg_tys.len() {
+            return Err(CodegenError::Unsupported(format!(
+                "{} (fn pointer): expected {} args, got {}",
+                callee_label,
+                arg_tys.len(),
+                args.len()
+            )));
+        }
+        let caller_arena = self.current_arena_ptr()?;
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            Vec::with_capacity(args.len() + 1);
+        let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
+            Vec::with_capacity(args.len() + 1);
+        call_args.push(caller_arena.into());
+        llvm_param_tys.push(ptr_t.into());
+        for (i, a) in args.iter().enumerate() {
+            let (v, vt) = self.lower_expr(a, scope)?;
+            if vt != arg_tys[i] {
+                return Err(CodegenError::Unsupported(format!(
+                    "{} arg {}: expected {:?}, got {:?}",
+                    callee_label, i, arg_tys[i], vt
+                )));
+            }
+            call_args.push(v.into());
+            llvm_param_tys.push(self.llvm_basic_type(&arg_tys[i]).into());
+        }
+        let fn_ty = match ret_ty {
+            None => self
+                .context
+                .void_type()
+                .fn_type(&llvm_param_tys, false),
+            Some(rt) => {
+                let lr = self.llvm_basic_type(rt);
+                match lr {
+                    inkwell::types::BasicTypeEnum::IntType(t) => {
+                        t.fn_type(&llvm_param_tys, false)
+                    }
+                    inkwell::types::BasicTypeEnum::FloatType(t) => {
+                        t.fn_type(&llvm_param_tys, false)
+                    }
+                    inkwell::types::BasicTypeEnum::PointerType(t) => {
+                        t.fn_type(&llvm_param_tys, false)
+                    }
+                    _ => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "fn-pointer return type {:?} not yet supported",
+                            rt
+                        )));
+                    }
+                }
+            }
+        };
+        let call = self
+            .builder
+            .build_indirect_call(
+                fn_ty,
+                fn_value_ptr,
+                &call_args,
+                "fnptr.call",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(match ret_ty {
+            None => None,
+            Some(rt) => {
+                let v = call
+                    .try_as_basic_value()
+                    .left()
+                    .expect("non-void fn-pointer call should yield a value");
+                Some((v, rt.clone()))
+            }
+        })
+    }
+
     /// type, or a child accepted via the F.7 hook). The shape
     /// mirrors lower_self_method_call but the self_ptr comes
     /// from the lowered receiver rather than current_self —

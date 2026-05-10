@@ -131,6 +131,45 @@ fn fn_pointer_with_two_args_round_trips() {
 }
 
 #[test]
+fn fn_pointer_with_locus_arg_round_trips() {
+    // m83 prerequisite: fn(SomeLocus) — a function pointer whose
+    // arg is a locus reference. Listener.on_connection: fn(Stream)
+    // depends on this. The m82 lifecycle fix means the locus
+    // passed in (b) is alive throughout the callback because the
+    // caller's let-binding scope owns its dissolve.
+    let src = r#"
+        locus Box {
+            params { value: Int = 0; }
+        }
+
+        fn show(b: Box) {
+            println("box value=", b.value);
+        }
+
+        locus L {
+            params {
+                cb: fn(Box) = show;
+            }
+            birth() {
+                let b = Box { value: 99 };
+                self.cb(b);
+            }
+        }
+
+        fn main() {
+            L { };
+        }
+    "#;
+    let (stdout, status) = build_and_run("locus_arg", src);
+    assert!(status.success(), "non-zero: {:?}", status);
+    assert!(
+        stdout.contains("box value=99"),
+        "fn(Locus) indirect call didn't fire; got: {:?}",
+        stdout
+    );
+}
+
+#[test]
 fn fn_pointer_with_string_arg_round_trips() {
     let src = r#"
         fn say(msg: String) {

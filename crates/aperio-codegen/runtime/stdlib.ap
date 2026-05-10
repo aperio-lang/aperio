@@ -12,51 +12,18 @@
 // collision with user-declared identifiers impossible at v0
 // while keeping the user-facing surface clean.
 //
-// m73b — real lifecycle. birth() binds + listens, run() accepts
-// one connection (m73c extends to a loop spawning Stream
-// children), dissolve() closes the listen socket. Internal
-// calls go via `std::io::tcp::__*` path-call primitives that
-// lower to lotus_tcp_listen_socket / accept_one / close_fd.
-//
-// The println diagnostics in birth/dissolve are intentional v0
-// observability: stdlib loci are new and the cost of the prints
-// is far less than the debugging value when something goes
-// wrong. Removed in a later milestone once the stdlib pattern
-// is well-trodden.
-
-locus __StdIoTcpListener {
-    params {
-        host: String = "127.0.0.1";
-        port: Int = 0;
-        // listen_fd is overwritten in birth(); -1 here is a
-        // "not yet bound" sentinel so dissolve() can detect a
-        // partially-constructed listener and skip the close.
-        listen_fd: Int = -1;
-    }
-    birth() {
-        println("__StdIoTcpListener.birth host=", self.host, " port=", self.port);
-        self.listen_fd = std::io::tcp::__listen_socket(self.host, self.port);
-    }
-    run() {
-        // m73b: accept exactly one connection, log, close it,
-        // then return. m82 will land the multi-accept loop
-        // here that spawns Stream children for each accepted
-        // connection and invokes a user-supplied callback;
-        // until then the single-accept Listener stands as a
-        // working entry-point for simple servers.
-        let conn = std::io::tcp::__accept_one(self.listen_fd);
-        println("__StdIoTcpListener.run accepted conn=", conn);
-        std::io::tcp::__close_fd(conn);
-    }
-    dissolve() {
-        println("__StdIoTcpListener.dissolve host=", self.host, " port=", self.port);
-        std::io::tcp::__close_fd(self.listen_fd);
-    }
-}
+// Declaration order matters within this file: pass A1 of
+// lower_program walks loci in source order and resolves each
+// locus's param types against `user_loci` as it goes. A locus
+// whose params reference another locus by name (e.g.
+// `on_connection: fn(std::io::tcp::Stream)`) must come AFTER
+// the locus it references. Stream is declared first; Listener
+// (which references Stream in its on_connection callback type)
+// follows.
 
 // m81: Stream locus — owns one connected TCP fd, exposes
 // send/recv via fn members, closes on dissolve. User code
-// receives a Stream as the parameter to a callback (via m82's
+// receives a Stream as the parameter to a callback (via
 // Listener.on_connection: fn(Stream)) and invokes
 // `s.send(msg)` / `s.recv(max)` against it directly. Standard
 // Aperio locus shape — no special cases.
@@ -73,5 +40,102 @@ locus __StdIoTcpStream {
     }
     dissolve() {
         std::io::tcp::__close_fd(self.conn_fd);
+    }
+}
+
+// Default on_connection callback. Logs the fd and returns —
+// the per-connection Stream dissolves once `__handle_one_
+// connection` returns, closing the fd. Users who want real
+// behavior pass their own fn via the on_connection field.
+fn __default_on_connection(s: std::io::tcp::Stream) {
+    println("__default_on_connection fd=", s.conn_fd);
+}
+
+// Per-connection scope owner. Wraps the accepted fd in a
+// Stream locus literal whose dissolve (= __close_fd) fires
+// when this fn returns. Invokes the user's callback in
+// between. Exists as a free fn (not inline in the run()
+// loop) so each call's scope-exit flush dissolves *its*
+// Stream — fn-level dissolve frame is what m82 ships.
+fn __handle_one_connection(conn_fd: Int, on_conn: fn(std::io::tcp::Stream)) {
+    let s = std::io::tcp::Stream { conn_fd: conn_fd };
+    on_conn(s);
+}
+
+// m73b → m83. birth() binds + listens, run() accepts in a
+// loop and dispatches each connection through the user's
+// on_connection callback (a fn(Stream)), dissolve() closes
+// the listen socket. Internal calls go via `std::io::tcp::__*`
+// path-call primitives that lower to lotus_tcp_listen_socket /
+// accept_one / close_fd.
+//
+// m83 — multi-accept. The accept loop terminates when
+// max_accepts is reached (a non-negative cap) or runs forever
+// when max_accepts < 0. Per-connection Stream dissolves are
+// owned by `__handle_one_connection`, a free fn whose
+// scope-exit flush (m82) closes each fd between iterations.
+// That keeps the loop footprint flat — no per-connection
+// resource pile-up — while reusing the locus-all-the-way-down
+// mechanism instead of a special block-level cleanup primitive.
+//
+// The user-facing `Listener { on_connection: my_handler }`
+// syntax composes m80 (function-pointer language addition)
+// with m81 (Stream locus + non-self method calls) and m82
+// (let-bound dissolve at scope exit). Each is reusable on
+// its own; the Listener is the first stdlib locus that
+// strings them together.
+//
+// The println diagnostics in birth/dissolve are intentional v0
+// observability: stdlib loci are new and the cost of the prints
+// is far less than the debugging value when something goes
+// wrong. Removed in a later milestone once the stdlib pattern
+// is well-trodden.
+
+locus __StdIoTcpListener {
+    params {
+        host: String = "127.0.0.1";
+        port: Int = 0;
+        // listen_fd is overwritten in birth(); -1 here is a
+        // "not yet bound" sentinel so dissolve() can detect a
+        // partially-constructed listener and skip the close.
+        listen_fd: Int = -1;
+        // m83: how many connections to accept before run() returns.
+        // Negative means "loop forever" (the canonical server
+        // shape); >= 0 caps the loop, useful for tests and
+        // bounded workloads. Default 1 preserves the m73b
+        // single-accept behavior so existing programs keep
+        // their semantics without recompiling against the new
+        // lifecycle.
+        max_accepts: Int = 1;
+        // m83: per-connection callback. Called once per accepted
+        // fd with a Stream wrapping it. Default logs and closes
+        // (via Stream dissolve) so a Listener with no override
+        // still acts like a real server. Users override at
+        // instantiation.
+        on_connection: fn(std::io::tcp::Stream) = __default_on_connection;
+    }
+    birth() {
+        println("__StdIoTcpListener.birth host=", self.host, " port=", self.port);
+        self.listen_fd = std::io::tcp::__listen_socket(self.host, self.port);
+    }
+    run() {
+        // m83: bounded accept loop. Each iteration accepts one
+        // connection, hands it to __handle_one_connection (whose
+        // scope-exit flush dissolves the Stream + closes the
+        // fd), and continues until max_accepts is reached.
+        // Negative max_accepts means run forever — never returns
+        // until killed. The helper is a flat user_fns entry
+        // (stdlib.ap is concat'd into the user program) so it's
+        // callable by bare name from inside Listener's run().
+        let mut accepted = 0;
+        while self.max_accepts < 0 || accepted < self.max_accepts {
+            let conn = std::io::tcp::__accept_one(self.listen_fd);
+            __handle_one_connection(conn, self.on_connection);
+            accepted = accepted + 1;
+        }
+    }
+    dissolve() {
+        println("__StdIoTcpListener.dissolve host=", self.host, " port=", self.port);
+        std::io::tcp::__close_fd(self.listen_fd);
     }
 }

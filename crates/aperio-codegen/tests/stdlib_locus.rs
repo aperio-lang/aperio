@@ -97,9 +97,14 @@ fn listener_binds_accepts_a_connection_and_exits_cleanly() {
         "birth diagnostic missing; got: {:?}",
         stdout
     );
+    // m83: the old "run accepted conn=" diagnostic is gone —
+    // run() now dispatches each accepted fd through the
+    // on_connection callback. With max_accepts=1 (default) and
+    // no override, that's `__default_on_connection`, which
+    // prints `__default_on_connection fd=<n>`.
     assert!(
-        stdout.contains("__StdIoTcpListener.run accepted conn="),
-        "accepted-conn diagnostic missing; got: {:?}",
+        stdout.contains("__default_on_connection fd="),
+        "default-callback diagnostic missing; got: {:?}",
         stdout
     );
     assert!(
