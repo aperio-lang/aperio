@@ -1,7 +1,25 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m65: stdlib `Result<T,E>` /
+in a new session. State as of **m66: parser `>>` split for
+nested generic args**. `Box<Box<Int>>`,
+`Result<Box<Int>, String>`, `Rich<Box<Int>>` etc. now parse
+cleanly. The lexer continues to emit `Shr` for `>>` (it must,
+because shift-right needs the token in expression position);
+instead, the parser's generic-args closer
+`expect_gt_or_split_shr` accepts a single `>` directly OR
+splits a `>>` token in-place — consumes the first half,
+rewrites the slot to a single `>` so the enclosing parser
+frame closes its generic args list against the second half.
+Three closer sites use the helper now: `parse_type_expr`'s
+named-type branch, `parse_type_expr`'s Projection branch
+(Rich/Chunked/Recognition), and `parse_generic_params_opt`
+(so `<T: Trait<Foo>>` style param-list bounds also close
+cleanly). Two new tests in generics.rs:
+`nested_generic_args_close_with_double_gt`,
+`nested_builtin_result_with_box_arg`. 126 tests pass (was 124;
++2 from generics.rs); 54 example builds unaffected. State
+before that was **m65: stdlib `Result<T,E>` /
 `Option<T>` as built-in generic enums**. Programs can now
 reference `Result<Int, String>` or `Option<Int>` (in field
 positions, let ascriptions, fn signatures, locus signatures —
@@ -2613,11 +2631,9 @@ based on whichever workload-shaped example pushes hardest):
    `Outer { inner: Holder { ... } }` don't. Tractable; needs
    walker extensions.
 
-4. **Parser `>>` ambiguity for nested generics
-   (`Box<Box<Int>>`).** Codegen substrate is nested-aware via
-   the m63 fixpoint queue; only the parser tokenizes `>>` as
-   `Shr`. A targeted fixup in the type-arg-list parser would
-   close it.
+4. **Parser `>>` ambiguity for nested generics — DONE (m66).**
+   `expect_gt_or_split_shr` splits `>>` in-place at all three
+   generic-args closer sites.
 
 5. **Typechecker exhaustiveness against synthesized enum
    monomorphs.** Match arms over `Result_Int_String` currently
@@ -2831,7 +2847,7 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 124 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 126 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
 listener + connector subprocesses; m58 added two more under

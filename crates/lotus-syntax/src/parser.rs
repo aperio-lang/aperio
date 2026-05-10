@@ -95,6 +95,44 @@ impl Parser {
         }
     }
 
+    /// m66: close a generic-args list. Accepts `>` directly, OR
+    /// splits a `>>` token in-place (consumes one `>`, rewrites
+    /// the current token to a single `>` so the enclosing parser
+    /// frame can close the next generic args list with the second
+    /// `>`). This lifts the parser-only nested-generics ambiguity
+    /// `Box<Box<Int>>` without changing the lexer (which still
+    /// emits `Shr` for `>>` because shift-right needs it in
+    /// expression position). Returns a Token whose span is the
+    /// first half of the `>>` byte range when split.
+    fn expect_gt_or_split_shr(&mut self) -> Result<Token, Diag> {
+        if matches!(self.peek(), TokenKind::Gt) {
+            return Ok(self.bump());
+        }
+        if matches!(self.peek(), TokenKind::Shr) {
+            let span = self.peek_token().span;
+            let start = span.start.0 as usize;
+            let end = span.end.0 as usize;
+            let mid = start + 1;
+            // Synthesize the inner closer's `>` token (first half
+            // of `>>`) and rewrite the current slot to the outer
+            // closer's `>` (second half).
+            let first_gt = Token::new(
+                TokenKind::Gt,
+                crate::span::Span::new(start, mid),
+            );
+            self.tokens[self.pos] = Token::new(
+                TokenKind::Gt,
+                crate::span::Span::new(mid, end),
+            );
+            return Ok(first_gt);
+        }
+        let span = self.peek_token().span;
+        Err(Diag::parse(
+            span,
+            format!("expected `>`, got {:?}", self.peek()),
+        ))
+    }
+
     fn expect_ident(&mut self, what: &str) -> Result<Ident, Diag> {
         match self.peek().clone() {
             TokenKind::Ident(name) => {
@@ -1036,7 +1074,7 @@ impl Parser {
         while self.eat(&TokenKind::Comma) {
             params.push(self.parse_generic_param()?);
         }
-        self.expect(TokenKind::Gt, ">")?;
+        self.expect_gt_or_split_shr()?;
         Ok(params)
     }
 
@@ -1136,7 +1174,7 @@ impl Parser {
                 };
                 self.expect(TokenKind::Lt, "<")?;
                 let inner = self.parse_type_expr()?;
-                let close = self.expect(TokenKind::Gt, ">")?;
+                let close = self.expect_gt_or_split_shr()?;
                 Ok(TypeExpr::Projection {
                     class,
                     inner: Box::new(inner),
@@ -1185,7 +1223,7 @@ impl Parser {
                     while self.eat(&TokenKind::Comma) {
                         generic_args.push(self.parse_type_expr()?);
                     }
-                    let gt = self.expect(TokenKind::Gt, ">")?;
+                    let gt = self.expect_gt_or_split_shr()?;
                     span = span.merge(gt.span);
                 }
                 Ok(TypeExpr::Named {

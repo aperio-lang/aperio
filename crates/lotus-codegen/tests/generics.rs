@@ -767,3 +767,67 @@ fn user_result_decl_takes_precedence_over_builtin() {
     assert!(status.success(), "exited non-zero: {:?}", status);
     assert!(stdout.contains("pending"), "got: {:?}", stdout);
 }
+
+// === m66 ====================================================
+// Parser `>>` ambiguity: nested generic args close cleanly.
+
+#[test]
+fn nested_generic_args_close_with_double_gt() {
+    // Pre-m66: `Box<Box<Int>>` failed to parse because the lexer
+    // emits `>>` as a single Shr token and the inner generic-args
+    // closer expected a single `>`. The m66 fix splits Shr in
+    // place at the closer site. Codegen substrate (m63 fixpoint
+    // queue) was already nested-aware.
+    let src = r#"
+        type Box<T> {
+            value: T;
+        }
+
+        type Outer {
+            b: Box<Box<Int>>;
+        }
+
+        fn main() {
+            let inner = Box_Int { value: 7 };
+            let outer = Box_Box_Int { value: inner };
+            let o = Outer { b: outer };
+            println("o.b.value.value=", o.b.value.value);
+        }
+    "#;
+    let (stdout, status) = build_and_run("nested_generics", src);
+    assert!(status.success(), "exited non-zero: {:?}", status);
+    assert!(
+        stdout.contains("o.b.value.value=7"),
+        "got: {:?}",
+        stdout,
+    );
+}
+
+#[test]
+fn nested_builtin_result_with_box_arg() {
+    // `Result<Box<Int>, String>` exercises the split at the
+    // built-in template lookup path: discovery walks the field
+    // type, synthesizes Box_Int and then Result_Box_Int_String.
+    let src = r#"
+        type Box<T> {
+            value: T;
+        }
+
+        type Holder {
+            r: Result<Box<Int>, String>;
+        }
+
+        fn main() {
+            let inner = Box_Int { value: 9 };
+            let r = Result_Box_Int_String::Ok(inner);
+            let h = Holder { r: r };
+            match h.r {
+                Result_Box_Int_String::Ok(b) -> println("ok: ", b.value),
+                _                             -> println("other"),
+            }
+        }
+    "#;
+    let (stdout, status) = build_and_run("nested_result", src);
+    assert!(status.success(), "exited non-zero: {:?}", status);
+    assert!(stdout.contains("ok: 9"), "got: {:?}", stdout);
+}
