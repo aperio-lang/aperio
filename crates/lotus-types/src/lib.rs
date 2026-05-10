@@ -270,6 +270,38 @@ mod tests {
     }
 
     #[test]
+    fn ok_generic_enum_match_with_monomorph_arms_no_wildcard() {
+        // m68: matching a generic-enum-typed scrutinee with
+        // arms that use the synthesized monomorph name
+        // (Result_Int_String::Ok / ::Err) should be exhaustive
+        // without a wildcard. The typechecker only sees the
+        // template `Result` (with variants Ok, Err); the user's
+        // arms use the mangled names codegen recognizes. The
+        // exhaustiveness check accepts the mangle prefix as
+        // covering the template's variants.
+        let src = r#"
+            type Result<T, E> = enum {
+                Ok(T),
+                Err(E),
+            };
+
+            fn main() {
+                let r: Result<Int, String> = Result_Int_String::Ok(7);
+                match r {
+                    Result_Int_String::Ok(n)  -> println("ok: ", n),
+                    Result_Int_String::Err(s) -> println("err: ", s),
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected no diags; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn ok_match_with_wildcard() {
         let src = r#"
             fn main() {

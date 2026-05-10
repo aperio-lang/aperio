@@ -76,10 +76,29 @@ fn match_is_exhaustive(scrut_ty: &Ty, arms: &[MatchArm], top: &TopScope) -> bool
         {
             let mut covered: std::collections::BTreeSet<&str> =
                 std::collections::BTreeSet::new();
+            // m68: also accept arms whose enum_seg is a
+            // synthesized monomorph of `name` — e.g. arms
+            // written as `Result_Int_String::Ok` count as
+            // covering `Ok` for a scrutinee typed as the
+            // generic `Result` template. Codegen monomorphizes
+            // generic enums into mangled-name decls
+            // (`Result_Int_String`) but the typechecker only
+            // sees the original template, so the user's match
+            // arms (which use the mangled names that codegen
+            // recognizes) would otherwise false-positive as
+            // non-exhaustive. The mangle convention is
+            // `<template>_<arg>_<arg>...` so the prefix check
+            // is unambiguous.
+            let mangle_prefix = format!("{}_", name);
             for arm in arms.iter().filter(unguarded) {
                 if let Pattern::Constructor { path, .. } = &arm.pattern {
                     if let [enum_seg, variant_seg] = path.segments.as_slice() {
-                        if enum_seg.name == *name {
+                        let matches_template_or_monomorph =
+                            enum_seg.name == *name
+                                || enum_seg
+                                    .name
+                                    .starts_with(&mangle_prefix);
+                        if matches_template_or_monomorph {
                             // m47-payloads: a Constructor arm
                             // covers its variant whether the
                             // sub-patterns are wildcards / bindings
@@ -96,6 +115,16 @@ fn match_is_exhaustive(scrut_ty: &Ty, arms: &[MatchArm], top: &TopScope) -> bool
                 }
             }
             return variants.iter().all(|v| covered.contains(v.name.as_str()));
+        }
+        // m68: a named type the typechecker doesn't know about
+        // at all (commonly: a fully-mangled monomorph that
+        // somehow flows in — codegen synthesizes those, the
+        // typechecker doesn't see them) should be permissive
+        // for exhaustiveness, same as Ty::Unknown. Narrowed
+        // to "name not in top.symbols" so known structs / loci
+        // / perspectives still require a wildcard / binding arm.
+        if !top.symbols.contains_key(name) {
+            return true;
         }
     }
     // Be permissive on Unknown — we genuinely can't say.

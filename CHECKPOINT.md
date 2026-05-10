@@ -1,9 +1,28 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m67: bare-name resolution at
-return + struct field-init sites + dependency-aware generic
-type declaration**. Two language ergonomic gaps closed plus a
+in a new session. State as of **m68: typechecker
+exhaustiveness recognizes synthesized-monomorph match arms**.
+For a scrutinee typed as a generic enum template (e.g.
+`Result<T,E>`, which the typechecker sees as the bare `Result`
+because resolve_type_expr drops generic_args), match arms
+written with the codegen-mangled monomorph name
+(`Result_Int_String::Ok(n)`, `Result_Int_String::Err(s)`) now
+count as covering the template's variants — no wildcard `_`
+arm required. The exhaustiveness check accepts an arm whose
+`enum_seg.name` either equals the template name OR starts
+with `<template>_`. The mangle convention is unambiguous
+(`Foo_Bar_Baz` only ever produced by mangle_generic_name from
+template `Foo`). Codegen-side exhaustiveness enforcement is
+unchanged (still trusts the typechecker per F.18). Also
+relaxes the same check for fully-mangled names not in
+top.symbols (treated as Ty::Unknown) — narrow safety net for
+edge cases. One new test in lotus-types lib tests:
+`ok_generic_enum_match_with_monomorph_arms_no_wildcard`.
+130 tests pass (was 129; +1 from lotus-types); 54 example
+builds unaffected. State before that was **m67: bare-name
+resolution at return + struct field-init sites + dependency-
+aware generic type declaration**. Two language ergonomic gaps closed plus a
 substrate hardening: (1) `fn make_box() -> Box<Int> { return
 Box { value: 5 }; }` — the bare `Box { ... }` rewrites to
 `Box_Int` using the fn's declared return LotusType. (2)
@@ -2666,11 +2685,9 @@ based on whichever workload-shaped example pushes hardest):
    generic-args closer sites.
 
 5. **Typechecker exhaustiveness against synthesized enum
-   monomorphs.** Match arms over `Result_Int_String` currently
-   need a wildcard `_` arm because the typechecker sees only
-   the `Result` template. Codegen-side exhaustiveness check
-   over the synthesized variant set is a tighter substitute
-   than full typechecker integration.
+   monomorphs — DONE (m68).** Exhaustiveness accepts an arm
+   whose enum_seg matches either the template name or the
+   `<template>_*` mangle prefix.
 
 Once the gaps that v1 actually *requires* are closed — **call
 v1**, then trellis-pair / multi-binary build / release
@@ -2877,7 +2894,7 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 129 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 130 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
 listener + connector subprocesses; m58 added two more under
