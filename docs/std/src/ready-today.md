@@ -99,6 +99,19 @@ Tiers:
 | Property-based tests | Blocked | Explicitly deferred per spec. |
 | Benchmarks | Blocked | Phase 2 v1.0 layer 3. |
 
+## Logging
+
+| Capability | Tier | Notes |
+|---|---|---|
+| Structured logging on the bus | Shipped | `std::log::Logger`, `std::log::LogEvent`, `std::log::StdoutSink` (m95) |
+| Cascading namespaces | Shipped | `Logger { name, parent_path }` → publishes on `log.<full_path>` |
+| Subtree-scoped subscribers | Shipped | `subscribe "log.app.**"` matches root + descendants (m94) |
+| Bus subject wildcards (`**`) | Shipped | Trailing-only; matches zero+ remaining segments (m94) |
+| Cross-process tailing from source | Blocked | `std::bus::expose` not yet shipped; substrate exists (m72) |
+| WARN/ERROR → stderr | Blocked | No `eprintln` primitive yet. |
+| Structured fields beyond `msg` | Blocked | Needs generic `Map` or fixed tuple array. |
+| Log-level filtering at default sink | Blocked | `StdoutSink` prints everything; write a custom sink with `if e.level >= 2`. |
+
 ## Language-level
 
 | Capability | Tier | Notes |

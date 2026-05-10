@@ -175,6 +175,7 @@ Stdlib namespaces you can use right now:
 - `std::str::{parse_int, can_parse_int, index_of}`
 - `std::time::{sleep, monotonic}`
 - `std::process::{pid, exit}`
+- `std::log::{Logger, LogEvent, StdoutSink}` — structured logging on the bus with cascading namespaces (m95). See `docs/std/src/log.md`.
 
 Built-in functions, no path needed: `print`, `println`, `len`,
 `to_string`, `min`, `max`, `abs`, `starts_with`, `contains`.

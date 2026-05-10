@@ -308,6 +308,8 @@ const STDLIB_AP_SOURCE: &str = concat!(
     include_str!("../runtime/stdlib/text.ap"),
     "\n",
     include_str!("../runtime/stdlib/test.ap"),
+    "\n",
+    include_str!("../runtime/stdlib/log.ap"),
 );
 
 /// Maps each user-facing stdlib path (locus OR type) to the
@@ -324,6 +326,9 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "http", "Response"], "__StdHttpResponse"),
     (&["std", "io", "tcp", "Listener"], "__StdIoTcpListener"),
     (&["std", "io", "tcp", "Stream"], "__StdIoTcpStream"),
+    (&["std", "log", "LogEvent"], "__StdLogEvent"),
+    (&["std", "log", "Logger"], "__StdLogLogger"),
+    (&["std", "log", "StdoutSink"], "__StdLogStdoutSink"),
 ];
 
 /// Look up the mangled name for a stdlib path (locus or type).

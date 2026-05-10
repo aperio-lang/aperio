@@ -1,0 +1,115 @@
+// Aperio stdlib — std::log.
+//
+// Structured logging on the bus. The Aperio-shape: every log
+// event is a typed payload published on a hierarchical subject;
+// sinks are bus subscribers. Cross-process tailing comes for
+// free once a subject is bridged via deployment config.
+//
+// User code reaches the surface via:
+//   - std::log::LogEvent     — record type for events
+//   - std::log::Logger       — the publishing locus
+//   - std::log::StdoutSink   — default sink (subscribes log.**)
+//
+// Path-call dispatch + STDLIB_PATH_RENAMES route those names
+// to the __StdLog* mangled forms declared here.
+//
+// Cascading namespaces: each Logger has a `name` (its segment)
+// and a `parent_path` (the parent's full path, or "" for root).
+// On birth() we compute full_path = parent_path + "." + name
+// (or just name if root). Publishes go to "log." + full_path.
+// A sink subscribed to "log.**" sees every Logger's events;
+// "log.app.**" scopes to one sub-tree; "log.app.db" pins to
+// one specific Logger.
+//
+// Levels are Int constants pending enum-variant patterns:
+//   1 = INFO    2 = WARN    3 = ERROR    4 = DEBUG    5 = TRACE
+//
+// Ordering note: all Aperio bus traffic registers at birth().
+// Instantiate StdoutSink BEFORE any Logger so the sink is
+// listening when Logger.info/warn/error fires.
+
+// std::log::LogEvent — payload type for every Logger publish.
+//
+// `level` is an Int constant in the 1..=5 range; sinks map it
+// to a printable name. `path` is the publishing Logger's
+// computed full_path (e.g. "app.db") so a sink subscribing on
+// a single subject can still show context.
+type __StdLogEvent {
+    level: Int;
+    msg:   String;
+    path:  String;
+}
+
+// std::log::Logger — a publishing locus with cascading
+// namespace.
+//
+// Each Logger has methods `info(msg)`, `warn(msg)`,
+// `error(msg)`, `debug(msg)`, `trace(msg)` that publish a
+// LogEvent on the computed subject "log." + full_path.
+//
+// The bus declaration uses a wildcard publish ("log.**")
+// — this is the m94 surface that authorizes computed
+// subjects of the right type. Without this declaration,
+// the type-checker would reject `subj <- LogEvent { ... }`
+// where `subj` is non-literal.
+locus __StdLogLogger {
+    params {
+        name:        String = "root";
+        parent_path: String = "";
+        full_path:   String = "";       // computed in birth()
+    }
+    bus {
+        publish "log.**" of type __StdLogEvent;
+    }
+    birth() {
+        if len(self.parent_path) == 0 {
+            self.full_path = self.name;
+        } else {
+            self.full_path = self.parent_path + "." + self.name;
+        }
+    }
+    fn info(msg: String) {
+        let subj = "log." + self.full_path;
+        subj <- __StdLogEvent { level: 1, msg: msg, path: self.full_path };
+    }
+    fn warn(msg: String) {
+        let subj = "log." + self.full_path;
+        subj <- __StdLogEvent { level: 2, msg: msg, path: self.full_path };
+    }
+    fn error(msg: String) {
+        let subj = "log." + self.full_path;
+        subj <- __StdLogEvent { level: 3, msg: msg, path: self.full_path };
+    }
+    fn debug(msg: String) {
+        let subj = "log." + self.full_path;
+        subj <- __StdLogEvent { level: 4, msg: msg, path: self.full_path };
+    }
+    fn trace(msg: String) {
+        let subj = "log." + self.full_path;
+        subj <- __StdLogEvent { level: 5, msg: msg, path: self.full_path };
+    }
+}
+
+// std::log::StdoutSink — default sink.
+//
+// Subscribes to "log.**" so it sees every Logger's publishes
+// regardless of namespace depth. Emits one line per event in
+// the form `[LEVEL path] msg`.
+//
+// v0 emits all levels to stdout. WARN/ERROR routing to stderr
+// is a follow-up — needs a `eprintln`-style primitive that
+// doesn't yet exist.
+locus __StdLogStdoutSink {
+    bus {
+        subscribe "log.**" as on_event of type __StdLogEvent;
+    }
+    fn on_event(e: __StdLogEvent) {
+        let mut name: String = "?";
+        if e.level == 1 { name = "INFO"; }
+        if e.level == 2 { name = "WARN"; }
+        if e.level == 3 { name = "ERROR"; }
+        if e.level == 4 { name = "DEBUG"; }
+        if e.level == 5 { name = "TRACE"; }
+        println("[", name, " ", e.path, "] ", e.msg);
+    }
+}

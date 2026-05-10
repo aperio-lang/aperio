@@ -249,6 +249,54 @@ pub struct BusRouter {
     /// override use [`TransportKind::Sync`] when first
     /// referenced.
     config: Rc<RefCell<BTreeMap<String, TransportKind>>>,
+    /// m94: wildcard subscriptions, kept separately from the
+    /// per-subject transport map. Each entry is `(pattern,
+    /// subscription)`; on publish, every pattern is matched
+    /// against the published subject and matching deliveries
+    /// land in `wildcard_pending`.
+    wildcard_subs: Rc<RefCell<Vec<(String, Subscription)>>>,
+    wildcard_pending: Rc<RefCell<VecDeque<Delivery>>>,
+}
+
+/// m94: subject wildcard matching.
+///
+/// v0 supports one form: a trailing `**` that matches *zero or
+/// more* remaining dot-separated segments. So `"log.app.**"`
+/// matches `"log.app"`, `"log.app.db"`, `"log.app.db.query"` —
+/// the publishing logger's own subject AND any descendant. This
+/// is the cascade-friendly semantics: subscribing to `log.app.**`
+/// captures the whole sub-tree including its root.
+///
+/// `**` must appear at the end of the pattern, preceded either
+/// by `.` or by nothing (the bare `"**"` pattern matches every
+/// subject). `**` in any other position rejects.
+///
+/// Patterns without `**` fall through to exact equality — the
+/// cheap path stays cheap.
+pub fn subject_match(pattern: &str, subject: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("**") {
+        if prefix.is_empty() {
+            // Bare "**" — matches every subject.
+            return true;
+        }
+        if !prefix.ends_with('.') {
+            // "log**" or similar — invalid, no match.
+            return false;
+        }
+        // The pattern is "<root>." + "**". Two valid forms:
+        //   - subject equals root (no trailing segments)
+        //   - subject starts with "<root>." and has a tail
+        let root = &prefix[..prefix.len() - 1]; // strip trailing "."
+        if subject == root {
+            return true;
+        }
+        subject.starts_with(prefix) && subject.len() > prefix.len()
+    } else if pattern.contains("**") {
+        // ** somewhere other than the end — reject.
+        false
+    } else {
+        pattern == subject
+    }
 }
 
 impl std::fmt::Debug for BusRouter {
@@ -292,16 +340,24 @@ impl BusRouter {
         handler: String,
         parent: Option<LocusHandle>,
     ) {
+        let sub = Subscription {
+            locus,
+            handler,
+            parent,
+        };
+        // m94: wildcard subscriptions live in a separate registry
+        // and are checked against every publish, independent of
+        // the per-subject transport map.
+        if subject.contains("**") {
+            self.wildcard_subs.borrow_mut().push((subject, sub));
+            return;
+        }
         self.ensure(&subject);
         self.transports
             .borrow_mut()
             .get_mut(&subject)
             .expect("subject ensured")
-            .subscribe(Subscription {
-                locus,
-                handler,
-                parent,
-            });
+            .subscribe(sub);
     }
 
     pub fn publish(&self, subject: &str, payload: Value) {
@@ -310,7 +366,23 @@ impl BusRouter {
             .borrow_mut()
             .get_mut(subject)
             .expect("subject ensured")
-            .publish(payload);
+            .publish(payload.clone());
+        // m94: also fan out to any wildcard subscribers whose
+        // pattern matches this subject. Deliveries land in
+        // wildcard_pending and ride the same drain loop as
+        // exact-match deliveries.
+        let wildcards = self.wildcard_subs.borrow();
+        if !wildcards.is_empty() {
+            let mut pending = self.wildcard_pending.borrow_mut();
+            for (pattern, sub) in wildcards.iter() {
+                if subject_match(pattern, subject) {
+                    pending.push_back(Delivery {
+                        subscription: sub.clone(),
+                        payload: payload.clone(),
+                    });
+                }
+            }
+        }
     }
 
     /// Drain pending deliveries across all configured
@@ -322,6 +394,8 @@ impl BusRouter {
         for transport in self.transports.borrow_mut().values_mut() {
             out.extend(transport.drain());
         }
+        // m94: wildcard subscribers' deliveries.
+        out.extend(self.wildcard_pending.borrow_mut().drain(..));
         out
     }
 }
@@ -460,5 +534,90 @@ mod tests {
         router.publish("hot", Value::Int(2));
         let deliveries = router.drain_all();
         assert_eq!(deliveries.len(), 2);
+    }
+
+    // ============================================================
+    // m94: subject wildcard matching.
+    // ============================================================
+
+    #[test]
+    fn subject_match_exact() {
+        assert!(subject_match("log.app", "log.app"));
+        assert!(!subject_match("log.app", "log.api"));
+        assert!(!subject_match("log.app", "log"));
+    }
+
+    #[test]
+    fn subject_match_trailing_double_star() {
+        assert!(subject_match("log.**", "log.app"));
+        assert!(subject_match("log.**", "log.app.db"));
+        assert!(subject_match("log.**", "log.app.db.query"));
+        // m94: zero+ trailing semantics — root subject matches too.
+        assert!(subject_match("log.**", "log"));
+        // Wrong root.
+        assert!(!subject_match("log.**", "logs"));
+        assert!(!subject_match("log.**", "logs.app"));
+    }
+
+    #[test]
+    fn subject_match_bare_double_star() {
+        assert!(subject_match("**", "anything"));
+        assert!(subject_match("**", "a.b.c"));
+        // Bare "**" matches every subject including empty.
+        assert!(subject_match("**", ""));
+    }
+
+    #[test]
+    fn subject_match_double_star_must_be_trailing() {
+        // ** in the middle is rejected (no fancy multi-segment
+        // matching in v0).
+        assert!(!subject_match("log.**.error", "log.app.error"));
+        // ** without preceding dot is rejected.
+        assert!(!subject_match("log**", "logXapp"));
+    }
+
+    #[test]
+    fn router_wildcard_subscriber_receives_matching_publish() {
+        let router = BusRouter::new();
+        router.subscribe(
+            "log.**".into(),
+            fake_subscription("Sink", "on_log").locus,
+            "on_log".into(),
+            None,
+        );
+        router.publish("log.app", Value::Int(1));
+        router.publish("log.app.db", Value::Int(2));
+        router.publish("other.thing", Value::Int(99));
+        let deliveries = router.drain_all();
+        assert_eq!(deliveries.len(), 2, "wildcard should receive 2 of 3");
+        assert!(matches!(deliveries[0].payload, Value::Int(1)));
+        assert!(matches!(deliveries[1].payload, Value::Int(2)));
+    }
+
+    #[test]
+    fn router_exact_and_wildcard_both_fire() {
+        let router = BusRouter::new();
+        router.subscribe(
+            "log.app".into(),
+            fake_subscription("Exact", "on_app").locus,
+            "on_app".into(),
+            None,
+        );
+        router.subscribe(
+            "log.**".into(),
+            fake_subscription("Wild", "on_any").locus,
+            "on_any".into(),
+            None,
+        );
+        router.publish("log.app", Value::Int(7));
+        let deliveries = router.drain_all();
+        // Both subscribers see the payload exactly once.
+        assert_eq!(deliveries.len(), 2);
+        let handlers: Vec<&str> = deliveries
+            .iter()
+            .map(|d| d.subscription.handler.as_str())
+            .collect();
+        assert!(handlers.contains(&"on_app"));
+        assert!(handlers.contains(&"on_any"));
     }
 }

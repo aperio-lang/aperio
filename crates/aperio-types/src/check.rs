@@ -717,14 +717,49 @@ impl<'a> Checker<'a> {
                 return;
             }
         };
+        // m94: a non-literal subject is allowed when the locus
+        // declares a wildcard `publish` whose payload matches.
+        // The wildcard declaration acts as the authorization +
+        // type-binding for any concrete subject computed at
+        // runtime that matches the pattern. Static subject-pattern
+        // verification is impossible by definition; we trust the
+        // declaration and let runtime dispatch route to whichever
+        // subscribers (exact or wildcard) match.
         let subject_str = match subject_str {
             Some(s) => s,
             None => {
-                self.diags.push(Diag::ty(
-                    subject.span(),
-                    "bus send subject must be a string literal in milestone 2"
-                        .to_string(),
-                ));
+                let wildcard_match = locus.bus_publishes.iter().find(|p| {
+                    p.subject.contains("**")
+                        && p.payload.assignable_from(&payload_ty)
+                });
+                if wildcard_match.is_none() {
+                    let any_wildcard = locus
+                        .bus_publishes
+                        .iter()
+                        .any(|p| p.subject.contains("**"));
+                    if any_wildcard {
+                        self.diags.push(Diag::ty(
+                            value.span(),
+                            format!(
+                                "bus send (computed subject): payload `{}` does \
+                                 not match any wildcard publish declaration in \
+                                 locus `{}`",
+                                payload_ty.display(),
+                                locus.name
+                            ),
+                        ));
+                    } else {
+                        self.diags.push(Diag::ty(
+                            subject.span(),
+                            format!(
+                                "bus send with computed subject requires a \
+                                 wildcard `publish` declaration (e.g. \
+                                 `publish \"log.**\" of type T`) in locus `{}`",
+                                locus.name
+                            ),
+                        ));
+                    }
+                }
                 return;
             }
         };
@@ -747,13 +782,25 @@ impl<'a> Checker<'a> {
                 }
             }
             None => {
-                self.diags.push(Diag::ty(
-                    subject.span(),
-                    format!(
-                        "bus send subject `{}` is not declared in locus `{}`'s bus block",
-                        subject_str, locus.name
-                    ),
-                ));
+                // m94: an exact-literal subject is also valid when
+                // it matches a wildcard publish declaration of the
+                // right type. This lets a locus declare
+                // `publish "log.**" of type LogEvent` once and
+                // then send on `"log.app"` etc. literally.
+                let wildcard_match = locus.bus_publishes.iter().find(|p| {
+                    p.subject.contains("**")
+                        && super::wildcard_match(&p.subject, &subject_str)
+                        && p.payload.assignable_from(&payload_ty)
+                });
+                if wildcard_match.is_none() {
+                    self.diags.push(Diag::ty(
+                        subject.span(),
+                        format!(
+                            "bus send subject `{}` is not declared in locus `{}`'s bus block",
+                            subject_str, locus.name
+                        ),
+                    ));
+                }
             }
         }
     }

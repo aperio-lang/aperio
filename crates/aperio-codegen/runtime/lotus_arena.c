@@ -614,6 +614,60 @@ static size_t             g_bus_cap     = 0;
 
 #define LOTUS_BUS_ROUTER_INITIAL_CAP 16
 
+/* m94: subject wildcard matching.
+ *
+ * v0 supports one wildcard form: a trailing "**" that matches
+ * zero or more remaining dot-separated segments. So "log.app.**"
+ * matches "log.app" (the root), "log.app.db", "log.app.db.query"
+ * — the publishing logger's own subject AND any descendant.
+ * This is the cascade-friendly semantics: subscribing to
+ * `log.app.**` captures the whole sub-tree including its root.
+ *
+ * "**" must appear at the end of the pattern, preceded either by
+ * "." or by nothing (the bare "**" pattern matches every subject).
+ * "**" in any other position rejects.
+ *
+ * Returns 1 on match, 0 otherwise. NULL inputs are treated as
+ * non-matching. Patterns without "**" fall through to strcmp —
+ * the cheap path stays cheap.
+ */
+int lotus_subject_match(const char *pattern, const char *subject) {
+    if (!pattern || !subject) return 0;
+    size_t plen = strlen(pattern);
+    if (plen < 2) {
+        /* Too short to contain "**". */
+        return strcmp(pattern, subject) == 0;
+    }
+    /* "**" is supported only as a trailing wildcard. Anywhere
+     * else we treat as no match (rather than try-and-fail
+     * matching) so a typo like "log.**.error" doesn't silently
+     * match a stray subject. */
+    if (pattern[plen - 1] == '*' && pattern[plen - 2] == '*') {
+        if (plen == 2) {
+            /* Bare "**" — matches every subject. */
+            return 1;
+        }
+        /* Must be preceded by '.', else "log**" — invalid. */
+        if (pattern[plen - 3] != '.') return 0;
+        /* Pattern is "<root>." + "**". Two valid forms:
+         *   - subject equals root (no trailing segments)
+         *   - subject starts with "<root>." and has tail bytes
+         */
+        size_t root_len = plen - 3;        /* "<root>" length */
+        size_t prefix_len = plen - 2;      /* "<root>." length */
+        if (strlen(subject) == root_len &&
+            strncmp(pattern, subject, root_len) == 0) {
+            return 1;
+        }
+        if (strncmp(pattern, subject, prefix_len) != 0) return 0;
+        return subject[prefix_len] != '\0';
+    }
+    /* Pattern contains "**" but not at the end — reject. */
+    if (strstr(pattern, "**") != NULL) return 0;
+    /* No wildcard. */
+    return strcmp(pattern, subject) == 0;
+}
+
 /* m58: forward-declare the remote-transport fanout hooks defined
  * at the bottom of this file. Dispatch and router_destroy call
  * them after the local-table loops so cross-process subscribers
@@ -688,7 +742,10 @@ void lotus_bus_local_dispatch(lotus_bus_queue_t *queue,
     for (size_t i = 0; i < g_bus_count; i++) {
         lotus_bus_entry_t *e = &g_bus_entries[i];
         if (!e->subject) continue;          /* deregistered */
-        if (strcmp(e->subject, subject) != 0) continue;
+        /* m94: pattern-match in case the subscriber registered a
+         * wildcard subject (e.g. "log.**"). The fast path —
+         * pattern with no '**' — costs one strcmp. */
+        if (!lotus_subject_match(e->subject, subject)) continue;
         if (e->mailbox) {
             lotus_mailbox_post(e->mailbox, e->handler, e->self_ptr,
                                payload, payload_size);
@@ -2260,7 +2317,13 @@ static void *lotus_bus_reader_thread_main(void *arg) {
         for (size_t i = 0; i < g_bus_count; i++) {
             lotus_bus_entry_t *e = &g_bus_entries[i];
             if (!e->subject) continue;
-            if (strcmp(e->subject, args->entry->subject) != 0) continue;
+            /* m94: wildcard locals (e.g. "log.**") need to match
+             * concrete remote-bound subjects too, so use the same
+             * pattern-matching as the dispatch path. By language
+             * constraint, all subscribers on the same subject
+             * share the payload type, so the deserialize_fn from
+             * any matching entry is the right one. */
+            if (!lotus_subject_match(e->subject, args->entry->subject)) continue;
             deserialize = e->deserialize;
             break;
         }

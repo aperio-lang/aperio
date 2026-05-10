@@ -24,6 +24,10 @@
 
 - [`std::text`](./text.md)
 
+# Phase 6: Substrate
+
+- [`std::log`](./log.md)
+
 # Primitives
 
 - [`Bytes`](./bytes.md)

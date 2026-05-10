@@ -26,6 +26,34 @@ pub mod resolve;
 pub mod symbol;
 pub mod ty;
 
+/// m94: subject wildcard matching used by the type checker
+/// (publish-side authorization for computed subjects) and
+/// mirrored at runtime by `aperio-runtime::bus::subject_match`
+/// and the C runtime's `lotus_subject_match`. v0 supports a
+/// trailing `**` that matches *zero or more* remaining
+/// dot-separated segments — `log.app.**` matches the root
+/// `log.app` AND any descendant. All three implementations
+/// must agree.
+pub fn wildcard_match(pattern: &str, subject: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix("**") {
+        if prefix.is_empty() {
+            return true;
+        }
+        if !prefix.ends_with('.') {
+            return false;
+        }
+        let root = &prefix[..prefix.len() - 1];
+        if subject == root {
+            return true;
+        }
+        subject.starts_with(prefix) && subject.len() > prefix.len()
+    } else if pattern.contains("**") {
+        false
+    } else {
+        pattern == subject
+    }
+}
+
 use std::collections::BTreeMap;
 
 use aperio_syntax::ast::Program;
