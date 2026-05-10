@@ -83,6 +83,17 @@ enum LotusType {
     /// (`t.0`, `t.1`, ...) or via tuple-destructuring let /
     /// match patterns.
     Tuple(Vec<LotusType>),
+    /// m80: function pointer. `fn(T1, T2) -> R` or `fn(T1, T2)`
+    /// for void-returning. At LLVM level, stored as a `ptr` (raw
+    /// function pointer); calls go through `build_indirect_call`
+    /// with an `inkwell::FunctionType` synthesized from this
+    /// LotusType's args + ret. Used by stdlib loci that take a
+    /// user-supplied callback (m82's Listener.on_connection); also
+    /// available for general user-code callback patterns.
+    FnPtr {
+        args: Vec<LotusType>,
+        ret: Option<Box<LotusType>>,
+    },
 }
 
 /// Did the last lowered statement leave the current basic block
@@ -3102,6 +3113,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 Ok(LotusType::Tuple(elem_tys))
             }
+            TypeExpr::Function { params, ret, .. } => {
+                let mut arg_tys = Vec::with_capacity(params.len());
+                for p in params {
+                    arg_tys.push(self.type_expr_to_lotus(p)?);
+                }
+                let ret_ty = match ret {
+                    Some(r) => Some(Box::new(self.type_expr_to_lotus(r)?)),
+                    None => None,
+                };
+                Ok(LotusType::FnPtr {
+                    args: arg_tys,
+                    ret: ret_ty,
+                })
+            }
             other => Err(CodegenError::Unsupported(format!(
                 "type form {:?} in signature",
                 std::mem::discriminant(other)
@@ -5171,7 +5196,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 | LotusType::LocusRef(_)
                                 | LotusType::TypeRef(_)
                                 | LotusType::Array(_, _)
-                                | LotusType::Tuple(_) => self
+                                | LotusType::Tuple(_)
+                                | LotusType::FnPtr { .. } => self
                                     .context
                                     .ptr_type(AddressSpace::default())
                                     .fn_type(&llvm_param_tys, false),
@@ -5334,7 +5360,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 | LotusType::LocusRef(_)
                                 | LotusType::TypeRef(_)
                                 | LotusType::Array(_, _)
-                                | LotusType::Tuple(_) => self
+                                | LotusType::Tuple(_)
+                                | LotusType::FnPtr { .. } => self
                                     .context
                                     .ptr_type(AddressSpace::default())
                                     .fn_type(&llvm_param_tys, false),
@@ -6372,7 +6399,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | Some(LotusType::LocusRef(_))
             | Some(LotusType::TypeRef(_))
             | Some(LotusType::Array(_, _))
-            | Some(LotusType::Tuple(_)) => self
+            | Some(LotusType::Tuple(_))
+            | Some(LotusType::FnPtr { .. }) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .fn_type(&llvm_param_tys, false),
@@ -6671,7 +6699,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | LotusType::Bool
             | LotusType::Decimal
             | LotusType::Time
-            | LotusType::Duration => Ok(value),
+            | LotusType::Duration
+            | LotusType::FnPtr { .. } => Ok(value),
             LotusType::Enum(name) => {
                 let info = self
                     .user_enums
@@ -9612,6 +9641,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .builder
                 .build_alloca(self.context.i64_type(), name)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
+            LotusType::FnPtr { .. } => self
+                .builder
+                .build_alloca(
+                    self.context.ptr_type(AddressSpace::default()),
+                    name,
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
             LotusType::Float => self
                 .builder
                 .build_alloca(self.context.f64_type(), name)
@@ -9771,6 +9807,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )))
             }
             Expr::Ident(id) => {
+                // m80: a bare identifier in expression position
+                // can be a user function name used as a value.
+                // The Expr::Call path that handles `handler(...)`
+                // checks user_fns separately, so this only fires
+                // when handler appears NOT as a callee.
+                if let Some(sig) = self.user_fns.get(&id.name).cloned() {
+                    let fn_ptr = sig
+                        .func
+                        .as_global_value()
+                        .as_pointer_value();
+                    let fn_ty = LotusType::FnPtr {
+                        args: sig.params.clone(),
+                        ret: sig.ret.clone().map(Box::new),
+                    };
+                    return Ok((fn_ptr.into(), fn_ty));
+                }
                 let (alloca, ty) = scope
                     .locals
                     .get(&id.name)
@@ -10315,6 +10367,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         match t {
             LotusType::Int | LotusType::Duration => {
                 self.context.i64_type().into()
+            }
+            LotusType::FnPtr { .. } => {
+                // m80: function pointers store as raw `ptr`. The
+                // FunctionType for indirect calls is synthesized
+                // from the FnPtr's args/ret at the call site, not
+                // baked into the storage layout.
+                self.context.ptr_type(AddressSpace::default()).into()
             }
             LotusType::Float => self.context.f64_type().into(),
             LotusType::Decimal => {
@@ -10889,6 +10948,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     return Err(CodegenError::Unsupported(
                         "println of a tuple — print individual \
                          components via .0 / .1 / let-destructure".into(),
+                    ));
+                }
+                LotusType::FnPtr { .. } => {
+                    return Err(CodegenError::Unsupported(
+                        "println of a function pointer — function \
+                         values have no surface representation".into(),
                     ));
                 }
                 LotusType::Enum(enum_name) => {
@@ -13225,6 +13290,128 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 method_name
             ))
         })?;
+
+        // m80: if `method_name` is a function-pointer field on
+        // self, indirect-call through it. This is how Listener
+        // (m82) invokes its on_connection callback per accepted
+        // connection. Field-shadows-method semantics: a struct
+        // field named the same as a method takes precedence,
+        // which is the conventional v0 behavior for any
+        // user-supplied callback override.
+        if let Some((field_idx, field_ty)) =
+            cs.fields.get(method_name).cloned()
+        {
+            if let LotusType::FnPtr {
+                args: arg_tys,
+                ret: ret_ty,
+            } = field_ty
+            {
+                if args.len() != arg_tys.len() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "self.{} (fn pointer): expected {} args, got {}",
+                        method_name,
+                        arg_tys.len(),
+                        args.len()
+                    )));
+                }
+                // m80: every user free fn has an implicit
+                // `__caller_arena: ptr` first param (m49 calling
+                // convention). The fn-pointer points to that same
+                // ABI-shaped fn, so the indirect call must
+                // prepend the caller's arena. Captured here
+                // BEFORE arg lowering — same discipline as
+                // lower_user_fn_call.
+                let caller_arena = self.current_arena_ptr()?;
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+                    Vec::with_capacity(args.len() + 1);
+                let mut llvm_param_tys: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
+                    Vec::with_capacity(args.len() + 1);
+                call_args.push(caller_arena.into());
+                llvm_param_tys.push(ptr_t.into());
+                // Lower each user-visible arg, type-checking
+                // against the declared FnPtr signature.
+                for (i, a) in args.iter().enumerate() {
+                    let (v, vt) = self.lower_expr(a, scope)?;
+                    if vt != arg_tys[i] {
+                        return Err(CodegenError::Unsupported(format!(
+                            "self.{} arg {}: expected {:?}, got {:?}",
+                            method_name, i, arg_tys[i], vt
+                        )));
+                    }
+                    call_args.push(v.into());
+                    llvm_param_tys.push(self.llvm_basic_type(&arg_tys[i]).into());
+                }
+                // GEP+load the field pointer.
+                let field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cs.struct_ty,
+                        cs.self_ptr,
+                        field_idx,
+                        "fnptr.field.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                let fn_value_ptr = self
+                    .builder
+                    .build_load(ptr_ty, field_ptr, "fnptr.value")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_pointer_value();
+                // Synthesize the LLVM FunctionType from the
+                // FnPtr's args/ret. For void-returning FnPtrs the
+                // call returns no usable value; for value-returning
+                // we propagate the result + LotusType up.
+                let fn_ty = match &ret_ty {
+                    None => self
+                        .context
+                        .void_type()
+                        .fn_type(&llvm_param_tys, false),
+                    Some(rt) => {
+                        let lr = self.llvm_basic_type(rt);
+                        match lr {
+                            inkwell::types::BasicTypeEnum::IntType(t) => {
+                                t.fn_type(&llvm_param_tys, false)
+                            }
+                            inkwell::types::BasicTypeEnum::FloatType(t) => {
+                                t.fn_type(&llvm_param_tys, false)
+                            }
+                            inkwell::types::BasicTypeEnum::PointerType(t) => {
+                                t.fn_type(&llvm_param_tys, false)
+                            }
+                            _ => {
+                                return Err(CodegenError::Unsupported(
+                                    format!(
+                                        "fn-pointer return type {:?} not yet supported",
+                                        rt
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                };
+                let call = self
+                    .builder
+                    .build_indirect_call(
+                        fn_ty,
+                        fn_value_ptr,
+                        &call_args,
+                        "fnptr.call",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                return Ok(match ret_ty {
+                    None => None,
+                    Some(rt) => {
+                        let v = call
+                            .try_as_basic_value()
+                            .left()
+                            .expect("non-void fn-pointer call should yield a value");
+                        Some((v, *rt))
+                    }
+                });
+            }
+        }
+
         let info = self
             .user_loci
             .get(&cs.locus_name)

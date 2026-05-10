@@ -1232,6 +1232,31 @@ impl Parser {
                     span,
                 })
             }
+            // m80: function-pointer type — `fn(T1, T2) -> R` or
+            // `fn(T1, T2)` for void-returning. Parses as a
+            // TypeExpr::Function the codegen layer maps to
+            // LotusType::FnPtr.
+            TokenKind::Fn => {
+                let kw = self.bump();
+                self.expect(TokenKind::LParen, "(")?;
+                let mut params = Vec::new();
+                if !self.at(&TokenKind::RParen) {
+                    params.push(self.parse_type_expr()?);
+                    while self.eat(&TokenKind::Comma) {
+                        params.push(self.parse_type_expr()?);
+                    }
+                }
+                let rp = self.expect(TokenKind::RParen, ")")?;
+                let mut span = kw.span.merge(rp.span);
+                let ret = if self.eat(&TokenKind::Arrow) {
+                    let r = self.parse_type_expr()?;
+                    span = span.merge(r.span());
+                    Some(Box::new(r))
+                } else {
+                    None
+                };
+                Ok(TypeExpr::Function { params, ret, span })
+            }
             other => Err(Diag::parse(
                 self.peek_token().span,
                 format!("expected type expression, got {:?}", other),
