@@ -6,6 +6,7 @@ members = [
     "crates/aperio-runtime",
     "crates/aperio-codegen",
     "crates/aperio-cli",
+    "crates/aperio-ts-shim",
 ]
 
 [workspace.package]

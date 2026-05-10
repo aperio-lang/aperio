@@ -1,0 +1,205 @@
+// import-graph — m97 dogfood.
+//
+// Walks a directory of Go files, parses each with std::ts, and
+// emits a JSON tower model: per-file `id` + `package` +
+// `imports`. First concrete consumer of the m96 tree-sitter
+// substrate; validates that the lotus-shape mapping is tractable
+// for real foreign code (per
+// notes/codebase-onboarding-design.md).
+//
+// Wrapped in an `ImportGraphL` locus per the lotus-all-the-way-
+// down ethos: an extraction job is emergent structure
+// (gather → walk → emit), so the outer encapsulation is a locus
+// rather than bare top-level fns. The locus's `run()` body
+// dispatches into a free helper fn to keep early-return
+// short-circuits available (m82-followup limitation: lifecycle
+// method bodies don't accept `return` at v0).
+//
+// Usage:
+//   aperio build apps/import-graph/main.ap
+//   apps/import-graph/main [GO_DIR]
+//
+// argv[1] is the directory to scan. Defaults to
+// `apps/import-graph/fixture/` so the demo runs from the repo
+// root with no flags. Output goes to stdout — wrap in
+// `> tower.json` to persist.
+//
+// v0 scope cuts (see README.md):
+//   - File-level locus mapping (not package-level aggregation).
+//   - Single directory only — `list_dir` is non-recursive.
+//   - Aliased imports collapse: `import f "fmt"` → `"fmt"`.
+//   - No JSON escaping (Go names don't contain `"` or `\`).
+
+// Recursively collect all interpreted_string_literal texts found
+// under `node`, with surrounding quotes stripped, separated by
+// "\n". For an import_declaration this yields one line per
+// imported package — handles both single-import shape
+// (`import "fmt"`) and grouped shape (`import ( "fmt"; "os" )`).
+fn __collect_string_literals(node: Int) -> String {
+    if node == 0 { return ""; }
+    let kind = std::ts::node_kind(node);
+    if kind == "interpreted_string_literal" {
+        let raw = std::ts::node_text(node);
+        let n = len(raw);
+        if n < 2 { return ""; }
+        return raw[1..n-1] + "\n";
+    }
+    let mut acc = "";
+    let cnt = std::ts::node_named_child_count(node);
+    let mut i = 0;
+    while i < cnt {
+        let c = std::ts::node_named_child(node, i);
+        acc = acc + __collect_string_literals(c);
+        i = i + 1;
+    }
+    return acc;
+}
+
+// Find the package_identifier text under a package_clause node.
+// Returns "?" if not found (shouldn't happen for valid Go).
+fn __find_package_id(pkg_clause: Int) -> String {
+    let n = std::ts::node_named_child_count(pkg_clause);
+    let mut i = 0;
+    while i < n {
+        let c = std::ts::node_named_child(pkg_clause, i);
+        if std::ts::node_kind(c) == "package_identifier" {
+            return std::ts::node_text(c);
+        }
+        i = i + 1;
+    }
+    return "?";
+}
+
+// Build the JSON imports array from a "\n"-separated string.
+// Empty lines drop. Entries are JSON-quoted but not escaped (Go
+// import paths don't contain " or \).
+fn __build_imports_array(imports: String) -> String {
+    let mut out = "[";
+    let mut from = 0;
+    let total = len(imports);
+    let mut first = true;
+    while from < total {
+        let rest = imports[from..total];
+        let nl = std::str::index_of(rest, "\n");
+        let mut entry = "";
+        if nl < 0 {
+            entry = rest;
+            from = total;
+        } else {
+            entry = rest[0..nl];
+            from = from + nl + 1;
+        }
+        if len(entry) > 0 {
+            if first {
+                out = out + "\"" + entry + "\"";
+                first = false;
+            } else {
+                out = out + ", \"" + entry + "\"";
+            }
+        }
+    }
+    out = out + "]";
+    return out;
+}
+
+// Extract one file's tower entry as a JSON object string.
+// Empty string return signals "skip this file" (read or parse
+// failure); the caller drops it from the array.
+fn __extract_file(path: String, name: String) -> String {
+    let src = std::io::fs::read_file(path);
+    if len(src) == 0 { return ""; }
+    let tree = std::ts::parse_go(src);
+    if tree == 0 { return ""; }
+    let root = std::ts::root_node(tree);
+
+    let mut pkg = "?";
+    let mut imports_raw = "";
+
+    let n = std::ts::node_named_child_count(root);
+    let mut i = 0;
+    while i < n {
+        let c = std::ts::node_named_child(root, i);
+        let k = std::ts::node_kind(c);
+        if k == "package_clause" {
+            pkg = __find_package_id(c);
+        }
+        if k == "import_declaration" {
+            imports_raw = imports_raw + __collect_string_literals(c);
+        }
+        i = i + 1;
+    }
+
+    let imports_json = __build_imports_array(imports_raw);
+    return "{\"id\": \"" + name + "\", \"package\": \"" + pkg
+        + "\", \"imports\": " + imports_json + "}";
+}
+
+// True iff `name` ends with ".go". Used to filter list_dir output
+// to Go source files only (skips README.md, go.mod, etc.).
+fn __ends_with_go(name: String) -> Bool {
+    let n = len(name);
+    if n < 3 { return false; }
+    let suffix = name[n-3..n];
+    return suffix == ".go";
+}
+
+// Drive the full extraction. Free fn so early-return on the
+// empty-dir path stays clean (m82 lifecycle bodies don't accept
+// `return`).
+fn __import_graph_drive(dir: String) {
+    let entries = std::io::fs::list_dir(dir);
+    let total = len(entries);
+    if total == 0 {
+        println("{\"files\": [], \"error\": \"empty or unreadable dir\"}");
+        return;
+    }
+
+    let mut json = "{\n  \"dir\": \"" + dir + "\",\n  \"files\": [";
+    let mut first = true;
+    let mut from = 0;
+    while from < total {
+        let rest = entries[from..total];
+        let nl = std::str::index_of(rest, "\n");
+        let mut name = "";
+        if nl < 0 {
+            name = rest;
+            from = total;
+        } else {
+            name = rest[0..nl];
+            from = from + nl + 1;
+        }
+        if len(name) > 0 {
+            if __ends_with_go(name) {
+                let path = dir + "/" + name;
+                let entry = __extract_file(path, name);
+                if len(entry) > 0 {
+                    if first {
+                        json = json + "\n    " + entry;
+                        first = false;
+                    } else {
+                        json = json + ",\n    " + entry;
+                    }
+                }
+            }
+        }
+    }
+    json = json + "\n  ]\n}";
+    println(json);
+}
+
+locus ImportGraphL {
+    params {
+        dir: String = "apps/import-graph/fixture";
+    }
+    run() {
+        __import_graph_drive(self.dir);
+    }
+}
+
+fn main() {
+    let mut dir = "apps/import-graph/fixture";
+    if std::env::args_count() > 1 {
+        dir = std::env::arg(1);
+    }
+    ImportGraphL { dir: dir };
+}

@@ -245,7 +245,20 @@ pub fn build_executable(
     std::fs::write(&runtime_c_path, RUNTIME_C_SOURCE)
         .map_err(|e| CodegenError::Link(format!("write runtime C: {}", e)))?;
 
-    let status = Command::new("clang")
+    // m96: locate the tree-sitter shim staticlib produced by the
+    // sibling `aperio-ts-shim` workspace crate. We don't try to
+    // build it here (cargo handles that when the workspace is
+    // built); we just check both `release/` and `debug/` profile
+    // dirs and pass whichever exists. Linking unconditionally
+    // means a program that doesn't use `std::ts` still pulls in
+    // the shim's symbols; LLVM/clang's GC will drop unreferenced
+    // ones. For ~28 MB of grammar tables that's a non-trivial
+    // size cost but acceptable for v0; if it becomes painful, a
+    // future flag can gate the link on `std::ts` actually being
+    // referenced by the user program.
+    let ts_shim_path = locate_ts_shim_staticlib();
+    let mut clang = Command::new("clang");
+    clang
         .arg(&obj_path)
         .arg(&runtime_c_path)
         .arg("-O2")
@@ -257,7 +270,15 @@ pub fn build_executable(
         // loci?" would entangle the codegen pass with the link
         // step. Cost: one extra dynamic dependency in the
         // resulting binary.
-        .arg("-lpthread")
+        .arg("-lpthread");
+    if let Some(p) = ts_shim_path.as_ref() {
+        clang.arg(p);
+        // Rust staticlibs depend on libdl + libm via libstd.
+        // Adding these unconditionally is harmless when no
+        // staticlib symbols are actually pulled in.
+        clang.arg("-ldl").arg("-lm");
+    }
+    let status = clang
         .arg("-o")
         .arg(output_path)
         .status()
@@ -280,6 +301,43 @@ pub fn build_executable(
 /// (m19 introduces the substrate; m20+ wires it to locus
 /// lifetimes).
 const RUNTIME_C_SOURCE: &str = include_str!("../runtime/lotus_arena.c");
+
+/// m96: find `libaperio_ts_shim.a`, the staticlib produced by the
+/// sibling `aperio-ts-shim` workspace crate. Returns `None` if the
+/// staticlib hasn't been built yet — the user-program link will
+/// then succeed only if the program doesn't actually call any
+/// `std::ts::*` primitive (the externs would resolve to undefined
+/// at link time and clang would error). For the dogfood phase the
+/// workspace target dir is right next to this crate; an installed
+/// `aperio` binary from `cargo install` would need a packaged
+/// substrate, which is a follow-up.
+///
+/// Lookup order: `APERIO_TS_SHIM_A` env var (explicit override),
+/// then `target/release/`, then `target/debug/` relative to the
+/// codegen crate's manifest dir.
+fn locate_ts_shim_staticlib() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("APERIO_TS_SHIM_A") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    // CARGO_MANIFEST_DIR at build time of aperio-codegen is
+    // `<workspace>/crates/aperio-codegen`. Workspace root is two
+    // dirs up.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.parent()?.parent()?;
+    for profile in ["release", "debug"] {
+        let p = workspace
+            .join("target")
+            .join(profile)
+            .join("libaperio_ts_shim.a");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
 
 /// Bundled Aperio source for the stdlib. m73a established the
 /// concat-with-user-source mechanism: the parsed stdlib `Program`
@@ -310,6 +368,12 @@ const STDLIB_AP_SOURCE: &str = concat!(
     include_str!("../runtime/stdlib/test.ap"),
     "\n",
     include_str!("../runtime/stdlib/log.ap"),
+    "\n",
+    // m96: tree-sitter substrate. Standalone — references only
+    // path-call primitives (`std::ts::*`) plus core builtins
+    // (`println`, while, assignment), so order is flexible.
+    // Lands last by convention.
+    include_str!("../runtime/stdlib/ts.ap"),
 );
 
 /// Maps each user-facing stdlib path (locus OR type) to the
@@ -1560,6 +1624,53 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             can_parse_ty,
             None,
         );
+
+        // m96: tree-sitter substrate. extern "C" symbols defined
+        // in `runtime/lotus_treesitter.rs` (compiled into the
+        // sibling `aperio-ts-shim` staticlib). The link step
+        // adds `libaperio_ts_shim.a` so these references resolve.
+        // All handles are i64 (1-based; 0 = absent / failure).
+        // String returns land in the lazy global payload arena.
+        let i64_handle_ty = i64_t;
+        // declare i64 @lotus_ts_parse_go(ptr src)
+        let ts_parse_ty = i64_handle_ty.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_ts_parse_go", ts_parse_ty, None);
+        // declare i64 @lotus_ts_root_node(i64 tree_id)
+        let ts_root_ty = i64_handle_ty.fn_type(&[i64_t.into()], false);
+        self.module
+            .add_function("lotus_ts_root_node", ts_root_ty, None);
+        // declare ptr @lotus_ts_node_kind(i64 node_id)
+        let ts_kind_ty = ptr_t.fn_type(&[i64_t.into()], false);
+        self.module
+            .add_function("lotus_ts_node_kind", ts_kind_ty, None);
+        // declare i64 @lotus_ts_node_child_count(i64 node_id)
+        let ts_count_ty = i64_t.fn_type(&[i64_t.into()], false);
+        self.module
+            .add_function("lotus_ts_node_child_count", ts_count_ty, None);
+        // declare i64 @lotus_ts_node_named_child_count(i64 node_id)
+        self.module
+            .add_function("lotus_ts_node_named_child_count", ts_count_ty, None);
+        // declare i64 @lotus_ts_node_child(i64 node_id, i64 idx)
+        let ts_child_ty =
+            i64_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_ts_node_child", ts_child_ty, None);
+        // declare i64 @lotus_ts_node_named_child(i64 node_id, i64 idx)
+        self.module
+            .add_function("lotus_ts_node_named_child", ts_child_ty, None);
+        // declare i64 @lotus_ts_node_start_byte(i64 node_id)
+        self.module
+            .add_function("lotus_ts_node_start_byte", ts_count_ty, None);
+        // declare i64 @lotus_ts_node_end_byte(i64 node_id)
+        self.module
+            .add_function("lotus_ts_node_end_byte", ts_count_ty, None);
+        // declare ptr @lotus_ts_node_text(i64 node_id)
+        self.module
+            .add_function("lotus_ts_node_text", ts_kind_ty, None);
+        // declare i64 @lotus_ts_node_is_named(i64 node_id)
+        self.module
+            .add_function("lotus_ts_node_is_named", ts_count_ty, None);
     }
 
     /// Mark the program as containing at least one `bus subscribe`
@@ -11909,6 +12020,104 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_can_parse_int(args, scope)?;
                 Ok(())
             }
+            // m96: std::ts::* tree-sitter substrate. All routes
+            // also have expression-position arms below; dropping
+            // the result here is fine for parse-and-discard
+            // patterns (which are unusual but legal).
+            ["std", "ts", "parse_go"] => {
+                let _ = self.lower_std_ts_parse_go(args, scope)?;
+                Ok(())
+            }
+            ["std", "ts", "root_node"] => {
+                let _ = self.lower_std_ts_int1_to_int(
+                    "lotus_ts_root_node",
+                    args,
+                    scope,
+                    "std::ts::root_node",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_kind"] => {
+                let _ = self.lower_std_ts_int1_to_string(
+                    "lotus_ts_node_kind",
+                    args,
+                    scope,
+                    "std::ts::node_kind",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_text"] => {
+                let _ = self.lower_std_ts_int1_to_string(
+                    "lotus_ts_node_text",
+                    args,
+                    scope,
+                    "std::ts::node_text",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_child_count"] => {
+                let _ = self.lower_std_ts_int1_to_int(
+                    "lotus_ts_node_child_count",
+                    args,
+                    scope,
+                    "std::ts::node_child_count",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_named_child_count"] => {
+                let _ = self.lower_std_ts_int1_to_int(
+                    "lotus_ts_node_named_child_count",
+                    args,
+                    scope,
+                    "std::ts::node_named_child_count",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_child"] => {
+                let _ = self.lower_std_ts_int2_to_int(
+                    "lotus_ts_node_child",
+                    args,
+                    scope,
+                    "std::ts::node_child",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_named_child"] => {
+                let _ = self.lower_std_ts_int2_to_int(
+                    "lotus_ts_node_named_child",
+                    args,
+                    scope,
+                    "std::ts::node_named_child",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_start_byte"] => {
+                let _ = self.lower_std_ts_int1_to_int(
+                    "lotus_ts_node_start_byte",
+                    args,
+                    scope,
+                    "std::ts::node_start_byte",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_end_byte"] => {
+                let _ = self.lower_std_ts_int1_to_int(
+                    "lotus_ts_node_end_byte",
+                    args,
+                    scope,
+                    "std::ts::node_end_byte",
+                )?;
+                Ok(())
+            }
+            ["std", "ts", "node_is_named"] => {
+                let _ = self.lower_std_ts_int1_to_int(
+                    "lotus_ts_node_is_named",
+                    args,
+                    scope,
+                    "std::ts::node_is_named",
+                )?;
+                Ok(())
+            }
             // m79: std::time::* aliases. The legacy `time::*`
             // dispatcher above still works; these route to the
             // same lower_time_* implementations under the
@@ -12030,6 +12239,71 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "str", "can_parse_int"] => {
                 self.lower_std_str_can_parse_int(args, scope)
             }
+            // m96: std::ts::* tree-sitter substrate (expression
+            // position). See sibling arms in
+            // `lower_stdlib_path_call` for shape rationale.
+            ["std", "ts", "parse_go"] => self.lower_std_ts_parse_go(args, scope),
+            ["std", "ts", "root_node"] => self.lower_std_ts_int1_to_int(
+                "lotus_ts_root_node",
+                args,
+                scope,
+                "std::ts::root_node",
+            ),
+            ["std", "ts", "node_kind"] => self.lower_std_ts_int1_to_string(
+                "lotus_ts_node_kind",
+                args,
+                scope,
+                "std::ts::node_kind",
+            ),
+            ["std", "ts", "node_text"] => self.lower_std_ts_int1_to_string(
+                "lotus_ts_node_text",
+                args,
+                scope,
+                "std::ts::node_text",
+            ),
+            ["std", "ts", "node_child_count"] => self.lower_std_ts_int1_to_int(
+                "lotus_ts_node_child_count",
+                args,
+                scope,
+                "std::ts::node_child_count",
+            ),
+            ["std", "ts", "node_named_child_count"] => self
+                .lower_std_ts_int1_to_int(
+                    "lotus_ts_node_named_child_count",
+                    args,
+                    scope,
+                    "std::ts::node_named_child_count",
+                ),
+            ["std", "ts", "node_child"] => self.lower_std_ts_int2_to_int(
+                "lotus_ts_node_child",
+                args,
+                scope,
+                "std::ts::node_child",
+            ),
+            ["std", "ts", "node_named_child"] => self.lower_std_ts_int2_to_int(
+                "lotus_ts_node_named_child",
+                args,
+                scope,
+                "std::ts::node_named_child",
+            ),
+            ["std", "ts", "node_start_byte"] => self.lower_std_ts_int1_to_int(
+                "lotus_ts_node_start_byte",
+                args,
+                scope,
+                "std::ts::node_start_byte",
+            ),
+            ["std", "ts", "node_end_byte"] => self.lower_std_ts_int1_to_int(
+                "lotus_ts_node_end_byte",
+                args,
+                scope,
+                "std::ts::node_end_byte",
+            ),
+            ["std", "ts", "node_is_named"] => self.lower_std_ts_int1_to_int(
+                "lotus_ts_node_is_named",
+                args,
+                scope,
+                "std::ts::node_is_named",
+            ),
             // m79: std::time::monotonic alias for expression position.
             // sleep is statement-only; trying to use it in an
             // expression falls through to the catch-all error.
@@ -12415,6 +12689,175 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok((ret_bool.into(), LotusType::Bool))
+    }
+
+    // ---- m96: std::ts (tree-sitter) lowering helpers ----
+    //
+    // The path-call dispatch arms (in `lower_stdlib_path_call`
+    // and `_expr`) route `std::ts::*` to these helpers. Each one
+    // is a thin wrapper over a `lotus_ts_*` extern declared in
+    // `declare_builtins`. Tree and node handles are i64 — 1-based
+    // with 0 as the "absent / failed" sentinel so the Aperio side
+    // can branch on zero without wrestling with Option types.
+
+    /// Lower `std::ts::parse_go(src: String) -> Int`. Returns a
+    /// tree handle (>=1) on success or 0 on failure.
+    fn lower_std_ts_parse_go(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::ts::parse_go takes 1 arg (src), got {}",
+                args.len()
+            )));
+        }
+        let (src_val, src_ty) = self.lower_expr(&args[0], scope)?;
+        if src_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::ts::parse_go: src must be String, got {:?}",
+                src_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_ts_parse_go")
+            .expect("lotus_ts_parse_go declared");
+        let call = self
+            .builder
+            .build_call(f, &[src_val.into()], "ts.parse.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((v, LotusType::Int))
+    }
+
+    /// Single-Int-arg → Int helper. Used by `root_node`, child-
+    /// count, named-child-count, start_byte, end_byte, is_named.
+    /// Picks the extern by name; threads the arg through unchanged.
+    fn lower_std_ts_int1_to_int(
+        &mut self,
+        extern_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        path: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "{} takes 1 arg, got {}",
+                path,
+                args.len()
+            )));
+        }
+        let (v, ty) = self.lower_expr(&args[0], scope)?;
+        if ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: arg must be Int, got {:?}",
+                path, ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function(extern_name)
+            .unwrap_or_else(|| panic!("{} declared", extern_name));
+        let call = self
+            .builder
+            .build_call(f, &[v.into()], "ts.i1.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let r = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((r, LotusType::Int))
+    }
+
+    /// Two-Int-arg → Int helper. Used by `node_child` and
+    /// `node_named_child`.
+    fn lower_std_ts_int2_to_int(
+        &mut self,
+        extern_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        path: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "{} takes 2 args, got {}",
+                path,
+                args.len()
+            )));
+        }
+        let (a, at) = self.lower_expr(&args[0], scope)?;
+        if at != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: arg 0 must be Int, got {:?}",
+                path, at
+            )));
+        }
+        let (b, bt) = self.lower_expr(&args[1], scope)?;
+        if bt != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: arg 1 must be Int, got {:?}",
+                path, bt
+            )));
+        }
+        let f = self
+            .module
+            .get_function(extern_name)
+            .unwrap_or_else(|| panic!("{} declared", extern_name));
+        let call = self
+            .builder
+            .build_call(f, &[a.into(), b.into()], "ts.i2.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let r = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((r, LotusType::Int))
+    }
+
+    /// Single-Int-arg → String helper. Used by `node_kind` and
+    /// `node_text`. The returned pointer is owned by the lazy
+    /// global payload arena (lifetime = program), so the caller
+    /// can stash it anywhere without lifetime concerns — same
+    /// shape as `std::io::fs::read_file`'s String return.
+    fn lower_std_ts_int1_to_string(
+        &mut self,
+        extern_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        path: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "{} takes 1 arg, got {}",
+                path,
+                args.len()
+            )));
+        }
+        let (v, ty) = self.lower_expr(&args[0], scope)?;
+        if ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: arg must be Int, got {:?}",
+                path, ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function(extern_name)
+            .unwrap_or_else(|| panic!("{} declared", extern_name));
+        let call = self
+            .builder
+            .build_call(f, &[v.into()], "ts.s.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let r = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((r, LotusType::String))
     }
 
     /// Lower `std::env::args_count() -> Int`. Returns argc as

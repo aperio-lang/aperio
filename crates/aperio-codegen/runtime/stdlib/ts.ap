@@ -1,0 +1,48 @@
+// Aperio stdlib — std::ts.
+//
+// m96. Tree-sitter substrate. The path-call dispatch in codegen
+// (lower_std_ts_*) routes `std::ts::*` calls to the extern "C"
+// symbols defined in `runtime/lotus_treesitter.rs` (the
+// aperio-ts-shim staticlib). This file is intentionally tiny —
+// most of the surface is path-call primitives, not Aperio source.
+//
+// Shape: tree and node "values" are i64 handles (1-based; 0 ==
+// "absent / failed parse / out of bounds"). The handle-based
+// shape sidesteps Aperio's missing-features (no generics for
+// Option<Node>; no methods on `type` records yet) by leaning on
+// Int return values. Once those features land, a thin Tree /
+// Node locus or type wrapper can be layered on top without
+// breaking this primitive surface.
+//
+// Lifetime: the underlying tree-sitter Tree and the source bytes
+// it was parsed from live for the program's duration. m96 v0
+// doesn't expose a free path. For codebase-onboarding's
+// "parse-N-files-then-render-then-exit" workload that's fine;
+// long-running uses will want a `tree_destroy` follow-up.
+//
+// At v0 only Go is wired (`parse_go`). Other languages slot in as
+// per-language milestones once the Go pipeline is validated.
+
+// __std_ts_walk_print: helper used by examples / tests to print a
+// node's kind plus depth-prefixed indentation. Recursive walk via
+// child_count + child handles. Caps at depth 8 so a deeply nested
+// tree doesn't drown the demo output.
+fn __std_ts_walk_print(node_id: Int, depth: Int) {
+    if node_id == 0 { return; }
+    if depth > 8 { return; }
+    let mut indent = "";
+    let mut i = 0;
+    while i < depth {
+        indent = indent + "  ";
+        i = i + 1;
+    }
+    let k = std::ts::node_kind(node_id);
+    println(indent, "(", k, ")");
+    let n = std::ts::node_named_child_count(node_id);
+    let mut j = 0;
+    while j < n {
+        let c = std::ts::node_named_child(node_id, j);
+        __std_ts_walk_print(c, depth + 1);
+        j = j + 1;
+    }
+}
