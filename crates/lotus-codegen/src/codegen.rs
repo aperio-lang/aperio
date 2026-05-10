@@ -2465,6 +2465,75 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(())
     }
 
+    /// m64: check that each generic param's declared bound (if
+    /// any) is satisfied by the corresponding type arg. v0.1
+    /// recognizes only the `Numeric` bound, which admits Int /
+    /// Float / Decimal / Duration. Unknown bound names error
+    /// clearly so future bounds (e.g., `Eq`, `Ord`,
+    /// `ProjectionClass`) surface a gap rather than passing
+    /// silently. Called from each synthesize_generic_* helper
+    /// before substitution so the check fires on the same code
+    /// path that produces the mangled name.
+    fn check_generic_bounds(
+        template_kind: &str,
+        template_name: &str,
+        params: &[GenericParam],
+        args: &[TypeExpr],
+    ) -> Result<(), CodegenError> {
+        for (gp, arg) in params.iter().zip(args.iter()) {
+            let bound = match &gp.bound {
+                Some(b) => b,
+                None => continue,
+            };
+            let bound_name = match bound {
+                TypeExpr::Named { path, generic_args, .. }
+                    if path.segments.len() == 1
+                        && generic_args.is_empty() =>
+                {
+                    path.segments[0].name.as_str()
+                }
+                _ => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "{} `{}`: bound on `{}` is not a simple \
+                         named bound (only simple names like \
+                         `Numeric` recognized at v0.1)",
+                        template_kind, template_name, gp.name.name
+                    )));
+                }
+            };
+            match bound_name {
+                "Numeric" => {
+                    let ok = matches!(
+                        arg,
+                        TypeExpr::Primitive(
+                            PrimType::Int
+                                | PrimType::Float
+                                | PrimType::Decimal
+                                | PrimType::Duration,
+                            _,
+                        )
+                    );
+                    if !ok {
+                        return Err(CodegenError::Unsupported(format!(
+                            "{} `{}`: type arg for `{}` must satisfy \
+                             `Numeric` bound (Int / Float / Decimal / \
+                             Duration); got non-numeric",
+                            template_kind, template_name, gp.name.name
+                        )));
+                    }
+                }
+                other => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "{} `{}`: unrecognized bound `{}` on `{}` \
+                         (only `Numeric` recognized at v0.1)",
+                        template_kind, template_name, other, gp.name.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// m61: produce the mangled name for a generic instantiation.
     /// `Box<Int>` → `"Box_Int"`, `Pair<Int, String>` →
     /// `"Pair_Int_String"`. Recurses into nested generics so
@@ -2598,6 +2667,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 type_args.len()
             )));
         }
+        Self::check_generic_bounds(
+            "generic locus",
+            &template.name.name,
+            &template.generics,
+            type_args,
+        )?;
         let mut subst: BTreeMap<String, TypeExpr> = BTreeMap::new();
         for (gp, arg) in template.generics.iter().zip(type_args.iter()) {
             subst.insert(gp.name.name.clone(), arg.clone());
@@ -2904,6 +2979,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 type_args.len()
             )));
         }
+        Self::check_generic_bounds(
+            "generic fn",
+            &template.name.name,
+            &template.generics,
+            type_args,
+        )?;
         let mut subst: BTreeMap<String, TypeExpr> = BTreeMap::new();
         for (gp, arg) in template.generics.iter().zip(type_args.iter()) {
             subst.insert(gp.name.name.clone(), arg.clone());
@@ -3412,6 +3493,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 args.len()
             )));
         }
+        // m64: enforce declared bounds (e.g., `T: Numeric`)
+        // before substitution.
+        Self::check_generic_bounds(
+            "generic type",
+            &template.name.name,
+            &template.generics,
+            args,
+        )?;
         let mangled = Self::mangle_generic_name(&template.name.name, args)?;
 
         let mut subst: BTreeMap<String, TypeExpr> = BTreeMap::new();

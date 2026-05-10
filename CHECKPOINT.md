@@ -1,7 +1,34 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m63: generic loci
+in a new session. State as of **m64: `Numeric` bound enforcement
++ generic closures via field-layout substitution**. The
+generics arc now enforces declared bounds at synthesis time:
+`fn add<T: Numeric>(a: T, b: T) -> T { return a + b; }` is
+fine when called with Int / Float / Decimal / Duration args,
+but errors with a clear message when called with String. The
+single new helper `check_generic_bounds(template_kind,
+template_name, params, args)` recognizes the `Numeric` bound
+(at v0.1, the only supported bound) and verifies each arg
+against the corresponding param's declared bound; this hooks
+into all three synthesis paths: `synthesize_generic_instantiation`
+(structs + enums), `synthesize_generic_locus_instantiation`
+(loci), `synthesize_generic_fn_instantiation` (free fns).
+Generic closures: the closure-substitution gap from m63 closes
+via the field-layout path — closure assertions live on the
+locus body, but the actual machinery they read (e.g. self.x
+where x: T) flows through Params substitution which m63
+already handles, so a generic locus with a closure assertion
+referencing a Numeric-bound field synthesizes correctly with
+the substituted layout. v0.1 limits: only the `Numeric` bound
+is recognized; other bound names (e.g. ProjectionClass) parse
+but are not yet enforced (rejection of unrecognized-as-bound
+type names will be tightened when those bounds matter for v1).
+Three new tests in generics.rs: `numeric_bound_admits_int_arg`,
+`numeric_bound_rejects_string_arg`,
+`generic_locus_with_closure_substitutes_via_field_layout`.
+120 tests pass (was 117; +3 from generics.rs); 54 example
+builds unaffected. State before that was **m63: generic loci
 monomorphization**. `locus Cache<K, V> { ... }` declarations
 parse (parser + AST extended), and codegen synthesizes one
 specialized LocusDecl per (template, args) tuple from
@@ -30,16 +57,7 @@ Failure, Closure, Contract, nested Type members of generic
 loci pass through without substitution; bus subscribe ty
 arg substitution works (m63 covers it), lifecycle bodies
 substitute let / let-tuple ascriptions only (mirrors m62
-fn-body shallow walk). Two new tests in generics.rs:
-generic_locus_with_typed_param_default,
-generic_locus_overridden_at_instantiation. Parser change in
-lotus-syntax: `parse_locus_decl` now calls
-`parse_generic_params_opt` after the locus name; AST
-LocusDecl gains a `generics: Vec<GenericParam>` field. One
-LocusDecl construction site in `crates/lotus-runtime/src/bus.rs`
-updated to include the new field. 117 tests pass (was 115;
-+2 from generics.rs); 54 example builds unaffected. State
-before that was **m62: generic free fns** —
+fn-body shallow walk). State before that was **m62: generic free fns** —
 the first generic-fn slice in the generics arc. Codegen now
 accepts `fn first<T>(x: T) -> T { return x; }` declarations
 and synthesizes per-call-site specialized fn bodies on demand.
@@ -2540,38 +2558,26 @@ capacity ceiling — the m45 quickfix `× 32` multiplier is gone.
 
 ### RESUME HERE (next session)
 
-**Generics arc in progress; m61, m61b, m61c, m62, m63 shipped.**
+**Generics arc in progress; m61, m61b, m61c, m62, m63, m64 shipped.**
 Cross-process bus substrate arc closed at m60. Generic
-structs + enums + free fns + loci all monomorphize. Per the
+structs + enums + free fns + loci all monomorphize, with
+`Numeric` bound enforcement at synthesis time. Per the
 user's hard rule, **no code towards trellis-pair until v1
 language is done.**
 
-**Start with m64: `Numeric` bound + generic closures.**
-`T: Numeric` bounds permit arithmetic on T (Int / Float /
-Decimal / Duration). Generic closures (closure assertions
-declared on a generic locus type whose `T` is bound to a
-Numeric) need to lower correctly per substituted T —
-arithmetic ops + comparisons.
-
-The Numeric bound part: parser already accepts
-`<T: Bound>` style via `GenericParam.bound: Option<TypeExpr>`.
-Wire the typechecker (or codegen-side check) to enforce
-that operations like `+`, `-`, `*`, `<` on T are only valid
-when T: Numeric. v0.1 narrow: enforce the bound at the
-substituted-call-site (e.g., when synthesizing
-`Compute<String>` from `Compute<T: Numeric>`, error if String
-isn't Numeric). Tightening into the typechecker is a
-v0.2 polish.
-
-The generic closures part: m61c covered closure substitution
-in non-generic loci (passes through unchanged). For generic
-loci, `substitute_locus_member` currently does NOT handle
-Closure members. Adding support means substituting through
-`ClosureAssertion` expressions (which have l/r/tolerance
-exprs that may reference generic param values via self.X
-fields). Tractable but needs care.
-
-**m65: stdlib `Result<T,E>` / `Option<T>`** as built-ins.
+**Start with m65: stdlib `Result<T,E>` / `Option<T>` as
+built-ins.** Inject `Result<T,E> = enum { Ok(T), Err(E) }`
+and `Option<T> = enum { Some(T), None }` as built-in generic
+enum templates available in every program without explicit
+declaration — programs can write `let r: Result<Int, String>
+= Ok(7);` without declaring `type Result<T,E> = ...` first.
+The injection mirrors the way the runtime injects
+`ClosureViolation` (search codegen for that name to find the
+hook). Once injected, the m61c enum monomorphization path
+handles them like any user-declared generic enum: discovery
+walks call sites, synthesis produces `Result_Int_String` /
+`Option_Int` etc. Tests: a program that uses Result + Option
+without declaring them in source builds and runs.
 
 **Smaller ergonomic gaps still parked (m61d-or-later):**
 - Bare-name struct literal resolution at return statements +
@@ -2701,10 +2707,15 @@ milestones expanded in RESUME HERE above:
   declare/lower passes. Limits: Mode / Failure / Closure /
   Contract / nested Type members pass through without
   substitution at v0.1.
-- **m62** — generic free fns.
-- **m63** — generic loci.
-- **m64** — `Numeric` bound + generic closures.
-- **m65** — stdlib `Result<T,E>` / `Option<T>`.
+- **m64 — DONE (Numeric bound + generic closures via field
+  layout)** — `check_generic_bounds` enforces declared
+  `Numeric` bound at synthesis time across all three paths
+  (struct/enum, locus, free fn): Int / Float / Decimal /
+  Duration accepted, others rejected with a clear message.
+  Generic closures work via the m63 Params substitution path
+  — closure assertions reference fields on substituted layout,
+  no extra Closure-member substitution needed at v0.1.
+- **m65** — stdlib `Result<T,E>` / `Option<T>` as built-ins.
 
 After this arc, scan v1 punch-list for any remaining gaps the
 substrate exposes (multi-peer fanout, Strings cross-process,
@@ -2761,7 +2772,7 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 117 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 120 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
 listener + connector subprocesses; m58 added two more under

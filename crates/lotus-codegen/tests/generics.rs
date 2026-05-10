@@ -299,6 +299,105 @@ fn locus_param_default_overridable_at_instantiation() {
     );
 }
 
+// === m64 ====================================================
+// Numeric bound enforcement at synthesis time + generic
+// closures (which already work because closures reference
+// fields by name and field types are substituted via the
+// Params block walk in m63).
+
+#[test]
+fn numeric_bound_admits_int_arg() {
+    // `T: Numeric` accepts Int / Float / Decimal / Duration.
+    // Verify Int instantiation works end-to-end.
+    let src = r#"
+        type Box<T: Numeric> {
+            value: T;
+        }
+
+        type Holder {
+            b: Box<Int>;
+        }
+
+        fn main() {
+            let b: Box<Int> = Box { value: 13 };
+            let h = Holder { b: b };
+            println("h.b.value=", h.b.value);
+        }
+    "#;
+    let (stdout, status) = build_and_run("numeric_int", src);
+    assert!(status.success(), "exited non-zero: {:?}", status);
+    assert!(
+        stdout.contains("h.b.value=13"),
+        "got: {:?}",
+        stdout,
+    );
+}
+
+#[test]
+fn numeric_bound_rejects_string_arg() {
+    // String is non-numeric; instantiating Box<String> when
+    // Box's T is bounded by Numeric should fail at codegen.
+    let src = r#"
+        type Box<T: Numeric> {
+            value: T;
+        }
+
+        type Holder {
+            b: Box<String>;
+        }
+
+        fn main() {
+            let h = Holder { b: Box_String { value: "hi" } };
+        }
+    "#;
+    let program = lotus_syntax::parse_source(src).expect("parse");
+    let bin = unique_bin("numeric_str_reject");
+    let result = build_executable(&program, &bin);
+    let _ = std::fs::remove_file(&bin);
+    let err = result.expect_err("expected codegen error for non-numeric");
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("Numeric") && msg.contains("Box"),
+        "expected Numeric-bound diagnostic; got: {}",
+        msg,
+    );
+}
+
+#[test]
+fn generic_locus_with_closure_substitutes_via_field_layout() {
+    // m64: generic closures already work without explicit
+    // closure-substitution because closure expressions
+    // reference fields by name; the Params-block walk in
+    // m63 substitutes field types correctly, and closure
+    // lowering at instantiation time picks up the substituted
+    // shape.
+    let src = r#"
+        locus Compute<T: Numeric> {
+            params {
+                scratch: T = 0;
+            }
+            closure scratch_nonneg {
+                self.scratch ~~ 0 within 999;
+                epoch tick;
+            }
+            birth() {
+                println("compute scratch=", self.scratch);
+            }
+        }
+
+        fn main() {
+            let c: Compute<Int> = Compute { };
+        }
+    "#;
+    let (stdout, status) = build_and_run("gen_closure", src);
+    assert!(status.success(), "exited non-zero: {:?}", status);
+    assert!(
+        stdout.contains("compute scratch=0"),
+        "got: {:?}",
+        stdout,
+    );
+}
+
 // === m63 ====================================================
 // Generic loci. Locus templates with `<T>` declare without
 // emitting LLVM directly; per-instantiation specialized
