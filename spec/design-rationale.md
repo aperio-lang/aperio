@@ -15,6 +15,59 @@ grammar parses but *why* it parses that and not something else.
 
 ---
 
+## Foundational axiom: types are for shapes, loci are for flow
+
+Aperio commits to a clean two-primitive split at the
+declaration level:
+
+- **`type`** — a static record. Pure shape. Fields, names,
+  layout. Returnable by value, equal by value, no projection
+  modes, no contracts, no birth/run/dissolve.
+- **`locus`** — dynamic flow. Lifecycle (birth → accept → run
+  → drain → dissolve), contracts (expose / consume), bus
+  participation (publish / subscribe), projection (resolution
+  / harmonic / bulk views over the same instance).
+
+If a thing has lifecycle, it is a locus. If it is pure data,
+it is a type. There is no third category at v0; the split is
+clean.
+
+**Recursive principle.** Loci are the fundamental building
+block at every layer of an Aperio program: an app is a locus;
+a library namespace is a locus (empty `params { }`, only
+methods — the namespace-lotus pattern); a long-running
+service is a locus; a goroutine-equivalent is a locus; a bus
+subscriber is a locus; an HTTP-handler is a locus; a cache /
+pool / pipeline / queue is a locus. **Inside any locus,
+behavior is itself a locus tower one layer down.** The
+recursion bottoms at primitive operations (arithmetic, single
+field reads, primitive calls). Everything above the floor is
+loci nested in loci.
+
+This axiom underlies most of the per-construct rationale that
+follows: every section answers some shape of *"why is this
+piece of locus syntax in the language?"* The answer, in every
+case, is that flow needs lifecycle / contracts / projection /
+recovery, and locus is the syntactic surface those four
+attach to. Type declarations need none of that — they are
+pure shape — so they have a separate, much simpler surface
+(see also `spec/types.md`).
+
+The axiom also explains a load-bearing decision in the
+codebase-onboarder (`notes/codebase-onboarding-design.md`):
+when extracting Aperio source from a foreign codebase,
+**cross-tower agreement = locus identity**. A node-name that
+appears in ≥ 2 of {operational, harmonic, domain} towers is
+emitted as a locus in the absorbed source; a node-name that
+appears in only one tower is a type, a free fn, or a comment.
+Cross-tower coincidence does the inventing — the absorber
+never synthesizes loci that aren't already implied by the
+foreign code's own emergent structure.
+
+Full design note: `notes/aperio-types-vs-loci.md`.
+
+---
+
 ## 0. Surface language: Go-shaped
 
 **Commits to.** Familiar syntax for engineers; braces for blocks;

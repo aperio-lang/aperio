@@ -49,6 +49,40 @@ Fractal-with-discipline. Pick any axis — space, time, visibility,
 failure, projection, communication — and the same structure is
 there. That is what substrate-invariance means in practice.
 
+## Inward, too
+
+The shape doesn't just spread *across* axes. It also descends
+*into* every locus. A locus's body is itself a lotus tower one
+layer down — its methods, its contracts, its sub-tasks, its
+lifecycle steps each have the same shape. A cache locus is
+not flat. Its `lookup` flow has its own birth (acquire lock),
+run (probe + return), dissolve (release lock); its `evict`
+flow has its own; the methods are siblings under one parent
+that is the cache itself.
+
+There is no level at which the recursion stops because there is
+no level at which "structure with lifecycle" stops. It bottoms
+out at primitive operations — arithmetic, single field reads,
+primitive calls. Everything above that floor is loci nested in
+loci.
+
+This is the directive that makes the language coherent with
+itself: the rules you learn at the app level reappear at the
+service level reappear at the method level reappear at the
+sub-flow level. **Pick any granularity, the discipline is the
+same.** Aperio is not a language with a special outer layer
+called "the framework." The framework's primitives *are* the
+language's primitives all the way down.
+
+The corollary, easy to miss until you've held it for a while:
+**types are for shapes; loci are for flow.** A `type` records a
+fact — the layout of some data. A `locus` records a motion — the
+flow that touches that data. Every part of an Aperio program is
+one or the other; there is no third category, no leaky middle
+ground. Once you can split a problem into "what's the shape" and
+"what's the flow," the syntax assigns each part its construct,
+and the lotus tower assembles itself.
+
 ## A new dimension across the wire
 
 When two Aperio apps meet, they are not strangers exchanging bytes.

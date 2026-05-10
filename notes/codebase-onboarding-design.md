@@ -57,6 +57,48 @@ same artifact under three modes; that experience IS Aperio's
 mental model, internalized through their own code rather than
 through a tutorial.**
 
+### Cross-tower agreement = locus identity
+
+The three towers are independent extractions, but they describe
+*one* underlying codebase. When the same source entity surfaces
+in multiple towers, that coincidence is the **signal** of
+locus-ness. Per the foundational axiom *types are for shapes,
+loci are for flow* (`notes/aperio-types-vs-loci.md`), the join
+layer that produces absorbed Aperio source obeys this rule:
+
+- **Node-name with ≥ 2 tower roles → emit as a locus.** It
+  appears in the operational tower as an entrypoint / handler /
+  spawn-target *and* in the import-graph tower as the originator
+  of certain dependencies, *or* in the domain tower as a named
+  entity with a motion-form. Cross-tower coincidence means the
+  codebase itself treats this thing as having flow.
+- **Node-name with exactly 1 tower role → emit as a type, free
+  fn, or structural comment.** Single-tower presence is a leaf
+  artifact, not a locus. A pure-data struct with no operational
+  signature is a `type`. A free function with no concurrent /
+  handler / lifecycle role is `fn`.
+- **Three-tower agreement → emit as a locus AND surface its
+  motion-form** (from the bulk tower) as a `// motion: ...`
+  comment until Aperio has a first-class metadata slot. This
+  is the strongest signal: the codebase explicitly names this
+  thing.
+
+The join layer **never invents loci**. Cross-tower coincidence
+does the inventing. The absorber's job is to detect agreement,
+not to impose structure.
+
+**Naming convention.** When a locus is emitted, its name comes
+from the operational tower's role (entrypoint / handler / spawn-
+target name) with an `L` suffix per the apps-are-loci rule.
+The motion-form goes in a comment, never in the name — names
+are the codebase's, not the extractor's.
+
+**Internal behavior is itself a tower.** When a locus is
+identified, its body — methods, lifecycle steps, child loci,
+sub-flows — gets extracted as a sub-tower one layer down (per
+the recursive principle). The recursion bottoms out at primitive
+operations.
+
 ### Operational lotus (resolution mode)
 
 The runtime / process model. What entities have lifecycles?
