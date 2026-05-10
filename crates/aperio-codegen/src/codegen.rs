@@ -1316,6 +1316,54 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let tcp_close_ty = i32_t.fn_type(&[i32_t.into()], false);
         self.module
             .add_function("lotus_tcp_close_fd", tcp_close_ty, None);
+
+        // m75: filesystem primitives reachable from Aperio source
+        // via the `std::io::fs::*` magic-path calls. The C-level
+        // surface is in lotus_arena.c (m74 ship); these
+        // declarations let codegen emit calls into them.
+
+        // declare i64 @lotus_fs_read_file(ptr path, ptr out_buf, i64 out_cap)
+        // returns bytes read (>=0) or -1.
+        let fs_read_ty =
+            i64_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_fs_read_file", fs_read_ty, None);
+
+        // declare i32 @lotus_fs_write_file(ptr path, ptr buf, i64 len)
+        // returns 0 or -1.
+        let fs_write_ty =
+            i32_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_fs_write_file", fs_write_ty, None);
+
+        // declare i64 @lotus_fs_file_size(ptr path)
+        // returns size or -1.
+        let fs_size_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_file_size", fs_size_ty, None);
+
+        // declare i32 @lotus_fs_file_exists(ptr path)
+        // returns 0 or 1.
+        let fs_exists_ty = i32_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_file_exists", fs_exists_ty, None);
+
+        // declare ptr @lotus_bus_payload_arena_alloc(i64 size, i64 align)
+        // m70 lazy global arena for cross-call buffer ownership.
+        // read_file uses this to allocate the returned String
+        // since the buffer must outlive the call frame.
+        let arena_alloc_ty =
+            ptr_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        self.module.add_function(
+            "lotus_bus_payload_arena_alloc",
+            arena_alloc_ty,
+            None,
+        );
+
+        // declare i64 @lotus_str_len(ptr s)
+        // (already declared earlier in this fn for String ops; re-
+        // declaration via add_function would be a duplicate symbol
+        // so we skip — codegen reuses the existing one.)
     }
 
     /// Mark the program as containing at least one `bus subscribe`
@@ -11186,6 +11234,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_tcp_close_fd(args, scope)?;
                 Ok(())
             }
+            ["std", "io", "fs", "read_file"] => {
+                let _ = self.lower_std_io_fs_read_file(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "fs", "write_file"] => {
+                let _ = self.lower_std_io_fs_write_file(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "fs", "file_size"] => {
+                let _ = self.lower_std_io_fs_file_size(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "fs", "file_exists"] => {
+                let _ = self.lower_std_io_fs_file_exists(args, scope)?;
+                Ok(())
+            }
             _ => Err(CodegenError::Unsupported(format!(
                 "stdlib path `{}` — not implemented",
                 segs.join("::")
@@ -11210,6 +11274,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "io", "tcp", "__close_fd"] => {
                 self.lower_std_io_tcp_close_fd(args, scope)
+            }
+            ["std", "io", "fs", "read_file"] => {
+                self.lower_std_io_fs_read_file(args, scope)
+            }
+            ["std", "io", "fs", "write_file"] => {
+                self.lower_std_io_fs_write_file(args, scope)
+            }
+            ["std", "io", "fs", "file_size"] => {
+                self.lower_std_io_fs_file_size(args, scope)
+            }
+            ["std", "io", "fs", "file_exists"] => {
+                self.lower_std_io_fs_file_exists(args, scope)
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "stdlib path `{}` in expression position — not implemented",
@@ -11357,6 +11433,298 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_int_s_extend(conn_i32, i64_t, "conn.i64")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok((conn_i64.into(), LotusType::Int))
+    }
+
+    /// Lower `std::io::fs::read_file(path: String) -> String`.
+    /// Two-phase: stat the file to learn its size, allocate a
+    /// (size+1)-byte buffer in the lazy global payload arena
+    /// (so the resulting String outlives the call frame), then
+    /// read into it and NUL-terminate at the actual bytes-read
+    /// offset. If the file is missing or unreadable, both
+    /// file_size and read_file return -1; we clamp to 0 and
+    /// hand back an empty String. Callers that need to
+    /// distinguish "empty file" from "missing file" use
+    /// `std::io::fs::file_exists` first.
+    fn lower_std_io_fs_read_file(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_file takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_file: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let i8_t = self.context.i8_type();
+        let i64_t = self.context.i64_type();
+        let zero64 = i64_t.const_zero();
+        let one64 = i64_t.const_int(1, false);
+
+        // 1. Get the file size.
+        let size_fn = self
+            .module
+            .get_function("lotus_fs_file_size")
+            .expect("lotus_fs_file_size declared");
+        let size_call = self
+            .builder
+            .build_call(size_fn, &[path_val.into()], "fs.size")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let raw_size = size_call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+
+        // 2. Clamp negative size to 0 so the alloc/read paths
+        //    proceed without a separate error branch.
+        let is_neg = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                raw_size,
+                zero64,
+                "size.neg",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let safe_size = self
+            .builder
+            .build_select(is_neg, zero64, raw_size, "size.safe")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let alloc_size = self
+            .builder
+            .build_int_add(safe_size, one64, "alloc.size")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // 3. Allocate (size+1) bytes in the lazy global arena.
+        let alloc_fn = self
+            .module
+            .get_function("lotus_bus_payload_arena_alloc")
+            .expect("lotus_bus_payload_arena_alloc declared");
+        let buf_call = self
+            .builder
+            .build_call(
+                alloc_fn,
+                &[alloc_size.into(), one64.into()],
+                "fs.buf",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let buf_ptr = buf_call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr")
+            .into_pointer_value();
+
+        // 4. Read into the buffer.
+        let read_fn = self
+            .module
+            .get_function("lotus_fs_read_file")
+            .expect("lotus_fs_read_file declared");
+        let read_call = self
+            .builder
+            .build_call(
+                read_fn,
+                &[path_val.into(), buf_ptr.into(), safe_size.into()],
+                "fs.read",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let raw_n = read_call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+
+        // 5. Clamp bytes-read to 0 for negative returns.
+        let n_neg = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                raw_n,
+                zero64,
+                "n.neg",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let safe_n = self
+            .builder
+            .build_select(n_neg, zero64, raw_n, "n.safe")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+
+        // 6. NUL-terminate at offset safe_n.
+        let nul_ptr = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, buf_ptr, &[safe_n], "nul.ptr")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.builder
+            .build_store(nul_ptr, i8_t.const_zero())
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        Ok((buf_ptr.into(), LotusType::String))
+    }
+
+    /// Lower `std::io::fs::write_file(path: String, content:
+    /// String) -> Int`. Returns 0 on success, -1 on error.
+    /// Truncates any existing file. Length is computed from
+    /// the content's String pointer via lotus_str_len (Aperio
+    /// Strings are NUL-terminated in memory).
+    fn lower_std_io_fs_write_file(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::write_file takes 2 args (path, content), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::write_file: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let (content_val, content_ty) = self.lower_expr(&args[1], scope)?;
+        if content_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::write_file: content must be String, got {:?}",
+                content_ty
+            )));
+        }
+        let i64_t = self.context.i64_type();
+
+        // strlen(content) → i64 length on the wire.
+        let len_fn = self
+            .module
+            .get_function("lotus_str_len")
+            .expect("lotus_str_len declared");
+        let len_call = self
+            .builder
+            .build_call(len_fn, &[content_val.into()], "wf.len")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let len_i64 = len_call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+
+        let write_fn = self
+            .module
+            .get_function("lotus_fs_write_file")
+            .expect("lotus_fs_write_file declared");
+        let write_call = self
+            .builder
+            .build_call(
+                write_fn,
+                &[path_val.into(), content_val.into(), len_i64.into()],
+                "fs.write.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i32 = write_call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let ret_i64 = self
+            .builder
+            .build_int_s_extend(ret_i32, i64_t, "wf.ret.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((ret_i64.into(), LotusType::Int))
+    }
+
+    /// Lower `std::io::fs::file_size(path: String) -> Int`.
+    /// Returns the byte size or -1 on error.
+    fn lower_std_io_fs_file_size(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::file_size takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::file_size: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_fs_file_size")
+            .expect("lotus_fs_file_size declared");
+        let call = self
+            .builder
+            .build_call(f, &[path_val.into()], "fs.size.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let size_i64 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+        Ok((size_i64.into(), LotusType::Int))
+    }
+
+    /// Lower `std::io::fs::file_exists(path: String) -> Bool`.
+    /// Returns true if the path exists, false otherwise.
+    fn lower_std_io_fs_file_exists(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::file_exists takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::file_exists: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let i1_t = self.context.bool_type();
+        let f = self
+            .module
+            .get_function("lotus_fs_file_exists")
+            .expect("lotus_fs_file_exists declared");
+        let call = self
+            .builder
+            .build_call(f, &[path_val.into()], "fs.exists.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i32 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        // Truncate i32 0/1 to i1 for Aperio Bool.
+        let ret_bool = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                ret_i32,
+                i32_t.const_zero(),
+                "exists.bool",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let _ = i1_t; // silence unused warning if any
+        Ok((ret_bool.into(), LotusType::Bool))
     }
 
     /// Lower `std::io::tcp::__close_fd(fd: Int) -> Int`. Returns
