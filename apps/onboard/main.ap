@@ -404,7 +404,19 @@ fn __render_unknowns(unknowns: String) -> String {
 
 fn __drive(dir: String, flavor: String) {
     let lang = std::lang::Lang { flavor: flavor };
-    let r = std::lang::Morpheme { flavor: flavor };
+
+    // Per-codebase overrides: an agent driving the session
+    // resolves <unknown:X> markers and writes its decisions to
+    // `<dir>/.aperio-overrides`. We pick that up automatically
+    // and pass to the morpheme rewriter so subsequent runs
+    // honor agent-resolved vocabulary without contaminating
+    // the universal seed.
+    let overrides_path = dir + "/.aperio-overrides";
+    let mut overrides_text = "";
+    if std::io::fs::file_exists(overrides_path) {
+        overrides_text = std::io::fs::read_file(overrides_path);
+    }
+    let r = std::lang::Morpheme { flavor: flavor, overrides: overrides_text };
     let entries = std::io::fs::list_dir(dir);
     let total = len(entries);
     if total == 0 {
@@ -415,6 +427,9 @@ fn __drive(dir: String, flavor: String) {
     println("============================================================");
     println("  Aperio recognition: ", dir);
     println("  flavor: ", flavor);
+    if len(overrides_text) > 0 {
+        println("  overrides: .aperio-overrides loaded (", len(overrides_text), " bytes)");
+    }
     println("============================================================");
     println("");
 
