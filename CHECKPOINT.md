@@ -1,7 +1,24 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m68: typechecker
+in a new session. State as of **m69: multi-peer fanout
+verified end-to-end**. The cross-process bus's
+`lotus_bus_remote_fanout` already iterated all CONNECT-role
+entries on a subject and dispatched to each, so multi-peer
+fanout is implicit substrate behavior — but no test had ever
+locked it in. m69 adds a two-subscriber + one-publisher end-
+to-end test where the publisher's config has TWO
+`evt = unix://... : connect` lines on the same subject;
+both subscriber processes receive the published Ping and
+print the sentinel value. No code changes (the implementation
+was already correct); only verification + a regression-guard
+test. The m58 punch-list note about "hardcoded one peer" was
+accurate at the time of writing but had since been resolved
+by the natural shape of `lotus_bus_remote_fanout`'s iteration
+loop. One new test in bus_subscriber.rs:
+`publisher_fans_out_to_two_connect_peers`. 131 tests pass
+(was 130; +1 from bus_subscriber.rs); 54 example builds
+unaffected. State before that was **m68: typechecker
 exhaustiveness recognizes synthesized-monomorph match arms**.
 For a scrutinee typed as a generic enum template (e.g.
 `Result<T,E>`, which the typechecker sees as the bare `Result`
@@ -2657,12 +2674,11 @@ substrate exposes, then close those before calling v1 done.**
 Candidate gaps in priority order (none currently blocking; pick
 based on whichever workload-shaped example pushes hardest):
 
-1. **Multi-peer fanout per subject (m58 hardcoded one peer).**
-   Cross-process bus currently registers exactly one CONNECT-
-   role peer per subject; m58's `lotus_bus_remote_register`
-   stores a single `peer_url`. Lifting to a Vec<peer_url> means
-   `lotus_bus_remote_fanout` iterates and sends to each. Needed
-   for any v1 deployment with one publisher → many subscribers.
+1. **Multi-peer fanout per subject — DONE (m69, verification
+   only).** The existing iteration loop in
+   `lotus_bus_remote_fanout` already handled multiple CONNECT
+   entries on the same subject; m69 adds a two-subscriber +
+   one-publisher e2e regression test that locks it in.
 
 2. **String fields in cross-process bus payloads.** m60's
    identity serializer can't follow String pointers across the
@@ -2894,7 +2910,7 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 130 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 131 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
 listener + connector subprocesses; m58 added two more under

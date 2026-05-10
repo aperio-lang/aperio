@@ -199,3 +199,162 @@ fn two_lotus_binaries_round_trip_a_publish() {
         String::from_utf8_lossy(&pub_out.stderr),
     );
 }
+
+#[test]
+fn publisher_fans_out_to_two_connect_peers() {
+    // m69: a publisher with TWO `subject = url : connect` lines
+    // (same subject, distinct unix sockets) should fan out a
+    // single publish to both peers. The existing
+    // lotus_bus_remote_fanout iterates the remote-entries table
+    // and dispatches to every CONNECT-role entry whose subject
+    // matches; this test locks in that multi-peer behavior end-
+    // to-end (was always-true substrate, never asserted before
+    // m69).
+    let sentinel: i64 = 0x1122_3344_5566_7788;
+
+    let subscriber_src = r#"
+        type Ping {
+            n: Int;
+        }
+
+        locus Sub {
+            bus {
+                subscribe "evt" as on_evt of type Ping;
+            }
+            fn on_evt(p: Ping) {
+                println("subscriber got n=", p.n);
+            }
+        }
+
+        fn main() {
+            Sub { };
+            time::sleep(500ms);
+            yield;
+        }
+    "#;
+
+    let publisher_src = format!(
+        r#"
+        type Ping {{
+            n: Int;
+        }}
+
+        locus Sub {{
+            bus {{
+                subscribe "evt" as on_evt of type Ping;
+            }}
+            fn on_evt(p: Ping) {{
+                println("publisher local got n=", p.n);
+            }}
+        }}
+
+        locus Pub {{
+            bus {{
+                publish "evt" of type Ping;
+            }}
+            birth() {{
+                "evt" <- Ping {{ n: {} }};
+            }}
+        }}
+
+        fn main() {{
+            Sub {{ }};
+            Pub {{ }};
+        }}
+    "#,
+        sentinel,
+    );
+
+    let sub_bin = build_binary(subscriber_src, "fanout-sub");
+    let pub_bin = build_binary(&publisher_src, "fanout-pub");
+
+    let sock_a = unique_path("fanout-a", "sock");
+    let sock_b = unique_path("fanout-b", "sock");
+    let sub_a_cfg = unique_path("fanout-suba", "conf");
+    let sub_b_cfg = unique_path("fanout-subb", "conf");
+    let pub_cfg = unique_path("fanout-pub", "conf");
+    std::fs::write(
+        &sub_a_cfg,
+        format!("evt = unix://{} : listen\n", sock_a.display()),
+    )
+    .expect("write sub A cfg");
+    std::fs::write(
+        &sub_b_cfg,
+        format!("evt = unix://{} : listen\n", sock_b.display()),
+    )
+    .expect("write sub B cfg");
+    std::fs::write(
+        &pub_cfg,
+        format!(
+            "evt = unix://{} : connect\nevt = unix://{} : connect\n",
+            sock_a.display(),
+            sock_b.display(),
+        ),
+    )
+    .expect("write pub cfg");
+
+    let sub_a = Command::new(&sub_bin)
+        .env("LOTUS_BUS_CONFIG", &sub_a_cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn subscriber A");
+    let sub_b = Command::new(&sub_bin)
+        .env("LOTUS_BUS_CONFIG", &sub_b_cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn subscriber B");
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    let pub_out = Command::new(&pub_bin)
+        .env("LOTUS_BUS_CONFIG", &pub_cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run publisher");
+
+    let a_out = sub_a.wait_with_output().expect("subscriber A wait");
+    let b_out = sub_b.wait_with_output().expect("subscriber B wait");
+
+    let _ = std::fs::remove_file(&sock_a);
+    let _ = std::fs::remove_file(&sock_b);
+    let _ = std::fs::remove_file(&sub_a_cfg);
+    let _ = std::fs::remove_file(&sub_b_cfg);
+    let _ = std::fs::remove_file(&pub_cfg);
+    let _ = std::fs::remove_file(&sub_bin);
+    let _ = std::fs::remove_file(&pub_bin);
+
+    assert!(
+        pub_out.status.success(),
+        "publisher exited non-zero: {:?}\nstdout: {}\nstderr: {}",
+        pub_out.status,
+        String::from_utf8_lossy(&pub_out.stdout),
+        String::from_utf8_lossy(&pub_out.stderr),
+    );
+    assert!(
+        a_out.status.success() && b_out.status.success(),
+        "subscriber non-zero: A={:?} B={:?}\nA stderr: {}\nB stderr: {}",
+        a_out.status,
+        b_out.status,
+        String::from_utf8_lossy(&a_out.stderr),
+        String::from_utf8_lossy(&b_out.stderr),
+    );
+
+    let expected = format!("subscriber got n={}", sentinel);
+    let a_stdout = String::from_utf8_lossy(&a_out.stdout);
+    let b_stdout = String::from_utf8_lossy(&b_out.stdout);
+    assert!(
+        a_stdout.contains(&expected),
+        "subscriber A missing expected line '{}'; got: {:?}",
+        expected,
+        a_stdout,
+    );
+    assert!(
+        b_stdout.contains(&expected),
+        "subscriber B missing expected line '{}'; got: {:?}",
+        expected,
+        b_stdout,
+    );
+}
