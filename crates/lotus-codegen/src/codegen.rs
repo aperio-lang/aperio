@@ -1793,11 +1793,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // would synthesize both `Pair_Int_String` and
         // `Box_Pair_Int_String` (parser `>>` ambiguity is a
         // separate gap; the codegen substrate is ready).
-        let generic_type_decls: BTreeMap<String, TypeDecl> = type_decls
+        let mut generic_type_decls: BTreeMap<String, TypeDecl> = type_decls
             .iter()
             .filter(|t| !t.generics.is_empty())
             .map(|t| (t.name.name.clone(), t.clone()))
             .collect();
+        // m65: inject built-in stdlib generics (Result, Option) so
+        // programs can reference them without an explicit `type`
+        // declaration. User-written `type Result<...>` /
+        // `type Option<...>` decls take precedence (existing entry
+        // kept) — this keeps the door open for stdlib customization
+        // in a future tooling milestone but doesn't fight the user
+        // today.
+        for builtin in Self::builtin_generic_type_decls() {
+            generic_type_decls
+                .entry(builtin.name.name.clone())
+                .or_insert(builtin);
+        }
         // m63: collect generic locus templates from the program.
         // Loci with non-empty `generics` get registered here so
         // discovery can route their TypeExpr uses through the
@@ -2367,6 +2379,74 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 field_order,
             },
         );
+    }
+
+    /// m65: synthesize the built-in stdlib generic enums
+    /// `Result<T, E>` and `Option<T>` as TypeDecls so programs
+    /// can reference them without an explicit `type` declaration.
+    /// They flow through the same m61c generic-enum
+    /// monomorphization path as user-declared generics: discovery
+    /// walks call sites and field types, synthesis produces e.g.
+    /// `Result_Int_String` / `Option_Int`, and the path-call
+    /// constructor (`Result_Int_String::Ok(...)`) lights up
+    /// automatically. Returned with synthetic spans (0,0); they
+    /// never surface in diagnostics because templates with
+    /// non-empty generics aren't lowered directly — only their
+    /// concrete instantiations are.
+    fn builtin_generic_type_decls() -> Vec<TypeDecl> {
+        let span = lotus_syntax::span::Span::new(0, 0);
+        let mk_ident = |s: &str| Ident {
+            name: s.to_string(),
+            span,
+        };
+        let mk_t = |name: &str| TypeExpr::Named {
+            path: QualifiedName {
+                segments: vec![mk_ident(name)],
+                span,
+            },
+            generic_args: Vec::new(),
+            span,
+        };
+        let mk_param = |name: &str| GenericParam {
+            name: mk_ident(name),
+            bound: None,
+            span,
+        };
+        let result_decl = TypeDecl {
+            name: mk_ident("Result"),
+            generics: vec![mk_param("T"), mk_param("E")],
+            body: TypeDeclBody::Enum(vec![
+                EnumVariant {
+                    name: mk_ident("Ok"),
+                    fields: vec![mk_t("T")],
+                    span,
+                },
+                EnumVariant {
+                    name: mk_ident("Err"),
+                    fields: vec![mk_t("E")],
+                    span,
+                },
+            ]),
+            span,
+        };
+        let option_decl = TypeDecl {
+            name: mk_ident("Option"),
+            generics: vec![mk_param("T")],
+            body: TypeDeclBody::Enum(vec![
+                EnumVariant {
+                    name: mk_ident("Some"),
+                    fields: vec![mk_t("T")],
+                    span,
+                },
+                EnumVariant {
+                    name: mk_ident("None"),
+                    fields: Vec::new(),
+                    span,
+                },
+            ]),
+            span,
+        };
+        vec![result_decl, option_decl]
     }
 
     /// Pass A0: declare a user `type` decl as an LLVM struct type.

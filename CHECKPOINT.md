@@ -1,7 +1,28 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m64: `Numeric` bound enforcement
+in a new session. State as of **m65: stdlib `Result<T,E>` /
+`Option<T>` as built-in generic enums**. Programs can now
+reference `Result<Int, String>` or `Option<Int>` (in field
+positions, let ascriptions, fn signatures, locus signatures —
+anywhere discovery walks) without an explicit `type Result<...>` /
+`type Option<...>` declaration in source. Codegen helper
+`builtin_generic_type_decls` returns synthetic TypeDecls for
+`Result<T,E> = enum { Ok(T), Err(E) }` and
+`Option<T> = enum { Some(T), None }`; `lower_program` injects
+them into the `generic_type_decls` map via `entry().or_insert()`
+so user-written declarations of the same name take precedence
+(keeps the door open for stdlib customization). Construction
+goes via the m61c path-call form: `Result_Int_String::Ok(7)`,
+`Option_Int::None`, etc., once discovery has triggered
+synthesis. Four new tests in generics.rs:
+`builtin_result_generic_used_without_declaration`,
+`builtin_option_generic_used_without_declaration`,
+`builtin_result_and_option_coexist`,
+`user_result_decl_takes_precedence_over_builtin`. 124 tests
+pass (was 120; +4 from generics.rs); 54 example builds
+unaffected. **Generics arc m61–m65 closed.** State before
+that was **m64: `Numeric` bound enforcement
 + generic closures via field-layout substitution**. The
 generics arc now enforces declared bounds at synthesis time:
 `fn add<T: Numeric>(a: T, b: T) -> T { return a + b; }` is
@@ -2558,26 +2579,56 @@ capacity ceiling — the m45 quickfix `× 32` multiplier is gone.
 
 ### RESUME HERE (next session)
 
-**Generics arc in progress; m61, m61b, m61c, m62, m63, m64 shipped.**
-Cross-process bus substrate arc closed at m60. Generic
-structs + enums + free fns + loci all monomorphize, with
-`Numeric` bound enforcement at synthesis time. Per the
+**Generics arc closed (m61, m61b, m61c, m62, m63, m64, m65 all
+shipped).** Cross-process bus substrate arc closed at m60.
+Generic structs + enums + free fns + loci all monomorphize,
+with `Numeric` bound enforcement at synthesis time, and
+`Result<T,E>` / `Option<T>` available as built-ins. Per the
 user's hard rule, **no code towards trellis-pair until v1
 language is done.**
 
-**Start with m65: stdlib `Result<T,E>` / `Option<T>` as
-built-ins.** Inject `Result<T,E> = enum { Ok(T), Err(E) }`
-and `Option<T> = enum { Some(T), None }` as built-in generic
-enum templates available in every program without explicit
-declaration — programs can write `let r: Result<Int, String>
-= Ok(7);` without declaring `type Result<T,E> = ...` first.
-The injection mirrors the way the runtime injects
-`ClosureViolation` (search codegen for that name to find the
-hook). Once injected, the m61c enum monomorphization path
-handles them like any user-declared generic enum: discovery
-walks call sites, synthesis produces `Result_Int_String` /
-`Option_Int` etc. Tests: a program that uses Result + Option
-without declaring them in source builds and runs.
+**Start by scanning the v1 punch-list for remaining gaps the
+substrate exposes, then close those before calling v1 done.**
+Candidate gaps in priority order (none currently blocking; pick
+based on whichever workload-shaped example pushes hardest):
+
+1. **Multi-peer fanout per subject (m58 hardcoded one peer).**
+   Cross-process bus currently registers exactly one CONNECT-
+   role peer per subject; m58's `lotus_bus_remote_register`
+   stores a single `peer_url`. Lifting to a Vec<peer_url> means
+   `lotus_bus_remote_fanout` iterates and sends to each. Needed
+   for any v1 deployment with one publisher → many subscribers.
+
+2. **String fields in cross-process bus payloads.** m60's
+   identity serializer can't follow String pointers across the
+   process boundary — copies the pointer bytes raw, which the
+   peer can't dereference. Needs a real wire format: field-by-
+   field little-endian + length-prefixed Strings + schema
+   versioning. The serializer/deserializer hook shape from m60
+   already routes through; this is a body-only change.
+
+3. **Bare-name resolution at return + struct-field-init sites
+   (m61d).** Currently `let h: Holder<Int> = Holder { ... };`
+   rewrites the bare name; `return Holder { ... };` and
+   `Outer { inner: Holder { ... } }` don't. Tractable; needs
+   walker extensions.
+
+4. **Parser `>>` ambiguity for nested generics
+   (`Box<Box<Int>>`).** Codegen substrate is nested-aware via
+   the m63 fixpoint queue; only the parser tokenizes `>>` as
+   `Shr`. A targeted fixup in the type-arg-list parser would
+   close it.
+
+5. **Typechecker exhaustiveness against synthesized enum
+   monomorphs.** Match arms over `Result_Int_String` currently
+   need a wildcard `_` arm because the typechecker sees only
+   the `Result` template. Codegen-side exhaustiveness check
+   over the synthesized variant set is a tighter substitute
+   than full typechecker integration.
+
+Once the gaps that v1 actually *requires* are closed — **call
+v1**, then trellis-pair / multi-binary build / release
+artifacts come next, in that order.
 
 **Smaller ergonomic gaps still parked (m61d-or-later):**
 - Bare-name struct literal resolution at return statements +
@@ -2715,7 +2766,15 @@ milestones expanded in RESUME HERE above:
   Generic closures work via the m63 Params substitution path
   — closure assertions reference fields on substituted layout,
   no extra Closure-member substitution needed at v0.1.
-- **m65** — stdlib `Result<T,E>` / `Option<T>` as built-ins.
+- **m65 — DONE (stdlib `Result<T,E>` / `Option<T>` as built-
+  ins)** — `builtin_generic_type_decls` returns synthetic
+  TypeDecls injected into `generic_type_decls` via
+  `entry().or_insert()`, so user-written `type Result<...>` /
+  `type Option<...>` declarations take precedence. Once
+  injected, they flow through the m61c enum monomorphization
+  path — programs can use `Result<Int,String>` /
+  `Option<Int>` (in field positions, let ascriptions, fn /
+  locus signatures) without declaring them in source.
 
 After this arc, scan v1 punch-list for any remaining gaps the
 substrate exposes (multi-peer fanout, Strings cross-process,
@@ -2772,7 +2831,7 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 120 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 124 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
 listener + connector subprocesses; m58 added two more under
