@@ -281,7 +281,7 @@ pub fn build_executable(
 /// lifetimes).
 const RUNTIME_C_SOURCE: &str = include_str!("../runtime/lotus_arena.c");
 
-/// Bundled Aperio source for the stdlib. m73a establishes the
+/// Bundled Aperio source for the stdlib. m73a established the
 /// concat-with-user-source mechanism: the parsed stdlib `Program`
 /// has its `items` appended to the user's `Program.items` before
 /// `lower_program` runs, so each stdlib locus sits in `user_loci`
@@ -289,7 +289,26 @@ const RUNTIME_C_SOURCE: &str = include_str!("../runtime/lotus_arena.c");
 /// (`std::io::tcp::Listener`) are rewritten at struct-literal
 /// codegen sites to the mangled locus names declared in this
 /// source via the `STDLIB_PATH_RENAMES` table below.
-const STDLIB_AP_SOURCE: &str = include_str!("../runtime/stdlib.ap");
+///
+/// m93 split the single stdlib.ap into one file per domain.
+/// Order matters: pass A1 walks loci in source order and resolves
+/// each locus's param types as it goes. Listener references
+/// Stream, so io_tcp.ap (which declares both, Stream first) lands
+/// before http.ap (which references Stream in fn signatures).
+/// core.ap lands first because text.ap depends on its
+/// __replace_all / __html_escape helpers. test.ap is standalone
+/// and could go anywhere — it ends up last by convention.
+const STDLIB_AP_SOURCE: &str = concat!(
+    include_str!("../runtime/stdlib/core.ap"),
+    "\n",
+    include_str!("../runtime/stdlib/io_tcp.ap"),
+    "\n",
+    include_str!("../runtime/stdlib/http.ap"),
+    "\n",
+    include_str!("../runtime/stdlib/text.ap"),
+    "\n",
+    include_str!("../runtime/stdlib/test.ap"),
+);
 
 /// Maps each user-facing stdlib path (locus OR type) to the
 /// mangled name declared in `STDLIB_AP_SOURCE`. The mangled

@@ -1,0 +1,45 @@
+// Aperio stdlib — core utility helpers.
+//
+// String surgery primitives that other stdlib files compose
+// with. Lives first in the concat order so downstream files
+// (http.ap, text.ap) can call into these freely. No
+// user-facing path mapping — these are internal helpers
+// reachable only by other stdlib code, not from user
+// programs.
+//
+// Anything added here should be: small, dependency-free,
+// useful to multiple stdlib files. Domain-specific helpers
+// (e.g. HTTP status phrases, markdown line tokenization)
+// live in their domain's file instead.
+
+// Replace every occurrence of `needle` in `s` with
+// `replacement`. Returns a fresh String. Empty needle returns
+// `s` unchanged (avoids the infinite-loop pitfall — an empty
+// match would keep firing at the same position forever).
+// (Param name avoids the reserved `with` token, which Aperio
+// uses for projection-class scoping.)
+fn __replace_all(s: String, needle: String, replacement: String) -> String {
+    if len(needle) == 0 { return s; }
+    let mut out = "";
+    let mut rest = s;
+    let mut idx = std::str::index_of(rest, needle);
+    while idx >= 0 {
+        out = out + rest[0..idx] + replacement;
+        let nlen = len(needle);
+        let rlen = len(rest);
+        rest = rest[(idx + nlen)..rlen];
+        idx = std::str::index_of(rest, needle);
+    }
+    out = out + rest;
+    return out;
+}
+
+// HTML-escape `&`, `<`, `>` in a content String. Order
+// matters: `&` first, otherwise the `&` we introduce while
+// escaping `<` (`&lt;`) would itself get escaped to `&amp;lt;`.
+fn __html_escape(s: String) -> String {
+    let a = __replace_all(s, "&", "&amp;");
+    let b = __replace_all(a, "<", "&lt;");
+    let c = __replace_all(b, ">", "&gt;");
+    return c;
+}
