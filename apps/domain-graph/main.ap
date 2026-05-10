@@ -18,144 +18,16 @@
 // but the rules apply broadly). Adding Rust / Python / TS is a
 // `Lang` extension.
 //
-// **Lotus-everywhere ethos.** The morpheme rewriter is its own
-// `MorphemeRewriterL` namespace lotus — empty `params { }`, only
-// methods, no lifecycle. Use site instantiates once
-// (`let r = MorphemeRewriterL { };`) and dispatches everything
-// through `r.name_to_motion(...)`. Self-method calls within the
-// locus keep the namespace coherent.
+// **Morpheme rewriter.** Comes from `std::lang::Morpheme`
+// (stdlib). Per `notes/onboarding-shape-rules.md`, the
+// onboarder is agent-driven — the seed lookup is small (15
+// universally-clear entries) and per-codebase vocabulary
+// expansion happens at the agent layer, not by hand-curating
+// the seed. `<unknown:X>` markers are the agent's prompt.
 //
 // Usage:
 //   aperio build apps/domain-graph/main.ap
 //   apps/domain-graph/main [SRC_DIR] [LANG_FLAVOR]
-
-// MorphemeRewriterL — namespace lotus for the noun→motion
-// transform. Empty params; pure methods.
-locus MorphemeRewriterL {
-    params { }
-
-    fn is_upper(c: String) -> Bool {
-        return std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0;
-    }
-
-    fn to_lower(s: String) -> String {
-        let n = len(s);
-        let mut out = "";
-        let mut i = 0;
-        while i < n {
-            let c = s[i..i+1];
-            let idx = std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c);
-            if idx >= 0 {
-                out = out + "abcdefghijklmnopqrstuvwxyz"[idx..idx+1];
-            } else {
-                out = out + c;
-            }
-            i = i + 1;
-        }
-        return out;
-    }
-
-    fn ends_with(s: String, suffix: String) -> Bool {
-        let sl = len(s);
-        let xl = len(suffix);
-        if sl < xl { return false; }
-        return s[sl-xl..sl] == suffix;
-    }
-
-    // Per-morpheme entity-noun lookup. Returns "" on miss so the
-    // caller falls through to the suffix rule.
-    fn lookup_morpheme(m: String) -> String {
-        if m == "Controller" { return "controlling"; }
-        if m == "Processor"  { return "processing"; }
-        if m == "Manager"    { return "managing"; }
-        if m == "Handler"    { return "handling"; }
-        if m == "Listener"   { return "listening"; }
-        if m == "Validator"  { return "checking"; }
-        if m == "Builder"    { return "building"; }
-        if m == "Parser"     { return "parsing"; }
-        if m == "Repository" { return "carrying"; }
-        if m == "Cache"      { return "remembering"; }
-        if m == "Bus"        { return "routing"; }
-        if m == "Queue"      { return "queuing"; }
-        if m == "Pool"       { return "pooling"; }
-        if m == "Pipeline"   { return "flowing"; }
-        if m == "Service"    { return "serving"; }
-        return "";
-    }
-
-    // Suffix rule with min-morpheme-6 guard against fabrication
-    // ("Order" → "Ord"+"ing" would be wrong; min-6 fails it).
-    fn suffix_rule(m: String) -> String {
-        let n = len(m);
-        if n < 6 { return ""; }
-        if self.ends_with(m, "er") {
-            return self.to_lower(m[0..n-2]) + "ing";
-        }
-        if self.ends_with(m, "or") {
-            return self.to_lower(m[0..n-2]) + "ing";
-        }
-        if self.ends_with(m, "ar") {
-            return self.to_lower(m[0..n-2]) + "ing";
-        }
-        return "";
-    }
-
-    fn morpheme_to_motion(m: String) -> String {
-        let hit = self.lookup_morpheme(m);
-        if len(hit) > 0 { return hit; }
-        let suf = self.suffix_rule(m);
-        if len(suf) > 0 { return suf; }
-        return "<unknown:" + m + ">";
-    }
-
-    fn split_camel(name: String) -> String {
-        let n = len(name);
-        if n == 0 { return ""; }
-        let mut out = "";
-        let mut start = 0;
-        let mut i = 1;
-        while i < n {
-            let c = name[i..i+1];
-            if self.is_upper(c) {
-                out = out + name[start..i] + "\n";
-                start = i;
-            }
-            i = i + 1;
-        }
-        out = out + name[start..n] + "\n";
-        return out;
-    }
-
-    fn name_to_motion(name: String) -> String {
-        let morphemes = self.split_camel(name);
-        let total = len(morphemes);
-        let mut out = "";
-        let mut from = 0;
-        let mut first = true;
-        while from < total {
-            let rest = morphemes[from..total];
-            let nl = std::str::index_of(rest, "\n");
-            let mut m = "";
-            if nl < 0 {
-                m = rest;
-                from = total;
-            } else {
-                m = rest[0..nl];
-                from = from + nl + 1;
-            }
-            if len(m) > 0 {
-                let motion = self.morpheme_to_motion(m);
-                if first {
-                    out = motion;
-                    first = false;
-                } else {
-                    out = out + "-" + motion;
-                }
-            }
-        }
-        return out;
-    }
-}
 
 // Recurse only under a type-decl to find type-spec leaves.
 // `lang` provides the per-flavor classifier; the recursion is
@@ -222,7 +94,7 @@ fn __domain_drive(dir: String, flavor: String) {
     }
 
     // One namespace-lotus instance for the whole walk.
-    let r = MorphemeRewriterL { };
+    let r = std::lang::Morpheme { flavor: flavor };
 
     let mut types_arr = "";
     let mut from = 0;

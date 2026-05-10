@@ -255,3 +255,175 @@ locus __StdLangLang {
         return false;
     }
 }
+
+// std::lang::Morpheme — noun→motion rewriter for the
+// codebase-onboarder's bulk (domain) tower.
+//
+// **Seed-only.** The lookup table holds 15 universally-clear
+// entity-noun mappings (Cache → remembering, Repository →
+// carrying, ...). We deliberately do NOT exhaustively curate
+// per-language vocabulary. Per
+// notes/onboarding-shape-rules.md, the codebase-onboarder is
+// agent-first: an LLM agent reads source to resolve
+// `<unknown:X>` markers per-codebase, with the seed as a
+// fallback for the universally-clear cases. Hand-curating
+// vocabulary tables ahead of time is speculative work that
+// doesn't generalize across codebases.
+//
+// **Three categorical shapes** (per the design note):
+//   - Agent noun  (-er/-or/-ar suffix on a verb stem) → motion
+//     by suffix rule.
+//   - Entity noun (named for the flow it enables) → motion
+//     by lookup table.
+//   - Shape noun  (pure data, no flow) → no motion; the agent
+//     classifies these as types, not loci.
+//
+// **Min-stem-6 guard** prevents the suffix rule from
+// fabricating motions for short non-verb-stem nouns
+// ("Order" → "ording" is wrong; "User" → "using" is wrong).
+// Honesty about uncertainty preserves the recognition.
+locus __StdLangMorpheme {
+    params {
+        // Per-language flavor. v0: "go". Other flavors share
+        // the rules; only the lookup-table seed varies.
+        flavor: String = "go";
+    }
+
+    fn is_upper(c: String) -> Bool {
+        return std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0;
+    }
+
+    fn to_lower(s: String) -> String {
+        let n = len(s);
+        let mut out = "";
+        let mut i = 0;
+        while i < n {
+            let c = s[i..i+1];
+            let idx = std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c);
+            if idx >= 0 {
+                out = out + "abcdefghijklmnopqrstuvwxyz"[idx..idx+1];
+            } else {
+                out = out + c;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn ends_with(s: String, suffix: String) -> Bool {
+        let sl = len(s);
+        let xl = len(suffix);
+        if sl < xl { return false; }
+        return s[sl-xl..sl] == suffix;
+    }
+
+    // The seed lookup table. Universal entity-noun mappings —
+    // these are agreed-upon across most languages and codebases.
+    // Per-codebase additions happen at the agent layer
+    // (codebase-overrides.json merge, future milestone), not
+    // here.
+    fn lookup_morpheme(m: String) -> String {
+        // The seed is currently flavor-independent — these
+        // entity nouns are common across Go, Rust, Python,
+        // and TypeScript codebases. Per-flavor specialization
+        // would gate on `self.flavor == "..."` but isn't
+        // needed at v0.
+        if m == "Controller" { return "controlling"; }
+        if m == "Processor"  { return "processing"; }
+        if m == "Manager"    { return "managing"; }
+        if m == "Handler"    { return "handling"; }
+        if m == "Listener"   { return "listening"; }
+        if m == "Validator"  { return "checking"; }
+        if m == "Builder"    { return "building"; }
+        if m == "Parser"     { return "parsing"; }
+        if m == "Repository" { return "carrying"; }
+        if m == "Cache"      { return "remembering"; }
+        if m == "Bus"        { return "routing"; }
+        if m == "Queue"      { return "queuing"; }
+        if m == "Pool"       { return "pooling"; }
+        if m == "Pipeline"   { return "flowing"; }
+        if m == "Service"    { return "serving"; }
+        return "";
+    }
+
+    // Agent-noun suffix rule with min-stem guard. See the design
+    // note for why min-morpheme-6 (= min-stem-4) is the right
+    // threshold.
+    fn suffix_rule(m: String) -> String {
+        let n = len(m);
+        if n < 6 { return ""; }
+        if self.ends_with(m, "er") {
+            return self.to_lower(m[0..n-2]) + "ing";
+        }
+        if self.ends_with(m, "or") {
+            return self.to_lower(m[0..n-2]) + "ing";
+        }
+        if self.ends_with(m, "ar") {
+            return self.to_lower(m[0..n-2]) + "ing";
+        }
+        return "";
+    }
+
+    // One morpheme → its motion form. Lookup wins over suffix;
+    // both failing yields the explicit `<unknown:X>` marker.
+    // **The unknown marker is the agent's prompt.** It says
+    // "read this name's defining file and propose a motion form
+    // (or reclassify as a shape noun)."
+    fn morpheme_to_motion(m: String) -> String {
+        let hit = self.lookup_morpheme(m);
+        if len(hit) > 0 { return hit; }
+        let suf = self.suffix_rule(m);
+        if len(suf) > 0 { return suf; }
+        return "<unknown:" + m + ">";
+    }
+
+    // Split a CamelCase identifier into morphemes, separated by
+    // "\n". "OrderProcessor" → "Order\nProcessor\n". (Acronyms
+    // run together; "HTTPClient" → "HTTPClient" is a known v0
+    // limitation — the agent can split + reclassify.)
+    fn split_camel(name: String) -> String {
+        let n = len(name);
+        if n == 0 { return ""; }
+        let mut out = "";
+        let mut start = 0;
+        let mut i = 1;
+        while i < n {
+            let c = name[i..i+1];
+            if self.is_upper(c) {
+                out = out + name[start..i] + "\n";
+                start = i;
+            }
+            i = i + 1;
+        }
+        out = out + name[start..n] + "\n";
+        return out;
+    }
+
+    // CamelCase name → motion form. Each morpheme rewritten
+    // independently; results joined with "-".
+    fn name_to_motion(name: String) -> String {
+        let morphemes = self.split_camel(name);
+        let total = len(morphemes);
+        let mut out = "";
+        let mut from = 0;
+        let mut first = true;
+        while from < total {
+            let rest = morphemes[from..total];
+            let nl = std::str::index_of(rest, "\n");
+            let mut m = "";
+            if nl < 0 {
+                m = rest;
+                from = total;
+            } else {
+                m = rest[0..nl];
+                from = from + nl + 1;
+            }
+            if len(m) > 0 {
+                let motion = self.morpheme_to_motion(m);
+                if first { out = motion; first = false; }
+                else { out = out + "-" + motion; }
+            }
+        }
+        return out;
+    }
+}
