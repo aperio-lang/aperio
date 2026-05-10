@@ -11690,6 +11690,35 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )?;
                 Ok(())
             }
+            // m87: std::test::* assertion primitives. Each is a
+            // void-returning stdlib fn that prints diagnostic
+            // + exits 1 on failure, no-op on success. Users
+            // write tests as ordinary Aperio binaries that
+            // exit 0 on pass.
+            ["std", "test", "assert"] => {
+                let _ = self.lower_user_fn_call(
+                    "__test_assert",
+                    args,
+                    scope,
+                )?;
+                Ok(())
+            }
+            ["std", "test", "assert_eq_int"] => {
+                let _ = self.lower_user_fn_call(
+                    "__test_assert_eq_int",
+                    args,
+                    scope,
+                )?;
+                Ok(())
+            }
+            ["std", "test", "assert_eq_str"] => {
+                let _ = self.lower_user_fn_call(
+                    "__test_assert_eq_str",
+                    args,
+                    scope,
+                )?;
+                Ok(())
+            }
             ["std", "str", "can_parse_int"] => {
                 let _ = self.lower_std_str_can_parse_int(args, scope)?;
                 Ok(())
