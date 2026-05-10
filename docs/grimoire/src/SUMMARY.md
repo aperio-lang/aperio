@@ -11,4 +11,5 @@
 
 # After the spell
 
+- [The same shape, everywhere](./06-the-same-shape.md)
 - [Where to go next](./05-where-next.md)
