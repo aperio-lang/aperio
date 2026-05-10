@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](./introduction.md)
+[Behavior index (status of every runtime/stdlib feature)](./behavior-index.md)
 
 # Lexical structure
 
