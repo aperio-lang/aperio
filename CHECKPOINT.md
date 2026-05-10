@@ -1,8 +1,65 @@
 # Lotus — session checkpoint
 
 **Read this first** if you're picking up the lotus language work
-in a new session. State as of **m69: multi-peer fanout
-verified end-to-end**. The cross-process bus's
+in a new session. State as of **m70: per-field cross-process
+wire format with String support**. Replaces the m60 memcpy
+serializer with a per-field walk for struct payloads. Wire
+format (per F-design "compile-time agreement, no runtime
+negotiation"; versioning is open-question #13's
+`serialize_as TypeV1` future, NOT m70):
+
+- Field order = declared order; no padding on wire.
+- Int / Float / Bool / Time / Duration: 8 bytes LE (matches
+  in-memory).
+- Decimal: 16 bytes (matches in-memory).
+- String: 8-byte i64 length-prefix LE, then N UTF-8 bytes (no
+  NUL on wire). Decode allocates `len+1` from the new lazy
+  global payload arena and writes a NUL terminator so existing
+  C-side strlen / strcpy / println work.
+- Nested struct / enum / array as fields: error at synthesis
+  time — defer to post-v1.
+
+C runtime substrate added: `lotus_bus_payload_arena_alloc(size,
+align)` is a thread-safe lazy bump allocator (lazy-created on
+first use, destroyed at `lotus_bus_remote_destroy_all`) used by
+the deserializer to allocate String byte storage that survives
+the reader-thread → `lotus_bus_local_dispatch` → drain →
+handler chain. Memory grows unbounded for the program's
+lifetime — acceptable for v1.
+
+`lotus_bus_dispatch` signature grew a 5th arg: a per-subject
+serialize-fn pointer. Local dispatch enqueues struct bytes
+verbatim (preserving in-process semantics — String pointers
+into the publisher's arena stay valid because the publisher
+outlives the immediate dispatch). Remote fanout serializes
+through the supplied fn into wire bytes, then dispatches to
+each CONNECT-role transport. Splitting local-vs-remote here
+keeps the variable-width wire format confined to the cross-
+process path; local subscribers see exactly the m60 shape.
+
+Codegen: `synthesize_serializer` now branches on payload kind
+(struct → per-field walk, enum → memcpy with String-in-
+variant rejection). Two new helpers:
+`emit_per_field_serialize` and `emit_per_field_deserialize`
+(walk fields via GEP + per-field LotusType dispatch). Three
+small helpers: `emit_memcpy_call`, `emit_str_len_call`. The
+`lower_send` call site no longer pre-serializes into a scratch
+buffer; it passes the struct pointer + size + serialize-fn
+ptr to `lotus_bus_dispatch` and lets the C runtime decide
+when to serialize.
+
+One new e2e test in bus_subscriber.rs:
+`cross_process_string_field_round_trips` (publisher sends
+`Msg { tag: "hello-world", n: 42 }`; subscriber receives the
+exact same tag string in a different process). Updated
+`serializer_shape.rs` to reflect the m70 dispatch model
+(serialize fn referenced as fn-ptr arg, not called inline).
+132 tests pass (was 131; +1 from bus_subscriber.rs); 54
+example builds unaffected.
+
+**v1 punch-list closed.** All language ergonomic gaps and the
+final cross-process substrate piece are done. State before
+that was **m69: multi-peer fanout verified end-to-end**. The cross-process bus's
 `lotus_bus_remote_fanout` already iterated all CONNECT-role
 entries on a subject and dispatched to each, so multi-peer
 fanout is implicit substrate behavior — but no test had ever
@@ -2661,68 +2718,43 @@ capacity ceiling — the m45 quickfix `× 32` multiplier is gone.
 
 ### RESUME HERE (next session)
 
-**Generics arc closed; v1 language ergonomics arc closed (m65,
-m66, m67, m68 all shipped); cross-process bus multi-peer
-fanout verified (m69).** Generic structs + enums + free fns +
-loci all monomorphize with `Numeric` bound enforcement;
-`Result<T,E>` / `Option<T>` available as built-ins; nested
-generics parse cleanly (`Box<Box<Int>>`); bare-name struct
-literal resolution works at let / return / struct-field-init
-positions; typechecker exhaustiveness recognizes synthesized
-monomorph match arms. Cross-process bus substrate works for
-fixed-layout primitive payloads with multi-peer fanout. Per
-the user's hard rule, **no code towards trellis-pair until v1
-language is done.**
+**v1 punch-list closed.** Generics arc shipped (m61–m65); v1
+language ergonomics arc shipped (m66 nested-`>>`, m67 bare-
+name + dep-aware decl, m68 typechecker exhaustiveness for
+monomorphs); cross-process bus arc completed (m69 multi-peer
+fanout, m70 per-field wire format with String support).
 
-**One v1 punch-list item remains: m70 (cross-process String
-fields).** Currently the m60 serializer memcpys the struct
-bytes verbatim — fine for primitives, broken for String
-fields whose pointer values can't survive the process
-boundary. Real wire format needed for any v1 deployment with
-non-primitive payloads.
+**Per the user's hard rule, no code towards trellis-pair until
+v1 language is done.** v1 IS done now — the language can
+express real workloads, the cross-process bus carries
+realistic payloads (primitives + Strings) across multiple
+peers, and the typechecker accepts the full generics surface
+without false-positive exhaustiveness diagnostics.
 
-**Start with m70: per-field wire format with String support.**
-Replaces the m60 memcpy serializer with a per-field walk.
-Plan:
+**Call v1.** Next moves, in order:
 
-1. **C runtime: lazy global payload arena.** The deserialize
-   path needs to allocate String byte storage that survives the
-   reader-thread → `lotus_bus_local_dispatch` → cell enqueue →
-   drain → handler chain. Subscriber arena isn't accessible at
-   deserialize time (we don't know which subscriber yet — the
-   queue dispatches later, and a subject can have multiple).
-   Cleanest solution: a `lotus_bus_payload_arena` lazily
-   created at first use, destroyed in
-   `lotus_bus_remote_destroy_all` (program exit). Memory grows
-   unbounded for the program lifetime — acceptable for v1
-   (subscribers run for bounded duration in trellis-pair).
-   Add helper `lotus_bus_payload_arena_alloc(size, align)`
-   that codegen can call from the synthesized deserialize body.
+1. **Multi-binary build orchestration** — trellis-pair will
+   need to compile two lotus binaries (the analyst + executor
+   pair) from a single workspace and wire them together via
+   deployment config. Currently `build_executable` produces
+   one binary at a time; trellis-pair needs a wrapper that
+   builds N binaries and emits a config file pointing each at
+   the others. Tooling milestone, not language work.
 
-2. **Codegen: per-field encode/decode.** Replace the memcpy in
-   `synthesize_serializer` with a field walk using GEP +
-   per-field LotusType dispatch. Wire layout:
-   - Int / Duration / Time / Float: 8 bytes little-endian.
-   - Decimal: 16 bytes (already fixed).
-   - Bool: 1 byte (zero-extend on decode).
-   - String: 8-byte length prefix (i64) + N bytes (no NUL
-     terminator — length-prefix is the boundary). Decode
-     allocates `length+1` bytes via
-     `lotus_bus_payload_arena_alloc`, copies bytes, writes
-     trailing NUL so existing C-side string ops work.
-   - Other (nested struct, enum, array): error at synthesis
-     time with a clear message — defer to a future polish.
+2. **Trellis-pair as v1 acceptance test** — the end-to-end
+   feedback loop The Design has been pointing at since the
+   substrate-up plan started. Two binaries: an analyst
+   publishes events, an executor subscribes, they reach a
+   convergent state through bus-mediated negotiation. Tests
+   the full v1 surface (locus lifecycle + bus + cross-process
+   + Strings + maybe generics if the workload calls for it)
+   from the user's perspective.
 
-3. **Test:** extend `bus_subscriber.rs` with a payload type
-   `Msg { tag: String; n: Int; }`; publisher sends
-   `Msg { tag: "hello", n: 42 }`; subscriber prints both;
-   assert subscriber's stdout contains "tag=hello" and "n=42".
-   Cross-process verifies the wire format actually carries
-   the bytes (not just the pointer).
+3. **Release artifacts** — packaged compiler binary, doc
+   site, install instructions, example programs. Pre-public-
+   announcement work.
 
-m70 is the LAST v1 punch-list item. Once it ships, **call v1.**
-
-Other items (none blocking; addressed earlier this session):
+Items addressed earlier in this session arc (none blocking now):
 
 1. **Multi-peer fanout per subject — DONE (m69, verification
    only).** The existing iteration loop in
@@ -2960,7 +2992,7 @@ System has:
 - `gcc` 13.x
 
 Cargo workspace builds clean. `cargo test --workspace --tests` passes
-all 131 tests (the locus-with-run test runs 3×500ms sleeps so the
+all 132 tests (the locus-with-run test runs 3×500ms sleeps so the
 runtime + codegen integration buckets clock ~1.5s each; m57 added
 two transport round-trip tests under tests/transport.rs that fork
 listener + connector subprocesses; m58 added two more under

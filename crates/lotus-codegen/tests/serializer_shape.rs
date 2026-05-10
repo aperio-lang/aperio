@@ -110,14 +110,17 @@ fn ir_contains_per_payload_serializer_pair() {
         );
     }
 
-    // The send site should call the serializer before dispatch.
-    // Look for a call to a __serialize_ fn near a bus dispatch
-    // call — the exact IR shape is "%n = call i64 @__serialize_T(...)
-    // ... call void @lotus_bus_dispatch(...". Loose check: both
-    // strings appear at all.
+    // m70: the send site no longer invokes __serialize_T inline.
+    // Codegen passes the serialize-fn pointer as the 5th arg to
+    // lotus_bus_dispatch; the C runtime does the actual serialize
+    // when remote fanout is needed (skipping it for purely-local
+    // dispatch). The IR still references __serialize_Ping (as a
+    // fn-pointer constant in the dispatch call); just not via a
+    // direct `call i64 @__serialize_Ping`.
     assert!(
-        ir_text.contains("call i64 @__serialize_Ping"),
-        "send site for Ping should invoke __serialize_Ping",
+        ir_text.contains("@__serialize_Ping"),
+        "send site for Ping should reference __serialize_Ping (passed \
+         as fn ptr to lotus_bus_dispatch)",
     );
     assert!(
         ir_text.contains("call void @lotus_bus_dispatch"),

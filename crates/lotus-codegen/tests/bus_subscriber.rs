@@ -358,3 +358,132 @@ fn publisher_fans_out_to_two_connect_peers() {
         b_stdout,
     );
 }
+
+#[test]
+fn cross_process_string_field_round_trips() {
+    // m70: payload type with a String field round-trips
+    // cross-process. Pre-m70 the m60 memcpy serializer copied
+    // the String pointer verbatim, which segfaulted (or
+    // garbage-printed) on the subscriber side because the
+    // pointer was meaningless in the receiver's address space.
+    // The m70 wire format length-prefixes Strings on the wire
+    // and allocates fresh storage from the subscriber's lazy
+    // global payload arena on deserialize, so the pointer in
+    // the deserialized struct points to valid local memory.
+    let subscriber_src = r#"
+        type Msg {
+            tag: String;
+            n: Int;
+        }
+
+        locus Sub {
+            bus {
+                subscribe "evt" as on_evt of type Msg;
+            }
+            fn on_evt(m: Msg) {
+                println("subscriber got tag=", m.tag, " n=", m.n);
+            }
+        }
+
+        fn main() {
+            Sub { };
+            time::sleep(500ms);
+            yield;
+        }
+    "#;
+
+    let publisher_src = r#"
+        type Msg {
+            tag: String;
+            n: Int;
+        }
+
+        // Local subscriber so the BusState gate is satisfied.
+        locus Sub {
+            bus {
+                subscribe "evt" as on_evt of type Msg;
+            }
+            fn on_evt(m: Msg) {
+                println("publisher local got tag=", m.tag, " n=", m.n);
+            }
+        }
+
+        locus Pub {
+            bus {
+                publish "evt" of type Msg;
+            }
+            birth() {
+                "evt" <- Msg { tag: "hello-world", n: 42 };
+            }
+        }
+
+        fn main() {
+            Sub { };
+            Pub { };
+        }
+    "#;
+
+    let sub_bin = build_binary(subscriber_src, "string-sub");
+    let pub_bin = build_binary(publisher_src, "string-pub");
+
+    let sock = unique_path("string-sock", "sock");
+    let sub_cfg = unique_path("string-subcfg", "conf");
+    let pub_cfg = unique_path("string-pubcfg", "conf");
+    std::fs::write(
+        &sub_cfg,
+        format!("evt = unix://{} : listen\n", sock.display()),
+    )
+    .expect("write sub cfg");
+    std::fs::write(
+        &pub_cfg,
+        format!("evt = unix://{} : connect\n", sock.display()),
+    )
+    .expect("write pub cfg");
+
+    let subscriber = Command::new(&sub_bin)
+        .env("LOTUS_BUS_CONFIG", &sub_cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn subscriber");
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    let pub_out = Command::new(&pub_bin)
+        .env("LOTUS_BUS_CONFIG", &pub_cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run publisher");
+
+    let sub_out = subscriber.wait_with_output().expect("subscriber wait");
+
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&sub_cfg);
+    let _ = std::fs::remove_file(&pub_cfg);
+    let _ = std::fs::remove_file(&sub_bin);
+    let _ = std::fs::remove_file(&pub_bin);
+
+    assert!(
+        pub_out.status.success(),
+        "publisher exited non-zero: {:?}\nstdout: {}\nstderr: {}",
+        pub_out.status,
+        String::from_utf8_lossy(&pub_out.stdout),
+        String::from_utf8_lossy(&pub_out.stderr),
+    );
+    assert!(
+        sub_out.status.success(),
+        "subscriber exited non-zero: {:?}\nstdout: {}\nstderr: {}",
+        sub_out.status,
+        String::from_utf8_lossy(&sub_out.stdout),
+        String::from_utf8_lossy(&sub_out.stderr),
+    );
+
+    let sub_stdout = String::from_utf8_lossy(&sub_out.stdout);
+    assert!(
+        sub_stdout.contains("subscriber got tag=hello-world n=42"),
+        "subscriber missing expected line; got: {:?}\npublisher stderr: {}",
+        sub_stdout,
+        String::from_utf8_lossy(&pub_out.stderr),
+    );
+}

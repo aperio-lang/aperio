@@ -1048,7 +1048,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         //                                  ptr handler, ptr mailbox,
         //                                  ptr deserialize_fn)
         // declare void @lotus_bus_dispatch(ptr queue, ptr subject,
-        //                                  ptr payload, i64 size)
+        //                                  ptr struct_payload, i64 struct_size,
+        //                                  ptr serialize_fn)
         // declare void @lotus_bus_quarantine_self(ptr self)
         // declare void @lotus_bus_router_destroy()
         // m60: lotus_bus_register grows a 5th arg, the per-subject
@@ -1058,6 +1059,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // bytes from the cross-process bus still pass it (it's
         // unused at runtime); kept unconditional to keep the ABI
         // stable across config-set vs config-not-set runs.
+        // m70: lotus_bus_dispatch grows a 5th arg, the per-subject
+        // serialize fn ptr. Local dispatch enqueues struct bytes
+        // (the in-memory layout the publisher built); remote fanout
+        // serializes those bytes via the supplied fn into the wire
+        // format the reader thread will deserialize. Splitting
+        // local-vs-remote here keeps the per-field wire format
+        // (variable-width Strings) confined to the cross-process
+        // path; local subscribers continue to receive struct bytes
+        // exactly as before m70.
         let bus_register_ty = void_t.fn_type(
             &[
                 ptr_t.into(),
@@ -1071,7 +1081,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_bus_register", bus_register_ty, None);
         let bus_dispatch_ty = void_t.fn_type(
-            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), i64_t.into()],
+            &[
+                ptr_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+                i64_t.into(),
+                ptr_t.into(),
+            ],
             false,
         );
         self.module
@@ -1124,6 +1140,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_bus_set_queue",
             bus_set_queue_ty,
+            None,
+        );
+
+        // m70: lazy global payload arena for cross-process String
+        // byte storage. The synthesized __deserialize_T body calls
+        // this when decoding a length-prefixed String — allocates
+        // a buffer that survives the reader-thread → dispatch →
+        // handler chain (the per-locus arena isn't accessible at
+        // deserialize time because the subscriber identity isn't
+        // known yet; one subject can have multiple subscribers).
+        // declare ptr @lotus_bus_payload_arena_alloc(i64 size, i64 align)
+        let bus_payload_alloc_ty =
+            ptr_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        self.module.add_function(
+            "lotus_bus_payload_arena_alloc",
+            bus_payload_alloc_ty,
             None,
         );
 
@@ -1547,15 +1579,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(())
     }
 
-    /// m60: synthesize `__serialize_T` and `__deserialize_T` for
-    /// a single bus payload type, registering them in
-    /// `cx.serializers` so call sites can look them up by type
-    /// name. Body is identity (memcpy of `sizeof(T)` bytes) at
-    /// v0.1 — the shape is what installs the substrate; the
-    /// actual wire format is a deliberate later choice. Saves
-    /// and restores the builder position so this can run between
-    /// passes that use the builder (notably between A2 and the
-    /// body-lowering passes C/D).
+    /// m70: synthesize `__serialize_T` / `__deserialize_T` for a
+    /// bus payload type with per-field wire encoding.
+    ///
+    /// Wire format (per F-design "compile-time agreement, no
+    /// runtime negotiation"; versioning is open-question #13's
+    /// `serialize_as TypeV1` future, NOT in m70):
+    /// - Field order = declared order. No padding on wire.
+    /// - Int / Float / Bool / Time / Duration: 8 bytes,
+    ///   little-endian (matches in-memory layout on x86_64).
+    /// - Decimal: 16 bytes (matches in-memory layout).
+    /// - String: 8-byte i64 length-prefix LE, then N UTF-8
+    ///   bytes (no NUL on wire). Decode allocates len+1 from
+    ///   the lazy global payload arena and writes a NUL
+    ///   terminator so existing C-side `strlen`/`strcpy` ops
+    ///   still work on the deserialized struct.
+    /// - Other field types (nested struct, enum, array): error
+    ///   at synthesis time — defer to a future polish.
+    ///
+    /// Enum payload types: keep memcpy-shape (no per-field walk
+    /// inside variants for v0.1). Enum-with-String fields
+    /// errors at synthesis time. Non-String enums round-trip
+    /// fine because their in-memory layout has no pointers.
+    ///
+    /// Saves and restores the builder position so this can run
+    /// between passes that use the builder (notably between A2
+    /// and the body-lowering passes C/D).
     fn synthesize_serializer(
         &mut self,
         type_name: &str,
@@ -1564,32 +1613,64 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             return Ok(());     /* already synthesized */
         }
         let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let i8_t = self.context.i8_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
 
-        // Resolve the LLVM struct type and its size from either
-        // the user-types or user-enums table. Either kind of
-        // payload (TypeRef struct OR has-payload Enum) ends up as
-        // a sized struct in memory.
-        let size_iv = if let Some(info) = self.user_types.get(type_name) {
-            info.struct_ty.size_of().expect("payload struct has known size")
+        // Decide the synthesis strategy. Two shapes:
+        //   - Struct payload (struct_layout = Some): per-field
+        //     walk (m70 wire format).
+        //   - Enum payload (struct_layout = None, enum_size =
+        //     Some): memcpy of the enum storage struct, after
+        //     verifying no variant carries a String (would
+        //     corrupt cross-process).
+        let struct_layout: Option<(
+            StructType<'ctx>,
+            Vec<String>,
+            BTreeMap<String, (u32, LotusType)>,
+        )>;
+        let enum_size: Option<inkwell::values::IntValue<'ctx>>;
+        if let Some(info) = self.user_types.get(type_name).cloned() {
+            struct_layout =
+                Some((info.struct_ty, info.field_order, info.fields));
+            enum_size = None;
         } else if let Some(info) = self.user_enums.get(type_name).cloned() {
             if !info.has_payload {
                 return Err(CodegenError::Unsupported(format!(
                     "bus payload `{}` is a no-payload enum; wrap in a \
-                     struct or add a variant payload (m60 needs a sized \
-                     storage struct)",
+                     struct or add a variant payload",
                     type_name
                 )));
             }
-            self.enum_storage_struct(&info)
+            // m70: refuse enum-with-String for cross-process —
+            // per-variant per-field serialization is post-v1.
+            for v in &info.variants {
+                for ft in &v.field_tys {
+                    if matches!(ft, LotusType::String) {
+                        return Err(CodegenError::Unsupported(format!(
+                            "bus payload `{}` variant `{}` has a String \
+                             field; cross-process String inside an enum \
+                             variant is post-v1 (m70 supports String only \
+                             at the top-level struct)",
+                            type_name, v.name
+                        )));
+                    }
+                }
+            }
+            let size = self
+                .enum_storage_struct(&info)
                 .size_of()
-                .expect("enum storage struct has known size")
+                .expect("enum storage struct has known size");
+            struct_layout = None;
+            enum_size = Some(size);
         } else {
             return Err(CodegenError::Unsupported(format!(
                 "synthesize_serializer: type `{}` not declared",
                 type_name
             )));
-        };
+        }
+        let _ = i32_t;
+        let _ = i8_t;
 
         let saved_block = self.builder.get_insert_block();
 
@@ -1613,22 +1694,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .get_nth_param(1)
             .expect("ser dst arg")
             .into_pointer_value();
-        // cap arg ignored at v0.1 — caller is trusted to provide
-        // at least sizeof(T) bytes. Future wire-format pass will
-        // bounds-check.
-        let memcpy_fn = self
-            .module
-            .get_function("memcpy")
-            .expect("memcpy declared");
+        let _ = ser_fn.get_nth_param(2); // cap, ignored at v0.1
+
+        let total_written: inkwell::values::IntValue<'ctx> =
+            if let Some((struct_ty, field_order, fields)) = &struct_layout
+            {
+                self.emit_per_field_serialize(
+                    ser_src,
+                    ser_dst,
+                    *struct_ty,
+                    field_order,
+                    fields,
+                )?
+            } else {
+                let size_iv = enum_size.expect("enum size present");
+                self.emit_memcpy_call(
+                    ser_dst,
+                    ser_src,
+                    size_iv,
+                    "ser.memcpy",
+                )?;
+                size_iv
+            };
         self.builder
-            .build_call(
-                memcpy_fn,
-                &[ser_dst.into(), ser_src.into(), size_iv.into()],
-                "ser.memcpy",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_return(Some(&size_iv))
+            .build_return(Some(&total_written))
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         // i64 @__deserialize_T(ptr src, i64 n, ptr dst, i64 cap)
@@ -1647,21 +1736,35 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .get_nth_param(0)
             .expect("de src arg")
             .into_pointer_value();
-        // n arg ignored at v0.1 — wire bytes ARE struct bytes, so
-        // n is expected to equal sizeof(T). cap arg likewise.
+        let _ = de_fn.get_nth_param(1); // n, ignored
         let de_dst = de_fn
             .get_nth_param(2)
             .expect("de dst arg")
             .into_pointer_value();
+        let _ = de_fn.get_nth_param(3); // cap, ignored
+
+        let de_struct_size: inkwell::values::IntValue<'ctx> =
+            if let Some((struct_ty, field_order, fields)) = &struct_layout
+            {
+                self.emit_per_field_deserialize(
+                    de_src,
+                    de_dst,
+                    *struct_ty,
+                    field_order,
+                    fields,
+                )?
+            } else {
+                let size_iv = enum_size.expect("enum size present");
+                self.emit_memcpy_call(
+                    de_dst,
+                    de_src,
+                    size_iv,
+                    "de.memcpy",
+                )?;
+                size_iv
+            };
         self.builder
-            .build_call(
-                memcpy_fn,
-                &[de_dst.into(), de_src.into(), size_iv.into()],
-                "de.memcpy",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_return(Some(&size_iv))
+            .build_return(Some(&de_struct_size))
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         if let Some(b) = saved_block {
@@ -1673,6 +1776,394 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             SerializerPair { serialize: ser_fn, deserialize: de_fn },
         );
         Ok(())
+    }
+
+    /// m70: emit a memcpy(dst, src, n) call without consuming
+    /// the result. Centralizes the symbol lookup so callers
+    /// don't repeat the `get_function("memcpy").expect(...)`
+    /// boilerplate.
+    fn emit_memcpy_call(
+        &self,
+        dst: PointerValue<'ctx>,
+        src: PointerValue<'ctx>,
+        n: inkwell::values::IntValue<'ctx>,
+        name: &str,
+    ) -> Result<(), CodegenError> {
+        let memcpy_fn = self
+            .module
+            .get_function("memcpy")
+            .expect("memcpy declared");
+        self.builder
+            .build_call(
+                memcpy_fn,
+                &[dst.into(), src.into(), n.into()],
+                name,
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
+    /// m70: emit IR for the body of `__serialize_T` for a struct
+    /// payload, walking fields in declared order. Returns the
+    /// total bytes-written value (i64) for the fn's return.
+    fn emit_per_field_serialize(
+        &mut self,
+        src: PointerValue<'ctx>,
+        dst: PointerValue<'ctx>,
+        struct_ty: StructType<'ctx>,
+        field_order: &[String],
+        fields: &BTreeMap<String, (u32, LotusType)>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let i64_t = self.context.i64_type();
+        let i8_t = self.context.i8_type();
+        let cursor_alloca = self
+            .builder
+            .build_alloca(i64_t, "ser.cursor")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(cursor_alloca, i64_t.const_int(0, false))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        for fname in field_order {
+            let (idx, field_ty) = fields
+                .get(fname)
+                .cloned()
+                .expect("field declared in field_order also present in fields");
+            let src_field_ptr = self
+                .builder
+                .build_struct_gep(struct_ty, src, idx, "ser.field.ptr")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let cursor_iv = self
+                .builder
+                .build_load(i64_t, cursor_alloca, "ser.cursor.load")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_int_value();
+            let dst_at_cursor = unsafe {
+                self.builder
+                    .build_gep(i8_t, dst, &[cursor_iv], "ser.dst.cursor")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            };
+
+            match &field_ty {
+                LotusType::String => {
+                    // Wire: i64 LE length + N bytes (no NUL).
+                    let str_ptr = self
+                        .builder
+                        .build_load(
+                            self.context.ptr_type(AddressSpace::default()),
+                            src_field_ptr,
+                            "ser.str.ptr",
+                        )
+                        .map_err(|e| {
+                            CodegenError::LlvmEmit(e.to_string())
+                        })?
+                        .into_pointer_value();
+                    let str_len = self.emit_str_len_call(str_ptr)?;
+                    // Write 8-byte length prefix.
+                    let len_alloca = self
+                        .builder
+                        .build_alloca(i64_t, "ser.str.len")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(len_alloca, str_len)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.emit_memcpy_call(
+                        dst_at_cursor,
+                        len_alloca,
+                        i64_t.const_int(8, false),
+                        "ser.str.memcpy.len",
+                    )?;
+                    let after_len = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            i64_t.const_int(8, false),
+                            "ser.cursor.after.len",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let dst_after_len = unsafe {
+                        self.builder
+                            .build_gep(
+                                i8_t,
+                                dst,
+                                &[after_len],
+                                "ser.dst.after.len",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    };
+                    self.emit_memcpy_call(
+                        dst_after_len,
+                        str_ptr,
+                        str_len,
+                        "ser.str.memcpy.bytes",
+                    )?;
+                    let after_bytes = self
+                        .builder
+                        .build_int_add(
+                            after_len,
+                            str_len,
+                            "ser.cursor.after.bytes",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after_bytes)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                LotusType::Int
+                | LotusType::Float
+                | LotusType::Bool
+                | LotusType::Time
+                | LotusType::Duration
+                | LotusType::Decimal => {
+                    let nbytes = lotus_type_size_bytes(self.context, &field_ty);
+                    let nbytes_iv = i64_t.const_int(nbytes, false);
+                    self.emit_memcpy_call(
+                        dst_at_cursor,
+                        src_field_ptr,
+                        nbytes_iv,
+                        "ser.fixed.memcpy",
+                    )?;
+                    let after = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            nbytes_iv,
+                            "ser.cursor.after",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                other => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "bus payload field `{}: {:?}` — m70 wire format \
+                         supports primitives and String only; nested \
+                         structs / enums / arrays / tuples cross-process \
+                         are post-v1 polish",
+                        fname, other
+                    )));
+                }
+            }
+        }
+
+        let total = self
+            .builder
+            .build_load(i64_t, cursor_alloca, "ser.cursor.final")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        Ok(total)
+    }
+
+    /// m70: emit IR for the body of `__deserialize_T` for a
+    /// struct payload, walking fields in declared order.
+    /// Returns the in-memory struct size (the dst contains a
+    /// concrete struct, regardless of how much wire was
+    /// consumed).
+    fn emit_per_field_deserialize(
+        &mut self,
+        src: PointerValue<'ctx>,
+        dst: PointerValue<'ctx>,
+        struct_ty: StructType<'ctx>,
+        field_order: &[String],
+        fields: &BTreeMap<String, (u32, LotusType)>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let i64_t = self.context.i64_type();
+        let i8_t = self.context.i8_type();
+        let cursor_alloca = self
+            .builder
+            .build_alloca(i64_t, "de.cursor")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(cursor_alloca, i64_t.const_int(0, false))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        for fname in field_order {
+            let (idx, field_ty) = fields
+                .get(fname)
+                .cloned()
+                .expect("field declared in field_order also present in fields");
+            let dst_field_ptr = self
+                .builder
+                .build_struct_gep(struct_ty, dst, idx, "de.field.ptr")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let cursor_iv = self
+                .builder
+                .build_load(i64_t, cursor_alloca, "de.cursor.load")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_int_value();
+            let src_at_cursor = unsafe {
+                self.builder
+                    .build_gep(i8_t, src, &[cursor_iv], "de.src.cursor")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            };
+
+            match &field_ty {
+                LotusType::String => {
+                    // Read 8-byte length prefix.
+                    let len_alloca = self
+                        .builder
+                        .build_alloca(i64_t, "de.str.len.alloca")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.emit_memcpy_call(
+                        len_alloca,
+                        src_at_cursor,
+                        i64_t.const_int(8, false),
+                        "de.str.memcpy.len",
+                    )?;
+                    let str_len = self
+                        .builder
+                        .build_load(i64_t, len_alloca, "de.str.len")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let after_len = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            i64_t.const_int(8, false),
+                            "de.cursor.after.len",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let src_after_len = unsafe {
+                        self.builder
+                            .build_gep(
+                                i8_t,
+                                src,
+                                &[after_len],
+                                "de.src.after.len",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    };
+                    // Allocate len+1 from the lazy global payload
+                    // arena. The +1 is for the C-side NUL
+                    // terminator so existing strlen / strcpy /
+                    // string-printing code works on the
+                    // deserialized struct.
+                    let alloc_size = self
+                        .builder
+                        .build_int_add(
+                            str_len,
+                            i64_t.const_int(1, false),
+                            "de.str.alloc.size",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let alloc_fn = self
+                        .module
+                        .get_function("lotus_bus_payload_arena_alloc")
+                        .expect("lotus_bus_payload_arena_alloc declared");
+                    let buf = self
+                        .builder
+                        .build_call(
+                            alloc_fn,
+                            &[
+                                alloc_size.into(),
+                                i64_t.const_int(1, false).into(),
+                            ],
+                            "de.str.alloc",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("payload arena alloc returns ptr")
+                        .into_pointer_value();
+                    self.emit_memcpy_call(
+                        buf,
+                        src_after_len,
+                        str_len,
+                        "de.str.memcpy.bytes",
+                    )?;
+                    // Write trailing NUL: buf[str_len] = 0.
+                    let nul_slot = unsafe {
+                        self.builder
+                            .build_gep(
+                                i8_t,
+                                buf,
+                                &[str_len],
+                                "de.str.nul.ptr",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    };
+                    self.builder
+                        .build_store(nul_slot, i8_t.const_int(0, false))
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    // Store buf pointer into dst struct's String
+                    // field slot.
+                    self.builder
+                        .build_store(dst_field_ptr, buf)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let after_bytes = self
+                        .builder
+                        .build_int_add(
+                            after_len,
+                            str_len,
+                            "de.cursor.after.bytes",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after_bytes)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                LotusType::Int
+                | LotusType::Float
+                | LotusType::Bool
+                | LotusType::Time
+                | LotusType::Duration
+                | LotusType::Decimal => {
+                    let nbytes = lotus_type_size_bytes(self.context, &field_ty);
+                    let nbytes_iv = i64_t.const_int(nbytes, false);
+                    self.emit_memcpy_call(
+                        dst_field_ptr,
+                        src_at_cursor,
+                        nbytes_iv,
+                        "de.fixed.memcpy",
+                    )?;
+                    let after = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            nbytes_iv,
+                            "de.cursor.after",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                other => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "bus payload field `{}: {:?}` — m70 wire format \
+                         supports primitives and String only",
+                        fname, other
+                    )));
+                }
+            }
+        }
+
+        let struct_size = struct_ty
+            .size_of()
+            .expect("payload struct has known size");
+        Ok(struct_size)
+    }
+
+    /// m70: emit a call to `lotus_str_len(s)` and return the
+    /// resulting i64. Centralizes the symbol lookup.
+    fn emit_str_len_call(
+        &self,
+        s: PointerValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let str_len_fn = self
+            .module
+            .get_function("lotus_str_len")
+            .expect("lotus_str_len declared");
+        let n = self
+            .builder
+            .build_call(str_len_fn, &[s.into()], "ser.str.len.call")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_str_len returns i64")
+            .into_int_value();
+        Ok(n)
     }
 
     /// Emit a single subscription registration as one call to
@@ -13263,21 +13754,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .size_of()
             .expect("payload struct has known size");
 
-        // m60: alloca a stack buffer large enough to hold the
-        // serialized form. v0.1 wire format is identity so
-        // sizeof(struct) is exactly right; once the wire-format
-        // milestone introduces variable-width encodings we'll
-        // either size up here or spill to the arena.
-        let scratch_buf = self
-            .builder
-            .build_alloca(payload_struct_ty, "bus.send.scratch")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-
-        // Call __serialize_T(payload, scratch, sizeof(T)) and use
-        // its return value as the dispatch size. For identity the
-        // returned size IS sizeof(T); the variable lets future
-        // encodings shrink/grow the wire payload without changing
-        // the dispatch surface.
+        // m70: pass struct bytes directly to lotus_bus_dispatch
+        // along with the per-subject __serialize_T fn pointer.
+        // The dispatcher does local enqueue with struct bytes
+        // (preserving in-process semantics: String pointers stay
+        // valid because the publisher's arena outlives the
+        // immediate dispatch), and serializes through the
+        // supplied fn into wire bytes for cross-process fanout.
+        // Pre-m70 lower_send allocated a scratch buffer + called
+        // __serialize_T inline; m70 moves serialization into the
+        // C runtime so the wire bytes are only computed when
+        // they're about to be sent.
         let ser_fn = self
             .serializers
             .get(&payload_type_name)
@@ -13289,21 +13776,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 ))
             })?
             .serialize;
-        let written_size = self
-            .builder
-            .build_call(
-                ser_fn,
-                &[
-                    payload_val.into(),
-                    scratch_buf.into(),
-                    payload_size_iv.into(),
-                ],
-                "bus.send.serialize",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .expect("__serialize_T returns i64");
 
         let queue_global = self
             .module
@@ -13328,8 +13800,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 &[
                     queue_ptr.into(),
                     subj_val.into(),
-                    scratch_buf.into(),
-                    written_size.into(),
+                    payload_val.into(),
+                    payload_size_iv.into(),
+                    ser_fn.as_global_value().as_pointer_value().into(),
                 ],
                 "bus.dispatch.call",
             )

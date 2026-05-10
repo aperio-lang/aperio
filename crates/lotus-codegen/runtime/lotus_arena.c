@@ -693,17 +693,55 @@ void lotus_bus_local_dispatch(lotus_bus_queue_t *queue,
     }
 }
 
+/* m70: lotus_bus_dispatch's signature grew a 5th arg — a per-
+ * subject serialize fn pointer (NULL for cooperative-only
+ * publishers; codegen always passes the right one for cross-
+ * process-capable subjects). Local dispatch enqueues struct
+ * bytes (in-memory layout); remote fanout serializes those
+ * bytes through the supplied fn into the wire format the
+ * reader thread will deserialize. Splitting local-vs-remote
+ * here lets the wire format diverge from the in-memory struct
+ * layout (variable-width Strings, length-prefixed) without
+ * breaking the local in-process path. */
+typedef ssize_t (*lotus_serialize_fn)(const void *src,
+                                       void *dst,
+                                       size_t cap);
+
 void lotus_bus_dispatch(lotus_bus_queue_t *queue,
                         const char *subject,
-                        const void *payload,
-                        size_t payload_size) {
-    lotus_bus_local_dispatch(queue, subject, payload, payload_size);
-    /* m58: fanout to any cross-process transports bound to this
-     * subject by deployment-config. Local + remote share the same
-     * subject namespace per notes/open-questions #9 (emergent
-     * cardinality). When no config has been loaded the table is
-     * empty and this call costs one branch + one length compare. */
-    lotus_bus_remote_fanout(subject, payload, payload_size);
+                        const void *struct_payload,
+                        size_t struct_size,
+                        lotus_serialize_fn serialize_fn) {
+    /* Local fanout: enqueue struct bytes verbatim. Same shape
+     * as the pre-m70 path — String fields inside the struct
+     * are pointers into the publisher's arena; the local
+     * subscriber's drain copies struct bytes into its own arena
+     * and the handler reads through those pointers (which are
+     * still valid in-process). */
+    lotus_bus_local_dispatch(queue, subject, struct_payload, struct_size);
+
+    /* Remote fanout: serialize struct → wire bytes (per-field
+     * walk; codegen synthesizes the body), then dispatch to
+     * each CONNECT-role transport bound to this subject via
+     * the existing lotus_bus_remote_fanout iteration. When the
+     * remote-entries table is empty for this subject (config-
+     * not-set or all entries are LISTEN-role) the fanout is a
+     * cheap loop. The serializer cost runs unconditionally
+     * when serialize_fn is non-NULL — local-only programs that
+     * never set LOTUS_BUS_CONFIG pay one extra serialize per
+     * publish, which is bounded (LOTUS_PAYLOAD_MAX bytes). A
+     * future polish could gate this behind a "any remote
+     * entry for subject" check via a new helper, but the
+     * minimal-coupling shape is preferable for v1.
+     *
+     * m58: local + remote share the same subject namespace per
+     * notes/open-questions #9 (emergent cardinality). */
+    if (!serialize_fn) return;
+    char wire_buf[LOTUS_PAYLOAD_MAX];
+    ssize_t wire_size = serialize_fn(struct_payload, wire_buf,
+                                     sizeof(wire_buf));
+    if (wire_size <= 0) return;
+    lotus_bus_remote_fanout(subject, wire_buf, (size_t)wire_size);
 }
 
 /* m41b semantic: null-out subject for any entry whose self
@@ -1480,6 +1518,37 @@ void lotus_bus_remote_fanout(const char *subject,
     }
 }
 
+/* m70: lazy global "payload arena" for String byte storage in
+ * cross-process bus deserialization. The reader thread fills a
+ * stack-local struct_buf, dispatches via lotus_bus_local_dispatch
+ * (which copies struct_buf bytes into a queue cell), and after
+ * drain copies the cell bytes into the subscriber's arena. Any
+ * String pointer in struct_buf must outlive that whole chain —
+ * the subscriber's arena isn't accessible at deserialize time
+ * (we don't yet know which subscriber will fire; a subject can
+ * have multiple), so we allocate from a long-lived shared arena
+ * instead. Lifetime is the program; destroyed in
+ * lotus_bus_remote_destroy_all. Memory grows unbounded —
+ * acceptable for v1 (subscribers run for bounded duration). The
+ * pthread mutex serializes allocator access since reader threads
+ * call this concurrently. */
+static lotus_arena_t   *g_bus_payload_arena       = NULL;
+static pthread_mutex_t  g_bus_payload_arena_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void *lotus_bus_payload_arena_alloc(size_t size, size_t align) {
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return NULL;
+        }
+    }
+    void *p = lotus_arena_alloc(g_bus_payload_arena, size, align);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    return p;
+}
+
 void lotus_bus_remote_destroy_all(void) {
     for (size_t i = 0; i < g_bus_remote_count; i++) {
         lotus_bus_remote_entry_t *e = &g_bus_remote_entries[i];
@@ -1515,4 +1584,16 @@ void lotus_bus_remote_destroy_all(void) {
     g_bus_remote_entries = NULL;
     g_bus_remote_count   = 0;
     g_bus_remote_cap     = 0;
+
+    /* m70: tear down the lazy payload arena (used by deserialize
+     * to allocate String byte storage that survives the reader-
+     * thread → dispatch → handler chain). Created on first use
+     * via lotus_bus_payload_arena_alloc; destroyed here at
+     * program shutdown alongside the rest of the bus tables. */
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (g_bus_payload_arena) {
+        lotus_arena_destroy(g_bus_payload_arena);
+        g_bus_payload_arena = NULL;
+    }
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
 }
