@@ -1,4 +1,4 @@
-// domain-graph — m102 v0.
+// domain-graph — m102 v0 (now agnostic over source language).
 //
 // Third of the three lotus towers. Bulk-mode view of a codebase:
 // what concepts the code works with, derived from a deterministic
@@ -9,38 +9,35 @@
 //
 // **Honesty about uncertainty preserves the recognition;
 // over-claiming breaks it.** The unknown marker is non-negotiable
-// at v0 — surfacing a fabricated motion-form for a name we don't
-// understand is exactly the kind of thing that would make the
-// three-tower demo land as a gimmick.
+// at v0.
+//
+// **Language-agnostic body.** Type-declaration classification +
+// name extraction route through `std::lang::Lang`. The
+// morpheme rewriter is itself language-agnostic (English-grammar
+// morphology; the lookup table seed is Go-flavored vocabulary
+// but the rules apply broadly). Adding Rust / Python / TS is a
+// `Lang` extension.
 //
 // **Lotus-everywhere ethos.** The morpheme rewriter is its own
 // `MorphemeRewriterL` namespace lotus — empty `params { }`, only
 // methods, no lifecycle. Use site instantiates once
 // (`let r = MorphemeRewriterL { };`) and dispatches everything
 // through `r.name_to_motion(...)`. Self-method calls within the
-// locus (`self.lookup_morpheme(...)`) keep the namespace coherent
-// without falling back to bare free fns. The outer
-// `DomainGraphL` is the app-shaped locus per the apps-are-loci
-// rule.
+// locus keep the namespace coherent.
 //
 // Usage:
 //   aperio build apps/domain-graph/main.ap
-//   apps/domain-graph/main [GO_DIR]
+//   apps/domain-graph/main [SRC_DIR] [LANG_FLAVOR]
 
 // MorphemeRewriterL — namespace lotus for the noun→motion
-// transform. Empty params; pure methods. Each method composes
-// with the others via self-calls.
+// transform. Empty params; pure methods.
 locus MorphemeRewriterL {
     params { }
 
-    // True iff `c` (assumed length 1) is an ASCII uppercase letter.
     fn is_upper(c: String) -> Bool {
         return std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0;
     }
 
-    // ASCII to_lower over a whole string. Aperio doesn't yet
-    // ship std::str::to_lower; this open-codes via a parallel-
-    // table lookup.
     fn to_lower(s: String) -> String {
         let n = len(s);
         let mut out = "";
@@ -67,10 +64,6 @@ locus MorphemeRewriterL {
 
     // Per-morpheme entity-noun lookup. Returns "" on miss so the
     // caller falls through to the suffix rule.
-    //
-    // Seed from the design doc. Per-language extension is
-    // expected; this is the Go-flavored seed. Aliased duals
-    // collapse to one motion-form at v0.
     fn lookup_morpheme(m: String) -> String {
         if m == "Controller" { return "controlling"; }
         if m == "Processor"  { return "processing"; }
@@ -90,14 +83,8 @@ locus MorphemeRewriterL {
         return "";
     }
 
-    // Suffix rule. Returns "" on miss.
-    //
-    // **Min-morpheme-6 guard.** Naive `-er` stripping is too
-    // aggressive: "Order" → "Ord" + "ing" → "ording" is
-    // fabrication. Real `-er` action-nouns (Greeter, Listener,
-    // Worker) are ≥ 6 chars total. Below that threshold we
-    // yield "" and fall through to the unknown marker —
-    // preserves the "honesty about uncertainty" constraint.
+    // Suffix rule with min-morpheme-6 guard against fabrication
+    // ("Order" → "Ord"+"ing" would be wrong; min-6 fails it).
     fn suffix_rule(m: String) -> String {
         let n = len(m);
         if n < 6 { return ""; }
@@ -113,8 +100,6 @@ locus MorphemeRewriterL {
         return "";
     }
 
-    // One morpheme → its motion form. Lookup wins over suffix;
-    // both failing yields the explicit `<unknown:X>` marker.
     fn morpheme_to_motion(m: String) -> String {
         let hit = self.lookup_morpheme(m);
         if len(hit) > 0 { return hit; }
@@ -123,10 +108,6 @@ locus MorphemeRewriterL {
         return "<unknown:" + m + ">";
     }
 
-    // Split a CamelCase identifier into morphemes, separated by
-    // "\n". "OrderProcessor" → "Order\nProcessor\n". (Acronyms
-    // run together; "HTTPClient" → "HTTPClient" is a known v0
-    // limitation.)
     fn split_camel(name: String) -> String {
         let n = len(name);
         if n == 0 { return ""; }
@@ -145,8 +126,6 @@ locus MorphemeRewriterL {
         return out;
     }
 
-    // CamelCase name → motion form. Each morpheme rewritten
-    // independently; results joined with "-".
     fn name_to_motion(name: String) -> String {
         let morphemes = self.split_camel(name);
         let total = len(morphemes);
@@ -178,65 +157,54 @@ locus MorphemeRewriterL {
     }
 }
 
-// Tree-walking helpers — kept as free fns at v0 because their
-// caller (`__domain_drive`) doesn't naturally form a coherent
-// "tree namespace" yet. Will likely move into a TreeWalkerL
-// namespace lotus once a second extractor needs the same shape.
-
-fn __type_spec_name(spec: Int) -> String {
-    let n = std::ts::node_named_child_count(spec);
-    let mut i = 0;
-    while i < n {
-        let c = std::ts::node_named_child(spec, i);
-        if std::ts::node_kind(c) == "type_identifier" {
-            return std::ts::node_text(c);
-        }
-        i = i + 1;
-    }
-    return "?";
-}
-
-fn __collect_type_specs(node: Int) -> String {
+// Recurse only under a type-decl to find type-spec leaves.
+// `lang` provides the per-flavor classifier; the recursion is
+// grammar-agnostic.
+fn __collect_type_specs(lang: std::lang::Lang, node: Int) -> String {
     if node == 0 { return ""; }
-    let kind = std::ts::node_kind(node);
-    if kind == "type_spec" {
-        return __type_spec_name(node) + "\n";
+    if lang.is_type_spec(node) {
+        return lang.extract_type_name(node) + "\n";
     }
     let mut acc = "";
     let cnt = std::ts::node_named_child_count(node);
     let mut i = 0;
     while i < cnt {
         let c = std::ts::node_named_child(node, i);
-        acc = acc + __collect_type_specs(c);
+        acc = acc + __collect_type_specs(lang, c);
         i = i + 1;
     }
     return acc;
 }
 
-fn __collect_type_names(node: Int) -> String {
+// Walk the file's root, collecting type-decl subtrees only.
+// Avoids picking up type-spec nodes inside function bodies (Go
+// allows local type declarations) by descending into the body
+// of each `type_declaration` separately.
+fn __collect_type_names(lang: std::lang::Lang, node: Int) -> String {
     if node == 0 { return ""; }
-    let kind = std::ts::node_kind(node);
     let mut acc = "";
-    if kind == "type_declaration" {
-        acc = acc + __collect_type_specs(node);
+    if lang.is_type_decl(node) {
+        acc = acc + __collect_type_specs(lang, node);
     }
     let cnt = std::ts::node_named_child_count(node);
     let mut i = 0;
     while i < cnt {
         let c = std::ts::node_named_child(node, i);
-        if kind != "type_declaration" {
-            acc = acc + __collect_type_names(c);
+        if !lang.is_type_decl(node) {
+            acc = acc + __collect_type_names(lang, c);
         }
         i = i + 1;
     }
     return acc;
 }
 
-fn __ends_with_go(name: String) -> Bool {
+fn __ends_with_source(name: String, flavor: String) -> Bool {
     let n = len(name);
-    if n < 3 { return false; }
-    let suffix = name[n-3..n];
-    return suffix == ".go";
+    if flavor == "go" {
+        if n < 3 { return false; }
+        return name[n-3..n] == ".go";
+    }
+    return false;
 }
 
 fn __append_entry(arr: String, entry: String) -> String {
@@ -244,7 +212,8 @@ fn __append_entry(arr: String, entry: String) -> String {
     return arr + ", " + entry;
 }
 
-fn __domain_drive(dir: String) {
+fn __domain_drive(dir: String, flavor: String) {
+    let lang = std::lang::Lang { flavor: flavor };
     let entries = std::io::fs::list_dir(dir);
     let total_e = len(entries);
     if total_e == 0 {
@@ -252,9 +221,7 @@ fn __domain_drive(dir: String) {
         return;
     }
 
-    // Single namespace-lotus instantiation; lives for the
-    // duration of this fn (m82 deferred-dissolve at scope-exit).
-    // One alloc total; every motion-rewrite dispatches through it.
+    // One namespace-lotus instance for the whole walk.
     let r = MorphemeRewriterL { };
 
     let mut types_arr = "";
@@ -271,14 +238,14 @@ fn __domain_drive(dir: String) {
             from = from + nl + 1;
         }
         if len(name) > 0 {
-            if __ends_with_go(name) {
+            if __ends_with_source(name, flavor) {
                 let path = dir + "/" + name;
                 let src = std::io::fs::read_file(path);
                 if len(src) > 0 {
-                    let tree = std::ts::parse_go(src);
+                    let tree = lang.parse(src);
                     if tree != 0 {
                         let root = std::ts::root_node(tree);
-                        let names = __collect_type_names(root);
+                        let names = __collect_type_names(lang, root);
                         let nlen = len(names);
                         let mut nfrom = 0;
                         while nfrom < nlen {
@@ -306,7 +273,8 @@ fn __domain_drive(dir: String) {
         }
     }
 
-    let json = "{\n  \"dir\": \"" + dir + "\",\n  \"domain\": {\n"
+    let json = "{\n  \"dir\": \"" + dir + "\",\n  \"flavor\": \"" + flavor
+        + "\",\n  \"domain\": {\n"
         + "    \"types\": [" + types_arr + "]\n"
         + "  }\n}";
     println(json);
@@ -315,16 +283,21 @@ fn __domain_drive(dir: String) {
 locus DomainGraphL {
     params {
         dir: String = "apps/domain-graph/fixture";
+        flavor: String = "go";
     }
     run() {
-        __domain_drive(self.dir);
+        __domain_drive(self.dir, self.flavor);
     }
 }
 
 fn main() {
     let mut dir = "apps/domain-graph/fixture";
+    let mut flavor = "go";
     if std::env::args_count() > 1 {
         dir = std::env::arg(1);
     }
-    DomainGraphL { dir: dir };
+    if std::env::args_count() > 2 {
+        flavor = std::env::arg(2);
+    }
+    DomainGraphL { dir: dir, flavor: flavor };
 }

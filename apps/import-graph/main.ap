@@ -1,28 +1,31 @@
-// import-graph — m97 dogfood.
+// import-graph — m97 (now agnostic over source language).
 //
-// Walks a directory of Go files, parses each with std::ts, and
-// emits a JSON tower model: per-file `id` + `package` +
-// `imports`. First concrete consumer of the m96 tree-sitter
-// substrate; validates that the lotus-shape mapping is tractable
-// for real foreign code (per
+// Walks a directory of source files, parses each via
+// `std::lang::Lang`, and emits a JSON tower model: per-file
+// `id` + `package` + `imports`. First concrete consumer of the
+// m96 tree-sitter substrate; validates that the lotus-shape
+// mapping is tractable for real foreign code (per
 // notes/codebase-onboarding-design.md).
 //
+// **Language-agnostic body.** All Go-specific tree-sitter kind
+// strings (`package_clause`, `import_declaration`,
+// `interpreted_string_literal`) live in `std::lang::Lang`, not
+// here. The extractor talks only to the `Lang` locus, never
+// directly to `std::ts::*` (except for generic walking — node
+// counts, named children — which is grammar-agnostic).
+// Adding Rust / Python / TS support is a `Lang` extension,
+// not an extractor change.
+//
 // Wrapped in an `ImportGraphL` locus per the lotus-all-the-way-
-// down ethos: an extraction job is emergent structure
-// (gather → walk → emit), so the outer encapsulation is a locus
-// rather than bare top-level fns. The locus's `run()` body
-// dispatches into a free helper fn to keep early-return
-// short-circuits available (m82-followup limitation: lifecycle
-// method bodies don't accept `return` at v0).
+// down ethos.
 //
 // Usage:
 //   aperio build apps/import-graph/main.ap
-//   apps/import-graph/main [GO_DIR]
+//   apps/import-graph/main [SRC_DIR] [LANG_FLAVOR]
 //
-// argv[1] is the directory to scan. Defaults to
-// `apps/import-graph/fixture/` so the demo runs from the repo
-// root with no flags. Output goes to stdout — wrap in
-// `> tower.json` to persist.
+// argv[1] is the directory to scan. argv[2] is the language
+// flavor ("go" today; "rust"/"python"/etc. when wired).
+// Defaults: fixture dir + "go".
 //
 // v0 scope cuts (see README.md):
 //   - File-level locus mapping (not package-level aggregation).
@@ -30,44 +33,26 @@
 //   - Aliased imports collapse: `import f "fmt"` → `"fmt"`.
 //   - No JSON escaping (Go names don't contain `"` or `\`).
 
-// Recursively collect all interpreted_string_literal texts found
-// under `node`, with surrounding quotes stripped, separated by
-// "\n". For an import_declaration this yields one line per
-// imported package — handles both single-import shape
-// (`import "fmt"`) and grouped shape (`import ( "fmt"; "os" )`).
-fn __collect_string_literals(node: Int) -> String {
+// Recursively collect all string-literal texts found under
+// `node`, with surrounding quotes stripped (via Lang),
+// separated by "\n". For an import-decl this yields one line
+// per imported package — handles both single-import and
+// grouped-block shapes uniformly.
+fn __collect_imports(lang: std::lang::Lang, node: Int) -> String {
     if node == 0 { return ""; }
-    let kind = std::ts::node_kind(node);
-    if kind == "interpreted_string_literal" {
+    if lang.is_string_literal(node) {
         let raw = std::ts::node_text(node);
-        let n = len(raw);
-        if n < 2 { return ""; }
-        return raw[1..n-1] + "\n";
+        return lang.strip_string_quotes(raw) + "\n";
     }
     let mut acc = "";
     let cnt = std::ts::node_named_child_count(node);
     let mut i = 0;
     while i < cnt {
         let c = std::ts::node_named_child(node, i);
-        acc = acc + __collect_string_literals(c);
+        acc = acc + __collect_imports(lang, c);
         i = i + 1;
     }
     return acc;
-}
-
-// Find the package_identifier text under a package_clause node.
-// Returns "?" if not found (shouldn't happen for valid Go).
-fn __find_package_id(pkg_clause: Int) -> String {
-    let n = std::ts::node_named_child_count(pkg_clause);
-    let mut i = 0;
-    while i < n {
-        let c = std::ts::node_named_child(pkg_clause, i);
-        if std::ts::node_kind(c) == "package_identifier" {
-            return std::ts::node_text(c);
-        }
-        i = i + 1;
-    }
-    return "?";
 }
 
 // Build the JSON imports array from a "\n"-separated string.
@@ -105,10 +90,10 @@ fn __build_imports_array(imports: String) -> String {
 // Extract one file's tower entry as a JSON object string.
 // Empty string return signals "skip this file" (read or parse
 // failure); the caller drops it from the array.
-fn __extract_file(path: String, name: String) -> String {
+fn __extract_file(lang: std::lang::Lang, path: String, name: String) -> String {
     let src = std::io::fs::read_file(path);
     if len(src) == 0 { return ""; }
-    let tree = std::ts::parse_go(src);
+    let tree = lang.parse(src);
     if tree == 0 { return ""; }
     let root = std::ts::root_node(tree);
 
@@ -119,12 +104,11 @@ fn __extract_file(path: String, name: String) -> String {
     let mut i = 0;
     while i < n {
         let c = std::ts::node_named_child(root, i);
-        let k = std::ts::node_kind(c);
-        if k == "package_clause" {
-            pkg = __find_package_id(c);
+        if lang.is_package_clause(c) {
+            pkg = lang.extract_package_name(c);
         }
-        if k == "import_declaration" {
-            imports_raw = imports_raw + __collect_string_literals(c);
+        if lang.is_import_decl(c) {
+            imports_raw = imports_raw + __collect_imports(lang, c);
         }
         i = i + 1;
     }
@@ -134,19 +118,21 @@ fn __extract_file(path: String, name: String) -> String {
         + "\", \"imports\": " + imports_json + "}";
 }
 
-// True iff `name` ends with ".go". Used to filter list_dir output
-// to Go source files only (skips README.md, go.mod, etc.).
-fn __ends_with_go(name: String) -> Bool {
+// True iff `name` ends with ".go". v0 hardcodes the Go suffix
+// since we only support Go. When other flavors land, this
+// becomes `lang.source_extension()` or similar — the hardcode
+// is the last Go-specific bit in this file.
+fn __ends_with_source(name: String, flavor: String) -> Bool {
     let n = len(name);
-    if n < 3 { return false; }
-    let suffix = name[n-3..n];
-    return suffix == ".go";
+    if flavor == "go" {
+        if n < 3 { return false; }
+        return name[n-3..n] == ".go";
+    }
+    return false;
 }
 
-// Drive the full extraction. Free fn so early-return on the
-// empty-dir path stays clean (m82 lifecycle bodies don't accept
-// `return`).
-fn __import_graph_drive(dir: String) {
+fn __import_graph_drive(dir: String, flavor: String) {
+    let lang = std::lang::Lang { flavor: flavor };
     let entries = std::io::fs::list_dir(dir);
     let total = len(entries);
     if total == 0 {
@@ -154,7 +140,8 @@ fn __import_graph_drive(dir: String) {
         return;
     }
 
-    let mut json = "{\n  \"dir\": \"" + dir + "\",\n  \"files\": [";
+    let mut json = "{\n  \"dir\": \"" + dir + "\",\n  \"flavor\": \"" + flavor
+        + "\",\n  \"files\": [";
     let mut first = true;
     let mut from = 0;
     while from < total {
@@ -169,9 +156,9 @@ fn __import_graph_drive(dir: String) {
             from = from + nl + 1;
         }
         if len(name) > 0 {
-            if __ends_with_go(name) {
+            if __ends_with_source(name, flavor) {
                 let path = dir + "/" + name;
-                let entry = __extract_file(path, name);
+                let entry = __extract_file(lang, path, name);
                 if len(entry) > 0 {
                     if first {
                         json = json + "\n    " + entry;
@@ -190,16 +177,21 @@ fn __import_graph_drive(dir: String) {
 locus ImportGraphL {
     params {
         dir: String = "apps/import-graph/fixture";
+        flavor: String = "go";
     }
     run() {
-        __import_graph_drive(self.dir);
+        __import_graph_drive(self.dir, self.flavor);
     }
 }
 
 fn main() {
     let mut dir = "apps/import-graph/fixture";
+    let mut flavor = "go";
     if std::env::args_count() > 1 {
         dir = std::env::arg(1);
     }
-    ImportGraphL { dir: dir };
+    if std::env::args_count() > 2 {
+        flavor = std::env::arg(2);
+    }
+    ImportGraphL { dir: dir, flavor: flavor };
 }

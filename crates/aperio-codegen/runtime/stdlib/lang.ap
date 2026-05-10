@@ -1,0 +1,257 @@
+// Aperio stdlib — std::lang.
+//
+// Language-agnostic AST query interface. Encapsulates per-
+// language tree-sitter node-kind strings + extraction
+// heuristics so the codebase-onboarding extractors (import-
+// graph, operational, domain) can be written agnostically over
+// languages. Per
+// notes/codebase-onboarding-design.md, the eventual product
+// targets multiple source languages; isolating Go-specific
+// knowledge behind one type lets the extractors compose
+// against a stable API.
+//
+// **v0 scope.** Only Go is wired. New languages slot in by:
+//   1. Adding a `parse_<lang>` to `std::ts` (m96-followup).
+//   2. Adding flavor arms to each method below.
+//
+// **Future direction.** When Aperio ships traits / interfaces,
+// `Lang` becomes a trait with per-language impls (`GoLang`,
+// `RustLang`, ...). Until then, the single-locus + flavor-
+// switch pattern is the cleanest available shape: extractors
+// see one type, language-specific knowledge stays internal.
+//
+// Use site:
+//   let lang = std::lang::Lang { flavor: "go" };
+//   let tree = lang.parse(src);
+//   let root = std::ts::root_node(tree);
+//   if lang.is_fn_decl(root) { ... }
+//
+// Tree handles + node handles still come from `std::ts::*`
+// directly — those are language-agnostic substrate. Only
+// CLASSIFICATION + NAME EXTRACTION go through `Lang`.
+
+locus __StdLangLang {
+    params {
+        // Per-language flavor. v0: "go". Future: "rust",
+        // "python", "ts", etc. Methods dispatch on this.
+        flavor: String = "go";
+    }
+
+    // ---- Parsing ----
+
+    // Parse source into a tree handle. Routes to the right
+    // `std::ts::parse_*` based on flavor. Returns 0 on
+    // unsupported flavor or parse failure.
+    fn parse(src: String) -> Int {
+        if self.flavor == "go" {
+            return std::ts::parse_go(src);
+        }
+        return 0;
+    }
+
+    // ---- Node-kind classifiers ----
+    //
+    // Each `is_X(node)` answers "is this node of category X in
+    // the active flavor's grammar?" Tree-sitter kind names vary
+    // per-grammar (Go's `function_declaration` ↔ Rust's
+    // `function_item` ↔ Python's `function_definition`) — this
+    // is exactly the friction we're isolating.
+
+    fn is_package_clause(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "package_clause"; }
+        return false;
+    }
+
+    fn is_import_decl(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "import_declaration"; }
+        return false;
+    }
+
+    fn is_fn_decl(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "function_declaration"; }
+        return false;
+    }
+
+    fn is_type_decl(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "type_declaration"; }
+        return false;
+    }
+
+    fn is_type_spec(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "type_spec"; }
+        return false;
+    }
+
+    fn is_string_literal(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "interpreted_string_literal"; }
+        return false;
+    }
+
+    // Concurrent-spawn statement. Go: `go_statement`. Rust:
+    // would be `tokio::spawn(...)` / `thread::spawn(...)` call
+    // expressions — needs different detection. Python: an
+    // `await` over an `asyncio.create_task` call. Each flavor
+    // wires its own equivalent.
+    fn is_concurrent_spawn(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "go_statement"; }
+        return false;
+    }
+
+    // Long-running loop heuristic. Go: a `for_statement` whose
+    // first named child is `block` (no condition / range_clause).
+    // Other flavors have analogous shapes (`loop {}` in Rust,
+    // `while True:` in Python).
+    fn is_infinite_loop(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" {
+            if k != "for_statement" { return false; }
+            let n = std::ts::node_named_child_count(node);
+            if n == 0 { return false; }
+            let first = std::ts::node_named_child(node, 0);
+            return std::ts::node_kind(first) == "block";
+        }
+        return false;
+    }
+
+    // ---- Name / text extractors ----
+    //
+    // Each `extract_X(node)` reads the relevant text from a
+    // classified node. Returns "?" for misses (defensive — the
+    // extractor's caller should already have verified the
+    // classification via `is_X` before calling here).
+
+    fn extract_fn_name(fn_decl: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(fn_decl);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(fn_decl, i);
+                if std::ts::node_kind(c) == "identifier" {
+                    return std::ts::node_text(c);
+                }
+                i = i + 1;
+            }
+        }
+        return "?";
+    }
+
+    fn extract_type_name(type_spec: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(type_spec);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(type_spec, i);
+                if std::ts::node_kind(c) == "type_identifier" {
+                    return std::ts::node_text(c);
+                }
+                i = i + 1;
+            }
+        }
+        return "?";
+    }
+
+    fn extract_package_name(pkg_clause: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(pkg_clause);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(pkg_clause, i);
+                if std::ts::node_kind(c) == "package_identifier" {
+                    return std::ts::node_text(c);
+                }
+                i = i + 1;
+            }
+        }
+        return "?";
+    }
+
+    // Strip surrounding quotes from a string-literal text.
+    // Go: "fmt" → fmt; Rust: same; Python: handles both
+    // 'foo' and "foo" — needs flavor branching at v1. v0 is
+    // language-agnostic since both supported flavors use ".
+    fn strip_string_quotes(raw: String) -> String {
+        let n = len(raw);
+        if n < 2 { return ""; }
+        return raw[1..n-1];
+    }
+
+    // ---- Heuristics ----
+
+    // HTTP-handler shape detection. v0 uses param-substring
+    // match. Each flavor has its own framework idiom:
+    //   Go:     (w http.ResponseWriter, r *http.Request)
+    //   Rust:   axum / actix per-extractor types
+    //   Python: Flask `request` global; FastAPI Depends()
+    fn is_http_handler(fn_decl: Int) -> Bool {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(fn_decl);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(fn_decl, i);
+                if std::ts::node_kind(c) == "parameter_list" {
+                    let txt = std::ts::node_text(c);
+                    return std::str::index_of(txt, "ResponseWriter") >= 0
+                        && std::str::index_of(txt, "Request") >= 0;
+                }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // Anonymous-vs-named spawn distinction.
+    //
+    //   "anonymous" — `go func() { ... }()` (Go),
+    //                 `tokio::spawn(async move { ... })` (Rust)
+    //   "named"     — `go someFunc()` / `tokio::spawn(someFn())`
+    //
+    // Returned as a String so the extractor's tagged
+    // accumulator can include it verbatim in the JSON output.
+    fn spawn_kind(spawn_stmt: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(spawn_stmt);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(spawn_stmt, i);
+                if std::ts::node_kind(c) == "call_expression" {
+                    let cn = std::ts::node_named_child_count(c);
+                    if cn > 0 {
+                        let f = std::ts::node_named_child(c, 0);
+                        if std::ts::node_kind(f) == "func_literal" {
+                            return "anonymous";
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            return "named";
+        }
+        return "named";
+    }
+
+    // Function with this name should be classified as the root
+    // locus's `main` lifecycle method. Go: "main". Rust:
+    // "main". Python: convention-based (`__main__`-guarded).
+    fn is_main_fn(fn_decl: Int) -> Bool {
+        return self.extract_fn_name(fn_decl) == "main";
+    }
+
+    // Function with this name should be classified as a
+    // `birth()` body for the root locus. Go: "init" (per-
+    // package init). Rust: no direct equivalent; might map to
+    // `lazy_static!` initializers or `ctor`-attributed fns.
+    // Python: module-level top-level statements.
+    fn is_init_fn(fn_decl: Int) -> Bool {
+        if self.flavor == "go" {
+            return self.extract_fn_name(fn_decl) == "init";
+        }
+        return false;
+    }
+}

@@ -374,6 +374,15 @@ const STDLIB_AP_SOURCE: &str = concat!(
     // (`println`, while, assignment), so order is flexible.
     // Lands last by convention.
     include_str!("../runtime/stdlib/ts.ap"),
+    "\n",
+    // Post-m102: language-agnostic AST query interface.
+    // Wraps `std::ts::*` + per-language node-kind strings
+    // behind a single `Lang` locus. Depends on `std::ts::*`
+    // path calls and `std::str::index_of`; both are path
+    // calls that resolve at codegen time, so source-order
+    // dependency on ts.ap is just stylistic — the
+    // path-call resolution is independent of bundle order.
+    include_str!("../runtime/stdlib/lang.ap"),
 );
 
 /// Maps each user-facing stdlib path (locus OR type) to the
@@ -390,6 +399,7 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "http", "Response"], "__StdHttpResponse"),
     (&["std", "io", "tcp", "Listener"], "__StdIoTcpListener"),
     (&["std", "io", "tcp", "Stream"], "__StdIoTcpStream"),
+    (&["std", "lang", "Lang"], "__StdLangLang"),
     (&["std", "log", "LogEvent"], "__StdLogEvent"),
     (&["std", "log", "Logger"], "__StdLogLogger"),
     (&["std", "log", "StdoutSink"], "__StdLogStdoutSink"),
