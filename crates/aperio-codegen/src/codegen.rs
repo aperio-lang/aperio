@@ -1902,6 +1902,62 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .get(&locus_name)
                 .cloned()
                 .expect("deferred locus declared");
+            // Skip entries whose `let X = SomeLocus { };` never
+            // executed on this control-flow path. The
+            // lower_locus_instantiation hoist (entry-block alloca
+            // with NULL-init arena field) gives us a reliable
+            // sentinel: if the arena field reads NULL here, the
+            // let-statement was bypassed (e.g., by an earlier
+            // `return`), and there is nothing to dissolve. Skip
+            // the entire entry — drain, dissolve, and
+            // arena_destroy all would dereference uninitialized
+            // state otherwise.
+            //
+            // For pinned entries the same sentinel applies: the
+            // pthread was never created, so pthread_join would
+            // block forever on a garbage TID.
+            let func = self
+                .current_fn
+                .expect("flush called outside a fn body");
+            let ptr_t = self.context.ptr_type(AddressSpace::default());
+            let arena_check_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    info.arena_field_idx,
+                    &format!("{}.dissolve.arena.gep", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let arena_check = self
+                .builder
+                .build_load(ptr_t, arena_check_ptr, &format!("{}.dissolve.arena", locus_name))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_pointer_value();
+            let is_null = self
+                .builder
+                .build_is_null(
+                    arena_check,
+                    &format!("{}.dissolve.skip", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let skip_bb = self
+                .context
+                .append_basic_block(func, &format!("{}.dissolve.skip", locus_name));
+            let process_bb = self
+                .context
+                .append_basic_block(func, &format!("{}.dissolve.process", locus_name));
+            let after_bb = self
+                .context
+                .append_basic_block(func, &format!("{}.dissolve.after", locus_name));
+            self.builder
+                .build_conditional_branch(is_null, skip_bb, process_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(skip_bb);
+            self.builder
+                .build_unconditional_branch(after_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(process_bb);
             // m28a + m28b: pinned loci — pthread_join blocks until
             // the pinned thread's full lifecycle (birth → run →
             // mailbox loop (if subscriptions) → drain → dissolve)
@@ -2058,6 +2114,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             if drain_queue {
                 self.emit_bus_drain()?;
             }
+            // Close the per-entry process_bb by branching to
+            // after_bb so both skip_bb and process_bb converge
+            // before the loop body advances to the next entry.
+            self.builder
+                .build_unconditional_branch(after_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(after_bb);
         }
         Ok(())
     }
@@ -13773,10 +13836,36 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map(|i| (i.name.name.as_str(), &i.value))
             .collect();
 
-        let self_ptr = self
-            .builder
-            .build_alloca(info.struct_ty, &format!("{}.self", locus_name))
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Deferred-dissolve gating: when this locus's dissolve
+        // is deferred to a fn-exit flush (let-bound `let x = X{};`
+        // or bus-subscribing long-lived locus), the body that
+        // contains this `let` may not execute on every control-
+        // flow path — e.g., an early `return` before the let.
+        // The flush iterates frame entries unconditionally; if
+        // we emit the struct's alloca at the let position, an
+        // early-return path leaves it uninitialized and the
+        // flush dereferences garbage (segv at a low address as
+        // arena field offset is read off a near-null pointer).
+        //
+        // Fix: hoist the alloca to the fn entry block and
+        // zero-init the arena field there. The let position
+        // overwrites the arena field with the real arena when
+        // it runs. The flush null-checks the arena field per
+        // entry (see flush_dissolve_frame_kind) and skips
+        // entries whose let never executed.
+        let early_defer = defer_for_let
+            || !info.subscriptions.is_empty();
+        let self_ptr = if early_defer && self.current_fn.is_some() {
+            self.alloca_in_entry_with_nulled_arena(
+                info.struct_ty,
+                info.arena_field_idx,
+                &format!("{}.self", locus_name),
+            )?
+        } else {
+            self.builder
+                .build_alloca(info.struct_ty, &format!("{}.self", locus_name))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
 
         // First — initialize the synthetic `__arena` field
         // (struct slot 0) with a fresh arena. Allocations made
@@ -17431,6 +17520,58 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_load(ptr_t, arena_global.as_pointer_value(), "arena.cur")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(arena_ptr.into_pointer_value())
+    }
+
+    /// Allocate a locus struct in the current fn's entry block
+    /// and store NULL into its arena field there. Used for
+    /// deferred-dissolve loci (let-bound or bus-subscribed) so
+    /// the dissolve frame's flush can safely null-check the
+    /// arena field per entry — entries whose `let` never
+    /// executed on this control-flow path read NULL and get
+    /// skipped, instead of dereferencing uninitialized stack.
+    fn alloca_in_entry_with_nulled_arena(
+        &mut self,
+        struct_ty: inkwell::types::StructType<'ctx>,
+        arena_field_idx: u32,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let func = self
+            .current_fn
+            .expect("alloca_in_entry called outside a fn body");
+        let entry_bb = func
+            .get_first_basic_block()
+            .expect("fn has an entry block");
+        let saved = self.builder.get_insert_block();
+        // Position before the entry block's terminator (if any)
+        // — for unfinished entry blocks the builder positions at
+        // the end; for finished ones we use position_before of
+        // the first instruction so the alloca lands at the top.
+        if let Some(first_instr) = entry_bb.get_first_instruction() {
+            self.builder.position_before(&first_instr);
+        } else {
+            self.builder.position_at_end(entry_bb);
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let slot = self
+            .builder
+            .build_alloca(struct_ty, name)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let arena_field_ptr = self
+            .builder
+            .build_struct_gep(
+                struct_ty,
+                slot,
+                arena_field_idx,
+                &format!("{}.__arena.entry_null", name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(arena_field_ptr, ptr_t.const_null())
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        Ok(slot)
     }
 
     /// Emit `lotus_arena_destroy(<load self_ptr->__arena>)` for a
