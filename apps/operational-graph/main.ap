@@ -33,13 +33,6 @@
 //   aperio build apps/operational-graph/main.ap
 //   apps/operational-graph/main [SRC_DIR] [LANG_FLAVOR]
 
-// Append a JSON entry to `arr_acc`, prefixing with ", " if
-// `arr_acc` already has content.
-fn __append_entry(arr_acc: String, entry: String) -> String {
-    if len(arr_acc) == 0 { return entry; }
-    return arr_acc + ", " + entry;
-}
-
 // Per-file walk. Recurses through all named children. Tagged-
 // string accumulator: each finding is one line `TAG:detail`,
 // the caller bins lines by tag for the final JSON. The
@@ -77,45 +70,26 @@ fn __walk(lang: std::lang::Lang, node: Int, file: String) -> String {
     return acc;
 }
 
-fn __ends_with_source(name: String, flavor: String) -> Bool {
-    let n = len(name);
-    if flavor == "go" {
-        if n < 3 { return false; }
-        return name[n-3..n] == ".go";
-    }
-    return false;
-}
-
 // Build a JSON array of entries from the tagged accumulator,
 // keeping only lines whose first colon-segment matches `tag`.
 // `to_entry` is a fn pointer that takes the post-tag content
 // (everything after the first ":") and produces one JSON object.
+// Walks the accumulator via std::tagged::Accumulator.each_body;
+// json::Builder formats the array.
 fn __collect_section(acc: String, tag: String, to_entry: fn(String) -> String) -> String {
+    let ta = std::tagged::Accumulator { };
+    let it = std::iter::Lines { };
+    let jb = std::json::Builder { };
+    let bodies = ta.each_body(acc, tag);
     let mut arr = "";
     let mut from = 0;
-    let total = len(acc);
-    let prefix = tag + ":";
-    let plen = len(prefix);
-    while from < total {
-        let rest = acc[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut line = "";
-        if nl < 0 {
-            line = rest;
-            from = total;
-        } else {
-            line = rest[0..nl];
-            from = from + nl + 1;
-        }
-        if len(line) > plen {
-            let head = line[0..plen];
-            if head == prefix {
-                let body = line[plen..len(line)];
-                arr = __append_entry(arr, to_entry(body));
-            }
-        }
+    while from >= 0 {
+        let body = it.line_at(bodies, from);
+        from = it.next_idx(bodies, from);
+        if len(body) == 0 { continue; }
+        arr = jb.append_entry(arr, to_entry(body));
     }
-    return "[" + arr + "]";
+    return jb.wrap_array(arr);
 }
 
 fn __fmt_file(body: String) -> String {
@@ -151,32 +125,21 @@ fn __operational_drive(dir: String, flavor: String) {
         return;
     }
 
+    let it = std::iter::Lines { };
     let mut acc = "";
     let mut from = 0;
-    while from < total {
-        let rest = entries[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut name = "";
-        if nl < 0 {
-            name = rest;
-            from = total;
-        } else {
-            name = rest[0..nl];
-            from = from + nl + 1;
-        }
-        if len(name) > 0 {
-            if __ends_with_source(name, flavor) {
-                let path = dir + "/" + name;
-                let src = std::io::fs::read_file(path);
-                if len(src) > 0 {
-                    let tree = lang.parse(src);
-                    if tree != 0 {
-                        let root = std::ts::root_node(tree);
-                        acc = acc + __walk(lang, root, name);
-                    }
-                }
-            }
-        }
+    while from >= 0 {
+        let name = it.line_at(entries, from);
+        from = it.next_idx(entries, from);
+        if len(name) == 0 { continue; }
+        if std::io::fs::extension(name) != ".go" { continue; }
+        let path = dir + "/" + name;
+        let src = std::io::fs::read_file(path);
+        if len(src) == 0 { continue; }
+        let tree = lang.parse(src);
+        if tree == 0 { continue; }
+        let root = std::ts::root_node(tree);
+        acc = acc + __walk(lang, root, name);
     }
 
     let main_arr = __collect_section(acc, "MAIN", __fmt_file);

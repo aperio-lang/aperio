@@ -55,38 +55,6 @@ fn __collect_imports(lang: std::lang::Lang, node: Int) -> String {
     return acc;
 }
 
-// Build the JSON imports array from a "\n"-separated string.
-// Empty lines drop. Entries are JSON-quoted but not escaped (Go
-// import paths don't contain " or \).
-fn __build_imports_array(imports: String) -> String {
-    let mut out = "[";
-    let mut from = 0;
-    let total = len(imports);
-    let mut first = true;
-    while from < total {
-        let rest = imports[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut entry = "";
-        if nl < 0 {
-            entry = rest;
-            from = total;
-        } else {
-            entry = rest[0..nl];
-            from = from + nl + 1;
-        }
-        if len(entry) > 0 {
-            if first {
-                out = out + "\"" + entry + "\"";
-                first = false;
-            } else {
-                out = out + ", \"" + entry + "\"";
-            }
-        }
-    }
-    out = out + "]";
-    return out;
-}
-
 // Extract one file's tower entry as a JSON object string.
 // Empty string return signals "skip this file" (read or parse
 // failure); the caller drops it from the array.
@@ -113,22 +81,10 @@ fn __extract_file(lang: std::lang::Lang, path: String, name: String) -> String {
         i = i + 1;
     }
 
-    let imports_json = __build_imports_array(imports_raw);
+    let jb = std::json::Builder { };
+    let imports_json = jb.build_quoted_array(imports_raw);
     return "{\"id\": \"" + name + "\", \"package\": \"" + pkg
         + "\", \"imports\": " + imports_json + "}";
-}
-
-// True iff `name` ends with ".go". v0 hardcodes the Go suffix
-// since we only support Go. When other flavors land, this
-// becomes `lang.source_extension()` or similar — the hardcode
-// is the last Go-specific bit in this file.
-fn __ends_with_source(name: String, flavor: String) -> Bool {
-    let n = len(name);
-    if flavor == "go" {
-        if n < 3 { return false; }
-        return name[n-3..n] == ".go";
-    }
-    return false;
 }
 
 fn __import_graph_drive(dir: String, flavor: String) {
@@ -140,34 +96,24 @@ fn __import_graph_drive(dir: String, flavor: String) {
         return;
     }
 
+    let it = std::iter::Lines { };
     let mut json = "{\n  \"dir\": \"" + dir + "\",\n  \"flavor\": \"" + flavor
         + "\",\n  \"files\": [";
     let mut first = true;
     let mut from = 0;
-    while from < total {
-        let rest = entries[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut name = "";
-        if nl < 0 {
-            name = rest;
-            from = total;
+    while from >= 0 {
+        let name = it.line_at(entries, from);
+        from = it.next_idx(entries, from);
+        if len(name) == 0 { continue; }
+        if std::io::fs::extension(name) != ".go" { continue; }
+        let path = dir + "/" + name;
+        let entry = __extract_file(lang, path, name);
+        if len(entry) == 0 { continue; }
+        if first {
+            json = json + "\n    " + entry;
+            first = false;
         } else {
-            name = rest[0..nl];
-            from = from + nl + 1;
-        }
-        if len(name) > 0 {
-            if __ends_with_source(name, flavor) {
-                let path = dir + "/" + name;
-                let entry = __extract_file(lang, path, name);
-                if len(entry) > 0 {
-                    if first {
-                        json = json + "\n    " + entry;
-                        first = false;
-                    } else {
-                        json = json + ",\n    " + entry;
-                    }
-                }
-            }
+            json = json + ",\n    " + entry;
         }
     }
     json = json + "\n  ]\n}";

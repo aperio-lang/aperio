@@ -70,20 +70,6 @@ fn __collect_type_names(lang: std::lang::Lang, node: Int) -> String {
     return acc;
 }
 
-fn __ends_with_source(name: String, flavor: String) -> Bool {
-    let n = len(name);
-    if flavor == "go" {
-        if n < 3 { return false; }
-        return name[n-3..n] == ".go";
-    }
-    return false;
-}
-
-fn __append_entry(arr: String, entry: String) -> String {
-    if len(arr) == 0 { return entry; }
-    return arr + ", " + entry;
-}
-
 fn __domain_drive(dir: String, flavor: String) {
     let lang = std::lang::Lang { flavor: flavor };
     let entries = std::io::fs::list_dir(dir);
@@ -95,53 +81,33 @@ fn __domain_drive(dir: String, flavor: String) {
 
     // One namespace-lotus instance for the whole walk.
     let r = std::lang::Morpheme { flavor: flavor };
+    let it = std::iter::Lines { };
+    let jb = std::json::Builder { };
 
     let mut types_arr = "";
     let mut from = 0;
-    while from < total_e {
-        let rest = entries[from..total_e];
-        let nl = std::str::index_of(rest, "\n");
-        let mut name = "";
-        if nl < 0 {
-            name = rest;
-            from = total_e;
-        } else {
-            name = rest[0..nl];
-            from = from + nl + 1;
-        }
-        if len(name) > 0 {
-            if __ends_with_source(name, flavor) {
-                let path = dir + "/" + name;
-                let src = std::io::fs::read_file(path);
-                if len(src) > 0 {
-                    let tree = lang.parse(src);
-                    if tree != 0 {
-                        let root = std::ts::root_node(tree);
-                        let names = __collect_type_names(lang, root);
-                        let nlen = len(names);
-                        let mut nfrom = 0;
-                        while nfrom < nlen {
-                            let nrest = names[nfrom..nlen];
-                            let nnl = std::str::index_of(nrest, "\n");
-                            let mut tname = "";
-                            if nnl < 0 {
-                                tname = nrest;
-                                nfrom = nlen;
-                            } else {
-                                tname = nrest[0..nnl];
-                                nfrom = nfrom + nnl + 1;
-                            }
-                            if len(tname) > 0 {
-                                let motion = r.name_to_motion(tname);
-                                let entry = "{\"name\": \"" + tname
-                                    + "\", \"motion\": \"" + motion
-                                    + "\", \"file\": \"" + name + "\"}";
-                                types_arr = __append_entry(types_arr, entry);
-                            }
-                        }
-                    }
-                }
-            }
+    while from >= 0 {
+        let name = it.line_at(entries, from);
+        from = it.next_idx(entries, from);
+        if len(name) == 0 { continue; }
+        if std::io::fs::extension(name) != ".go" { continue; }
+        let path = dir + "/" + name;
+        let src = std::io::fs::read_file(path);
+        if len(src) == 0 { continue; }
+        let tree = lang.parse(src);
+        if tree == 0 { continue; }
+        let root = std::ts::root_node(tree);
+        let names = __collect_type_names(lang, root);
+        let mut nfrom = 0;
+        while nfrom >= 0 {
+            let tname = it.line_at(names, nfrom);
+            nfrom = it.next_idx(names, nfrom);
+            if len(tname) == 0 { continue; }
+            let motion = r.name_to_motion(tname);
+            let entry = "{\"name\": \"" + tname
+                + "\", \"motion\": \"" + motion
+                + "\", \"file\": \"" + name + "\"}";
+            types_arr = jb.append_entry(types_arr, entry);
         }
     }
 
