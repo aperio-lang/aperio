@@ -215,6 +215,164 @@ fn inward_tower_seeds_with_wire_target_files() {
     );
 }
 
+/// Stage a tiny multi-dir Go fixture so cross-dir resolution
+/// has something to chase. Layout:
+///
+///   <root>/go.mod              `module xdir`
+///   <root>/cmd/api/main.go     calls Init + Run
+///   <root>/internal/setup.go   `Init` defined here, calls `Connect`
+///   <root>/internal/db.go      `Connect` defined here
+fn stage_xdir_fixture() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut root = std::env::temp_dir();
+    root.push(format!(
+        "aperio_onboard_xdir_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(root.join("cmd/api")).unwrap();
+    std::fs::create_dir_all(root.join("internal")).unwrap();
+    std::fs::write(root.join("go.mod"), "module xdir\n").unwrap();
+    std::fs::write(
+        root.join("cmd/api/main.go"),
+        "package main\n\
+         \n\
+         import (\n\
+         \t\"xdir/internal\"\n\
+         )\n\
+         \n\
+         func main() {\n\
+         \tinternal.Init()\n\
+         \tinternal.Run()\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("internal/setup.go"),
+        "package internal\n\
+         \n\
+         func Init() {\n\
+         \tConnect()\n\
+         }\n\
+         \n\
+         func Run() {\n\
+         \tConnect()\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("internal/db.go"),
+        "package internal\n\
+         \n\
+         func Connect() {\n\
+         }\n",
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn cross_dir_resolves_callees_into_sibling_pkg() {
+    let src_path = workspace_root()
+        .join("apps")
+        .join("onboard")
+        .join("main.ap");
+    let src = std::fs::read_to_string(&src_path).expect("read main.ap");
+    let program = aperio_syntax::parse_source(&src).expect("parse main.ap");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut bin = std::env::temp_dir();
+    bin.push(format!(
+        "aperio_onboard_xdir_bin_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    build_executable(&program, &bin).expect("build");
+    let root = stage_xdir_fixture();
+    let out = Command::new(&bin)
+        .arg(root.join("cmd/api"))
+        .output()
+        .expect("run");
+    let _ = std::fs::remove_file(&bin);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        out.status.success(),
+        "onboard exited non-zero on xdir fixture: {:?}; stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    // The outward tower should show main → Init resolved to a
+    // sibling-dir file (internal/setup.go), not {external}.
+    assert!(
+        report.contains("Init  (internal/setup.go)"),
+        "expected main → Init resolved to internal/setup.go; \
+         output:\n{}",
+        report
+    );
+    // And Run resolved to its sibling file too.
+    assert!(
+        report.contains("Run  (internal/setup.go)"),
+        "expected main → Run resolved to internal/setup.go; \
+         output:\n{}",
+        report
+    );
+    // Depth-2 cross-dir: Init calls Connect, which lives in
+    // internal/db.go.
+    assert!(
+        report.contains("Connect  (internal/db.go)"),
+        "expected depth-2 cross-dir resolution to \
+         internal/db.go; output:\n{}",
+        report
+    );
+    // Inward tower marks xdir/internal as {local}, not stdlib.
+    assert!(
+        report.contains("xdir/internal  {local}"),
+        "expected xdir/internal classified as {{local}}; \
+         output:\n{}",
+        report
+    );
+}
+
+#[test]
+fn no_go_mod_means_no_cross_dir_walk() {
+    // Operational fixture has no go.mod next to it. The
+    // entrypoint walk should still work, but no sibling dirs
+    // get pulled in — and no callee should resolve to a path
+    // containing a "/" (the cross-dir file-stamp marker).
+    let report = run_against_operational_fixture();
+    let outward_start = report
+        .find("Outward tower")
+        .expect("outward header present");
+    let inward_start = report
+        .find("Inward tower")
+        .expect("inward header present");
+    let outward = &report[outward_start..inward_start];
+    // None of the resolved file-stamps in the outward tower
+    // should have a "/" — only flat filenames like worker.go.
+    for line in outward.lines() {
+        // file annotations look like `(filename)`; skip
+        // anything that isn't a resolved-callee row.
+        if let Some(open) = line.find('(') {
+            if let Some(close) = line[open..].find(')') {
+                let stamp = &line[open + 1..open + close];
+                assert!(
+                    !stamp.contains('/'),
+                    "no-go.mod run should not emit slash-bearing \
+                     file stamps in outward tower; got `{}` on line: {}",
+                    stamp,
+                    line
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn entrypoint_mode_skipped_when_no_main_present() {
     // operational fixture has main; check the library-package

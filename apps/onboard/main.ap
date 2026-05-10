@@ -297,6 +297,109 @@ fn __render_call_row(d: Int, callee: String, where_at: String,
 // Recursive outward walk. Returns the tree text rooted at
 // `caller`. Cycles broken via `visited`; overall depth capped
 // at `max_depth` so a tangled program can't blow the output.
+// Walk every .go file in `dir` and return a combined
+// tagged-string accumulator. FN_DEF, IMP_FILE, and OP_MAIN
+// lines stamp the file as `file_prefix + filename` so the
+// outward walker's __lookup_fn_file resolves across dir
+// boundaries unambiguously. The user-given dir is walked with
+// file_prefix="" so files appear as bare names; sibling dirs
+// pulled in via local imports use a relative-path prefix like
+// "cmd/" or "src/alerts/".
+fn __walk_dir_tagged(lang: std::lang::Lang, dir: String,
+                     file_prefix: String) -> String {
+    let entries = std::io::fs::list_dir(dir);
+    if len(entries) == 0 { return ""; }
+    let it = std::iter::Lines { };
+    let mut out = "";
+    let mut from = 0;
+    while from >= 0 {
+        let name = it.line_at(entries, from);
+        from = it.next_idx(entries, from);
+        if len(name) == 0 { continue; }
+        if std::io::fs::extension(name) != ".go" { continue; }
+        let path = dir + "/" + name;
+        let src = std::io::fs::read_file(path);
+        if len(src) == 0 { continue; }
+        let tree = lang.parse(src);
+        if tree == 0 { continue; }
+        let root = std::ts::root_node(tree);
+        let walk = __unified_walk(lang, root, false, "");
+        let stamped_file = file_prefix + name;
+        // Re-emit the walker output with each FN_DEF /
+        // IMP_FILE / OP_MAIN stamped with the file's prefixed
+        // name. WIRE and CALL lines pass through unchanged.
+        let it2 = std::iter::Lines { };
+        let mut sfrom = 0;
+        while sfrom >= 0 {
+            let line = it2.line_at(walk, sfrom);
+            sfrom = it2.next_idx(walk, sfrom);
+            if len(line) == 0 { continue; }
+            if len(line) > 4 {
+                if line[0..4] == "IMP:" {
+                    let imp = line[4..len(line)];
+                    out = out + "IMP_FILE:" + stamped_file
+                        + ":" + imp + "\n";
+                    continue;
+                }
+            }
+            if len(line) > 5 {
+                if line[0..5] == "WIRE:" {
+                    out = out + line + "\n";
+                    continue;
+                }
+                if line[0..5] == "CALL:" {
+                    out = out + line + "\n";
+                    continue;
+                }
+            }
+            if len(line) > 7 {
+                if line[0..7] == "FN_DEF:" {
+                    let fname = line[7..len(line)];
+                    out = out + "FN_DEF:" + fname + ":"
+                        + stamped_file + "\n";
+                    continue;
+                }
+            }
+            if len(line) >= 8 {
+                if line[0..8] == "OP_MAIN:" {
+                    out = out + "OP_MAIN:" + stamped_file + "\n";
+                    continue;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Pull the unique set of local-import paths from a walked
+// dir's tagged accumulator. Used by __drive to discover which
+// sibling dirs to also walk for the cross-dir FN_DEF index.
+fn __collect_local_imports(walked: String,
+                           module_name: String) -> String {
+    let it = std::iter::Lines { };
+    let mut out = "";
+    let mut from = 0;
+    while from >= 0 {
+        let line = it.line_at(walked, from);
+        from = it.next_idx(walked, from);
+        if len(line) <= 9 { continue; }
+        if line[0..9] != "IMP_FILE:" { continue; }
+        // IMP_FILE:<file>:<imp> — strip the leading "IMP_FILE:"
+        // and find the colon between file and imp.
+        let body = line[9..len(line)];
+        let colon = std::str::index_of(body, ":");
+        if colon < 0 { continue; }
+        let imp = body[colon+1..len(body)];
+        if !__is_local_import(imp, module_name) { continue; }
+        // Dedupe.
+        let needle = imp + "\n";
+        let hay = "\n" + out;
+        if std::str::index_of(hay, "\n" + needle) >= 0 { continue; }
+        out = out + needle;
+    }
+    return out;
+}
+
 fn __walk_outward(calls: String, fn_defs: String,
                   caller: String, visited: String, depth: Int,
                   max_depth: Int, r: std::lang::Morpheme) -> String {
@@ -406,14 +509,113 @@ fn __imports_of(imports_by_file: String, file: String) -> String {
     return out;
 }
 
+// ---- Cross-dir traversal helpers. ----
+//
+// Real-world Go binaries usually have a thin cmd/X/main.go
+// that imports application loci from sibling dirs
+// (cmd/X imports module/src/foo, module/src/bar). To make the
+// outward tower cross those boundaries we resolve the module
+// name from go.mod, then walk local-import dirs into the same
+// FN_DEF aggregate the single-dir walker populates.
+
+// Index of the last '/' in `s`, or -1 if none.
+fn __last_slash_idx(s: String) -> Int {
+    let n = len(s);
+    let mut i = n - 1;
+    while i >= 0 {
+        if s[i..i+1] == "/" { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Return the parent directory of `d` (strip the last "/<seg>").
+// Returns "" when there is no parent ("/" or "foo").
+fn __parent_dir(d: String) -> String {
+    let idx = __last_slash_idx(d);
+    if idx <= 0 { return ""; }
+    return d[0..idx];
+}
+
+// Walk up from `start_dir` looking for a go.mod file. Returns
+// the directory containing go.mod (the module root) on hit, or
+// "" if none found within 10 ancestor steps. The 10-step cap
+// bounds the search on degenerate filesystems and matches the
+// conventional Go-tooling expectation that go.mod sits within
+// a handful of levels of the source file.
+fn __find_module_root(start_dir: String) -> String {
+    let mut d = start_dir;
+    let mut hops = 0;
+    while hops < 10 {
+        let probe = d + "/go.mod";
+        if std::io::fs::file_exists(probe) { return d; }
+        let parent = __parent_dir(d);
+        if len(parent) == 0 { return ""; }
+        d = parent;
+        hops = hops + 1;
+    }
+    return "";
+}
+
+// Pull the module name from `module X` line in go.mod text.
+// Returns "" if no module line is found.
+fn __extract_module_name(go_mod_text: String) -> String {
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    while from >= 0 {
+        let line = it.line_at(go_mod_text, from);
+        from = it.next_idx(go_mod_text, from);
+        if len(line) < 7 { continue; }
+        if line[0..7] != "module " { continue; }
+        let rest = line[7..len(line)];
+        // Tolerate trailing whitespace by trimming a CR if any.
+        let n = len(rest);
+        if n > 0 {
+            if rest[n-1..n] == "\r" { return rest[0..n-1]; }
+        }
+        return rest;
+    }
+    return "";
+}
+
+// True if `imp` is an import path that resolves to this
+// module's own source (the part of the import graph we can
+// follow at v0). Either `imp == module_name` exactly (the
+// module's root package) or it begins with `<module_name>/`.
+fn __is_local_import(imp: String, module_name: String) -> Bool {
+    let ml = len(module_name);
+    if ml == 0 { return false; }
+    let il = len(imp);
+    if il < ml { return false; }
+    if imp[0..ml] != module_name { return false; }
+    if il == ml { return true; }
+    return imp[ml..ml+1] == "/";
+}
+
+// Convert a local import path into its filesystem directory.
+// `grease/cmd` → `<module_root>/cmd`. The exact-module case
+// (`grease`) → `<module_root>`.
+fn __local_import_to_dir(module_root: String,
+                         module_name: String,
+                         imp: String) -> String {
+    let ml = len(module_name);
+    let il = len(imp);
+    if il == ml { return module_root; }
+    // Drop the "<module_name>/" prefix, prepend module_root.
+    return module_root + "/" + imp[ml+1..il];
+}
+
 // Classify an import path so the rendering can group them.
 //   "stdlib"   — single-segment paths ("log", "fmt") and
 //                multi-segment stdlib namespaces
 //                ("net/http", "log/slog", "encoding/json").
-//                Heuristic: no dot in the first segment.
+//                Heuristic: no dot in the first segment AND
+//                not a recognized local-module path.
 //   "external" — paths whose first segment contains a dot
 //                ("github.com/...", "gopkg.in/...").
-fn __classify_import(imp: String) -> String {
+//   "local"    — paths under the module declared in go.mod.
+fn __classify_import(imp: String, module_name: String) -> String {
+    if __is_local_import(imp, module_name) { return "local"; }
     let slash = std::str::index_of(imp, "/");
     let head = "";
     let mut h = head;
@@ -427,7 +629,8 @@ fn __classify_import(imp: String) -> String {
 // reader can see at a glance whether main's needs are mostly
 // stdlib (self-contained) or external (dependency-heavy).
 fn __render_file_imports(imports_by_file: String,
-                         file: String) -> String {
+                         file: String,
+                         module_name: String) -> String {
     let imps = __imports_of(imports_by_file, file);
     if len(imps) == 0 {
         return "    (no imports)\n";
@@ -439,7 +642,7 @@ fn __render_file_imports(imports_by_file: String,
         let imp = it.line_at(imps, from);
         from = it.next_idx(imps, from);
         if len(imp) == 0 { continue; }
-        let kind = __classify_import(imp);
+        let kind = __classify_import(imp, module_name);
         out = out + "    ├─ " + imp + "  {" + kind + "}\n";
     }
     return out;
@@ -479,7 +682,8 @@ fn __wire_target_files(wires: String, fn_defs: String) -> String {
 fn __render_inward_tower(calls: String, fn_defs: String,
                          wires: String,
                          imports_by_file: String,
-                         main_file: String) -> String {
+                         main_file: String,
+                         module_name: String) -> String {
     if len(main_file) == 0 { return ""; }
     let mut out = "Inward tower — what main()'s package needs\n";
     out = out + "------------------------------------------\n";
@@ -507,7 +711,8 @@ fn __render_inward_tower(calls: String, fn_defs: String,
         from = it.next_idx(files, from);
         if len(file) == 0 { continue; }
         out = out + file + "\n";
-        out = out + __render_file_imports(imports_by_file, file);
+        out = out + __render_file_imports(imports_by_file, file,
+                                          module_name);
     }
     out = out + "\n";
     return out;
@@ -800,86 +1005,103 @@ fn __drive(dir: String, flavor: String) {
     println("============================================================");
     println("");
 
-    // First pass: collect cross-file aggregates needed by the
-    // per-file render — WIRE tags (handler registration → route
-    // map) and FN_DEF tags (fn name → defining file). The
-    // wiring often lives in main.go while handler defs live in
-    // handlers.go; goroutine spawns reference fns defined in
-    // sibling files. Both lookups need to span the whole dir.
+    // Module resolution. Walk up from `dir` looking for
+    // go.mod, then extract its `module X` line. Used to:
+    //   - Classify imports as "local" vs stdlib/external.
+    //   - Resolve local-import paths to sibling dirs so the
+    //     cross-dir walk can pull their FN_DEFs into the
+    //     outward-tower lookup table. Without this step, every
+    //     callee that crosses a package boundary degrades to
+    //     {external} regardless of whether it's reachable from
+    //     the codebase itself.
+    let mut module_name = "";
+    let mut module_root = "";
+    let mod_root_candidate = __find_module_root(dir);
+    if len(mod_root_candidate) > 0 {
+        module_root = mod_root_candidate;
+        let mod_text = std::io::fs::read_file(module_root + "/go.mod");
+        module_name = __extract_module_name(mod_text);
+    }
+
+    // First pass: walk the user-given dir and every local-
+    // import dir into one combined tagged-string accumulator,
+    // then route the combined output into the per-tag buckets
+    // the renderers expect.
     //
-    // The entrypoint-mode tower also needs CALL: rows
-    // (every in-fn call site, caller→callee) and the file that
-    // owns `main` — both collected here so the renderer can
-    // walk outward from main without re-parsing.
+    // Local-import walks contribute FN_DEF, IMP_FILE, WIRE, and
+    // CALL rows (so the outward tower can resolve cross-dir
+    // callees) but their OP_MAIN rows are ignored — main_file
+    // means "the entrypoint binary this onboard run is
+    // describing," which is always rooted in the user-given
+    // dir. A sibling pkg with its own main is a different
+    // binary's entrypoint and not relevant to this run.
+    let user_walk = __walk_dir_tagged(lang, dir, "");
+    let mut combined = user_walk;
+    if len(module_name) > 0 {
+        let local_imps = __collect_local_imports(user_walk, module_name);
+        let it_li = std::iter::Lines { };
+        let mut lfrom = 0;
+        while lfrom >= 0 {
+            let imp = it_li.line_at(local_imps, lfrom);
+            lfrom = it_li.next_idx(local_imps, lfrom);
+            if len(imp) == 0 { continue; }
+            let sib_dir = __local_import_to_dir(module_root,
+                                                module_name, imp);
+            // file_prefix mirrors the import path under the
+            // module name, with a trailing slash so files stamp
+            // as "<sibling-relpath>/<filename>".
+            let ml = len(module_name);
+            let mut sib_prefix = "";
+            if len(imp) > ml { sib_prefix = imp[ml+1..len(imp)] + "/"; }
+            combined = combined + __walk_dir_tagged(lang, sib_dir,
+                                                    sib_prefix);
+        }
+    }
+
+    // Route combined into the per-tag aggregates that the
+    // renderers consume. OP_MAIN file is recorded only from the
+    // user-dir walk (which preserves the bare filename, no
+    // sibling prefix), so the first OP_MAIN row with no slash
+    // wins. Sibling-dir OP_MAINs have a "/"-bearing file stamp
+    // and are ignored for entrypoint-mode purposes.
     let mut wires = "";
     let mut fn_defs = "";
     let mut calls = "";
     let mut main_file = "";
     let mut imports_by_file = "";
-    let mut wfrom = 0;
-    while wfrom < total {
-        let wrest = entries[wfrom..total];
-        let wnl = std::str::index_of(wrest, "\n");
-        let mut wname = "";
-        if wnl < 0 { wname = wrest; wfrom = total; }
-        else { wname = wrest[0..wnl]; wfrom = wfrom + wnl + 1; }
-        if len(wname) > 0 {
-            if std::io::fs::extension(wname) == ".go" {
-                let path = dir + "/" + wname;
-                let src = std::io::fs::read_file(path);
-                if len(src) > 0 {
-                    let tree = lang.parse(src);
-                    if tree != 0 {
-                        let root = std::ts::root_node(tree);
-                        let walk = __unified_walk(lang, root, false, "");
-                        // Pull WIRE: and FN_DEF: lines into
-                        // their respective aggregates. FN_DEF
-                        // entries get stamped with the file
-                        // name so cross-file lookups know where
-                        // each fn was defined.
-                        let mut sfrom = 0;
-                        let stotal = len(walk);
-                        while sfrom < stotal {
-                            let srest = walk[sfrom..stotal];
-                            let snl = std::str::index_of(srest, "\n");
-                            let mut sline = "";
-                            if snl < 0 { sline = srest; sfrom = stotal; }
-                            else { sline = srest[0..snl]; sfrom = sfrom + snl + 1; }
-                            if len(sline) > 4 {
-                                if sline[0..4] == "IMP:" {
-                                    let imp = sline[4..len(sline)];
-                                    imports_by_file = imports_by_file
-                                        + "IMP_FILE:" + wname + ":"
-                                        + imp + "\n";
-                                }
-                            }
-                            if len(sline) > 5 {
-                                if sline[0..5] == "WIRE:" {
-                                    wires = wires + sline + "\n";
-                                }
-                                if sline[0..5] == "CALL:" {
-                                    calls = calls + sline + "\n";
-                                }
-                            }
-                            if len(sline) > 7 {
-                                if sline[0..7] == "FN_DEF:" {
-                                    let fname = sline[7..len(sline)];
-                                    fn_defs = fn_defs + "FN_DEF:" + fname
-                                        + ":" + wname + "\n";
-                                }
-                            }
-                            // OP_MAIN:1 — this file owns main().
-                            // First main wins (multiple mains in
-                            // one dir is illegal Go anyway).
-                            if len(sline) >= 8 {
-                                if sline[0..8] == "OP_MAIN:" {
-                                    if len(main_file) == 0 {
-                                        main_file = wname;
-                                    }
-                                }
-                            }
-                        }
-                    }
+    let it_c = std::iter::Lines { };
+    let mut cfrom = 0;
+    while cfrom >= 0 {
+        let sline = it_c.line_at(combined, cfrom);
+        cfrom = it_c.next_idx(combined, cfrom);
+        if len(sline) == 0 { continue; }
+        if len(sline) > 5 {
+            if sline[0..5] == "WIRE:" {
+                wires = wires + sline + "\n";
+                continue;
+            }
+            if sline[0..5] == "CALL:" {
+                calls = calls + sline + "\n";
+                continue;
+            }
+        }
+        if len(sline) > 7 {
+            if sline[0..7] == "FN_DEF:" {
+                fn_defs = fn_defs + sline + "\n";
+                continue;
+            }
+        }
+        if len(sline) > 9 {
+            if sline[0..9] == "IMP_FILE:" {
+                imports_by_file = imports_by_file + sline + "\n";
+                continue;
+            }
+        }
+        if len(sline) >= 8 {
+            if sline[0..8] == "OP_MAIN:" {
+                let body = sline[8..len(sline)];
+                if std::str::index_of(body, "/") < 0 {
+                    if len(main_file) == 0 { main_file = body; }
                 }
             }
         }
@@ -954,7 +1176,8 @@ fn __drive(dir: String, flavor: String) {
     print(all_files_section);
     print(__render_outward_tower(calls, fn_defs, main_file, r));
     print(__render_inward_tower(calls, fn_defs, wires,
-                                imports_by_file, main_file));
+                                imports_by_file, main_file,
+                                module_name));
     print(__render_unknowns(unknowns_section));
     print(__render_narrative(n_loci, n_type_or_fn, n_struct, n_unknowns));
 }
