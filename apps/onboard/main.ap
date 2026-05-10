@@ -93,112 +93,11 @@ fn __unified_walk(lang: std::lang::Lang, node: Int, in_import: Bool) -> String {
     return acc;
 }
 
-fn __count_tag(acc: String, tag: String) -> Int {
-    let prefix = tag + ":";
-    let plen = len(prefix);
-    let mut from = 0;
-    let total = len(acc);
-    let mut count = 0;
-    while from < total {
-        let rest = acc[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut line = "";
-        if nl < 0 { line = rest; from = total; }
-        else { line = rest[0..nl]; from = from + nl + 1; }
-        if len(line) >= plen {
-            if line[0..plen] == prefix { count = count + 1; }
-        }
-    }
-    return count;
-}
-
-fn __first_tag_body(acc: String, tag: String) -> String {
-    let prefix = tag + ":";
-    let plen = len(prefix);
-    let mut from = 0;
-    let total = len(acc);
-    while from < total {
-        let rest = acc[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut line = "";
-        if nl < 0 { line = rest; from = total; }
-        else { line = rest[0..nl]; from = from + nl + 1; }
-        if len(line) > plen {
-            if line[0..plen] == prefix {
-                return line[plen..len(line)];
-            }
-        }
-    }
-    return "";
-}
-
-// Comma-joined list of bodies for matching tags. For the report,
-// we want plain "log, net/http" not JSON.
-fn __collect_tag_csv(acc: String, tag: String) -> String {
-    let prefix = tag + ":";
-    let plen = len(prefix);
-    let mut from = 0;
-    let total = len(acc);
-    let mut out = "";
-    let mut first = true;
-    while from < total {
-        let rest = acc[from..total];
-        let nl = std::str::index_of(rest, "\n");
-        let mut line = "";
-        if nl < 0 { line = rest; from = total; }
-        else { line = rest[0..nl]; from = from + nl + 1; }
-        if len(line) > plen {
-            if line[0..plen] == prefix {
-                let body = line[plen..len(line)];
-                if first { out = body; first = false; }
-                else { out = out + ", " + body; }
-            }
-        }
-    }
-    return out;
-}
-
-// ---- Locus name proposal (file-stem → CamelCase + L suffix). ----
-
-fn __propose_locus_name(file: String) -> String {
-    let n = len(file);
-    if n < 3 { return "?L"; }
-    let stem = file[0..n-3];
-    let sn = len(stem);
-    if sn == 0 { return "?L"; }
-    let mut out = "";
-    let mut i = 0;
-    let mut next_upper = true;
-    while i < sn {
-        let c = stem[i..i+1];
-        if c == "_" {
-            next_upper = true;
-        } else {
-            if next_upper {
-                let lower_idx = std::str::index_of("abcdefghijklmnopqrstuvwxyz", c);
-                if lower_idx >= 0 {
-                    out = out + "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[lower_idx..lower_idx+1];
-                } else {
-                    out = out + c;
-                }
-                next_upper = false;
-            } else {
-                out = out + c;
-            }
-        }
-        i = i + 1;
-    }
-    return out + "L";
-}
-
-fn __ends_with_source(name: String, flavor: String) -> Bool {
-    let n = len(name);
-    if flavor == "go" {
-        if n < 3 { return false; }
-        return name[n-3..n] == ".go";
-    }
-    return false;
-}
+// __count_tag / __first_tag_body / __collect_tag_csv lifted to
+// std::tagged::Accumulator. __propose_locus_name lifted to
+// std::name::Convention. __ends_with_source superseded by the
+// std::io::fs::extension primitive. The render path below uses
+// `ta`, `nc`, and `std::io::fs::extension` directly.
 
 // ---- Aperio-shape narrative inference. ----
 //
@@ -310,17 +209,18 @@ fn __render_per_file(lang: std::lang::Lang, r: std::lang::Morpheme,
     let root = std::ts::root_node(tree);
     let acc = __unified_walk(lang, root, false);
 
-    let pkg = __first_tag_body(acc, "PKG");
-    let imports = __collect_tag_csv(acc, "IMP");
-    let handlers = __collect_tag_csv(acc, "OP_HANDLER");
-    let spawns = __collect_tag_csv(acc, "OP_SPAWN");
-    let has_main = __count_tag(acc, "OP_MAIN") > 0;
-    let has_init = __count_tag(acc, "OP_INIT") > 0;
-    let n_handlers = __count_tag(acc, "OP_HANDLER");
-    let n_spawns = __count_tag(acc, "OP_SPAWN");
-    let n_loops = __count_tag(acc, "OP_LOOP");
-    let n_imports = __count_tag(acc, "IMP");
-    let n_types = __count_tag(acc, "TYPE");
+    let ta = std::tagged::Accumulator { };
+    let pkg = ta.first_body(acc, "PKG");
+    let imports = ta.collect_csv(acc, "IMP");
+    let handlers = ta.collect_csv(acc, "OP_HANDLER");
+    let spawns = ta.collect_csv(acc, "OP_SPAWN");
+    let has_main = ta.count(acc, "OP_MAIN") > 0;
+    let has_init = ta.count(acc, "OP_INIT") > 0;
+    let n_handlers = ta.count(acc, "OP_HANDLER");
+    let n_spawns = ta.count(acc, "OP_SPAWN");
+    let n_loops = ta.count(acc, "OP_LOOP");
+    let n_imports = ta.count(acc, "IMP");
+    let n_types = ta.count(acc, "TYPE");
 
     let has_op = has_main || has_init || n_handlers > 0
                  || n_spawns > 0 || n_loops > 0;
@@ -336,7 +236,8 @@ fn __render_per_file(lang: std::lang::Lang, r: std::lang::Morpheme,
     if agreement >= 2 { verdict = "locus"; }
     else if agreement == 1 { verdict = "type_or_fn"; }
 
-    let proposed = __propose_locus_name(name);
+    let nc = std::name::Convention { strip: ".go" };
+    let proposed = nc.propose_locus_name(name);
 
     // Operational summary line.
     let mut op_summary = "";
@@ -600,7 +501,7 @@ fn __drive(dir: String, flavor: String) {
         if wnl < 0 { wname = wrest; wfrom = total; }
         else { wname = wrest[0..wnl]; wfrom = wfrom + wnl + 1; }
         if len(wname) > 0 {
-            if __ends_with_source(wname, flavor) {
+            if std::io::fs::extension(wname) == ".go" {
                 let path = dir + "/" + wname;
                 let src = std::io::fs::read_file(path);
                 if len(src) > 0 {
@@ -654,7 +555,7 @@ fn __drive(dir: String, flavor: String) {
         if nl < 0 { name = rest; from = total; }
         else { name = rest[0..nl]; from = from + nl + 1; }
         if len(name) > 0 {
-            if __ends_with_source(name, flavor) {
+            if std::io::fs::extension(name) == ".go" {
                 let block = __render_per_file(lang, r, dir, name, wires, fn_defs);
                 if len(block) > 0 {
                     all_files_section = all_files_section + block;
