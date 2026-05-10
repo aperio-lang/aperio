@@ -52,10 +52,10 @@ What is **not** a friction entry:
 
 <!-- Append below this line. Do not edit existing entries. -->
 
-## 2026-05-10 cross-locus-return-deep-copy
+## 2026-05-10 cross-locus-return-deep-copy [FIXED same session]
 
 **Source:** corpus-extraction migration (tower-join, operational-graph)
 **Tried:** End a free fn with `return jb.wrap_array(inner);` after the body called another locus method (e.g. `ta.each_body(acc, tag)`).
 **Hit:** Caller observes `""` for the returned String. Standalone callsites of `jb.wrap_array("")` work fine; the bug triggers only when the fn first calls a *different* sub-locus's method, then returns the second method's result directly. Reproduced minimally with `let bodies = ta.each_body(...); return jb.wrap_array("");`.
-**Workaround:** Replace `return jb.wrap_array(inner);` with inline `return "[" + inner + "]";` (primitive concat allocates in the local region and round-trips). Equivalently, `return jb.wrap_array(inner) + "";` works.
-**Why it matters:** Cross-locus composition is the std seed's whole point. Without this fix the surface forces callers to inline primitive concat for any value crossing a fn boundary — undoing half the extraction. Likely a return-boundary deep-copy that does not chase pointers into sub-locus arenas; the fix probably lives in the m49 free-fn return path.
+**Workaround:** None needed — fixed in the m49 free-fn epilogue (`emit_fn_exit_epilogue` in `crates/aperio-codegen/src/codegen.rs`). The epilogue used to run `flush_dissolve_frame()` BEFORE the return-value deep-copy; this freed any let-bound sub-locus arenas while `ret_alloca` still pointed into one of them, so the subsequent `lotus_str_clone` read freed memory (the freshly-freed page often still contained the right bytes for a single-locus fn, hiding the bug; a second sub-locus dissolve was enough to clobber the chunk). Fix swaps the order: deep-copy first (caller_arena is the parent caller's region, unaffected by this fn's flush), then flush, then destroy the per-call subregion. Returning `jb.wrap_array(...)` directly now round-trips through the caller boundary correctly.
+**Why it matters:** Cross-locus composition is the std seed's whole point. The fix lets `__collect_types_with_motion` (apps/tower-join) and `__collect_section` (apps/operational-graph) return `jb.wrap_array(arr)` directly instead of inline `[ + arr + ]`. Verified byte-identical fixture output for both apps and all 312 workspace tests stay green.

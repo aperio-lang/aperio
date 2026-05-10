@@ -98,15 +98,6 @@ fn __unified_walk(lang: std::lang::Lang, node: Int, in_import: Bool) -> String {
 // Walks the accumulator via std::tagged::Accumulator + iter::Lines
 // so the line-scan logic stays in the std seed; the per-body
 // transform (name → motion via `r`) lives here.
-//
-// Return uses an inline `[ + inner + ]` rather than
-// `jb.wrap_array(inner)` because at v0 a cross-locus method's
-// result, when returned directly from a free fn after another
-// cross-locus method call also touched a sub-locus arena, can
-// come back as "" at the caller — likely a return-boundary
-// deep-copy that does not chase into sub-locus arenas. Inline
-// concat allocates in the local region and round-trips cleanly.
-// Tracked in notes/aperio-friction.md.
 fn __collect_types_with_motion(acc: String, r: std::lang::Morpheme) -> String {
     let ta = std::tagged::Accumulator { };
     let it = std::iter::Lines { };
@@ -123,7 +114,7 @@ fn __collect_types_with_motion(acc: String, r: std::lang::Morpheme) -> String {
             + motion + "\"}";
         inner = jb.append_entry(inner, entry);
     }
-    return "[" + inner + "]";
+    return jb.wrap_array(inner);
 }
 
 fn __per_file_entry(lang: std::lang::Lang, r: std::lang::Morpheme,

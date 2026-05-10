@@ -6930,24 +6930,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("exit_bb set during fn body lowering");
         self.builder.position_at_end(exit_bb);
 
-        // m53: free-fn handle-rooting. Flush the deferred-
-        // dissolves frame opened at fn entry so any long-lived
-        // loci bound in the fn body (e.g. `let _w = Watcher { };`
-        // where Watcher subscribes to a bus subject) get drained
-        // + dissolved before fn return. Pre-m53 the typed-return
-        // path silently popped the frame without flushing,
-        // leaking those handles past fn return. Per spec/memory
-        // §"Free `fn` functions": "the function returns when:
-        // body's last statement completes, AND all children of
-        // the implicit locus have dissolved." flush_dissolve_frame
-        // realizes the second clause at the codegen substrate.
-        // The bus drain inside the flush dispatches any cells
-        // published during the body (or by birth() of the loci
-        // we're about to dissolve) before they go away. Same
-        // entry point as locus-method scope-exit so the
-        // semantics is uniform across all fn flavors.
-        self.flush_dissolve_frame()?;
-
         let caller_arena_alloca = self
             .current_user_fn_caller_arena
             .expect("caller_arena_alloca set during fn body lowering");
@@ -6955,6 +6937,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .current_user_fn_arena
             .expect("fn_arena_alloca set during fn body lowering");
 
+        // Deep-copy BEFORE flush_dissolve_frame. The return value
+        // can point into a let-bound sub-locus's arena (e.g. when
+        // a body returns `someLocus.method(...)` directly — the
+        // method allocates its concat result in its own arena);
+        // flushing first frees those arenas, leaving ret_alloca
+        // dangling for the str_clone read. The copy lands in
+        // caller_arena, which is the parent caller's region and
+        // stays alive across this fn's flush + arena_destroy
+        // below. flush_dissolve_frame is a downstream operation:
+        // by the time we reach it, the caller-visible value is
+        // already safe in caller_arena, so dissolves can free
+        // sub-locus arenas without touching what we just copied.
         let copied_ret: Option<BasicValueEnum<'ctx>> = match &sig.ret {
             None => None,
             Some(ret_ty) => {
@@ -6977,6 +6971,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Some(copied)
             }
         };
+
+        // m53: free-fn handle-rooting. Flush the deferred-
+        // dissolves frame opened at fn entry so any long-lived
+        // loci bound in the fn body (e.g. `let _w = Watcher { };`
+        // where Watcher subscribes to a bus subject) get drained
+        // + dissolved before fn return. Pre-m53 the typed-return
+        // path silently popped the frame without flushing,
+        // leaking those handles past fn return. Per spec/memory
+        // §"Free `fn` functions": "the function returns when:
+        // body's last statement completes, AND all children of
+        // the implicit locus have dissolved." flush_dissolve_frame
+        // realizes the second clause at the codegen substrate.
+        // The bus drain inside the flush dispatches any cells
+        // published during the body (or by birth() of the loci
+        // we're about to dissolve) before they go away. Same
+        // entry point as locus-method scope-exit so the
+        // semantics is uniform across all fn flavors. Runs after
+        // the return-value deep-copy so freeing sub-locus arenas
+        // here can't strand a String the caller is about to read.
+        self.flush_dissolve_frame()?;
 
         // Destroy the per-call subregion AFTER the deep-copy so the
         // copy reads from valid memory. The subregion's chunk list
