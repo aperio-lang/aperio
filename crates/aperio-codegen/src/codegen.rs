@@ -283,6 +283,7 @@ const STDLIB_AP_SOURCE: &str = include_str!("../runtime/stdlib.ap");
 /// flat string. Keep this table sorted by path for review.
 const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "io", "tcp", "Listener"], "__StdIoTcpListener"),
+    (&["std", "io", "tcp", "Stream"], "__StdIoTcpStream"),
 ];
 
 /// Look up the mangled locus name for a stdlib path. Returns
@@ -1322,11 +1323,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_tcp_accept_one", tcp_accept_ty, None);
 
+        // declare i32 @lotus_tcp_connect(ptr host, i16 port)
+        // socket + connect with retry, returns conn_fd or -1.
+        let tcp_connect_ty =
+            i32_t.fn_type(&[ptr_t.into(), i16_t.into()], false);
+        self.module
+            .add_function("lotus_tcp_connect", tcp_connect_ty, None);
+
         // declare i32 @lotus_tcp_close_fd(i32 fd)
         // close, returns 0 or -1.
         let tcp_close_ty = i32_t.fn_type(&[i32_t.into()], false);
         self.module
             .add_function("lotus_tcp_close_fd", tcp_close_ty, None);
+
+        // m81: send / recv on a connected TCP fd, String-shaped.
+        // declare i32 @lotus_tcp_send_str(i32 fd, ptr msg)
+        let tcp_send_str_ty =
+            i32_t.fn_type(&[i32_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_tcp_send_str", tcp_send_str_ty, None);
+        // declare ptr @lotus_tcp_recv_str(i32 fd, i32 max_bytes)
+        let tcp_recv_str_ty =
+            ptr_t.fn_type(&[i32_t.into(), i32_t.into()], false);
+        self.module
+            .add_function("lotus_tcp_recv_str", tcp_recv_str_ty, None);
 
         // m75: filesystem primitives reachable from Aperio source
         // via the `std::io::fs::*` magic-path calls. The C-level
@@ -7413,6 +7433,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             scope,
                         )?;
                     }
+                    Expr::Field { receiver, name, .. } => {
+                        // m81: external method call —
+                        // `obj.method(args)` where obj is a
+                        // LocusRef value (let-bound, fn param,
+                        // accepted child).
+                        let _ = self.lower_external_method_call(
+                            receiver,
+                            &name.name,
+                            args,
+                            scope,
+                        )?;
+                    }
                     _ => {
                         return Err(CodegenError::Unsupported(
                             "non-identifier callee".to_string(),
@@ -10073,6 +10105,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ))
                     })
                 }
+                Expr::Field { receiver, name, .. } => {
+                    // m81: external method call in expression
+                    // position. Same shape as the stmt arm but
+                    // requires the method to return a value.
+                    let result = self.lower_external_method_call(
+                        receiver, &name.name, args, scope,
+                    )?;
+                    result.ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "method `{}` returns no value but is used in \
+                             expression position",
+                            name.name
+                        ))
+                    })
+                }
                 _ => Err(CodegenError::Unsupported(format!(
                     "non-user-fn call in expression position: {:?}",
                     std::mem::discriminant(callee.as_ref())
@@ -10098,6 +10145,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let ptr =
                     self.lower_locus_instantiation(&name, inits, scope)?;
                 Ok((ptr.into(), LotusType::LocusRef(name)))
+            }
+            // m81: path-qualified stdlib locus in expression
+            // position — `std::io::tcp::Stream { conn_fd }`
+            // bound to a let or passed to a fn arg. Rewrite the
+            // path to its mangled bundled-locus name and
+            // dispatch the same way as the bare-name arm above.
+            Expr::Struct { path, inits, .. }
+                if path.segments.len() > 1 => {
+                let segs: Vec<&str> = path
+                    .segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let mangled = stdlib_locus_for_path(&segs).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "qualified-name struct literal `{}` in expression position",
+                        segs.join("::")
+                    ))
+                })?;
+                if !self.user_loci.contains_key(mangled) {
+                    return Err(CodegenError::Unsupported(format!(
+                        "stdlib locus `{}` (mangled `{}`) not found",
+                        segs.join("::"),
+                        mangled
+                    )));
+                }
+                let ptr = self.lower_locus_instantiation(mangled, inits, scope)?;
+                Ok((ptr.into(), LotusType::LocusRef(mangled.to_string())))
             }
             Expr::Struct { path, inits, .. }
                 if path.segments.len() == 1
@@ -11367,8 +11442,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_tcp_accept_one(args, scope)?;
                 Ok(())
             }
+            ["std", "io", "tcp", "__connect"] => {
+                let _ = self.lower_std_io_tcp_connect(args, scope)?;
+                Ok(())
+            }
             ["std", "io", "tcp", "__close_fd"] => {
                 let _ = self.lower_std_io_tcp_close_fd(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "tcp", "__send"] => {
+                let _ = self.lower_std_io_tcp_send(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "tcp", "__recv"] => {
+                let _ = self.lower_std_io_tcp_recv(args, scope)?;
                 Ok(())
             }
             ["std", "io", "fs", "read_file"] => {
@@ -11450,8 +11537,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "tcp", "__accept_one"] => {
                 self.lower_std_io_tcp_accept_one(args, scope)
             }
+            ["std", "io", "tcp", "__connect"] => {
+                self.lower_std_io_tcp_connect(args, scope)
+            }
             ["std", "io", "tcp", "__close_fd"] => {
                 self.lower_std_io_tcp_close_fd(args, scope)
+            }
+            ["std", "io", "tcp", "__send"] => {
+                self.lower_std_io_tcp_send(args, scope)
+            }
+            ["std", "io", "tcp", "__recv"] => {
+                self.lower_std_io_tcp_recv(args, scope)
             }
             ["std", "io", "fs", "read_file"] => {
                 self.lower_std_io_fs_read_file(args, scope)
@@ -11628,6 +11724,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let fd_i64 = self
             .builder
             .build_int_s_extend(fd_i32, i64_t, "fd.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((fd_i64.into(), LotusType::Int))
+    }
+
+    /// Lower `std::io::tcp::__connect(host: String, port: Int)
+    /// -> Int`. Returns conn_fd (or -1 on error) as Int.
+    fn lower_std_io_tcp_connect(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__connect takes 2 args (host, port), got {}",
+                args.len()
+            )));
+        }
+        let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
+        if host_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__connect: host must be String, got {:?}",
+                host_ty
+            )));
+        }
+        let (port_val, port_ty) = self.lower_expr(&args[1], scope)?;
+        if port_ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__connect: port must be Int, got {:?}",
+                port_ty
+            )));
+        }
+        let i16_t = self.context.i16_type();
+        let i64_t = self.context.i64_type();
+        let port_i16 = self
+            .builder
+            .build_int_truncate(port_val.into_int_value(), i16_t, "port.i16")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_tcp_connect")
+            .expect("lotus_tcp_connect declared");
+        let call = self
+            .builder
+            .build_call(f, &[host_val.into(), port_i16.into()], "connect.fd")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let fd_i32 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let fd_i64 = self
+            .builder
+            .build_int_s_extend(fd_i32, i64_t, "connfd.i64")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok((fd_i64.into(), LotusType::Int))
     }
@@ -12206,6 +12355,113 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let _ = i1_t; // silence unused warning if any
         Ok((ret_bool.into(), LotusType::Bool))
+    }
+
+    /// Lower `std::io::tcp::__send(fd: Int, msg: String) -> Int`.
+    /// Writes msg's bytes (strlen-determined length) to fd.
+    /// Returns 0 on success, -1 on error.
+    fn lower_std_io_tcp_send(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__send takes 2 args (fd, msg), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__send: fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let (msg_val, msg_ty) = self.lower_expr(&args[1], scope)?;
+        if msg_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__send: msg must be String, got {:?}",
+                msg_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "send.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_tcp_send_str")
+            .expect("lotus_tcp_send_str declared");
+        let call = self
+            .builder
+            .build_call(f, &[fd_i32.into(), msg_val.into()], "send.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i32 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let ret_i64 = self
+            .builder
+            .build_int_s_extend(ret_i32, i64_t, "send.ret.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((ret_i64.into(), LotusType::Int))
+    }
+
+    /// Lower `std::io::tcp::__recv(fd: Int, max_bytes: Int) ->
+    /// String`. Returns up to max_bytes from fd as a String
+    /// (allocated in the lazy global arena, stable for program
+    /// lifetime). Empty String on EOF or error.
+    fn lower_std_io_tcp_recv(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__recv takes 2 args (fd, max_bytes), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__recv: fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let (max_val, max_ty) = self.lower_expr(&args[1], scope)?;
+        if max_ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__recv: max_bytes must be Int, got {:?}",
+                max_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "recv.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let max_i32 = self
+            .builder
+            .build_int_truncate(max_val.into_int_value(), i32_t, "recv.max.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_tcp_recv_str")
+            .expect("lotus_tcp_recv_str declared");
+        let call = self
+            .builder
+            .build_call(f, &[fd_i32.into(), max_i32.into()], "recv.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, LotusType::String))
     }
 
     /// Lower `std::io::tcp::__close_fd(fd: Int) -> Int`. Returns
@@ -13520,6 +13776,143 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 func,
                 &llvm_args,
                 &format!("self.{}.call", method_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        match &sig.ret {
+            None => Ok(None),
+            Some(t) => {
+                let rt = self.type_expr_to_lotus(t)?;
+                let v = call
+                    .try_as_basic_value()
+                    .left()
+                    .expect("non-void method returns a basic value");
+                Ok(Some((v, rt)))
+            }
+        }
+    }
+
+    /// Lower `receiver.method_name(args)` where `receiver` is any
+    /// expression yielding a LocusRef value (typically a
+    /// let-binding to a locus literal, a fn parameter of locus
+    /// type, or a child accepted via the F.7 hook). The shape
+    /// mirrors lower_self_method_call but the self_ptr comes
+    /// from the lowered receiver rather than current_self —
+    /// allowing user code to call methods on locus values
+    /// outside of self-context.
+    ///
+    /// m81: required for the std::io::tcp::Stream pattern where
+    /// user code receives a Stream via callback and invokes
+    /// `s.send(msg)` / `s.recv(n)` on it. Also generally useful
+    /// for any "locus as service handle" idiom.
+    fn lower_external_method_call(
+        &mut self,
+        receiver_expr: &Expr,
+        method_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<Option<(BasicValueEnum<'ctx>, LotusType)>, CodegenError> {
+        let (recv_val, recv_ty) = self.lower_expr(receiver_expr, scope)?;
+        let locus_name = match recv_ty {
+            LotusType::LocusRef(n) => n,
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "method call on non-locus value of type {:?}",
+                    other
+                )));
+            }
+        };
+        let info = self
+            .user_loci
+            .get(&locus_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "method call: unknown locus `{}`",
+                    locus_name
+                ))
+            })?;
+        let func = info
+            .user_methods
+            .get(method_name)
+            .copied()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "locus `{}` has no method `{}`",
+                    locus_name, method_name
+                ))
+            })?;
+        // Look up the method's source-level signature.
+        struct MethodSig {
+            params: Vec<Param>,
+            ret: Option<TypeExpr>,
+        }
+        let sig: MethodSig = self
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TopDecl::Locus(l) if l.name.name == locus_name => l
+                    .members
+                    .iter()
+                    .find_map(|m| match m {
+                        LocusMember::Fn(fd) if fd.name.name == method_name => {
+                            Some(MethodSig {
+                                params: fd.params.clone(),
+                                ret: fd.ret.clone(),
+                            })
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "method `{}` declaration not found on locus `{}`",
+                    method_name, locus_name
+                ))
+            })?;
+        if args.len() > sig.params.len() {
+            return Err(CodegenError::Unsupported(format!(
+                "{}.{}: expected at most {} args, got {}",
+                locus_name,
+                method_name,
+                sig.params.len(),
+                args.len()
+            )));
+        }
+        let mut llvm_args: Vec<BasicMetadataValueEnum<'ctx>> =
+            Vec::with_capacity(sig.params.len() + 1);
+        llvm_args.push(recv_val.into_pointer_value().into());
+        for i in 0..sig.params.len() {
+            let (v, ty) = if i < args.len() {
+                self.lower_expr(&args[i], scope)?
+            } else {
+                let default_expr = sig.params[i]
+                    .default
+                    .as_ref()
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "{}.{}: required param `{}` not provided",
+                            locus_name, method_name, sig.params[i].name.name
+                        ))
+                    })?;
+                self.lower_expr(default_expr, scope)?
+            };
+            let want = self.type_expr_to_lotus(&sig.params[i].ty)?;
+            if ty != want {
+                return Err(CodegenError::Unsupported(format!(
+                    "{}.{} arg {} type mismatch: expected {:?}, got {:?}",
+                    locus_name, method_name, i, want, ty
+                )));
+            }
+            llvm_args.push(v.into());
+        }
+        let call = self
+            .builder
+            .build_call(
+                func,
+                &llvm_args,
+                &format!("{}.{}.call", locus_name, method_name),
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         match &sig.ret {

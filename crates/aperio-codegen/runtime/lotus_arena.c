@@ -1578,9 +1578,123 @@ int lotus_tcp_accept_one(int listen_fd) {
     return conn;
 }
 
+int lotus_tcp_connect(const char *host, uint16_t port) {
+    /* Mirrors lotus_tcp_create's CONNECT-role logic but returns a
+     * raw fd so it can be wrapped by `std::io::tcp::Stream {
+     * conn_fd }` from Aperio source. Same retry-on-ECONNREFUSED
+     * shape (~1s window). */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    const char *h = host ? host : "127.0.0.1";
+    if (inet_pton(AF_INET, h, &addr.sin_addr) != 1) {
+        fprintf(stderr, "lotus_tcp_connect: invalid host %s\n", h);
+        errno = EINVAL;
+        return -1;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("lotus_tcp_connect: socket");
+        return -1;
+    }
+    struct timespec backoff = { 0, 5L * 1000L * 1000L };
+    int attempts = 200;
+    while (attempts-- > 0) {
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            int nodelay = 1;
+            (void)setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                             &nodelay, sizeof(nodelay));
+            return sock;
+        }
+        if (errno != ECONNREFUSED && errno != EAGAIN) {
+            perror("lotus_tcp_connect: connect");
+            close(sock);
+            return -1;
+        }
+        nanosleep(&backoff, NULL);
+    }
+    fprintf(stderr,
+            "lotus_tcp_connect: connect to %s:%u timed out\n",
+            h, (unsigned)port);
+    close(sock);
+    return -1;
+}
+
 int lotus_tcp_close_fd(int fd) {
     if (fd < 0) return 0;
     return close(fd);
+}
+
+/*
+ * m81: send / recv on a connected TCP fd, exposed to Aperio
+ * as String-shaped operations. send_str writes the bytes of
+ * the NUL-terminated input (length via strlen — embedded NULs
+ * truncate, mirroring m75's std::io::fs::write_file behavior;
+ * binary I/O waits on Bytes codegen). recv_str reads up to
+ * max_bytes into a freshly-allocated buffer in the lazy global
+ * payload arena, NUL-terminates at the actual byte count, and
+ * returns a stable pointer the caller can hold for the program
+ * lifetime (same ownership model as m75's read_file).
+ */
+
+/* Forward decl — defined later in this file. */
+void *lotus_bus_payload_arena_alloc(size_t size, size_t align);
+
+int lotus_tcp_send_str(int fd, const char *msg) {
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (!msg) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t len = strlen(msg);
+    const char *p = msg;
+    size_t      left = len;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w > 0) {
+            p    += (size_t)w;
+            left -= (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        perror("lotus_tcp_send_str: write");
+        return -1;
+    }
+    return 0;
+}
+
+const char *lotus_tcp_recv_str(int fd, int max_bytes) {
+    /* Stable empty-string sentinel — same trick as g_empty_str
+     * but local to this function-family because m81 may run
+     * before lotus_env_init has cleared the env globals. */
+    static const char empty[1] = { 0 };
+    if (fd < 0 || max_bytes <= 0) {
+        return empty;
+    }
+    size_t cap = (size_t)max_bytes;
+    char *buf = (char *)lotus_bus_payload_arena_alloc(cap + 1, 1);
+    if (!buf) {
+        return empty;
+    }
+    ssize_t n = read(fd, buf, cap);
+    if (n < 0) {
+        if (errno != EINTR) {
+            /* Treat read errors as "got nothing" at this level —
+             * the buffer is in the lazy arena so it persists; the
+             * stable empty-string sentinel signals "no data" to
+             * the caller. */
+        }
+        return empty;
+    }
+    /* NUL-terminate at the actual bytes-read offset; a zero-byte
+     * read (peer closed cleanly) yields an empty string at the
+     * arena buffer. */
+    buf[(size_t)n] = '\0';
+    return buf;
 }
 
 /*

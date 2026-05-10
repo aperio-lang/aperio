@@ -39,11 +39,11 @@ locus __StdIoTcpListener {
     }
     run() {
         // m73b: accept exactly one connection, log, close it,
-        // then return. m73c replaces this with a real loop that
-        // spawns __StdIoTcpStream children for each accepted
-        // connection — the parent locus's `accept(s: Stream)`
-        // hook then handles each one via the standard F.7
-        // accept-before-birth machinery.
+        // then return. m82 will land the multi-accept loop
+        // here that spawns Stream children for each accepted
+        // connection and invokes a user-supplied callback;
+        // until then the single-accept Listener stands as a
+        // working entry-point for simple servers.
         let conn = std::io::tcp::__accept_one(self.listen_fd);
         println("__StdIoTcpListener.run accepted conn=", conn);
         std::io::tcp::__close_fd(conn);
@@ -51,5 +51,27 @@ locus __StdIoTcpListener {
     dissolve() {
         println("__StdIoTcpListener.dissolve host=", self.host, " port=", self.port);
         std::io::tcp::__close_fd(self.listen_fd);
+    }
+}
+
+// m81: Stream locus — owns one connected TCP fd, exposes
+// send/recv via fn members, closes on dissolve. User code
+// receives a Stream as the parameter to a callback (via m82's
+// Listener.on_connection: fn(Stream)) and invokes
+// `s.send(msg)` / `s.recv(max)` against it directly. Standard
+// Aperio locus shape — no special cases.
+
+locus __StdIoTcpStream {
+    params {
+        conn_fd: Int = -1;
+    }
+    fn send(msg: String) -> Int {
+        return std::io::tcp::__send(self.conn_fd, msg);
+    }
+    fn recv(max_bytes: Int) -> String {
+        return std::io::tcp::__recv(self.conn_fd, max_bytes);
+    }
+    dissolve() {
+        std::io::tcp::__close_fd(self.conn_fd);
     }
 }
