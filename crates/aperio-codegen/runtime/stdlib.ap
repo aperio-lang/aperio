@@ -206,6 +206,173 @@ fn __write_http_response(s: std::io::tcp::Stream, resp: std::http::Response) {
 // failure) — without them, users would write
 // `assert(a == b, "...")` and lose the diagnostic detail.
 
+// m91 — std::text::md_to_html (block-level only).
+//
+// Converts a markdown source String to an HTML String. v0.1
+// supports:
+//   - ATX headings: `# h1`, `## h2`, ..., `###### h6`
+//     (one-to-six leading `#` chars, then a space, then content).
+//   - Paragraphs: consecutive non-blank lines joined with a
+//     single space, wrapped in `<p>...</p>`. Blank lines
+//     terminate paragraphs.
+//   - Fenced code blocks: ``` on its own line opens, ``` on
+//     its own line closes. Body emitted verbatim (HTML-escaped)
+//     inside `<pre><code>...</code></pre>`.
+//   - HTML escaping: `&`, `<`, `>` rewritten in all rendered
+//     content so untrusted markdown can't inject HTML/script.
+//
+// Intentionally NOT in v0.1: inline formatting (bold,
+// italic, code, links), lists, blockquotes, setext headings,
+// reference-style links, raw HTML pass-through. Each is a
+// follow-up milestone (m92+); the current v0.1 is what
+// Phase 5's doc server needs to render Aperio's own
+// markdown documentation in a usable form.
+
+// Replace every occurrence of `needle` in `s` with
+// `replacement`. Returns a fresh String. Empty needle returns
+// `s` unchanged (avoids the infinite-loop pitfall — an empty
+// match would keep firing at the same position forever).
+// (Param name avoids the reserved `with` token, which Aperio
+// uses for projection-class scoping.)
+fn __replace_all(s: String, needle: String, replacement: String) -> String {
+    if len(needle) == 0 { return s; }
+    let mut out = "";
+    let mut rest = s;
+    let mut idx = std::str::index_of(rest, needle);
+    while idx >= 0 {
+        out = out + rest[0..idx] + replacement;
+        let nlen = len(needle);
+        let rlen = len(rest);
+        rest = rest[(idx + nlen)..rlen];
+        idx = std::str::index_of(rest, needle);
+    }
+    out = out + rest;
+    return out;
+}
+
+// HTML-escape `&`, `<`, `>` in a content String. Order
+// matters: `&` first, otherwise the `&` we introduce while
+// escaping `<` (`&lt;`) would itself get escaped to `&amp;lt;`.
+fn __html_escape(s: String) -> String {
+    let a = __replace_all(s, "&", "&amp;");
+    let b = __replace_all(a, "<", "&lt;");
+    let c = __replace_all(b, ">", "&gt;");
+    return c;
+}
+
+// Count leading `#` characters at the start of `line`.
+// Returns the count (1-6) iff followed by a space (the ATX
+// requirement); 0 otherwise. A bare `######` with no
+// trailing space is treated as a paragraph in v0.1, matching
+// CommonMark's strict ATX rule.
+fn __count_heading_level(line: String) -> Int {
+    let n = len(line);
+    let mut count = 0;
+    while count < 6 && count < n && line[count..(count + 1)] == "#" {
+        count = count + 1;
+    }
+    if count == 0 { return 0; }
+    if count >= n { return 0; }
+    if line[count..(count + 1)] != " " { return 0; }
+    return count;
+}
+
+// Extract the next line from `md` starting at byte offset
+// `start`. Returns a String containing bytes [start, line_end),
+// where line_end is either the next `\n` or the end of `md`.
+// Caller advances by len(line) + 1 to skip past the newline.
+// (A trailing line with no terminating `\n` still works —
+// line_end == total in that case.)
+fn __next_line(md: String, start: Int) -> String {
+    let total = len(md);
+    let rest = md[start..total];
+    let nl = std::str::index_of(rest, "\n");
+    if nl < 0 {
+        return rest;
+    }
+    return md[start..(start + nl)];
+}
+
+fn __md_to_html(md: String) -> String {
+    let mut html = "";
+    let mut buffer = "";
+    let mut in_code = false;
+    let mut i = 0;
+    let total = len(md);
+
+    while i < total {
+        let line = __next_line(md, i);
+        i = i + len(line) + 1;
+
+        if in_code {
+            if line == "```" {
+                html = html + "</code></pre>\n";
+                in_code = false;
+            } else {
+                html = html + __html_escape(line) + "\n";
+            }
+        } else {
+            let level = __count_heading_level(line);
+            let is_heading = level > 0;
+            let is_code_fence = line == "```";
+            let is_blank = len(line) == 0;
+
+            // Any block-level transition (heading, code fence,
+            // or blank line) flushes the in-progress paragraph
+            // first so its content lands before the new block.
+            if (is_heading || is_code_fence || is_blank) && len(buffer) > 0 {
+                html = html + "<p>" + __html_escape(buffer) + "</p>\n";
+                buffer = "";
+            }
+
+            // Three-way classify (blank handled by the
+            // earlier flush; here we only act on code-fence /
+            // heading / paragraph). Using else-if chains because
+            // Aperio's parser doesn't accept empty if-blocks.
+            if is_code_fence {
+                html = html + "<pre><code>";
+                in_code = true;
+            } else if is_heading {
+                let line_len = len(line);
+                let content_start = level + 1;
+                // Aperio v0 has no if-as-expression; use a
+                // mutable let + branch.
+                let mut content = "";
+                if content_start < line_len {
+                    content = line[content_start..line_len];
+                }
+                let level_str = to_string(level);
+                html = html + "<h" + level_str + ">"
+                            + __html_escape(content)
+                            + "</h" + level_str + ">\n";
+            } else if !is_blank {
+                // Plain paragraph content — accumulate.
+                // Multi-line paragraphs join with a single
+                // space (CommonMark semantics).
+                if len(buffer) > 0 {
+                    buffer = buffer + " ";
+                }
+                buffer = buffer + line;
+            }
+            // Blank line: nothing to do here — the paragraph
+            // flush above already handled the separator
+            // semantics, and there's no <br>-style emission.
+        }
+    }
+
+    // Flush any in-flight paragraph at end-of-input.
+    if len(buffer) > 0 {
+        html = html + "<p>" + __html_escape(buffer) + "</p>\n";
+    }
+    // Unclosed code fence: emit the closing tags so the HTML
+    // is well-formed. Real markdown might warn here; v0.1
+    // silently closes.
+    if in_code {
+        html = html + "</code></pre>\n";
+    }
+    return html;
+}
+
 fn __test_assert(cond: Bool, msg: String) {
     if !cond {
         println("ASSERTION FAILED: ", msg);

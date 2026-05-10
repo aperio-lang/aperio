@@ -11846,6 +11846,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // + exits 1 on failure, no-op on success. Users
             // write tests as ordinary Aperio binaries that
             // exit 0 on pass.
+            // m91: markdown → HTML (statement position rare, but
+            // wired for completeness). The expression-position arm
+            // below is the canonical use.
+            ["std", "text", "md_to_html"] => {
+                let _ = self.lower_user_fn_call(
+                    "__md_to_html",
+                    args,
+                    scope,
+                )?;
+                Ok(())
+            }
             ["std", "test", "assert"] => {
                 let _ = self.lower_user_fn_call(
                     "__test_assert",
@@ -11972,6 +11983,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 result.ok_or_else(|| {
                     CodegenError::Unsupported(
                         "std::http::parse_request returns Request but \
+                         called in a position that expects no value"
+                            .to_string(),
+                    )
+                })
+            }
+            // m91: markdown → HTML.
+            ["std", "text", "md_to_html"] => {
+                let result = self.lower_user_fn_call(
+                    "__md_to_html",
+                    args,
+                    scope,
+                )?;
+                result.ok_or_else(|| {
+                    CodegenError::Unsupported(
+                        "std::text::md_to_html returns String but \
                          called in a position that expects no value"
                             .to_string(),
                     )
