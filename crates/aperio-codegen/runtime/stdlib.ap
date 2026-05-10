@@ -1,0 +1,35 @@
+// Aperio standard library — bundled source.
+//
+// Each file in this directory declares stdlib loci as ordinary
+// Aperio source. The codegen layer concatenates these with user
+// source before lowering, so by the time `lower_program` runs
+// they sit in `user_loci` exactly like user-declared loci.
+//
+// User code references stdlib loci via fully-qualified paths
+// (`std::io::tcp::Listener { ... }`); the codegen path-rewrite
+// step maps each known stdlib path to the mangled name declared
+// here. The leading double-underscore on stdlib names makes
+// collision with user-declared identifiers impossible at v0
+// while keeping the user-facing surface clean.
+//
+// m73a — placeholder. Lifecycle bodies just println so the
+// stdlib-loci-via-bundled-source mechanism can be verified end
+// to end. m73b replaces these bodies with real lotus_tcp_*
+// calls (via the m71-style `std::io::tcp::__*` path-call
+// primitives). m73c adds the Stream locus + send/recv methods.
+
+locus __StdIoTcpListener {
+    params {
+        host: String = "127.0.0.1";
+        port: Int = 0;
+    }
+    birth() {
+        println("__StdIoTcpListener.birth host=", self.host, " port=", self.port);
+    }
+    run() {
+        println("__StdIoTcpListener.run host=", self.host, " port=", self.port);
+    }
+    dissolve() {
+        println("__StdIoTcpListener.dissolve host=", self.host, " port=", self.port);
+    }
+}

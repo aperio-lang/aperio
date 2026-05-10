@@ -131,6 +131,23 @@ pub fn build_executable(
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| CodegenError::LlvmInit(e.to_string()))?;
 
+    // m73a: parse the bundled stdlib source and merge its decls
+    // into the user program before lowering. Stdlib loci land in
+    // `user_loci` alongside user-declared loci with no special
+    // casing in the lowering passes; collision with user names is
+    // prevented by the `__Std*` mangled prefix on bundled decls.
+    let stdlib_program = aperio_syntax::parse_source(STDLIB_AP_SOURCE)
+        .map_err(|diags| {
+            let summary = diags
+                .iter()
+                .map(|d| format!("{:?}", d))
+                .collect::<Vec<_>>()
+                .join("; ");
+            CodegenError::Unsupported(format!("stdlib parse: {}", summary))
+        })?;
+    let mut merged = program.clone();
+    merged.items.extend(stdlib_program.items);
+
     let context = Context::create();
     let module = context.create_module("lotus_main");
     let builder = context.create_builder();
@@ -139,7 +156,7 @@ pub fn build_executable(
         context: &context,
         module,
         builder,
-        program,
+        program: &merged,
         current_fn: None,
         current_user_fn_ret: None,
         current_self: None,
@@ -237,6 +254,36 @@ pub fn build_executable(
 /// (m19 introduces the substrate; m20+ wires it to locus
 /// lifetimes).
 const RUNTIME_C_SOURCE: &str = include_str!("../runtime/lotus_arena.c");
+
+/// Bundled Aperio source for the stdlib. m73a establishes the
+/// concat-with-user-source mechanism: the parsed stdlib `Program`
+/// has its `items` appended to the user's `Program.items` before
+/// `lower_program` runs, so each stdlib locus sits in `user_loci`
+/// exactly like user-declared loci. Path-qualified references
+/// (`std::io::tcp::Listener`) are rewritten at struct-literal
+/// codegen sites to the mangled locus names declared in this
+/// source via the `STDLIB_PATH_RENAMES` table below.
+const STDLIB_AP_SOURCE: &str = include_str!("../runtime/stdlib.ap");
+
+/// Maps each user-facing stdlib locus path to the mangled locus
+/// name declared in `STDLIB_AP_SOURCE`. The mangled prefix
+/// (`__StdIo...`) makes collision with user-declared identifiers
+/// impossible at v0. Each entry is `&[&"std", &"io", ...]` →
+/// flat string. Keep this table sorted by path for review.
+const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
+    (&["std", "io", "tcp", "Listener"], "__StdIoTcpListener"),
+];
+
+/// Look up the mangled locus name for a stdlib path. Returns
+/// `None` when the path isn't a recognized stdlib locus, in
+/// which case the qualified-path struct literal falls through to
+/// the existing "unknown" error.
+fn stdlib_locus_for_path(segs: &[&str]) -> Option<&'static str> {
+    STDLIB_PATH_RENAMES
+        .iter()
+        .find(|(p, _)| *p == segs)
+        .map(|(_, name)| *name)
+}
 
 struct Cx<'ctx, 'p> {
     context: &'ctx Context,
@@ -7103,17 +7150,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ) -> Result<BlockEnd, CodegenError> {
         match stmt {
             Stmt::Expr(Expr::Struct { path, inits, .. }) => {
-                if path.segments.len() != 1 {
-                    return Err(CodegenError::Unsupported(format!(
-                        "qualified-name struct literal `{}`",
-                        path.segments
-                            .iter()
-                            .map(|s| s.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join("::")
-                    )));
-                }
-                let name = path.segments[0].name.as_str();
+                // m73a: rewrite recognized `std::*` paths to the
+                // mangled stdlib locus name declared in
+                // STDLIB_AP_SOURCE. Unknown qualified paths still
+                // error below, just with the better
+                // "no locus or type by that name" message.
+                let segs: Vec<&str> = path
+                    .segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let resolved_name: String = if path.segments.len() > 1 {
+                    match stdlib_locus_for_path(&segs) {
+                        Some(mangled) => mangled.to_string(),
+                        None => {
+                            return Err(CodegenError::Unsupported(format!(
+                                "qualified-name struct literal `{}`",
+                                segs.join("::")
+                            )));
+                        }
+                    }
+                } else {
+                    path.segments[0].name.clone()
+                };
+                let name = resolved_name.as_str();
                 if self.user_loci.contains_key(name) {
                     let _ = self.lower_locus_instantiation(name, inits, scope)?;
                 } else if self.user_types.contains_key(name) {
