@@ -28,6 +28,10 @@
 
 - [`std::log`](./log.md)
 
+# Phase 7: Corpus-extraction helpers
+
+- [`std::iter`](./iter.md)
+
 # Primitives
 
 - [`Bytes`](./bytes.md)

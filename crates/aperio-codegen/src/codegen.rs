@@ -383,6 +383,13 @@ const STDLIB_AP_SOURCE: &str = concat!(
     // dependency on ts.ap is just stylistic — the
     // path-call resolution is independent of bundle order.
     include_str!("../runtime/stdlib/lang.ap"),
+    "\n",
+    // Corpus-extraction pass: cross-cutting helpers lifted from
+    // the apps/ tree into the std seed so they stop being
+    // hand-rolled per consumer. Each is a namespace lotus
+    // (empty params, methods only). Order between these is
+    // flexible — they reference only path-call primitives.
+    include_str!("../runtime/stdlib/iter.ap"),
 );
 
 /// Maps each user-facing stdlib path (locus OR type) to the
@@ -399,6 +406,7 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "http", "Response"], "__StdHttpResponse"),
     (&["std", "io", "tcp", "Listener"], "__StdIoTcpListener"),
     (&["std", "io", "tcp", "Stream"], "__StdIoTcpStream"),
+    (&["std", "iter", "Lines"], "__StdIterLines"),
     (&["std", "lang", "Lang"], "__StdLangLang"),
     (&["std", "lang", "Morpheme"], "__StdLangMorpheme"),
     (&["std", "log", "LogEvent"], "__StdLogEvent"),

@@ -1,0 +1,69 @@
+// std::iter::Lines — cursor-shape iteration over a
+// newline-separated String.
+//
+// Replaces the 6-line while-loop boilerplate that several apps
+// open-code today (newline scan + slice + index advancement).
+// The cursor shape is honest about v0: fn-pointer callbacks
+// can't capture state, so a callback API would force every
+// caller to bus-route or reconstruct state inside the closure.
+// Cursor-shape works with the surface that's shipped today; a
+// callback method lands as a backward-compatible addition once
+// closures-with-state arrive.
+//
+// Use site:
+//
+//   let it = std::iter::Lines { };
+//   let mut from = 0;
+//   while from >= 0 {
+//       let line = it.line_at(s, from);
+//       from = it.next_idx(s, from);
+//       if it.is_skippable(line) { continue; }
+//       // do something with line
+//   }
+//
+// `next_idx` returns -1 when there is nothing left, which lets
+// the loop exit on the `while from >= 0` guard. `is_skippable`
+// covers the universal config-file shape (blank lines + lines
+// starting with `#`); callers with different skip rules drop the
+// helper and write their own predicate.
+locus __StdIterLines {
+    params { }
+
+    // Returns the index where the next line begins, or -1 when
+    // `from` has consumed the input. When the last line has no
+    // trailing newline, returns `len(s)` once — the follow-up
+    // call from there returns -1.
+    fn next_idx(s: String, from: Int) -> Int {
+        let total = len(s);
+        if from < 0 { return -1; }
+        if from >= total { return -1; }
+        let rest = s[from..total];
+        let nl = std::str::index_of(rest, "\n");
+        if nl < 0 { return total; }
+        return from + nl + 1;
+    }
+
+    // Returns the line at `from`, stripped of its trailing
+    // newline. Returns "" when `from` is past the end (the
+    // safe value for the one-extra trailing iteration that
+    // `next_idx` returning `len(s)` produces).
+    fn line_at(s: String, from: Int) -> String {
+        let total = len(s);
+        if from < 0 { return ""; }
+        if from >= total { return ""; }
+        let rest = s[from..total];
+        let nl = std::str::index_of(rest, "\n");
+        if nl < 0 { return rest; }
+        return rest[0..nl];
+    }
+
+    // True for config-style lines that callers usually skip:
+    // blank lines and lines whose first character is `#`. Open-
+    // codes the universal case; callers with richer comment
+    // syntax skip this helper.
+    fn is_skippable(line: String) -> Bool {
+        if len(line) == 0 { return true; }
+        if line[0..1] == "#" { return true; }
+        return false;
+    }
+}
