@@ -263,6 +263,50 @@ locus __StdLangLang {
         return "named";
     }
 
+    // True if `node` is a call expression. The entrypoint-mode
+    // call walker uses this to enumerate every call site inside
+    // a fn body for the outward tower.
+    fn is_call_expression(node: Int) -> Bool {
+        if self.flavor == "go" {
+            return std::ts::node_kind(node) == "call_expression";
+        }
+        return false;
+    }
+
+    // Extract the callee name from a `call_expression`. Two shapes:
+    //   - bare identifier:        `foo(args)`        → "foo"
+    //   - selector expression:    `pkg.Bar(args)`    → "Bar"
+    //     (only the right-hand side; v0 doesn't resolve
+    //     `pkg` against the import list)
+    // Returns "" for anything else (func-literal callees, type
+    // assertions used as calls, etc.).
+    fn extract_call_name(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            if n == 0 { return ""; }
+            let f = std::ts::node_named_child(call_node, 0);
+            let k = std::ts::node_kind(f);
+            if k == "identifier" {
+                return std::ts::node_text(f);
+            }
+            if k == "selector_expression" {
+                // Selector right-hand-side is a field_identifier
+                // — that's the method/function name. Walk children
+                // and pick the first field_identifier.
+                let fn_count = std::ts::node_named_child_count(f);
+                let mut i = 0;
+                while i < fn_count {
+                    let c = std::ts::node_named_child(f, i);
+                    if std::ts::node_kind(c) == "field_identifier" {
+                        return std::ts::node_text(c);
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        return "";
+    }
+
     // Function with this name should be classified as the root
     // locus's `main` lifecycle method. Go: "main". Rust:
     // "main". Python: convention-based (`__main__`-guarded).
