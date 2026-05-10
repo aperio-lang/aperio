@@ -946,6 +946,50 @@ int lotus_str_contains(const char *s, const char *sub) {
  * and path, `\r\n` at the end of the request line, etc.). Empty
  * needle returns 0 by convention; null inputs return -1.
  */
+/*
+ * m89: Bytes value primitives.
+ *
+ * A Bytes value is a single arena-allocated pointer to a blob
+ * laid out as `[i64 len][u8 data[len]]`. The leading length
+ * makes the value self-describing — same single-pointer ABI
+ * as String, but binary content with embedded NUL bytes
+ * doesn't truncate (NUL is not a terminator here).
+ *
+ * Memory: allocated via lotus_arena_alloc on the caller's
+ * arena, so the lifetime matches the locus or fn whose arena
+ * it came from. v0 has no resize/append — Bytes is created
+ * once with a known length (via read, recv, etc.) and lives
+ * as long as the caller's arena does.
+ */
+void *lotus_bytes_create(lotus_arena_t *a, int64_t len) {
+    if (len < 0) {
+        return NULL;
+    }
+    /* sizeof(int64_t) for the prefix + len bytes for the body. */
+    size_t blob = sizeof(int64_t) + (size_t)len;
+    void *p = lotus_arena_alloc(a, blob, 8);
+    if (!p) {
+        return NULL;
+    }
+    *(int64_t *)p = len;
+    /* Body bytes left uninitialized — caller fills them via
+     * lotus_bytes_data(). Zeroing here would double the cost
+     * for callers that overwrite the whole blob immediately
+     * (the common case: read syscall reads into it, recv
+     * fills it, etc.). */
+    return p;
+}
+
+int64_t lotus_bytes_len(const void *b) {
+    if (!b) return 0;
+    return *(const int64_t *)b;
+}
+
+void *lotus_bytes_data(void *b) {
+    if (!b) return NULL;
+    return (char *)b + sizeof(int64_t);
+}
+
 int64_t lotus_str_index_of(const char *s, const char *sub) {
     if (!s || !sub) return -1;
     if (*sub == '\0') return 0;
@@ -1683,6 +1727,42 @@ int lotus_tcp_send_str(int fd, const char *msg) {
     return 0;
 }
 
+/*
+ * m89: write a Bytes blob to a TCP fd. Uses the explicit
+ * length stored in the blob's prefix (not strlen) so embedded
+ * NUL bytes don't truncate. write(2) loop handles partial
+ * writes; returns 0 on full send, -1 on error.
+ */
+int lotus_tcp_send_bytes(int fd, const void *bytes_ptr) {
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (!bytes_ptr) {
+        errno = EINVAL;
+        return -1;
+    }
+    int64_t total = lotus_bytes_len(bytes_ptr);
+    if (total < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *p = (const char *)bytes_ptr + sizeof(int64_t);
+    size_t left = (size_t)total;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w > 0) {
+            p    += (size_t)w;
+            left -= (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        perror("lotus_tcp_send_bytes: write");
+        return -1;
+    }
+    return 0;
+}
+
 const char *lotus_tcp_recv_str(int fd, int max_bytes) {
     /* Stable empty-string sentinel — same trick as g_empty_str
      * but local to this function-family because m81 may run
@@ -1775,6 +1855,61 @@ ssize_t lotus_fs_read_file(const char *path,
     }
     close(fd);
     return total;
+}
+
+/*
+ * m89: read whole file as a Bytes blob. Allocates a fresh
+ * Bytes value on the caller's arena sized to the file's
+ * length, fills it from the fd, returns the pointer. NULL
+ * on any error (file missing, permission denied, etc.) —
+ * caller distinguishes via errno. Used by std::io::fs::
+ * read_bytes for binary file I/O where String's NUL
+ * truncation would silently corrupt the data.
+ */
+void *lotus_fs_read_bytes(lotus_arena_t *a, const char *path) {
+    if (!a || !path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return NULL;
+    }
+    /* Stat to size the blob exactly. fstat keeps us off a
+     * second open; on regular files st_size is the byte
+     * count we need. */
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return NULL;
+    }
+    int64_t size = (int64_t)st.st_size;
+    void *blob = lotus_bytes_create(a, size);
+    if (!blob) {
+        close(fd);
+        errno = ENOMEM;
+        return NULL;
+    }
+    char *body = (char *)lotus_bytes_data(blob);
+    size_t left = (size_t)size;
+    while (left > 0) {
+        ssize_t r = read(fd, body, left);
+        if (r > 0) {
+            body += (size_t)r;
+            left -= (size_t)r;
+            continue;
+        }
+        if (r == 0) break;
+        if (errno == EINTR) continue;
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+    /* If the file shrank between fstat and read (race), the
+     * trailing bytes are uninitialized blob memory. v0
+     * accepts that — the next milestone might re-read st_size
+     * after the loop and patch the prefix down. */
+    return blob;
 }
 
 /* Write exactly `len` bytes from `buf` to `path`. Truncates
@@ -2281,6 +2416,31 @@ void *lotus_bus_payload_arena_alloc(size_t size, size_t align) {
     void *p = lotus_arena_alloc(g_bus_payload_arena, size, align);
     pthread_mutex_unlock(&g_bus_payload_arena_mutex);
     return p;
+}
+
+/*
+ * m89: read_bytes wrapper that anchors the resulting Bytes
+ * blob in the lazy global payload arena (same lifetime
+ * mechanism as read_file's String). Doing it this way keeps
+ * the Bytes value valid for the entire program — a fn that
+ * returns Bytes can rely on the pointer staying live past
+ * the call site without m49-style deep-copy plumbing.
+ */
+void *lotus_fs_read_bytes_global(const char *path) {
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return NULL;
+        }
+    }
+    /* lotus_fs_read_bytes allocates internally via
+     * lotus_arena_alloc; we hold the mutex around it because
+     * the global arena is shared across reader threads. */
+    void *result = lotus_fs_read_bytes(g_bus_payload_arena, path);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    return result;
 }
 
 void lotus_bus_remote_destroy_all(void) {

@@ -51,6 +51,20 @@ enum LotusType {
     /// lowering lands later. Distinct from `String` at the type
     /// level so the typechecker keeps `Time` and `String` apart.
     Time,
+    /// m89: opaque byte buffer. Distinct from `String` because
+    /// String is NUL-terminated (binary content with embedded 0
+    /// bytes truncates). Bytes carries an explicit length, so
+    /// it's the right type for binary file I/O, raw HTTP bodies,
+    /// images, etc.
+    ///
+    /// Representation: a single `ptr` value at the LLVM level,
+    /// pointing to an arena-allocated blob laid out as
+    /// `[i64 len][u8 data[len]]`. Same single-pointer ABI as
+    /// String — fits return-by-value through the m49 calling
+    /// convention without struct-typed return shenanigans.
+    /// Length is read by dereferencing the prefix; the data
+    /// pointer is the blob plus 8 bytes.
+    Bytes,
     /// Pointer to a locus's struct. The string carries the locus
     /// name; the layout + field map live in `Cx.user_loci`. Used
     /// for the child param of `accept(g: ChildLocus)`.
@@ -1026,6 +1040,45 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             i64_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function("lotus_str_index_of", str_index_of_ty, None);
+
+        // m89: Bytes value primitives.
+        // declare ptr @lotus_bytes_create(ptr arena, i64 len)
+        // declare i64 @lotus_bytes_len(ptr b)
+        // declare ptr @lotus_bytes_data(ptr b)
+        let bytes_create_ty =
+            ptr_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_bytes_create", bytes_create_ty, None);
+        let bytes_len_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_bytes_len", bytes_len_ty, None);
+        let bytes_data_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_bytes_data", bytes_data_ty, None);
+
+        // m89: file/socket I/O on Bytes.
+        // declare ptr @lotus_fs_read_bytes(ptr arena, ptr path)
+        // declare ptr @lotus_fs_read_bytes_global(ptr path)
+        // declare i32 @lotus_tcp_send_bytes(i32 fd, ptr bytes)
+        let fs_read_bytes_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_read_bytes", fs_read_bytes_ty, None);
+        let fs_read_bytes_global_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_fs_read_bytes_global",
+            fs_read_bytes_global_ty,
+            None,
+        );
+        let tcp_send_bytes_ty = i32_t_local.fn_type(
+            &[self.context.i32_type().into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_tcp_send_bytes",
+            tcp_send_bytes_ty,
+            None,
+        );
 
         // m48: render a Decimal (i128 mantissa, implicit scale 9)
         // into a NUL-terminated string buffer.
@@ -3080,6 +3133,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 PrimType::Duration => Ok(LotusType::Duration),
                 PrimType::Decimal => Ok(LotusType::Decimal),
                 PrimType::Time => Ok(LotusType::Time),
+                PrimType::Bytes => Ok(LotusType::Bytes),
                 other => Err(CodegenError::Unsupported(format!(
                     "type primitive `{:?}` in signature",
                     other
@@ -5285,6 +5339,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     }
                                 }
                                 LotusType::String
+                                | LotusType::Bytes
                                 | LotusType::Time
                                 | LotusType::LocusRef(_)
                                 | LotusType::TypeRef(_)
@@ -5449,6 +5504,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     }
                                 }
                                 LotusType::String
+                                | LotusType::Bytes
                                 | LotusType::Time
                                 | LotusType::LocusRef(_)
                                 | LotusType::TypeRef(_)
@@ -6488,6 +6544,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
             }
             Some(LotusType::String)
+            | Some(LotusType::Bytes)
             | Some(LotusType::Time)
             | Some(LotusType::LocusRef(_))
             | Some(LotusType::TypeRef(_))
@@ -6830,6 +6887,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .left()
                     .expect("lotus_str_clone returns ptr");
                 Ok(res)
+            }
+            LotusType::Bytes => {
+                // m89: Bytes returned from a fn is shipped through
+                // the same lazy-global-payload arena that
+                // read_bytes uses, so the returned pointer is
+                // already program-lifetime-safe. No deep-copy
+                // into dest_arena needed (and we'd lose the
+                // length prefix if we tried to use lotus_str_clone,
+                // which strlens). Pass the value through as-is —
+                // future m89 follow-up: a `lotus_bytes_clone`
+                // primitive that copies len + body into
+                // dest_arena, for callers that genuinely want
+                // the payload moved.
+                Ok(value)
             }
             LotusType::Tuple(elem_tys) => {
                 // Allocate a fresh tuple-storage struct in
@@ -8045,6 +8116,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .try_as_basic_value()
                     .left()
                     .expect("lotus_str_len returns i64");
+                Ok((val, LotusType::Int))
+            }
+            LotusType::Bytes => {
+                // m89: Bytes carries an explicit length prefix —
+                // not strlen, since binary data may have embedded
+                // NULs. lotus_bytes_len reads the i64 at offset 0.
+                let len_fn = self
+                    .module
+                    .get_function("lotus_bytes_len")
+                    .expect("lotus_bytes_len declared");
+                let val = self
+                    .builder
+                    .build_call(
+                        len_fn,
+                        &[v.into_pointer_value().into()],
+                        "bytes.len",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_bytes_len returns i64");
                 Ok((val, LotusType::Int))
             }
             LotusType::Array(_, n) => {
@@ -9829,6 +9921,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
             }
             LotusType::String
+            | LotusType::Bytes
             | LotusType::Time
             | LotusType::LocusRef(_)
             | LotusType::TypeRef(_)
@@ -9959,6 +10052,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )))
             }
             Expr::Ident(id) => {
+                // m89-fix: locals shadow globals. Check scope
+                // first; only fall back to user_fns (treating the
+                // identifier as a fn-pointer value, m80) when no
+                // local of that name exists. The reverse order
+                // would let stdlib fns whose params happen to
+                // share a name with a user-declared fn (e.g. a
+                // user fn `b` and a stdlib param `b: Bytes`)
+                // resolve the param to the global fn — exactly
+                // the silent shadowing bug locals are meant to
+                // prevent.
+                if let Some((alloca, ty)) =
+                    scope.locals.get(&id.name).cloned()
+                {
+                    let llvm_ty = self.llvm_basic_type(&ty);
+                    let loaded = self
+                        .builder
+                        .build_load(llvm_ty, alloca, &id.name)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    return Ok((loaded, ty));
+                }
                 // m80: a bare identifier in expression position
                 // can be a user function name used as a value.
                 // The Expr::Call path that handles `handler(...)`
@@ -9975,22 +10088,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     };
                     return Ok((fn_ptr.into(), fn_ty));
                 }
-                let (alloca, ty) = scope
-                    .locals
-                    .get(&id.name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        CodegenError::Unsupported(format!(
-                            "unknown identifier `{}`",
-                            id.name
-                        ))
-                    })?;
-                let llvm_ty = self.llvm_basic_type(&ty);
-                let loaded = self
-                    .builder
-                    .build_load(llvm_ty, alloca, &id.name)
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                Ok((loaded, ty))
+                Err(CodegenError::Unsupported(format!(
+                    "unknown identifier `{}`",
+                    id.name
+                )))
             }
             Expr::Field { receiver, name, .. }
                 if matches!(receiver.as_ref(), Expr::KwSelf(_)) =>
@@ -10650,6 +10751,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
             }
             LotusType::String
+            | LotusType::Bytes
             | LotusType::Time
             | LotusType::LocusRef(_)
             | LotusType::TypeRef(_)
@@ -11201,6 +11303,33 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                          values have no surface representation".into(),
                     ));
                 }
+                LotusType::Bytes => {
+                    // m89: print Bytes as `<bytes len=N>` so it's
+                    // identifiable in logs without dumping
+                    // potentially-binary content. Users who want the
+                    // body should write a hex / base64 helper —
+                    // direct stringification would be lossy for
+                    // binary data and confusing for ASCII data
+                    // (NUL-terminated assumptions break).
+                    let len_fn = self
+                        .module
+                        .get_function("lotus_bytes_len")
+                        .expect("lotus_bytes_len declared");
+                    let len_v = self
+                        .builder
+                        .build_call(
+                            len_fn,
+                            &[val.into_pointer_value().into()],
+                            "println.bytes.len",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("lotus_bytes_len returns i64")
+                        .into_int_value();
+                    format.push_str("<bytes len=%lld>");
+                    printf_args.push(BasicMetadataValueEnum::IntValue(len_v));
+                }
                 LotusType::Enum(enum_name) => {
                     // m47-followup + payloads: render the enum
                     // value via the shared value_to_string path —
@@ -11628,6 +11757,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_tcp_recv(args, scope)?;
                 Ok(())
             }
+            ["std", "io", "fs", "read_bytes"] => {
+                let _ = self.lower_std_io_fs_read_bytes(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "tcp", "__send_bytes"] => {
+                let _ = self.lower_std_io_tcp_send_bytes(args, scope)?;
+                Ok(())
+            }
             ["std", "io", "fs", "read_file"] => {
                 let _ = self.lower_std_io_fs_read_file(args, scope)?;
                 Ok(())
@@ -11773,6 +11910,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "io", "tcp", "__recv"] => {
                 self.lower_std_io_tcp_recv(args, scope)
+            }
+            ["std", "io", "fs", "read_bytes"] => {
+                self.lower_std_io_fs_read_bytes(args, scope)
+            }
+            ["std", "io", "tcp", "__send_bytes"] => {
+                self.lower_std_io_tcp_send_bytes(args, scope)
             }
             ["std", "io", "fs", "read_file"] => {
                 self.lower_std_io_fs_read_file(args, scope)
@@ -12361,6 +12504,111 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok((ret_bool.into(), LotusType::Bool))
+    }
+
+    /// m89: Lower `std::io::fs::read_bytes(path: String) -> Bytes`.
+    /// Routes to `lotus_fs_read_bytes_global` so the resulting
+    /// Bytes blob lives in the lazy global payload arena (same
+    /// lifetime story as read_file's String). Embedded NUL bytes
+    /// are preserved because Bytes carries an explicit length
+    /// prefix — the reason this exists alongside read_file.
+    fn lower_std_io_fs_read_bytes(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_bytes takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != LotusType::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_bytes: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_fs_read_bytes_global")
+            .expect("lotus_fs_read_bytes_global declared");
+        let call = self
+            .builder
+            .build_call(f, &[path_val.into()], "fs.read_bytes.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_fs_read_bytes_global returns ptr");
+        Ok((v, LotusType::Bytes))
+    }
+
+    /// m89: Lower `std::io::tcp::__send_bytes(fd: Int, b: Bytes) -> Int`.
+    /// Wraps `lotus_tcp_send_bytes` — same shape as `__send` but
+    /// uses the explicit Bytes length, no NUL truncation. Returns
+    /// the i32-cast-to-i64 result (0 on success, -1 on error)
+    /// so user code can branch on it.
+    fn lower_std_io_tcp_send_bytes(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, LotusType), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__send_bytes takes 2 args (fd, bytes), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != LotusType::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__send_bytes: fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let (b_val, b_ty) = self.lower_expr(&args[1], scope)?;
+        if b_ty != LotusType::Bytes {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__send_bytes: bytes must be Bytes, got {:?}",
+                b_ty
+            )));
+        }
+        // Truncate fd's Int (i64) → i32 to match the C ABI.
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(
+                fd_val.into_int_value(),
+                i32_t,
+                "fd.i32",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_tcp_send_bytes")
+            .expect("lotus_tcp_send_bytes declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), b_val.into()],
+                "tcp.send_bytes.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i32 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        // Sign-extend i32 → i64 so the result fits the Int contract.
+        let i64_t = self.context.i64_type();
+        let ret_i64 = self
+            .builder
+            .build_int_s_extend(ret_i32, i64_t, "send_bytes.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((ret_i64.into(), LotusType::Int))
     }
 
     /// Lower `std::io::fs::read_file(path: String) -> String`.

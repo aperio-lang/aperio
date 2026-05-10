@@ -245,6 +245,12 @@ locus __StdIoTcpStream {
     fn send(msg: String) -> Int {
         return std::io::tcp::__send(self.conn_fd, msg);
     }
+    // m89: binary-safe send. Use this for image bodies, raw
+    // protocol frames, or anything where embedded NUL bytes
+    // would cause `send`'s strlen-based shipping to truncate.
+    fn send_bytes(b: Bytes) -> Int {
+        return std::io::tcp::__send_bytes(self.conn_fd, b);
+    }
     fn recv(max_bytes: Int) -> String {
         return std::io::tcp::__recv(self.conn_fd, max_bytes);
     }
