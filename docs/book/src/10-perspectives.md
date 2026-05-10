@@ -116,22 +116,26 @@ lands when an example forces it.
 ## Perspectives
 
 A *perspective* is a serializable bundle of parameters that
-moves between two loci — typically between an *analyst* (which
-fits the bundle's values from observed data) and an *executor*
+moves between two loci — typically between a *fitter* (which
+fits the bundle's values from observed data) and an *applier*
 (which applies them at production speed). The trellis-pair
-example uses perspectives to ship `TradeKernel` from analyst
-to executor.
+example uses perspectives to ship a fitted `Kernel` from the
+fitter to the applier.
 
 ```aperio
-perspective TradeKernel {
-    multiplier: Decimal = 1.0d;
-    valid_after: Time;
-    perspective_id: Int;
+perspective KernelPerspective {
+    params {
+        kernel: Kernel;
+        validation_count: Int = 0;
+    }
 
     stable_when {
         // commit predicate: this perspective ships only after
         // N validations agree.
+        return self.validation_count >= 3;
     }
+
+    serialize_as Kernel;
 }
 ```
 

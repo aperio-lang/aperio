@@ -123,4 +123,4 @@ These appear in subsequent examples (planned, not yet written):
 
 When all five are written and compile cleanly, the v0.1 spec
 is empirically validated at the smallest scale. The trellis
-trader/analyst pair is the next step beyond.
+fitter/applier pair is the next step beyond.

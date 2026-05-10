@@ -1,19 +1,20 @@
-// analyst.lt — the analyst binary.
+// fitter.ap — the fitter binary.
 //
-// Consumes Book messages (from grease, via UDP multicast in
-// production). Computes a fitted TradeKernel. Ships kernels to
-// the executor only once the multi-perspective-stability
-// commit-rule fires (validation_count >= 3).
+// Consumes Observation messages from the upstream observation
+// stream (UDP multicast in production). Computes a fitted
+// Kernel. Ships kernels to the applier only once the
+// multi-perspective-stability commit-rule fires
+// (validation_count >= 3).
 //
 // Runs in resolution-mode regime: structure-finding, slow
 // clock, holding multiple perspectives in flight, only
-// publishing the converged ones. The executor is the
-// bulk-mode counterpart that applies these kernels at line
-// rate.
+// publishing the converged ones. The applier is the
+// bulk-mode counterpart that applies these kernels at high
+// frequency.
 
 import "trellis-pair/shared";
 
-locus AnalystL {
+locus FitterL {
     params {
         // Locus capacity parameters
         B: Int = 1000;
@@ -22,8 +23,8 @@ locus AnalystL {
         phi: Float = 1.0;
 
         // Locus state
-        latest_kernel: TradeKernel = TradeKernel {
-            multiplier: 1.0d,
+        latest_kernel: Kernel = Kernel {
+            scale: 1.0d,
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
@@ -32,23 +33,23 @@ locus AnalystL {
     }
 
     bus {
-        subscribe "trellis.book"   as on_book   of type Book;
-        publish   "trellis.kernel"             of type TradeKernel;
+        subscribe "trellis.observation" as on_observation of type Observation;
+        publish   "trellis.kernel"                        of type Kernel;
     }
 
-    fn on_book(book: Book) {
-        // Update fitted kernel from the new book observation.
+    fn on_observation(obs: Observation) {
+        // Update fitted kernel from the new observation.
         // In production this is real curve fitting; here a
         // stub that increments perspective_id each time.
-        self.latest_kernel = TradeKernel {
-            multiplier: self.latest_kernel.multiplier,
-            valid_after: book.timestamp,
+        self.latest_kernel = Kernel {
+            scale: self.latest_kernel.scale,
+            valid_after: obs.timestamp,
             perspective_id: self.latest_kernel.perspective_id + 1,
         };
         self.validation_count = self.validation_count + 1;
 
         // Wrap as a perspective, ship if stable.
-        let p = TradeKernelPerspective {
+        let p = KernelPerspective {
             kernel: self.latest_kernel,
             validation_count: self.validation_count,
         };
@@ -69,5 +70,5 @@ locus AnalystL {
 }
 
 fn main() {
-    AnalystL { };
+    FitterL { };
 }

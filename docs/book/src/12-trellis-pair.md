@@ -1,20 +1,19 @@
 # Building trellis-pair
 
 This is the capstone. **trellis-pair** is the multi-binary
-analyst/executor pair that the example ladder ends with — a
-production-shaped Aperio program that exercises every
-substrate primitive introduced over the previous eleven
-chapters.
+fitter/applier pair that the example ladder ends with — a
+production-shaped Aperio program that exercises every substrate
+primitive introduced over the previous eleven chapters.
 
-The shape: an *analyst* binary fits trade kernels from observed
-market data, ships stable kernels to an *executor* over the bus,
-and each one runs in its own process under its own scheduling
-regime. The two communicate only through declared bus subjects,
-each subject typed against a shared schema compiled into both
-binaries.
+The shape: a *fitter* binary fits parameters from an upstream
+observation stream, ships stable parameters to an *applier* over
+the bus, and each one runs in its own process under its own
+scheduling regime. The two communicate only through declared bus
+subjects, each subject typed against a shared schema compiled
+into both binaries.
 
 This chapter walks the program in full: the shared schema, the
-analyst's source, the executor's source, the deployment
+fitter's source, the applier's source, the deployment
 configuration, and how the substrate primitives compose into a
 working production-shaped artifact.
 
@@ -23,8 +22,8 @@ working production-shaped artifact.
 ```text
 examples/trellis-pair/
     shared.ap         // types compiled into both binaries
-    analyst.ap        // the analyst binary's main
-    executor.ap       // the executor binary's main
+    fitter.ap         // the fitter binary's main
+    applier.ap        // the applier binary's main
     deployment.yaml   // intended deployment-time config
     README.md
 ```
@@ -32,12 +31,12 @@ examples/trellis-pair/
 Each `.ap` file is built independently:
 
 ```bash
-aperio build examples/trellis-pair/analyst.ap
-aperio build examples/trellis-pair/executor.ap
+aperio build examples/trellis-pair/fitter.ap
+aperio build examples/trellis-pair/applier.ap
 ```
 
-Two ELF binaries land beside the source: `analyst` and
-`executor`. They run as separate operating-system processes,
+Two ELF binaries land beside the source: `fitter` and
+`applier`. They run as separate operating-system processes,
 each opening its own
 [lotus](../../reference/src/glossary.md#lotus).
 
@@ -47,34 +46,34 @@ The shared file declares the wire-level types that travel on
 the bus, plus a perspective for the kernel:
 
 ```aperio
-type Book {
-    bid_price: Decimal;
-    ask_price: Decimal;
+type Observation {
+    value_low: Decimal;
+    value_high: Decimal;
     timestamp: Time;
 }
 
-type TradeKernel {
-    multiplier: Decimal;
+type Kernel {
+    scale: Decimal;
     valid_after: Time;
     perspective_id: Int;
 }
 
-type Intent {
-    side: String;
-    price: Decimal;
+type Action {
+    kind: String;
+    magnitude: Decimal;
     quantity: Decimal;
-    intent_id: Int;
+    action_id: Int;
 }
 
-type Fill {
-    intent_id: Int;
-    fill_price: Decimal;
-    fill_quantity: Decimal;
+type Receipt {
+    action_id: Int;
+    receipt_value: Decimal;
+    receipt_count: Decimal;
 }
 
-perspective TradeKernelPerspective {
+perspective KernelPerspective {
     params {
-        kernel: TradeKernel;
+        kernel: Kernel;
         validation_count: Int = 0;
     }
 
@@ -82,7 +81,7 @@ perspective TradeKernelPerspective {
         return self.validation_count >= 3;
     }
 
-    serialize_as TradeKernel;
+    serialize_as Kernel;
 }
 ```
 
@@ -92,32 +91,31 @@ Per [chapter 8](./08-cross-process.md), schema agreement is
 layouts; the wire format is exactly that in-memory layout, so
 deserialization is exact.
 
-The `TradeKernelPerspective` ([chapter
-10](./10-perspectives.md)) wraps the wire-shaped `TradeKernel`
-with a `validation_count` and a `stable_when` commit predicate
-("ship only after at least three perspectives agree"). The
-`serialize_as TradeKernel` annotation declares that on the
-wire the perspective is a `TradeKernel` — the
-`validation_count` is internal-to-the-analyst bookkeeping that
+The `KernelPerspective` ([chapter 10](./10-perspectives.md))
+wraps the wire-shaped `Kernel` with a `validation_count` and a
+`stable_when` commit predicate ("ship only after at least three
+perspectives agree"). The `serialize_as Kernel` annotation
+declares that on the wire the perspective is a `Kernel` — the
+`validation_count` is internal-to-the-fitter bookkeeping that
 does not cross the bus.
 
-## The analyst (`analyst.ap`)
+## The fitter (`fitter.ap`)
 
-The analyst's job: consume `Book` messages, fit a trade
-kernel, ship stable kernels.
+The fitter's job: consume `Observation` messages, fit a kernel,
+ship stable kernels.
 
 ```aperio
 import "trellis-pair/shared";
 
-locus AnalystL {
+locus FitterL {
     params {
         B: Int = 1000;
         c: Int = 10;
         sigma: Int = 1;
         phi: Float = 1.0;
 
-        latest_kernel: TradeKernel = TradeKernel {
-            multiplier: 1.0d,
+        latest_kernel: Kernel = Kernel {
+            scale: 1.0d,
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
@@ -126,21 +124,21 @@ locus AnalystL {
     }
 
     bus {
-        subscribe "trellis.book"   as on_book   of type Book;
-        publish   "trellis.kernel"             of type TradeKernel;
+        subscribe "trellis.observation" as on_observation of type Observation;
+        publish   "trellis.kernel"                        of type Kernel;
     }
 
-    fn on_book(book: Book) {
-        // Update fitted kernel from the new book observation.
-        self.latest_kernel = TradeKernel {
-            multiplier: self.latest_kernel.multiplier,
-            valid_after: book.timestamp,
+    fn on_observation(obs: Observation) {
+        // Update fitted kernel from the new observation.
+        self.latest_kernel = Kernel {
+            scale: self.latest_kernel.scale,
+            valid_after: obs.timestamp,
             perspective_id: self.latest_kernel.perspective_id + 1,
         };
         self.validation_count = self.validation_count + 1;
 
         // Wrap as a perspective; ship if stable.
-        let p = TradeKernelPerspective {
+        let p = KernelPerspective {
             kernel: self.latest_kernel,
             validation_count: self.validation_count,
         };
@@ -157,7 +155,7 @@ locus AnalystL {
 }
 
 fn main() {
-    AnalystL { };
+    FitterL { };
 }
 ```
 
@@ -168,97 +166,98 @@ The substrate primitives in play, all introduced earlier:
   5](./05-contracts-and-parents.md)).
 - **`bus` block** with one subscription and one publication
   ([chapter 6](./06-the-bus.md)).
-- **A bus handler** (`on_book`) that mutates the locus's state
-  and conditionally publishes ([chapter 6](./06-the-bus.md)).
-- **A perspective construction** wrapping a `TradeKernel` with
-  a validation count, then `is_stable()` invoking the
+- **A bus handler** (`on_observation`) that mutates the locus's
+  state and conditionally publishes ([chapter
+  6](./06-the-bus.md)).
+- **A perspective construction** wrapping a `Kernel` with a
+  validation count, then `is_stable()` invoking the
   perspective's `stable_when` predicate ([chapter
   10](./10-perspectives.md)).
 - **A closure** auditing that `published_count` keeps pace
-  with `validation_count` (within a small tolerance for in-
-  flight perspectives that have not yet hit the stability
+  with `validation_count` (within a small tolerance for
+  in-flight perspectives that have not yet hit the stability
   threshold) ([chapter 7](./07-closures.md)).
 
-## The executor (`executor.ap`)
+## The applier (`applier.ap`)
 
-The executor's job: consume `Book` messages, apply the
-current kernel, emit `Intent` messages, track `Fill`
+The applier's job: consume `Observation` messages, apply the
+current kernel, emit `Action` messages, track `Receipt`
 responses.
 
 ```aperio
 import "trellis-pair/shared";
 
-locus ExecutorL {
+locus ApplierL {
     params {
         B: Int = 10000;
         c: Int = 1;
         sigma: Int = 1;
         phi: Float = 1.0;
 
-        current_kernel: TradeKernel = TradeKernel {
-            multiplier: 1.0d,
+        current_kernel: Kernel = Kernel {
+            scale: 1.0d,
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
-        intents_emitted: Int = 0;
-        fills_received: Int = 0;
-        next_intent_id: Int = 1;
+        actions_emitted: Int = 0;
+        receipts_received: Int = 0;
+        next_action_id: Int = 1;
         kernels_received: Int = 0;
     }
 
     bus {
-        subscribe "trellis.book"   as on_book   of type Book;
-        subscribe "trellis.kernel" as on_kernel of type TradeKernel;
-        subscribe "trellis.fill"   as on_fill   of type Fill;
-        publish   "trellis.intent"             of type Intent;
+        subscribe "trellis.observation" as on_observation of type Observation;
+        subscribe "trellis.kernel"      as on_kernel      of type Kernel;
+        subscribe "trellis.receipt"     as on_receipt     of type Receipt;
+        publish   "trellis.action"                        of type Action;
     }
 
-    fn on_book(book: Book) {
-        let i = Intent {
-            side: "buy",
-            price: book.bid_price * self.current_kernel.multiplier,
+    fn on_observation(obs: Observation) {
+        let a = Action {
+            kind: "primary",
+            magnitude: obs.value_low * self.current_kernel.scale,
             quantity: 1.0d,
-            intent_id: self.next_intent_id,
+            action_id: self.next_action_id,
         };
-        self.next_intent_id = self.next_intent_id + 1;
-        self.intents_emitted = self.intents_emitted + 1;
-        "trellis.intent" <- i;
+        self.next_action_id = self.next_action_id + 1;
+        self.actions_emitted = self.actions_emitted + 1;
+        "trellis.action" <- a;
     }
 
-    fn on_kernel(k: TradeKernel) {
+    fn on_kernel(k: Kernel) {
         self.current_kernel = k;
         self.kernels_received = self.kernels_received + 1;
     }
 
-    fn on_fill(f: Fill) {
-        self.fills_received = self.fills_received + 1;
+    fn on_receipt(r: Receipt) {
+        self.receipts_received = self.receipts_received + 1;
     }
 
-    closure intent_fill_balance {
-        self.intents_emitted ~~ self.fills_received within 5;
+    closure action_receipt_balance {
+        self.actions_emitted ~~ self.receipts_received within 5;
         epoch dissolve;
     }
 }
 
 fn main() {
-    ExecutorL { };
+    ApplierL { };
 }
 ```
 
-A larger surface than the analyst, exercising:
+A larger surface than the fitter, exercising:
 
-- **Three subscriptions and one publication.** The executor
-  consumes `Book` (market data), `TradeKernel` (analyst
-  output), and `Fill` (gateway response); it produces
-  `Intent` (its own orders).
+- **Three subscriptions and one publication.** The applier
+  consumes `Observation` (upstream stream), `Kernel` (fitter
+  output), and `Receipt` (downstream response); it produces
+  `Action` (its own outputs).
 - **Hot-loading kernels.** `on_kernel` replaces
-  `self.current_kernel` atomically. The next `on_book`
+  `self.current_kernel` atomically. The next `on_observation`
   invocation reads the new kernel; the swap is torn-read-free
   because bus dispatch in v0 is cooperatively scheduled (per
   the runtime spec).
 - **An at-dissolve closure** auditing that every emitted
-  `Intent` eventually became a `Fill` (within a tolerance of
-  5 for any in-flight intents).
+  `Action` eventually became a `Receipt` (within a tolerance of
+  5 for any in-flight actions).
 
 ## The deployment
 
@@ -267,7 +266,7 @@ production transport binding:
 
 ```yaml
 channels:
-  "trellis.book":
+  "trellis.observation":
     transport: udp_multicast
     group: "239.7.7.7"
     port: 9000
@@ -276,11 +275,11 @@ channels:
     transport: nats
     url: "nats://nats-control:4222"
 
-  "trellis.intent":
+  "trellis.action":
     transport: nats
     url: "nats://nats-control:4222"
 
-  "trellis.fill":
+  "trellis.receipt":
     transport: nats
     url: "nats://nats-control:4222"
 ```
@@ -288,14 +287,15 @@ channels:
 Each subject is bound to a transport appropriate to its
 traffic shape:
 
-- **`trellis.book`** — UDP multicast. Line-rate, lossy-
-  acceptable, broadcast to many subscribers (every executor
-  on the same group receives the same book stream).
+- **`trellis.observation`** — UDP multicast. High-frequency,
+  lossy-acceptable, broadcast to many subscribers (every
+  applier on the same group receives the same observation
+  stream).
 - **`trellis.kernel`** — NATS. Slow cadence, reliable
-  delivery, ordered per analyst. Kernels need to arrive,
+  delivery, ordered per fitter. Kernels need to arrive,
   and they need to arrive in order.
-- **`trellis.intent`** / **`trellis.fill`** — NATS. Control-
-  plane messaging with the gateway.
+- **`trellis.action`** / **`trellis.receipt`** — NATS.
+  Control-plane messaging with the downstream sink.
 
 For local testing, the YAML supports a wildcard swap:
 
@@ -319,26 +319,24 @@ single-process integration test.
 
 Putting the parts together, the trellis-pair pipeline:
 
-1. **Market data flows in.** A separate process (in
-   production, the *grease* gateway) publishes `Book`
-   messages on `trellis.book` over UDP multicast. Both the
-   analyst and the executor subscribe.
-2. **The analyst fits.** Each `Book` arrival updates the
-   analyst's `latest_kernel` and increments
-   `validation_count`. When `validation_count >= 3`, the
-   analyst publishes the current `TradeKernel` on
-   `trellis.kernel` over NATS.
-3. **The executor applies.** Each `Book` arrival multiplies
-   the bid price by `current_kernel.multiplier`, packages an
-   `Intent`, and publishes on `trellis.intent`. Each
-   `TradeKernel` arrival hot-loads
-   `self.current_kernel`. Each `Fill` arrival increments
-   `fills_received`.
-4. **The closures audit.** The analyst's `publish_keeps_pace`
-   fires at every tick and complains if publishes drift
-   beyond expected lag from validations. The executor's
-   `intent_fill_balance` fires at dissolve and complains if
-   intents and fills diverge beyond an in-flight tolerance
+1. **Observations flow in.** A separate process (an upstream
+   observation source) publishes `Observation` messages on
+   `trellis.observation` over UDP multicast. Both the fitter
+   and the applier subscribe.
+2. **The fitter fits.** Each `Observation` arrival updates the
+   fitter's `latest_kernel` and increments `validation_count`.
+   When `validation_count >= 3`, the fitter publishes the
+   current `Kernel` on `trellis.kernel` over NATS.
+3. **The applier applies.** Each `Observation` arrival
+   multiplies `value_low` by `current_kernel.scale`, packages
+   an `Action`, and publishes on `trellis.action`. Each
+   `Kernel` arrival hot-loads `self.current_kernel`. Each
+   `Receipt` arrival increments `receipts_received`.
+4. **The closures audit.** The fitter's `publish_keeps_pace`
+   fires at every tick and complains if publishes drift beyond
+   expected lag from validations. The applier's
+   `action_receipt_balance` fires at dissolve and complains if
+   actions and receipts diverge beyond an in-flight tolerance
    of 5.
 
 Each binary's lotus is independently lifecycle-managed:
@@ -354,12 +352,12 @@ substrate-up stance the language was built for. A reader
 familiar with the previous eleven chapters can verify the
 following at the source level:
 
-- **No leaked allocations.** Every `Intent`, every
-  intermediate string, every `Book` copy lives in its locus's
-  arena and is freed when the locus dissolves. There is no
-  available concept of escape across the boundary.
+- **No leaked allocations.** Every `Action`, every
+  intermediate string, every `Observation` copy lives in its
+  locus's arena and is freed when the locus dissolves. There
+  is no available concept of escape across the boundary.
 - **No lateral failure routing.** A `ClosureViolation` on the
-  executor's `intent_fill_balance` reaches `ExecutorL`'s
+  applier's `action_receipt_balance` reaches `ApplierL`'s
   `on_failure` (which is unhandled in this version, so the
   process exits non-zero with the violation report).
   Sibling-to-sibling absorption is structurally impossible.
@@ -369,9 +367,9 @@ following at the source level:
   recompile from the same source, and the deployment is a
   single rolling update.
 - **Hot-loaded perspectives, not patched code.** When the
-  analyst's understanding of the market changes, it ships a
-  new `TradeKernel`. The executor swaps it in atomically.
-  No code reload, no executor restart, no special "config
+  fitter's understanding of the upstream stream changes, it
+  ships a new `Kernel`. The applier swaps it in atomically.
+  No code reload, no applier restart, no special "config
   refresh" mechanism — the kernel is the value the system
   was built around.
 
@@ -379,7 +377,7 @@ following at the source level:
 
 A few production-relevant pieces are roadmap, not v0:
 
-- **`p.is_stable()` as a method.** The analyst calls
+- **`p.is_stable()` as a method.** The fitter calls
   `p.is_stable()` on the perspective; for v0 the substrate
   treats the `stable_when` block as the body of an
   `is_stable()` method. Generalizing perspective methods

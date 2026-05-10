@@ -63,7 +63,7 @@ symbol-input friction. Tooling is simpler.
 ## 2. Locus declaration
 
 ```
-locus AnalystL : tier 4, projection chunked {
+locus FitterL : tier 4, projection chunked {
     params { ... }
     contract { ... }
     bus { ... }
@@ -234,8 +234,8 @@ closure tests and respect substrate-derivation anchoring.
 
 ```
 bus {
-    subscribe "trellis.book.alpha.intent" as on_intent of type StratIntent;
-    subscribe "trellis.kappa.updates" as on_kappa of type KappaUpdate;
+    subscribe "trellis.observation" as on_observation of type Observation;
+    subscribe "trellis.kernel.updates" as on_kernel of type KernelUpdate;
     publish "trellis.drift" of type DriftReport;
 }
 ```
@@ -435,9 +435,9 @@ a compile error rather than a silent `Ty::Unknown` slip.
 ## 10. `perspective` declarations
 
 ```
-perspective TradeKernel<T> {
+perspective Kernel<T> {
     params {
-        kappa_row: [decimal; 8];
+        scale_row: [decimal; 8];
         sigma_factor: decimal;
         regime_id: int;
     }
@@ -446,21 +446,21 @@ perspective TradeKernel<T> {
         // and the closure tests at the producing locus pass.
         return num_validated >= 3 && closure_status == ok;
     }
-    serialize_as TradeKernelV1;
+    serialize_as KernelV1;
 }
 ```
 
 **Commits to.** A perspective is a serializable parameter bundle
-within a shared compiled-in schema. Both producer (analyst) and
-consumer (executor) compile from the same Aperio source, so the
+within a shared compiled-in schema. Both producer (fitter) and
+consumer (applier) compile from the same Aperio source, so the
 type *is* the contract; the bus carries only parameter values.
 
-**Why.** This is the analyst/executor split discussed in the
-design conversation. The serialization format isn't a separate
-concern — it's the perspective type. Compile-time type agreement
-between binaries means no protocol-versioning handshake; the
-schema version is the source-code version they both compile
-from.
+**Why.** This is the fitter/applier split: one process fits
+parameters from observations; another applies them at high
+frequency. The serialization format isn't a separate concern —
+it's the perspective type. Compile-time type agreement between
+binaries means no protocol-versioning handshake; the schema
+version is the source-code version they both compile from.
 
 `stable_when` is a function-level boolean expression that the
 runtime evaluates to decide whether a perspective is ready to
@@ -1025,7 +1025,7 @@ A locus emits a message on a declared subject with the `<-`
 operator at statement position:
 
 ```
-"trellis.intent" <- intent_value;
+"trellis.action" <- action_value;
 ```
 
 The left side names a subject declared in the locus's

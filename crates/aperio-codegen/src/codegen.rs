@@ -304,7 +304,7 @@ struct Cx<'ctx, 'p> {
     /// When set, `arena_alloc` routes through this arena pointer
     /// instead of `current_self`'s arena field or the program
     /// global. Used during locus-instantiation field init so
-    /// composite literals (`TradeKernel { ... }`) used as
+    /// composite literals (`Kernel { ... }`) used as
     /// default-init values land in the *new* locus's arena
     /// rather than the parent's. Restored after the field-init
     /// loop completes.
@@ -519,7 +519,7 @@ struct LocusInfo<'ctx> {
     /// pre-resolved literal (so simple defaults stay cheap) OR a
     /// deferred AST expression evaluated at the instantiation
     /// site (for composite literals like
-    /// `current_kernel: TradeKernel = TradeKernel { ... }` where
+    /// `current_kernel: Kernel = Kernel { ... }` where
     /// the default isn't a scalar literal).
     defaults: Vec<(String, DefaultInit)>,
     /// Lifecycle method LLVM functions, keyed by lifecycle name
@@ -737,7 +737,7 @@ const CHILDREN_CAP: u32 = 16;
 /// One locus param's default-initializer. Either pre-resolved
 /// (the common case — scalar literal) or deferred to the
 /// instantiation site (composite literal like
-/// `TradeKernel { ... }` whose evaluation needs the codegen
+/// `Kernel { ... }` whose evaluation needs the codegen
 /// builder).
 #[derive(Debug, Clone)]
 enum DefaultInit {
@@ -4316,7 +4316,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // a typed default expression evaluable at instantiation
         // time. Scalar literals lock in `DefaultInit::Const` so
         // const_param can build them directly; non-literal defaults
-        // (like `current_kernel: TradeKernel = TradeKernel { ... }`)
+        // (like `current_kernel: Kernel = Kernel { ... }`)
         // get `DefaultInit::Expr` and are evaluated at the
         // instantiation site through lower_expr. Type ascription is
         // REQUIRED for non-literal defaults (we don't infer a type
@@ -11179,7 +11179,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // can be passed. Defaults are either pre-resolved scalar
         // literals (DefaultInit::Const → const_param) or deferred
         // expressions (DefaultInit::Expr → lower_expr) that may
-        // construct composite values like `TradeKernel { ... }` at
+        // construct composite values like `Kernel { ... }` at
         // the instantiation site.
         //
         // While evaluating field defaults / overrides, allocations

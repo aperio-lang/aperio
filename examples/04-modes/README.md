@@ -146,5 +146,5 @@ back and we'll redesign.
 `05-bus` — a locus that consumes inbound messages from a typed
 bus channel and emits typed messages back. Adds the `bus { }`
 block, transport binding via deployment config, and the
-analyst/executor split's messaging primitive. After 05, the
-trellis trader/analyst pair is reachable.
+fitter/applier split's messaging primitive. After 05, the
+trellis fitter/applier pair is reachable.

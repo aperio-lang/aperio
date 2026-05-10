@@ -73,7 +73,7 @@ type, allocated as a region within the enclosing scope (per
 
 A `perspective P { ... }` declaration introduces a *perspective
 type* P — a serializable parameter bundle within a shared
-compiled-in schema. Used for analyst↔executor communication
+compiled-in schema. Used for fitter↔applier communication
 (among other things). Has:
 
 - Params (the parameter bundle)

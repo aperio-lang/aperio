@@ -3,91 +3,93 @@
 //
 // Same shared types and same locus shapes as
 // `examples/trellis-pair/`, but bundled into one binary so the
-// pipeline runs end-to-end under `lotus run`. In production
+// pipeline runs end-to-end under `aperio run`. In production
 // each locus would be its own binary, communicating across the
 // bus over NATS / UDP multicast / shared memory; here they all
 // subscribe to the same in-process router.
 //
 // Pipeline:
-//   BookProducerL — publishes 5 synthetic Book events at birth
-//   AnalystL      — subscribes Book; publishes Kernel after
-//                   3 validations
-//   ExecutorL     — subscribes Book + Kernel; publishes Intent
-//   IntentLogL    — subscribes Intent; prints
+//   ObservationSourceL — publishes 5 synthetic Observation
+//                        events at birth
+//   FitterL            — subscribes Observation; publishes
+//                        Kernel after 3 validations
+//   ApplierL           — subscribes Observation + Kernel;
+//                        publishes Action
+//   ActionLogL         — subscribes Action; prints
 //
-// Order of instantiation: subscribers first (logger, executor,
-// analyst), then producer last so its birth() publishes into
+// Order of instantiation: subscribers first (logger, applier,
+// fitter), then source last so its birth() publishes into
 // fully-wired transports.
 
-type Book {
-    bid_price: Decimal;
-    ask_price: Decimal;
+type Observation {
+    value_low: Decimal;
+    value_high: Decimal;
     timestamp: Time;
 }
 
-type TradeKernel {
-    multiplier: Decimal;
+type Kernel {
+    scale: Decimal;
     valid_after: Time;
     perspective_id: Int;
 }
 
-type Intent {
-    side: String;
-    price: Decimal;
+type Action {
+    kind: String;
+    magnitude: Decimal;
     quantity: Decimal;
-    intent_id: Int;
+    action_id: Int;
 }
 
-locus IntentLogL {
+locus ActionLogL {
     bus {
-        subscribe "trellis.intent" as on_intent of type Intent;
+        subscribe "trellis.action" as on_action of type Action;
     }
 
-    fn on_intent(i: Intent) {
-        println("intent #", i.intent_id, ": ", i.side, " ", i.quantity, " @ ", i.price);
+    fn on_action(a: Action) {
+        println("action #", a.action_id, ": ", a.kind, " ", a.quantity, " @ ", a.magnitude);
     }
 }
 
-locus ExecutorL {
+locus ApplierL {
     params {
-        current_kernel: TradeKernel = TradeKernel {
-            multiplier: 1.0d,
+        current_kernel: Kernel = Kernel {
+            scale: 1.0d,
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
-        next_intent_id: Int = 1;
+        next_action_id: Int = 1;
     }
 
     bus {
-        subscribe "trellis.book"   as on_book   of type Book;
-        subscribe "trellis.kernel" as on_kernel of type TradeKernel;
-        publish   "trellis.intent"             of type Intent;
+        subscribe "trellis.observation" as on_observation of type Observation;
+        subscribe "trellis.kernel"      as on_kernel      of type Kernel;
+        publish   "trellis.action"                        of type Action;
     }
 
-    fn on_book(book: Book) {
-        let i = Intent {
-            side: "buy",
-            price: book.bid_price * self.current_kernel.multiplier,
+    fn on_observation(obs: Observation) {
+        let a = Action {
+            kind: "primary",
+            magnitude: obs.value_low * self.current_kernel.scale,
             quantity: 1.0d,
-            intent_id: self.next_intent_id,
+            action_id: self.next_action_id,
         };
-        self.next_intent_id = self.next_intent_id + 1;
-        "trellis.intent" <- i;
+        self.next_action_id = self.next_action_id + 1;
+        "trellis.action" <- a;
     }
 
-    fn on_kernel(k: TradeKernel) {
+    fn on_kernel(k: Kernel) {
         // Hot-load: replace the current kernel atomically. In
         // production this is the perspective hot-load
         // mechanism (F.7) — torn-read-free.
         self.current_kernel = k;
-        println("executor: hot-loaded kernel id=", k.perspective_id);
+        println("applier: hot-loaded kernel id=", k.perspective_id);
     }
 }
 
-locus AnalystL {
+locus FitterL {
     params {
-        latest_kernel: TradeKernel = TradeKernel {
-            multiplier: 1.0d,
+        latest_kernel: Kernel = Kernel {
+            scale: 1.0d,
             valid_after: `2026-01-01T00:00:00Z`,
             perspective_id: 0,
         };
@@ -96,17 +98,17 @@ locus AnalystL {
     }
 
     bus {
-        subscribe "trellis.book"   as on_book   of type Book;
-        publish   "trellis.kernel"             of type TradeKernel;
+        subscribe "trellis.observation" as on_observation of type Observation;
+        publish   "trellis.kernel"                        of type Kernel;
     }
 
-    fn on_book(book: Book) {
-        // Refit the kernel from the new book observation. v0
-        // stub: bump perspective_id each time, leave the
-        // multiplier at 1.0d.
-        self.latest_kernel = TradeKernel {
-            multiplier: self.latest_kernel.multiplier,
-            valid_after: book.timestamp,
+    fn on_observation(obs: Observation) {
+        // Refit the kernel from the new observation. v0 stub:
+        // bump perspective_id each time, leave the scale at
+        // 1.0d.
+        self.latest_kernel = Kernel {
+            scale: self.latest_kernel.scale,
+            valid_after: obs.timestamp,
             perspective_id: self.latest_kernel.perspective_id + 1,
         };
         self.validation_count = self.validation_count + 1;
@@ -129,38 +131,38 @@ locus AnalystL {
     }
 }
 
-locus BookProducerL {
+locus ObservationSourceL {
     bus {
-        publish "trellis.book" of type Book;
+        publish "trellis.observation" of type Observation;
     }
 
     birth() {
-        // Five synthetic books — enough to cross the analyst's
-        // validation_count >= 3 threshold and observe a kernel
-        // hot-load mid-stream.
-        "trellis.book" <- Book {
-            bid_price: 100.00d,
-            ask_price: 100.05d,
+        // Five synthetic observations — enough to cross the
+        // fitter's validation_count >= 3 threshold and observe
+        // a kernel hot-load mid-stream.
+        "trellis.observation" <- Observation {
+            value_low: 100.00d,
+            value_high: 100.05d,
             timestamp: `2026-05-08T09:30:00Z`,
         };
-        "trellis.book" <- Book {
-            bid_price: 100.10d,
-            ask_price: 100.15d,
+        "trellis.observation" <- Observation {
+            value_low: 100.10d,
+            value_high: 100.15d,
             timestamp: `2026-05-08T09:30:01Z`,
         };
-        "trellis.book" <- Book {
-            bid_price: 100.20d,
-            ask_price: 100.25d,
+        "trellis.observation" <- Observation {
+            value_low: 100.20d,
+            value_high: 100.25d,
             timestamp: `2026-05-08T09:30:02Z`,
         };
-        "trellis.book" <- Book {
-            bid_price: 100.30d,
-            ask_price: 100.35d,
+        "trellis.observation" <- Observation {
+            value_low: 100.30d,
+            value_high: 100.35d,
             timestamp: `2026-05-08T09:30:03Z`,
         };
-        "trellis.book" <- Book {
-            bid_price: 100.40d,
-            ask_price: 100.45d,
+        "trellis.observation" <- Observation {
+            value_low: 100.40d,
+            value_high: 100.45d,
             timestamp: `2026-05-08T09:30:04Z`,
         };
     }
@@ -168,10 +170,10 @@ locus BookProducerL {
 
 fn main() {
     // Subscribers first — they must be registered before the
-    // producer's birth() publishes (v0 router has no
-    // history; late subscribers don't see past events).
-    IntentLogL { };
-    ExecutorL { };
-    AnalystL { };
-    BookProducerL { };
+    // source's birth() publishes (v0 router has no history;
+    // late subscribers don't see past events).
+    ActionLogL { };
+    ApplierL { };
+    FitterL { };
+    ObservationSourceL { };
 }

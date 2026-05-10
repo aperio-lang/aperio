@@ -109,8 +109,8 @@ position.
 Annotation:
 
 ```
-locus AnalystL         : schedule cooperative { ... }   // default
-locus MarketDataIngest : schedule pinned      { ... }
+locus FitterL          : schedule cooperative { ... }   // default
+locus DataIngestL      : schedule pinned      { ... }
 ```
 
 | Class | Yield discipline | Resource |

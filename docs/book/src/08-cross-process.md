@@ -9,8 +9,9 @@ the same named subjects you already know from
 
 The substrate-level claim is striking and worth stating upfront:
 **source code does not change** when a bus subject moves from
-in-process to cross-process. A `subscribe "trellis.book" of type
-Book` declaration in a locus reads identically whether the
+in-process to cross-process. A `subscribe "trellis.observation"
+of type Observation` declaration in a locus reads identically
+whether the
 publisher is another locus in the same binary, another locus in a
 different binary on the same machine, or another locus on a
 different machine entirely. What changes is the *deployment* —
@@ -24,9 +25,9 @@ Multiple binaries make sense when:
 - **Different fault domains.** A `restart` in the analyst process
   must not restart the executor. They are separate operating-
   system processes, each opening its own lotus.
-- **Different schedule regimes.** The executor runs at line rate
-  in `bulk` mode; the analyst runs slowly in `resolution` mode.
-  Each process gets its own scheduling.
+- **Different schedule regimes.** One process runs at high
+  frequency in `bulk` mode; another runs slowly in `resolution`
+  mode. Each process gets its own scheduling.
 - **Different machines.** Geographic separation, redundancy,
   scale-out — the bus carries the same subjects across the
   network as it does across local pipes.
@@ -42,8 +43,8 @@ files:
 
 ```text
 trellis-pair/
-    analyst.ap         // the analyst binary's main
-    executor.ap        // the executor binary's main
+    fitter.ap          // the fitter binary's main
+    applier.ap         // the applier binary's main
     shared.ap          // types compiled into both binaries
 ```
 
@@ -51,21 +52,21 @@ The shared file declares the types that travel on the bus:
 
 ```aperio
 // shared.ap
-type Book {
-    bid_price: Decimal;
-    ask_price: Decimal;
+type Observation {
+    value_low: Decimal;
+    value_high: Decimal;
     timestamp: Time;
 }
 
-type TradeKernel {
-    multiplier: Decimal;
+type Kernel {
+    scale: Decimal;
     valid_after: Time;
     perspective_id: Int;
 }
 ```
 
 Both binaries `import "trellis-pair/shared";`. The compiler emits
-the same struct layout for `Book` and `TradeKernel` in each
+the same struct layout for `Observation` and `Kernel` in each
 binary's compiled output. **Schema agreement is by compilation,
 not by runtime negotiation** — the wire format is exactly the
 in-memory layout, and both sides agree because both sides compiled
@@ -81,12 +82,12 @@ the schema.
 Each binary's main file is built separately:
 
 ```bash
-aperio build examples/trellis-pair/analyst.ap
-aperio build examples/trellis-pair/executor.ap
+aperio build examples/trellis-pair/fitter.ap
+aperio build examples/trellis-pair/applier.ap
 ```
 
-Two ELF binaries land alongside their source: `analyst` and
-`executor`. Each statically embeds the bundled
+Two ELF binaries land alongside their source: `fitter` and
+`applier`. Each statically embeds the bundled
 [lotus](../../reference/src/glossary.md#lotus) C runtime, the
 shared types, and its own loci. Neither binary needs the other to
 run; they share state only through the bus at runtime.
@@ -103,8 +104,8 @@ In v0, this is provided via the `LOTUS_BUS_CONFIG` environment
 variable, pointing at a small line-oriented config file:
 
 ```text
-trellis.book   = unix:///tmp/trellis-book.sock   : listen
-trellis.kernel = unix:///tmp/trellis-kernel.sock : connect
+trellis.observation = unix:///tmp/trellis-obs.sock    : listen
+trellis.kernel      = unix:///tmp/trellis-kernel.sock : connect
 ```
 
 Each line has the shape:
