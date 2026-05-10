@@ -254,6 +254,97 @@ locus __StdLangLang {
         }
         return false;
     }
+
+    // ---- HTTP handler registration detection ----
+    //
+    // Recognizes calls like `mux.HandleFunc("/path", fn)` or
+    // `http.HandleFunc("/path", fn)` — the wiring that connects
+    // an HTTP route to a handler function. Used by the
+    // operational extractor / onboard report to enrich handler
+    // entries with their subjects (path-derived bus subject in
+    // Aperio terms).
+    //
+    // v0 covers the stdlib-net/http patterns. Per-framework
+    // routers (chi, echo, gin, gorilla/mux v2) have analogous
+    // shapes (`r.Get`, `e.GET`, `app.Get`, `r.HandleFunc`) —
+    // future flavors / extensions can recognize them.
+
+    fn is_handler_registration(node: Int) -> Bool {
+        if self.flavor == "go" {
+            let k = std::ts::node_kind(node);
+            if k != "call_expression" { return false; }
+            let n = std::ts::node_named_child_count(node);
+            if n < 2 { return false; }
+            let fn_part = std::ts::node_named_child(node, 0);
+            if std::ts::node_kind(fn_part) != "selector_expression" {
+                return false;
+            }
+            // Find the selector's field_identifier (the method
+            // name on the receiver). Match on canonical handler-
+            // registration method names.
+            let fcn = std::ts::node_named_child_count(fn_part);
+            let mut i = 0;
+            while i < fcn {
+                let c = std::ts::node_named_child(fn_part, i);
+                if std::ts::node_kind(c) == "field_identifier" {
+                    let name = std::ts::node_text(c);
+                    if name == "HandleFunc" || name == "Handle" {
+                        return true;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // Extract the route string (with quotes stripped) from a
+    // handler-registration call. Returns "" on miss.
+    fn extract_handler_route(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(call_node, i);
+                if std::ts::node_kind(c) == "argument_list" {
+                    let an = std::ts::node_named_child_count(c);
+                    if an >= 1 {
+                        let arg0 = std::ts::node_named_child(c, 0);
+                        if std::ts::node_kind(arg0) == "interpreted_string_literal" {
+                            return self.strip_string_quotes(std::ts::node_text(arg0));
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return "";
+    }
+
+    // Extract the target handler fn name from a handler-
+    // registration call. Returns "" if the second arg isn't a
+    // bare identifier (e.g. an inline func_literal — those
+    // don't bind to a named fn we can cross-reference).
+    fn extract_handler_target(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(call_node, i);
+                if std::ts::node_kind(c) == "argument_list" {
+                    let an = std::ts::node_named_child_count(c);
+                    if an >= 2 {
+                        let arg1 = std::ts::node_named_child(c, 1);
+                        if std::ts::node_kind(arg1) == "identifier" {
+                            return std::ts::node_text(arg1);
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return "";
+    }
 }
 
 // std::lang::Morpheme — noun→motion rewriter for the

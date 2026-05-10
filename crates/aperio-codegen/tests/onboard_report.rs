@@ -213,6 +213,27 @@ fn no_fabricated_motion_forms_in_report() {
 }
 
 #[test]
+fn http_handlers_show_their_routes_inline() {
+    // The operational fixture's main.go wires
+    //   mux.HandleFunc("/hello", helloHandler)
+    //   mux.HandleFunc("/status", statusHandler)
+    // The polished report should surface each handler's route
+    // inline so the dev/agent sees what subjects each handler
+    // serves.
+    let report = run_against("operational-graph");
+    assert!(
+        report.contains("helloHandler (/hello)"),
+        "expected helloHandler with /hello route inline; output:\n{}",
+        report
+    );
+    assert!(
+        report.contains("statusHandler (/status)"),
+        "expected statusHandler with /status route inline; output:\n{}",
+        report
+    );
+}
+
+#[test]
 fn shape_rules_doc_referenced_for_agents() {
     // The unknowns section must point the agent at the canonical
     // rules doc so the recognition is reproducible across

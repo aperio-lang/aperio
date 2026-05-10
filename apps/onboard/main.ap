@@ -63,6 +63,17 @@ fn __unified_walk(lang: std::lang::Lang, node: Int, in_import: Bool) -> String {
     if lang.is_type_spec(node) {
         acc = acc + "TYPE:" + lang.extract_type_name(node) + "\n";
     }
+    // Handler wiring: `mux.HandleFunc("/path", h)` records
+    // both the route + target so the operational summary can
+    // show handlers with their bus-subject equivalent (the
+    // Aperio shape: HTTP route → bus subject).
+    if lang.is_handler_registration(node) {
+        let route = lang.extract_handler_route(node);
+        let target = lang.extract_handler_target(node);
+        if len(route) > 0 && len(target) > 0 {
+            acc = acc + "WIRE:" + target + "->" + route + "\n";
+        }
+    }
     let n = std::ts::node_named_child_count(node);
     let mut i = 0;
     while i < n {
@@ -230,8 +241,32 @@ fn __indent_block(label: String, content: String) -> String {
     return "  " + label + "  " + content + "\n";
 }
 
+// Look up a handler fn's route in a "WIRE:target->route\n"-
+// formatted aggregate string. Returns "" if the target hasn't
+// been wired in this codebase (the handler is defined but not
+// registered, or the registration uses an unrecognized router).
+fn __lookup_handler_route(wires: String, target: String) -> String {
+    let total = len(wires);
+    let mut from = 0;
+    let needle = "WIRE:" + target + "->";
+    let nlen = len(needle);
+    while from < total {
+        let rest = wires[from..total];
+        let nl = std::str::index_of(rest, "\n");
+        let mut line = "";
+        if nl < 0 { line = rest; from = total; }
+        else { line = rest[0..nl]; from = from + nl + 1; }
+        if len(line) > nlen {
+            if line[0..nlen] == needle {
+                return line[nlen..len(line)];
+            }
+        }
+    }
+    return "";
+}
+
 fn __render_per_file(lang: std::lang::Lang, r: std::lang::Morpheme,
-                     dir: String, name: String) -> String {
+                     dir: String, name: String, wires: String) -> String {
     let path = dir + "/" + name;
     let src = std::io::fs::read_file(path);
     if len(src) == 0 { return ""; }
@@ -277,8 +312,42 @@ fn __render_per_file(lang: std::lang::Lang, r: std::lang::Morpheme,
     }
     if n_handlers > 0 {
         if len(op_summary) > 0 { op_summary = op_summary + "; "; }
+        // Build a comma-separated handler list with each
+        // handler's route in parens if known. Without a known
+        // route, just show the name (the wiring may live in
+        // a file we haven't scanned, or use an unrecognized
+        // router idiom).
+        let mut handlers_with_routes = "";
+        let prefix = "OP_HANDLER:";
+        let plen = len(prefix);
+        let mut afrom = 0;
+        let atotal = len(acc);
+        let mut afirst = true;
+        while afrom < atotal {
+            let arest = acc[afrom..atotal];
+            let anl = std::str::index_of(arest, "\n");
+            let mut aline = "";
+            if anl < 0 { aline = arest; afrom = atotal; }
+            else { aline = arest[0..anl]; afrom = afrom + anl + 1; }
+            if len(aline) > plen {
+                if aline[0..plen] == prefix {
+                    let hname = aline[plen..len(aline)];
+                    let route = __lookup_handler_route(wires, hname);
+                    let mut entry = hname;
+                    if len(route) > 0 {
+                        entry = hname + " (" + route + ")";
+                    }
+                    if afirst {
+                        handlers_with_routes = entry;
+                        afirst = false;
+                    } else {
+                        handlers_with_routes = handlers_with_routes + ", " + entry;
+                    }
+                }
+            }
+        }
         op_summary = op_summary + to_string(n_handlers) + " HTTP handler(s): "
-            + handlers;
+            + handlers_with_routes;
     }
     if n_spawns > 0 {
         if len(op_summary) > 0 { op_summary = op_summary + "; "; }
@@ -433,6 +502,49 @@ fn __drive(dir: String, flavor: String) {
     println("============================================================");
     println("");
 
+    // First pass: collect all WIRE tags across files. The
+    // wiring (mux.HandleFunc) typically lives in main.go while
+    // handler defs live elsewhere; we need the cross-file
+    // route table available before per-file rendering so each
+    // handler's route can show inline.
+    let mut wires = "";
+    let mut wfrom = 0;
+    while wfrom < total {
+        let wrest = entries[wfrom..total];
+        let wnl = std::str::index_of(wrest, "\n");
+        let mut wname = "";
+        if wnl < 0 { wname = wrest; wfrom = total; }
+        else { wname = wrest[0..wnl]; wfrom = wfrom + wnl + 1; }
+        if len(wname) > 0 {
+            if __ends_with_source(wname, flavor) {
+                let path = dir + "/" + wname;
+                let src = std::io::fs::read_file(path);
+                if len(src) > 0 {
+                    let tree = lang.parse(src);
+                    if tree != 0 {
+                        let root = std::ts::root_node(tree);
+                        let walk = __unified_walk(lang, root, false);
+                        // Pull WIRE: lines into the aggregate.
+                        let mut sfrom = 0;
+                        let stotal = len(walk);
+                        while sfrom < stotal {
+                            let srest = walk[sfrom..stotal];
+                            let snl = std::str::index_of(srest, "\n");
+                            let mut sline = "";
+                            if snl < 0 { sline = srest; sfrom = stotal; }
+                            else { sline = srest[0..snl]; sfrom = sfrom + snl + 1; }
+                            if len(sline) > 5 {
+                                if sline[0..5] == "WIRE:" {
+                                    wires = wires + sline + "\n";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut all_files_section = "";
     let mut unknowns_section = "";
     let mut n_loci = 0;
@@ -448,7 +560,7 @@ fn __drive(dir: String, flavor: String) {
         else { name = rest[0..nl]; from = from + nl + 1; }
         if len(name) > 0 {
             if __ends_with_source(name, flavor) {
-                let block = __render_per_file(lang, r, dir, name);
+                let block = __render_per_file(lang, r, dir, name, wires);
                 if len(block) > 0 {
                     all_files_section = all_files_section + block;
                     if std::str::index_of(block, "[locus]") >= 0 {
