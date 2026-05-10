@@ -1,0 +1,51 @@
+// io-demo — Phase 1 capstone.
+//
+// Combines std::io::fs (config + log) with std::io::tcp
+// (listener) into a single Aperio program. The shape of "open
+// the door once, write down who knocked" — small enough to
+// read in one sitting, complete enough to exercise every
+// primitive Phase 1 ships.
+//
+// What it does:
+//   1. Probe an optional config file. If present, read its
+//      contents into the log payload; otherwise use a default.
+//   2. Bind a TCP Listener on 127.0.0.1:9876, wait for one
+//      connection, log the accepted fd, close.
+//   3. Write the log payload to a known path.
+//   4. Print where the log went and exit.
+//
+// To run manually:
+//   aperio run examples/io-demo/main.ap
+// then from a second terminal:
+//   nc 127.0.0.1 9876
+//
+// The integration test for this example (in
+// crates/aperio-codegen/tests/io_demo.rs) drives the
+// connection from Rust so CI runs without manual
+// intervention.
+
+fn main() {
+    let config_path: String = "/tmp/aperio_io_demo_config.txt";
+    let log_path: String = "/tmp/aperio_io_demo_log.txt";
+
+    let mut payload: String = "default visit\n";
+    if std::io::fs::file_exists(config_path) {
+        payload = std::io::fs::read_file(config_path);
+        println("config: loaded from ", config_path);
+    } else {
+        println("config: none, using default");
+    }
+
+    println("io-demo: listening on 127.0.0.1:9876");
+    std::io::tcp::Listener {
+        host: "127.0.0.1",
+        port: 9876,
+    };
+
+    let r: Int = std::io::fs::write_file(log_path, payload);
+    if r == 0 {
+        println("io-demo: wrote log to ", log_path);
+    } else {
+        println("io-demo: log write failed");
+    }
+}

@@ -2,13 +2,45 @@
 
 Bundled with the toolchain, no separate install required.
 
-> **Status (m71+):** The active build-out is Phase 1 of the v1.x
-> stdlib roadmap (see `docs/std/src/roadmap.md` for current scope).
-> The aspirational module map below this section was sketched
-> pre-rename and is being progressively realigned as Phase 1–5
-> milestones land. Treat the v1.x roadmap doc as authoritative for
-> what's shipped or shipping; the module sketches here are
-> directional, not prescriptive.
+> **Status (m76):** Phase 1 of the v1.x stdlib roadmap is
+> **sealed** as of m76 — the substrate floor is shipped and
+> documented. See `docs/std/src/roadmap.md` for the full v1.x
+> plan. The aspirational module map below this section was
+> sketched pre-rename and is being progressively realigned as
+> later phases land. Treat the v1.x roadmap doc as authoritative
+> for what's shipped or shipping; the module sketches in the
+> "v0 module map" section below are directional, not prescriptive.
+
+## Phase 1 — what shipped
+
+The first arc of the v1.x stdlib build-out: importable I/O
+substrate plus a working capstone example.
+
+| Milestone | What it shipped |
+|-----------|-----------------|
+| m71 | Magic `std::*` path resolver in codegen + `std::process::pid()` proof symbol. No general module system; `std::*` is the only recognized prefix. |
+| m72 | `lotus_tcp_*` C substrate. AF_INET sibling adapter to the m57 AF_UNIX SEQPACKET transport. Internal 8-byte LE length-prefix framing preserves the bus's atomic-message contract over `SOCK_STREAM`. |
+| m73 | `std::io::tcp::Listener` stdlib locus. Bundled-source mechanism (`runtime/stdlib.ap`) + path-rewrite at qualified struct literals. Real birth/run/dissolve lifecycle wired through `__listen_socket` / `__accept_one` / `__close_fd` path-call primitives. Single-accept shape; multi-accept + Stream + send/recv defer to a future arc. |
+| m74 | `lotus_fs_*` C substrate: `read_file`, `write_file`, `file_size`, `file_exists`. POSIX wrappers, no buffering, one-shot synchronous shape. `read_dir` deferred. |
+| m75 | `std::io::fs::*` Aperio surface. Functional path-call shape (mirrors `std::process::pid`), not locus-wrapped — one-shot file ops don't need lifetime-of-a-stream. `read_file` allocates from the m70 lazy global payload arena so the returned `String` outlives the call frame. |
+| m76 | `examples/io-demo/` capstone exercising both surfaces. Reads optional config, listens, accepts one connection, writes a log. Integration test in `tests/io_demo.rs` drives it under CI. |
+
+Phase-1 honest scope cuts (each documented in the relevant
+reference page):
+
+- **Single-accept Listener.** Multi-accept loop + per-connection
+  Stream + send/recv methods need a language-design pass on
+  function refs as locus params (or some other shape). Probably
+  lands when Phase 3's HTTP server forces it.
+- **No `read_dir`.** Variable-length-output story (NUL-separated
+  buffer? iteration model?) deserves its own design pass.
+- **No `Bytes` codegen.** Parser recognizes the type; types and
+  codegen don't lower it. v0 send/write paths use `String`.
+- **No errno surface.** Errors collapse to `-1` / `false` /
+  empty string. Disambiguation between "missing" and "permission
+  denied" needs an error-introspection follow-up.
+
+## Path resolution (m71)
 
 ## Path resolution (m71)
 
@@ -16,8 +48,8 @@ Bundled with the toolchain, no separate install required.
 
 ```aperio
 let p = std::process::pid();
-let bytes = std::io::fs::read_file("config.toml");
-let listener = std::io::tcp::listen(8080);
+let contents = std::io::fs::read_file("config.toml");
+std::io::tcp::Listener { host: "127.0.0.1", port: 8080 };
 ```
 
 The parser tokenizes `::` as a path separator and the type checker
