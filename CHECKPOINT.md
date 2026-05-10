@@ -17,7 +17,7 @@ paths plus the formal reference:
   per-tree register section pins the framing as load-bearing for
   future contributors.
 - `docs/book/` — The Aperio Programming Language. **All 12 chapters
-  substantively written** (~5,200 lines of prose). Layered
+  substantively written** (~3,300 lines of prose). Layered
   substrate-up tutorial from "Why Aperio?" through "Hello, locus"
   through types, lifecycle, contracts, bus, closures, cross-process,
   generics, perspectives, recovery, and the trellis-pair capstone.
