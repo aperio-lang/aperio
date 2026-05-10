@@ -1,8 +1,13 @@
 # Memory model
 
-This document specifies lotus's memory model: how regions are
+This document specifies Aperio's memory model: how regions are
 allocated, organized, and freed; how locus structure constrains
 memory layout; how access between loci is mediated.
+
+> **Naming note:** The language is **Aperio**; the runtime
+> substrate is called **lotus** ("lotus structure provides the
+> memory hierarchy" below refers to the substrate concept, not
+> the language). C-runtime symbols stay `lotus_*`.
 
 ## Foundational rule
 
@@ -305,7 +310,7 @@ machinery, scheduler integration, and lifecycle dispatcher.
 
 ## Codegen ABI (v0)
 
-The native-codegen path (`lotus build`) lowers each locus to an
+The native-codegen path (`aperio build`) lowers each locus to an
 LLVM struct one field per declared param, and each lifecycle
 method to an LLVM function whose first parameter is a pointer to
 that struct. Field reads / writes via `self.X` lower to
@@ -386,7 +391,7 @@ Constraints v0 codegen enforces (will relax as more lands):
   return `void`.
 - Locus param defaults must be literals (Int / Float / Bool /
   String / Duration). Non-literal defaults compile under the
-  interpreter but not via `lotus build`.
+  interpreter but not via `aperio build`.
 - Contracts are typecheck-only at this layer — they're accepted
   in the AST and skipped by codegen. The expose / consume
   surfaces are still type-checked across coordinator / coordinatee
@@ -450,18 +455,27 @@ loci instantiated inside push their `(self_ptr, locus_name)` onto
 the frame; at body exit (just before `ret`) the frame is flushed
 in reverse instantiation order, calling drain → dissolve on each.
 
-Ephemeral loci (no subscribe) keep the original semantics:
-drain → dissolve fires at end of `lower_locus_instantiation`,
-inside the same lifecycle body that instantiated them. The
-F.4 cascade still falls out structurally — children dissolve
-before their parent, regardless of which mechanism handles each.
+Ephemeral loci (no subscribe) at *statement-position* keep the
+original semantics: drain → dissolve fires at end of
+`lower_locus_instantiation`, inside the same lifecycle body
+that instantiated them. m82 changed the *let-bound* case:
+`let h = LocusName { ... }` now defers dissolve to the
+enclosing fn's scope-exit flush instead of the struct-literal
+boundary, so the user-visible binding stays valid for
+subsequent method calls. Long-lived loci (with `bus subscribe`)
+continue to defer regardless of binding shape. See
+`spec/semantics.md` "Dissolve timing rules" for the full rule.
+
+The F.4 cascade still falls out structurally — children
+dissolve before their parent, regardless of which mechanism
+handles each.
 
 ### Region allocator substrate (m19)
 
 The codegen path links a small C arena runtime
-(`crates/lotus-codegen/runtime/lotus_arena.c`, bundled into the
-compiler via `include_str!`) into every emitted binary. Public
-ABI:
+(`crates/aperio-codegen/runtime/lotus_arena.c`, bundled into
+the compiler via `include_str!`) into every emitted binary.
+Public ABI:
 
 ```
 ptr  lotus_arena_create(void)                              // new arena

@@ -7,17 +7,28 @@ document tells you what's *meaningfully* valid.
 
 ## Primitive types
 
-| Type | Bytes | Notes |
+| Type | Repr (v0 codegen) | Notes |
 |---|---|---|
-| `int` | 8 | Signed; default for integer literals |
-| `uint` | 8 | Unsigned |
-| `float` | 8 | IEEE 754 double; default for float literals |
-| `decimal` | 16 | Fixed-precision; matches shopspring/decimal semantics; suffix `d` on literals (`1.50d`) |
-| `string` | 16 (ptr+len) | UTF-8 bytes |
-| `bool` | 1 | `true` / `false` |
-| `time` | 8 | Monotonic instant |
-| `duration` | 8 | Time interval; suffix literals (`5s`, `100ms`) |
-| `bytes` | 16 (ptr+len) | Raw byte buffer |
+| `Int` | i64 | Signed; default for integer literals |
+| `Uint` | i64 | Unsigned at the type level; codegen lowers as i64. Parser-recognized; full lowering pending a workload that exercises the unsigned-arithmetic distinction. |
+| `Float` | f64 | IEEE 754 double; default for float literals |
+| `Decimal` | i128 | Mantissa with implicit scale 9 (`mantissa × 10^-9`). Distinct from `Float` at the type level; same-shape arithmetic with scale-adjusted mul/div. Suffix `d` on literals (`1.50d`). Real arbitrary-precision deferred. |
+| `String` | ptr (NUL-terminated) | UTF-8 bytes, C-style NUL-terminated. Single-pointer ABI to fit return-by-value through the m49 calling convention. Embedded NUL truncates — use `Bytes` for binary content. Allocated in the caller's arena (or the lazy global payload arena for stdlib returns whose lifetime needs to outlive the call). |
+| `Bool` | i1 | `true` / `false` |
+| `Time` | ptr (string-shaped, v0) | v0 codegen stores `Time` as a pointer to the literal's source-spelling String — a placeholder shape that the typechecker keeps distinct from `String`. Real `i64`-since-epoch lowering deferred. |
+| `Duration` | i64 | Nanoseconds. Suffix literals (`5s`, `100ms`). |
+| `Bytes` (m89) | ptr → `[i64 len][u8 data[len]]` | Binary-safe. Single-pointer ABI like String, but the underlying blob carries an explicit length prefix so embedded NUL bytes don't truncate. `len(b)` reads the prefix. Operations: `std::io::fs::read_bytes`, `Stream.send_bytes`. Distinct from `String` at the type level; the typechecker keeps them apart. |
+
+**FnPtr (m80):** First-class function values, type-spelled
+`fn(T1, T2) -> R` (or `fn(T1, T2)` for void-returning). LLVM
+lowering is `ptr` (raw fn pointer); calls go through
+`build_indirect_call` with an LLVM `FunctionType` synthesized
+from the FnPtr's args/ret at the call site. The implicit
+`__caller_arena: ptr` first param of every user fn (m49 calling
+convention) is also expected on the FnPtr's call ABI —
+indirect calls prepend it before user-visible args. See
+`stdlib/io_tcp.ap` for the canonical use:
+`Listener.on_connection: fn(std::io::tcp::Stream)`.
 
 ## Compound types
 

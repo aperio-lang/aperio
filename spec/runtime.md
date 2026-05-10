@@ -1,13 +1,19 @@
 # Runtime
 
-What the lotus binary always ships with. Always-loaded; not
-optional; no `import` needed; the substrate every Aperio program
-depends on.
+What every compiled Aperio binary always ships with. Always-
+loaded; not optional; no `import` needed; the substrate every
+Aperio program depends on.
 
 This document distinguishes the **runtime** (always there) from
 the **standard library** (`stdlib.md`, importable but bundled).
 Go's distinction between `runtime` and other stdlib packages is
 the model: runtime is automatic; stdlib is explicit.
+
+> **Naming note:** The language is **Aperio**; the runtime/
+> substrate concept is called **lotus**, and the C-runtime
+> symbols stay `lotus_*` (per project memory). When this doc
+> says "lotus" it means the substrate; "Aperio" means the
+> language proper.
 
 ## What's in the runtime
 

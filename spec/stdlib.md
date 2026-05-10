@@ -2,16 +2,18 @@
 
 Bundled with the toolchain, no separate install required.
 
-> **Status (m76):** Phase 1 of the v1.x stdlib roadmap is
-> **sealed** as of m76 — the substrate floor is shipped and
-> documented. See `docs/std/src/roadmap.md` for the full v1.x
-> plan. The aspirational module map below this section was
-> sketched pre-rename and is being progressively realigned as
-> later phases land. Treat the v1.x roadmap doc as authoritative
-> for what's shipped or shipping; the module sketches in the
-> "v0 module map" section below are directional, not prescriptive.
+> **Status (m93):** Phases 1-5 of the v1.x stdlib roadmap are
+> **sealed**. Phase 1 (substrate floor) at m76, Phase 3 (HTTP)
+> at m86, Phase 2 v0.1 (assertions) at m88, Phase 4 v0.1
+> (markdown) at m91, Phase 5 (doc-server capstone) at m92,
+> stdlib organization (per-domain `.ap` files) at m93. See
+> `docs/std/src/roadmap.md` for the v1.x plan and the
+> per-phase tables below for what shipped under each.
+> The aspirational "v0 module map" section near the bottom
+> of this file was sketched pre-rename; treat the per-phase
+> tables as authoritative for what's actually shipped.
 
-## Phase 1 — what shipped
+## Phase 1 — what shipped (sealed m76)
 
 The first arc of the v1.x stdlib build-out: importable I/O
 substrate plus a working capstone example.
@@ -20,27 +22,111 @@ substrate plus a working capstone example.
 |-----------|-----------------|
 | m71 | Magic `std::*` path resolver in codegen + `std::process::pid()` proof symbol. No general module system; `std::*` is the only recognized prefix. |
 | m72 | `lotus_tcp_*` C substrate. AF_INET sibling adapter to the m57 AF_UNIX SEQPACKET transport. Internal 8-byte LE length-prefix framing preserves the bus's atomic-message contract over `SOCK_STREAM`. |
-| m73 | `std::io::tcp::Listener` stdlib locus. Bundled-source mechanism (`runtime/stdlib.ap`) + path-rewrite at qualified struct literals. Real birth/run/dissolve lifecycle wired through `__listen_socket` / `__accept_one` / `__close_fd` path-call primitives. Single-accept shape; multi-accept + Stream + send/recv defer to a future arc. |
-| m74 | `lotus_fs_*` C substrate: `read_file`, `write_file`, `file_size`, `file_exists`. POSIX wrappers, no buffering, one-shot synchronous shape. `read_dir` deferred. |
+| m73 | `std::io::tcp::Listener` stdlib locus. Bundled-source mechanism (`runtime/stdlib/`) + path-rewrite at qualified struct literals. Real birth/run/dissolve lifecycle wired through `__listen_socket` / `__accept_one` / `__close_fd` path-call primitives. Single-accept shape (resolved in m83). |
+| m74 | `lotus_fs_*` C substrate: `read_file`, `write_file`, `file_size`, `file_exists`. POSIX wrappers, no buffering, one-shot synchronous shape. (`read_dir` resolved in m90.) |
 | m75 | `std::io::fs::*` Aperio surface. Functional path-call shape (mirrors `std::process::pid`), not locus-wrapped — one-shot file ops don't need lifetime-of-a-stream. `read_file` allocates from the m70 lazy global payload arena so the returned `String` outlives the call frame. |
 | m76 | `examples/io-demo/` capstone exercising both surfaces. Reads optional config, listens, accepts one connection, writes a log. Integration test in `tests/io_demo.rs` drives it under CI. |
 
-Phase-1 honest scope cuts (each documented in the relevant
-reference page):
+## Inter-phase cleanup (m77 → m81)
 
-- **Single-accept Listener.** Multi-accept loop + per-connection
-  Stream + send/recv methods need a language-design pass on
-  function refs as locus params (or some other shape). Probably
-  lands when Phase 3's HTTP server forces it.
-- **No `read_dir`.** Variable-length-output story (NUL-separated
-  buffer? iteration model?) deserves its own design pass.
-- **No `Bytes` codegen.** Parser recognizes the type; types and
-  codegen don't lower it. v0 send/write paths use `String`.
-- **No errno surface.** Errors collapse to `-1` / `false` /
+Bridge milestones between Phase 1 and Phase 3 — argv/env
+plumbing and the language additions Phase 3 needed.
+
+| Milestone | What it shipped |
+|-----------|-----------------|
+| m77 | `std::env::args_count` / `arg` / `var` / `var_exists`. Lifted main's signature to `i32 @main(i32, ptr)` so codegen captures argc/argv into a runtime stash via `lotus_env_init` in main's prelude. |
+| m78 | `std::str::parse_int` / `can_parse_int`. strtoll-based, base 10, strict trailing-char check. |
+| m79 | `std::time::sleep` / `monotonic` aliases under `std::*` namespace; `std::process::exit(code)`. |
+| m80 | Function-pointer language addition. `LotusType::FnPtr`, parser support for `fn(T) -> R` types, codegen lowering of fn names as values + indirect calls through fn-pointer fields. The Phase 3 prerequisite. |
+| m81 | Stream locus + non-self method calls + `__send` / `__recv` / `__connect` primitives. New `lower_external_method_call` for `obj.method(args)`. Bundled `__StdIoTcpStream` declaration. |
+
+## Language addition driven by m81 — m82 (locus-all-the-way-down)
+
+m81's Stream test surfaced an Aperio v0 lifecycle issue:
+custom `dissolve()` on a let-bound locus literal fired
+eagerly at the end of the struct-literal expression, not at
+the binding's scope exit. m82 fixes it: let-bound locus
+literals defer dissolve to the enclosing fn's scope-exit
+flush. The user-visible binding is the handle; the locus
+instance lives until the binding's scope ends. One construct,
+one mental model — no parallel "handle type" needed. See
+`spec/semantics.md` for the operational rule.
+
+## Phase 3 — HTTP (sealed m86)
+
+Multi-accept Listener + request parser + response writer +
+end-to-end working server.
+
+| Milestone | What it shipped |
+|-----------|-----------------|
+| m83 | Multi-accept Listener with `on_connection: fn(Stream)` callback. Composes m80 + m81 + m82. Per-connection Stream lifecycles owned by a free-fn helper (`__handle_one_connection`) whose scope-exit flush closes the fd between iterations. |
+| m84 | `std::http::Request` + parser. Request and Response are `type` records (no lifecycle). Adds `std::str::index_of` substring-search primitive. STDLIB_PATH_RENAMES generalized to cover both loci and types. |
+| m85 | `std::http::write_response`. Builds the HTTP/1.1 wire format (status line + Content-Type + Content-Length + Connection: close + body) via String concatenation, ships through `Stream.send`. |
+| m86 | `examples/http-hello/` — Phase 3 capstone, real curl-able HTTP server in ~70 lines of Aperio. |
+
+## Phase 2 v0.1 — testing primitives (sealed m88)
+
+Bedrock assertion library, written purely in Aperio.
+
+| Milestone | What it shipped |
+|-----------|-----------------|
+| m87 | `std::test::assert(cond, msg)`, `std::test::assert_eq_int(actual, expected, msg)`, `std::test::assert_eq_str(actual, expected, msg)`. Implementations compose `std::process::exit`. Pass = silent + exit 0; fail = "ASSERTION FAILED: <msg>" on stdout + exit 1. |
+| m88 | Aperio self-tests on top of std::test (`tests/aperio_self_test.rs`). Six `.ap` programs assert on real Aperio behavior using the new layer. |
+
+What's NOT in v0.1 (each a future-milestone arc): `aperio
+test` CLI runner, `assert_rejects` (compile-time-error tests),
+`assert_closure` (closure-test introspection), benchmarks,
+property-based testing.
+
+## Phase 4 v0.1 — markdown (sealed m91)
+
+Block-level markdown → HTML rendering, written purely in
+Aperio. Plus the Phase 5 prerequisites that landed alongside.
+
+| Milestone | What it shipped |
+|-----------|-----------------|
+| m89 | `Bytes` codegen — the binary-safe sibling of String. Memory layout `[i64 len][u8 data[len]]`; same single-pointer ABI as String. `len(b)`, `std::io::fs::read_bytes`, `std::io::tcp::__send_bytes`, `Stream.send_bytes` method. Embedded NUL bytes preserved across all three. |
+| m90 | `std::io::fs::list_dir(path) -> String`. Newline-separated entry names (skipping `.` / `..`). v0 shape; sibling `[String]` API waits on a generic `List<T>` type. |
+| m91 | `std::text::md_to_html(md) -> String`. ATX headings, multi-line paragraphs, fenced code blocks, HTML escaping. Inline formatting (bold/italic/code/links) deferred. |
+
+## Phase 5 — the capstone (sealed m92)
+
+| Milestone | What it shipped |
+|-----------|-----------------|
+| m92 | `examples/docs-server/main.ap`. Real HTTP server in ~200 lines of Aperio that lists and renders markdown files from a configured directory. Composes Listener (m83) + parse_request (m84) + write_response (m85) + read_file (m74) + list_dir (m90) + md_to_html (m91) + Stream lifecycle (m82) + function pointers (m80). |
+
+## Stdlib organization — m93
+
+The bundled stdlib was a single ~530-line `runtime/stdlib.ap`
+through m92. m93 split it into per-domain files under
+`runtime/stdlib/`:
+
+| File | Contents |
+|------|----------|
+| `core.ap`   | Helpers used across the stdlib (`__replace_all`, `__html_escape`). |
+| `io_tcp.ap` | `Stream` + `Listener` loci + `__handle_one_connection` + `__default_on_connection`. |
+| `http.ap`   | `Request` + `Response` types + `__parse_http_request` + `__write_http_response` + `__status_phrase`. |
+| `text.ap`   | `__md_to_html` + line tokenization helpers. |
+| `test.ap`   | `__test_assert` + `assert_eq_*` variants. |
+
+`STDLIB_AP_SOURCE` in codegen is now
+`concat!(include_str!("core.ap"), "\n", include_str!("io_tcp.ap"), ...)`.
+Order matters — `core.ap` must precede `text.ap` (markdown
+depends on `core`'s helpers); `io_tcp.ap` must precede
+`http.ap` (HTTP signatures reference `Stream`). Each file
+header documents its constraint.
+
+## What landed but isn't yet a phase capstone
+
+- **Errno surface.** Errors still collapse to `-1` / `false` /
   empty string. Disambiguation between "missing" and "permission
   denied" needs an error-introspection follow-up.
-
-## Path resolution (m71)
+- **Inline markdown.** Bold, italic, inline code, links — m92+.
+- **HTTP keep-alive, custom headers, large bodies.** v0 hardcodes
+  `Connection: close`, no header-map type, single-recv assumption
+  for the request line + headers. All Phase 3 v1.0 follow-ups.
+- **`aperio test` CLI runner.** Phase 2 v1.0 — currently the
+  Rust integration harness fills the role.
 
 ## Path resolution (m71)
 

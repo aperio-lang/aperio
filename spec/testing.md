@@ -186,28 +186,48 @@ tests by suffix (`_test.lt`) regardless of location.
 ## Test assertion library
 
 Provided by `std::test`. Not a separate testing framework; the
-language's stdlib includes test primitives:
+language's stdlib includes test primitives.
 
-```
-import std::test;
+### v0.1 (sealed m87, m88)
 
-fn test_hello_locus_dissolves_after_birth() {
-    let observed_dissolution = false;
+Three primitives, all written purely in Aperio (composing
+`std::process::exit`):
 
-    locus ObserverL {
-        on_dissolve(c: HelloL) {
-            observed_dissolution = true;
-        }
-    }
-
-    let obs = ObserverL { };
-    HelloL { };  // unbound; should dissolve at this `;`
-
-    test::assert(observed_dissolution);
+```aperio
+fn main() {
+    std::test::assert(2 + 2 == 4, "trivial arithmetic");
+    std::test::assert_eq_int(answer(), 42, "answer");
+    std::test::assert_eq_str(greet("world"), "hello, world", "greeting");
 }
 ```
 
-(Sketch; precise stdlib API specified in stdlib.md.)
+The test-runner contract is exit-code based:
+
+- **Pass** = exit 0 with **no stdout**. A test program that
+  runs to completion silently has passed.
+- **Fail** = non-zero exit code with `ASSERTION FAILED: <msg>`
+  (and, for `assert_eq_*`, `expected: X / actual: Y`) on
+  stdout. The first failure short-circuits — `std::process::exit`
+  terminates immediately.
+
+A `.ap` test program is just an ordinary Aperio binary. The
+current test runner is the Rust integration harness in
+`crates/aperio-codegen/tests/`; future `aperio test` CLI runs
+the same `.ap` programs unchanged.
+
+### What landed vs what's still aspirational
+
+| Surface | Status |
+|---|---|
+| `std::test::assert(cond, msg)` | sealed m87 |
+| `std::test::assert_eq_int(actual, expected, msg)` | sealed m87 |
+| `std::test::assert_eq_str(actual, expected, msg)` | sealed m87 |
+| `assert_neq` / `assert_neq_int` / `assert_neq_str` | not shipped |
+| `assert_rejects(...)` (compile-time errors) | not shipped — needs compiler-level surface |
+| `assert_closure(name, tolerance)` | not shipped — needs closure-test introspection |
+| `mock_locus<T>(...)` | not shipped |
+| `bench_iter(n, f)` | not shipped |
+| `aperio test` CLI runner | not shipped — Rust harness fills the role today |
 
 ## Property-based testing
 

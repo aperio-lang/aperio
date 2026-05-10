@@ -1,12 +1,12 @@
 # Lexical structure
 
-This document specifies the lexical layer of lotus: the set of
+This document specifies the lexical layer of Aperio: the set of
 tokens the lexer produces and feeds to the parser. The formal
 grammar in `grammar.ebnf` is defined over these tokens.
 
 ## Source encoding
 
-Source files are UTF-8 encoded. File extension: `.lt`.
+Source files are UTF-8 encoded. File extension: `.ap`.
 
 Outside string literals and comments, only ASCII characters are
 permitted. The framework's mathematical primitives are spelled

@@ -1,6 +1,6 @@
 # Design rationale
 
-For each major syntactic construct in the lotus grammar, this
+For each major syntactic construct in the Aperio grammar, this
 document records:
 
 1. **What the construct does.**
@@ -140,7 +140,7 @@ otherwise at runtime via the lotus runtime's perspective-stability
 machinery).
 
 **`params` is also the locus's state.** Following Ruby's `@foo`
-pattern, lotus collapses the params-vs-state distinction. The
+pattern, Aperio collapses the params-vs-state distinction. The
 declared params are simultaneously:
 
 1. *Birth-time defaults*: overridable at instantiation
@@ -487,7 +487,7 @@ is locus-scoped; dissolution frees the region wholesale. No
 garbage collector; no borrow checker.
 
 **Why.** The framework's recursion property gives the hierarchy
-for free. The lotus-lifecycle methods give the deterministic
+for free. Aperio's locus-lifecycle methods give the deterministic
 free-points. The contract block gives the access discipline.
 Together they give region-based memory management without the
 inference problems that have historically made region-based MM
@@ -507,9 +507,10 @@ class.
 
 **Considered and rejected.**
 
-- *Garbage collection.* Reject; trading systems can't afford
-  GC pauses, and the lotus structure obviates the need.
-- *Rust-style ownership/borrow checker.* Reject; lotus
+- *Garbage collection.* Reject; latency-sensitive systems
+  can't afford GC pauses, and Aperio's locus structure
+  obviates the need.
+- *Rust-style ownership/borrow checker.* Reject; Aperio's
   hierarchical regions provide the ownership structure
   implicitly. Ownership tracking is unnecessary.
 - *Reference counting.* Reject; same as GC but worse latency
@@ -972,7 +973,7 @@ Considered and rejected:
   top.
 
 This is the same approach Rust takes with raw identifiers
-(though Rust uses `r#` prefix for any keyword; lotus permits
+(though Rust uses `r#` prefix for any keyword; Aperio permits
 just the mode keywords post-dot, less surface area).
 
 ### F.11 `self.children` typing and lifecycle
@@ -1067,9 +1068,9 @@ Considered and rejected:
   shape. The operator makes the dataflow visible at a glance:
   *something flows from right to left into a named channel.*
 - *Bidirectional `<-` (Go-shape, both send and receive).*
-  Reject; subscription is structural in lotus (declared in
+  Reject; subscription is structural in Aperio (declared in
   `bus`, dispatched by the runtime), so a receive operator
-  has no statement position to occupy. Lotus's subscriptions
+  has no statement position to occupy. Aperio's subscriptions
   are closer to Erlang's process mailbox + `receive` block
   than to Go's channel reads.
 - *`!` for send (Erlang-shape).* Reject; `!` is taken by

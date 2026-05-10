@@ -54,11 +54,37 @@ A `fn name(args) -> ret { body }` invocation:
    scheduler.
 8. Expression returns the locus handle.
 
-If unbound and ephemeral (only birth + params), the handle is
-discarded; locus dissolves at enclosing statement boundary.
+### Dissolve timing rules
 
-If unbound and long-lived (run / bus / modes), locus becomes
-anonymous child of enclosing scope.
+Three shapes, three timings (m82 — "locus all the way down"):
+
+- **Statement-position literal** (`LocusName { ... };`, no
+  binding): birth → run → drain → dissolve all fire at the
+  statement boundary. Fire-and-forget. The handle is discarded.
+- **Let-bound literal** (`let h = LocusName { ... };`): birth
+  + run + drain fire at the construction site. Dissolve is
+  **deferred to the enclosing fn's scope-exit flush**. The
+  user-visible binding `h` is the handle; the locus instance
+  lives until `h` goes out of scope. This is what makes
+  `let s = Stream { conn_fd: fd }; s.send(msg);` work — `s`
+  stays valid for the method call because dissolve hasn't
+  fired yet.
+- **Long-lived** (locus has `bus subscribe`): always deferred,
+  irrespective of binding shape — the locus must stay alive to
+  receive published events between birth and the enclosing
+  scope's exit.
+
+Multiple deferred dissolves in the same scope fire in
+**reverse instantiation order** at scope exit (LIFO), matching
+the F.4 depth-first cascade. The reason: a later-created
+locus may depend on an earlier-created one, so the later one
+must dissolve first.
+
+The deferred-dissolve mechanism is fn-level, not block-level,
+in v0. Loops that bind a locus per iteration accumulate
+dissolves until fn exit. Per-iteration cleanup uses a helper
+free fn whose return is the per-iteration boundary (see
+`__handle_one_connection` in `stdlib/io_tcp.ap`).
 
 ## Lifecycle method invocation
 
