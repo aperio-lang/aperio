@@ -38,6 +38,9 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -1188,6 +1191,311 @@ void lotus_transport_destroy(lotus_transport_t *t) {
         unlink(t->path);
         free(t->path);
     }
+    free(t);
+}
+
+/*
+ * m72: TCP transport (AF_INET) — sibling adapter to the AF_UNIX
+ * SEQPACKET transport above.
+ *
+ * Design context (project_tcp_framing.md): the transport surface
+ * contracts to deliver atomic messages — one send produces one
+ * recv of the same byte sequence at the other end. SEQPACKET
+ * satisfies this via kernel datagram semantics; TCP satisfies it
+ * by length-prefix framing inside this adapter. The bus layer
+ * above is transport-agnostic and treats every transport as
+ * "give me the next whole message." Future transports (TLS, QUIC,
+ * shared-memory rings) will each pick whatever internal mechanism
+ * satisfies the same atomic-message contract.
+ *
+ * Wire format per message:
+ *   [8-byte little-endian uint64 length] [N bytes payload]
+ * The 8-byte LE length matches the m70 per-field serializer's
+ * String framing convention.
+ *
+ * Sanity cap: LOTUS_TCP_MAX_MSG_BYTES rejects pathologically
+ * large length headers before any allocation or recv loop runs,
+ * preventing a malicious or buggy peer from claiming 2^63 bytes
+ * and stalling the receiver.
+ *
+ * Lifecycle mirrors lotus_transport:
+ *   - LISTEN role: socket + SO_REUSEADDR + bind + listen + accept.
+ *     Blocks lotus_tcp_create until exactly one connector connects.
+ *   - CONNECT role: connect with retry on ECONNREFUSED for ~1s.
+ *
+ * SO_REUSEADDR is set on the listener so a freshly-released port
+ * (very recent test runs, dev iteration) doesn't trip TIME_WAIT.
+ * TCP_NODELAY is set on the connection so single small messages
+ * aren't held by Nagle's algorithm — the bus's typical workload
+ * is request/response-shaped where latency matters more than
+ * coalescing.
+ *
+ * Errors return NULL (create) or -1 (send/recv); recv also
+ * returns -1 if the framed length exceeds `cap` (caller's buffer
+ * too small) or LOTUS_TCP_MAX_MSG_BYTES (cap regardless).
+ */
+
+#define LOTUS_TCP_LISTEN  0
+#define LOTUS_TCP_CONNECT 1
+
+/* 8 MB ceiling. Generous for typed bus payloads while still
+ * making a malicious 2^63 length header an immediate -1. */
+#define LOTUS_TCP_MAX_MSG_BYTES (8u * 1024u * 1024u)
+
+typedef struct lotus_tcp {
+    int   conn_fd;     /* the connected stream socket */
+    int   listen_fd;   /* listener role only; -1 for connector */
+    int   role;
+    uint16_t port;     /* the actual bound/connected port (esp. when listen requested 0) */
+} lotus_tcp_t;
+
+/* Read exactly `n` bytes into `buf` from `fd`, looping over short
+ * reads. Returns 0 on success, -1 on error or EOF before n bytes.
+ * Used by recv to reassemble the framed message — TCP is a byte
+ * stream, so a single read may return any prefix of the requested
+ * count. */
+static int lotus__tcp_read_full(int fd, void *buf, size_t n) {
+    char  *p = (char *)buf;
+    size_t left = n;
+    while (left > 0) {
+        ssize_t r = read(fd, p, left);
+        if (r > 0) {
+            p    += (size_t)r;
+            left -= (size_t)r;
+            continue;
+        }
+        if (r == 0) {
+            /* peer closed mid-message — surface as EIO so the
+             * caller sees a non-zero errno. */
+            errno = EIO;
+            return -1;
+        }
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+/* Write exactly `n` bytes from `buf` to `fd`, looping over short
+ * writes. Mirrors lotus__tcp_read_full. */
+static int lotus__tcp_write_full(int fd, const void *buf, size_t n) {
+    const char *p = (const char *)buf;
+    size_t      left = n;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w > 0) {
+            p    += (size_t)w;
+            left -= (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        /* w == 0 on a regular fd is unusual; treat as error. */
+        return -1;
+    }
+    return 0;
+}
+
+/* Encode a host-order uint64 as 8 little-endian bytes. */
+static void lotus__u64_to_le(uint64_t v, unsigned char out[8]) {
+    for (int i = 0; i < 8; i++) {
+        out[i] = (unsigned char)(v >> (i * 8));
+    }
+}
+
+/* Decode 8 little-endian bytes to a host-order uint64. */
+static uint64_t lotus__u64_from_le(const unsigned char in[8]) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= ((uint64_t)in[i]) << (i * 8);
+    }
+    return v;
+}
+
+lotus_tcp_t *lotus_tcp_create(const char *host, uint16_t port, int role) {
+    /* host=NULL is allowed for both roles: listener interprets as
+     * INADDR_ANY (bind-on-any-interface); connector defaults to
+     * 127.0.0.1 since "no peer specified" means same-host. */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    if (role == LOTUS_TCP_LISTEN) {
+        if (!host) {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            fprintf(stderr,
+                    "lotus_tcp_create: invalid listen host %s\n", host);
+            errno = EINVAL;
+            return NULL;
+        }
+    } else if (role == LOTUS_TCP_CONNECT) {
+        const char *h = host ? host : "127.0.0.1";
+        if (inet_pton(AF_INET, h, &addr.sin_addr) != 1) {
+            fprintf(stderr,
+                    "lotus_tcp_create: invalid connect host %s\n", h);
+            errno = EINVAL;
+            return NULL;
+        }
+    } else {
+        fprintf(stderr, "lotus_tcp_create: invalid role %d\n", role);
+        errno = EINVAL;
+        return NULL;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("lotus_tcp_create: socket");
+        return NULL;
+    }
+
+    if (role == LOTUS_TCP_LISTEN) {
+        int one = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                       &one, sizeof(one)) < 0) {
+            perror("lotus_tcp_create: SO_REUSEADDR");
+            close(sock);
+            return NULL;
+        }
+        if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            perror("lotus_tcp_create: bind");
+            close(sock);
+            return NULL;
+        }
+        /* If port=0 the OS picked one; getsockname tells us which. */
+        socklen_t alen = sizeof(addr);
+        if (getsockname(sock, (struct sockaddr *)&addr, &alen) < 0) {
+            perror("lotus_tcp_create: getsockname");
+            close(sock);
+            return NULL;
+        }
+        if (listen(sock, 1) < 0) {
+            perror("lotus_tcp_create: listen");
+            close(sock);
+            return NULL;
+        }
+        int conn = accept(sock, NULL, NULL);
+        if (conn < 0) {
+            perror("lotus_tcp_create: accept");
+            close(sock);
+            return NULL;
+        }
+        int nodelay = 1;
+        (void)setsockopt(conn, IPPROTO_TCP, TCP_NODELAY,
+                         &nodelay, sizeof(nodelay));
+        lotus_tcp_t *t = (lotus_tcp_t *)calloc(1, sizeof(*t));
+        if (!t) {
+            close(conn);
+            close(sock);
+            return NULL;
+        }
+        t->conn_fd   = conn;
+        t->listen_fd = sock;
+        t->role      = role;
+        t->port      = ntohs(addr.sin_port);
+        return t;
+    }
+
+    /* CONNECT: retry on ECONNREFUSED for ~1s so a connector that
+     * races ahead of the listener's bind/listen still succeeds
+     * once the listener becomes ready. Mirrors the unix-socket
+     * adapter. */
+    struct timespec backoff = { 0, 5L * 1000L * 1000L };  /* 5ms */
+    int attempts = 200;                                   /* 200 × 5ms */
+    while (attempts-- > 0) {
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            int nodelay = 1;
+            (void)setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                             &nodelay, sizeof(nodelay));
+            lotus_tcp_t *t = (lotus_tcp_t *)calloc(1, sizeof(*t));
+            if (!t) {
+                close(sock);
+                return NULL;
+            }
+            t->conn_fd   = sock;
+            t->listen_fd = -1;
+            t->role      = role;
+            t->port      = port;
+            return t;
+        }
+        if (errno != ECONNREFUSED && errno != EAGAIN) {
+            perror("lotus_tcp_create: connect");
+            close(sock);
+            return NULL;
+        }
+        nanosleep(&backoff, NULL);
+    }
+    fprintf(stderr,
+            "lotus_tcp_create: connect to port %u timed out\n",
+            (unsigned)port);
+    close(sock);
+    return NULL;
+}
+
+uint16_t lotus_tcp_port(lotus_tcp_t *t) {
+    return t ? t->port : 0;
+}
+
+int lotus_tcp_send(lotus_tcp_t *t, const void *buf, size_t len) {
+    if (!t || (!buf && len > 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((uint64_t)len > LOTUS_TCP_MAX_MSG_BYTES) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    unsigned char header[8];
+    lotus__u64_to_le((uint64_t)len, header);
+    if (lotus__tcp_write_full(t->conn_fd, header, sizeof(header)) < 0) {
+        perror("lotus_tcp_send: header");
+        return -1;
+    }
+    if (len > 0 && lotus__tcp_write_full(t->conn_fd, buf, len) < 0) {
+        perror("lotus_tcp_send: payload");
+        return -1;
+    }
+    return 0;
+}
+
+ssize_t lotus_tcp_recv(lotus_tcp_t *t, void *buf, size_t cap) {
+    if (!t || (!buf && cap > 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned char header[8];
+    if (lotus__tcp_read_full(t->conn_fd, header, sizeof(header)) < 0) {
+        /* don't perror on the common EOF case — the caller knows
+         * a -1 here means "stream ended or read error"; spammy
+         * stderr would obscure the actual program output. */
+        return -1;
+    }
+    uint64_t len = lotus__u64_from_le(header);
+    if (len > LOTUS_TCP_MAX_MSG_BYTES) {
+        fprintf(stderr,
+                "lotus_tcp_recv: framed length %llu exceeds %u\n",
+                (unsigned long long)len, LOTUS_TCP_MAX_MSG_BYTES);
+        errno = EMSGSIZE;
+        return -1;
+    }
+    if (len > (uint64_t)cap) {
+        fprintf(stderr,
+                "lotus_tcp_recv: framed length %llu exceeds caller cap %zu\n",
+                (unsigned long long)len, cap);
+        errno = EMSGSIZE;
+        return -1;
+    }
+    if (len == 0) return 0;
+    if (lotus__tcp_read_full(t->conn_fd, buf, (size_t)len) < 0) {
+        perror("lotus_tcp_recv: payload");
+        return -1;
+    }
+    return (ssize_t)len;
+}
+
+void lotus_tcp_destroy(lotus_tcp_t *t) {
+    if (!t) return;
+    if (t->conn_fd >= 0) close(t->conn_fd);
+    if (t->listen_fd >= 0) close(t->listen_fd);
     free(t);
 }
 
