@@ -282,6 +282,20 @@ fn register_locus(
         }
     }
 
+    // F.22: collect capacity slot names so the typechecker can
+    // recognize `self.<slot>` as a slot reference rather than a
+    // missing field. Kinds + element types stay codegen-side;
+    // typecheck only needs the names for the
+    // self-field-vs-slot distinction.
+    let mut capacity_slot_names: Vec<String> = Vec::new();
+    for member in &decl.members {
+        if let LocusMember::Capacity(cb) = member {
+            for slot in &cb.slots {
+                capacity_slot_names.push(slot.name.name.clone());
+            }
+        }
+    }
+
     let info = LocusInfo {
         name: decl.name.name.clone(),
         params,
@@ -293,6 +307,7 @@ fn register_locus(
         contract_expose,
         contract_consume,
         methods,
+        capacity_slot_names,
         span: decl.span,
     };
 

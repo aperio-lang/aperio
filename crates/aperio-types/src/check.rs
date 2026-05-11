@@ -1238,6 +1238,29 @@ impl<'a> Checker<'a> {
                 match self.field_ty(&rt, &name.name) {
                     Some(t) => t,
                     None => {
+                        // F.22: `self.<slot>` references a capacity
+                        // slot, not a field. Slots don't have a
+                        // value-level type the typechecker reasons
+                        // about (the cell value only appears when
+                        // they're used as a method-call receiver),
+                        // so return Unknown rather than diagnosing
+                        // a missing field. Codegen catches misuse
+                        // (slot in non-method-call position).
+                        if matches!(receiver.as_ref(), Expr::KwSelf(_)) {
+                            if let Ty::Named(locus_name) = &rt {
+                                if let Some(TopSymbol::Locus(li)) =
+                                    self.top.symbols.get(locus_name)
+                                {
+                                    if li
+                                        .capacity_slot_names
+                                        .iter()
+                                        .any(|n| n == &name.name)
+                                    {
+                                        return Ty::Unknown;
+                                    }
+                                }
+                            }
+                        }
                         // Permissive on Unknown — stdlib paths
                         // and externally-typed values pass
                         // through. Strict when the receiver

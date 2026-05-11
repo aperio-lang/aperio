@@ -120,6 +120,16 @@ enum CodegenTy {
     /// dispatch loads vtable[i] and indirect-calls with data
     /// as the implicit self arg.
     Interface(String),
+    /// F.22 capacity-slot cell handle. `acquire()` / `alloc()`
+    /// return one of these; `release(cell)` / `free(cell)`
+    /// accept one. The boxed `CodegenTy` is the cell's element
+    /// type (T from `pool X of T` / `heap Y of T`). At LLVM
+    /// level, a `ptr` to T's struct layout — opaque to direct
+    /// read/write at v1, valid only as a round-trip arg back
+    /// into the same slot. Map/Vec stdlib in v1.x will surface
+    /// cell-content access (load/store through the pointer)
+    /// once a workload exercises it.
+    Cell(Box<CodegenTy>),
 }
 
 /// Did the last lowered statement leave the current basic block
@@ -6330,7 +6340,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 | CodegenTy::Array(_, _)
                                 | CodegenTy::Tuple(_)
                                 | CodegenTy::FnPtr { .. }
-                                | CodegenTy::Interface(_) => self
+                                | CodegenTy::Interface(_)
+                                | CodegenTy::Cell(_) => self
                                     .context
                                     .ptr_type(AddressSpace::default())
                                     .fn_type(&llvm_param_tys, false),
@@ -6496,7 +6507,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 | CodegenTy::Array(_, _)
                                 | CodegenTy::Tuple(_)
                                 | CodegenTy::FnPtr { .. }
-                                | CodegenTy::Interface(_) => self
+                                | CodegenTy::Interface(_)
+                                | CodegenTy::Cell(_) => self
                                     .context
                                     .ptr_type(AddressSpace::default())
                                     .fn_type(&llvm_param_tys, false),
@@ -7545,7 +7557,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | Some(CodegenTy::Array(_, _))
             | Some(CodegenTy::Tuple(_))
             | Some(CodegenTy::FnPtr { .. })
-            | Some(CodegenTy::Interface(_)) => self
+            | Some(CodegenTy::Interface(_))
+            | Some(CodegenTy::Cell(_)) => self
                 .context
                 .ptr_type(AddressSpace::default())
                 .fn_type(&llvm_param_tys, false),
@@ -8173,6 +8186,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                  inside the fat pointer would dangle. Interface return \
                  deep-copy is a Phase B follow-up; for now, take an \
                  interface arg and dispatch from the caller's frame.",
+                ty
+            ))),
+            CodegenTy::Cell(_) => Err(CodegenError::Unsupported(format!(
+                "free-fn return of {:?}: F.22 capacity-slot cells \
+                 can't cross fn boundaries — the cell's lifetime is \
+                 the locus's slot, and the caller's frame doesn't \
+                 know which slot to release/free into. Round-trip \
+                 cells inside the locus body instead.",
                 ty
             ))),
         }
@@ -11136,7 +11157,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | CodegenTy::TypeRef(_)
             | CodegenTy::Array(_, _)
             | CodegenTy::Tuple(_)
-            | CodegenTy::Interface(_) => self
+            | CodegenTy::Interface(_)
+            | CodegenTy::Cell(_) => self
                 .builder
                 .build_alloca(self.context.ptr_type(AddressSpace::default()), name)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string())),
@@ -12240,7 +12262,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | CodegenTy::TypeRef(_)
             | CodegenTy::Array(_, _)
             | CodegenTy::Tuple(_)
-            | CodegenTy::Interface(_) => {
+            | CodegenTy::Interface(_)
+            | CodegenTy::Cell(_) => {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
         }
@@ -12868,6 +12891,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                          interface values have no surface \
                          representation; call a method on it instead",
                         name
+                    )));
+                }
+                CodegenTy::Cell(inner) => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "println of an F.22 capacity-slot cell \
+                         (Cell<{:?}>) — cells are opaque round-trip \
+                         handles at v1, not printable values. \
+                         Release/free the cell and println a \
+                         specific value instead.",
+                        inner
                     )));
                 }
             }
@@ -17710,6 +17743,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         args: &[Expr],
         scope: &Scope<'ctx>,
     ) -> Result<Option<(BasicValueEnum<'ctx>, CodegenTy)>, CodegenError> {
+        // F.22: `self.<slot>.<method>(args)` routes directly to the
+        // C allocator without going through normal locus-method
+        // dispatch. The receiver here is `self.<slot>` — a Field
+        // expression whose base is KwSelf and whose name matches a
+        // declared capacity slot on the current self's locus. We
+        // catch this before lowering the receiver because slots
+        // don't have a value-level CodegenTy that survives outside
+        // a method-call position; lowering `self.<slot>` as a
+        // standalone expression would error.
+        //
+        // The helper's outer Option distinguishes "not a slot,
+        // fall through" (None) from "handled" (Some(inner)) where
+        // inner is the method's value-or-void return.
+        if let Some(slot_result) = self.try_lower_capacity_slot_method_call(
+            receiver_expr,
+            method_name,
+            args,
+            scope,
+        )? {
+            return Ok(slot_result);
+        }
         let (recv_val, recv_ty) = self.lower_expr(receiver_expr, scope)?;
         // F.20 Phase B: dispatch through an interface fat pointer.
         // The receiver value is a pointer to a `{data, vtable}`
@@ -17839,6 +17893,190 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .left()
                     .expect("non-void method returns a basic value");
                 Ok(Some((v, rt)))
+            }
+        }
+    }
+
+    /// F.22 slot dispatch. Checks if `receiver_expr` is `self.<X>`
+    /// where X is a declared capacity slot on the current self's
+    /// locus, and if so routes the method call directly to the
+    /// matching `lotus_pool_*` / `lotus_heap_*` C primitive.
+    ///
+    /// Returns `Ok(None)` when the receiver isn't a slot — caller
+    /// falls through to ordinary external-method dispatch.
+    /// Returns `Ok(Some(...))` when dispatch succeeded.
+    /// Returns `Err` for diagnosable mismatches (wrong method
+    /// for slot kind, wrong arg count, wrong cell type).
+    ///
+    /// Surface (per spec §F.22):
+    ///   pool: acquire() -> Cell(T); release(c: Cell(T)) -> void
+    ///   heap: alloc()   -> Cell(T); free(c:    Cell(T)) -> void
+    fn try_lower_capacity_slot_method_call(
+        &mut self,
+        receiver_expr: &Expr,
+        method_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<
+        // Outer None = "not a slot, caller falls through to
+        // ordinary external-method dispatch". Outer Some(inner)
+        // = "handled"; inner mirrors the regular method-call
+        // result (Some(value, ty) for non-void, None for void).
+        Option<Option<(BasicValueEnum<'ctx>, CodegenTy)>>,
+        CodegenError,
+    > {
+        let slot_name = match receiver_expr {
+            Expr::Field { receiver, name, .. }
+                if matches!(receiver.as_ref(), Expr::KwSelf(_)) =>
+            {
+                name.name.clone()
+            }
+            _ => return Ok(None),
+        };
+        let Some(cs) = self.current_self.as_ref().cloned() else {
+            return Ok(None);
+        };
+        let Some(info) = self.user_loci.get(&cs.locus_name).cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(slot) = info
+            .capacity_slots
+            .iter()
+            .find(|s| s.name == slot_name)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        // Slot exists; from here, any mismatch is a hard error
+        // (returning Ok(None) would fall through to a less-clear
+        // diagnostic about "method on non-locus" since slot fields
+        // don't have a LocusRef type).
+        enum Op {
+            Acquire,
+            Release,
+            Alloc,
+            Free,
+        }
+        let op = match (slot.kind, method_name) {
+            (CapacitySlotKind::Pool, "acquire") => Op::Acquire,
+            (CapacitySlotKind::Pool, "release") => Op::Release,
+            (CapacitySlotKind::Heap, "alloc") => Op::Alloc,
+            (CapacitySlotKind::Heap, "free") => Op::Free,
+            (CapacitySlotKind::Pool, other) => {
+                return Err(CodegenError::Unsupported(format!(
+                    "pool slot `{}`: method `{}` not available — use \
+                     `acquire()` to borrow a cell or `release(cell)` \
+                     to return one",
+                    slot_name, other
+                )));
+            }
+            (CapacitySlotKind::Heap, other) => {
+                return Err(CodegenError::Unsupported(format!(
+                    "heap slot `{}`: method `{}` not available — use \
+                     `alloc()` to allocate a cell or `free(cell)` to \
+                     release one",
+                    slot_name, other
+                )));
+            }
+        };
+        // Load the allocator pointer from the slot field.
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let slot_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                cs.self_ptr,
+                slot.struct_field_idx,
+                &format!("self.__slot_{}.ptr", slot_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let allocator_ptr = self
+            .builder
+            .build_load(
+                ptr_t,
+                slot_field_ptr,
+                &format!("self.__slot_{}", slot_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        match op {
+            Op::Acquire | Op::Alloc => {
+                if !args.is_empty() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "slot `{}`.{}: takes no args, got {}",
+                        slot_name,
+                        method_name,
+                        args.len()
+                    )));
+                }
+                let fn_name = match op {
+                    Op::Acquire => "lotus_pool_acquire",
+                    Op::Alloc => "lotus_heap_alloc",
+                    _ => unreachable!(),
+                };
+                let fn_value = self
+                    .module
+                    .get_function(fn_name)
+                    .expect("F.22 allocator extern declared");
+                let cell_ptr = self
+                    .builder
+                    .build_call(
+                        fn_value,
+                        &[allocator_ptr.into()],
+                        &format!("{}.{}.call", slot_name, method_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("allocator acquire/alloc returns ptr");
+                Ok(Some(Some((
+                    cell_ptr,
+                    CodegenTy::Cell(Box::new(slot.elem_ty.clone())),
+                ))))
+            }
+            Op::Release | Op::Free => {
+                if args.len() != 1 {
+                    return Err(CodegenError::Unsupported(format!(
+                        "slot `{}`.{}: takes exactly 1 cell arg, got {}",
+                        slot_name,
+                        method_name,
+                        args.len()
+                    )));
+                }
+                let (cell_val, cell_ty) =
+                    self.lower_expr(&args[0], scope)?;
+                let expected = CodegenTy::Cell(Box::new(slot.elem_ty.clone()));
+                if cell_ty != expected {
+                    return Err(CodegenError::Unsupported(format!(
+                        "slot `{}`.{}: expected {:?}, got {:?} — \
+                         cells can only be returned to the slot they \
+                         came from",
+                        slot_name, method_name, expected, cell_ty
+                    )));
+                }
+                let fn_name = match op {
+                    Op::Release => "lotus_pool_release",
+                    Op::Free => "lotus_heap_free",
+                    _ => unreachable!(),
+                };
+                let fn_value = self
+                    .module
+                    .get_function(fn_name)
+                    .expect("F.22 allocator extern declared");
+                self.builder
+                    .build_call(
+                        fn_value,
+                        &[allocator_ptr.into(), cell_val.into()],
+                        &format!("{}.{}.call", slot_name, method_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                // release/free return void at the C ABI. Outer
+                // Some marks "we handled this"; inner None
+                // signals the value-less return. The expr-position
+                // caller in `lower_expr` errors on an inner None,
+                // which matches the user's expectation that
+                // `let x = self.X.release(c);` is meaningless.
+                Ok(Some(None))
             }
         }
     }

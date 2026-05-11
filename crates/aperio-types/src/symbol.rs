@@ -83,6 +83,14 @@ pub struct LocusInfo {
     /// members + the three mode declarations (bulk /
     /// harmonic / resolution).
     pub methods: Vec<MethodInfo>,
+    /// F.22 capacity-tuple slot names declared on this locus
+    /// (`pool X of T;` / `heap Y of T;`). Just the names —
+    /// typecheck only needs to recognize `self.<X>` as
+    /// referring to a slot rather than a field, so the
+    /// `self.X.method()` shape doesn't error with
+    /// "no field `X`". Slot kinds + element types live on
+    /// the codegen-side LocusInfo where dispatch happens.
+    pub capacity_slot_names: Vec<String>,
     pub span: Span,
 }
 
