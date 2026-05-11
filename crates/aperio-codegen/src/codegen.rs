@@ -446,6 +446,7 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "name", "Convention"], "__StdNameConvention"),
     (&["std", "source", "Walk"], "__StdSourceWalk"),
     (&["std", "tagged", "Accumulator"], "__StdTaggedAccumulator"),
+    (&["std", "text", "Sink"], "__StdTextSink"),
     (&["std", "yaml", "Builder"], "__StdYamlBuilder"),
     (&["std", "yaml", "Reader"], "__StdYamlReader"),
 ];

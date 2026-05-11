@@ -143,3 +143,71 @@ fn __md_to_html(md: String) -> String {
     }
     return html;
 }
+
+
+// std::text::Sink — destination locus for flowing text.
+//
+// Types are shapes; loci are flow. A Sink is the *flow* of
+// text toward a destination — not a String it holds. Callers
+// thread one through the walk like `lang: std::lang::Lang` is
+// threaded today, and write rows out as they're produced
+// instead of concatenating a giant String and returning it up
+// the recursion. That single change converts O(n²) report
+// assembly into O(n) streaming.
+//
+// Two destination modes in v0:
+//
+//   dest = "stdout"   → write/line print() immediately. Memory
+//                       cost stays constant regardless of input
+//                       size. The default and the safe pick for
+//                       any partner-facing CLI.
+//
+//   dest = "string"   → accumulate into self.buf; result() exposes
+//                       the full text. Intended for tests that
+//                       want to assert on rendered output. Same
+//                       OOM hazard the streaming mode avoids
+//                       still applies if the produced text is
+//                       large — only safe when bounded.
+//
+// File mode is intentionally absent at v0. The only existing fs
+// primitive is std::io::fs::write_file (truncating), so a "file"
+// Sink would have to buffer fully and write once — same shape
+// as today's skeleton emitter, no OOM win. Add it when
+// fs::append_file lands.
+locus __StdTextSink {
+    params {
+        dest: String = "stdout";
+        buf:  String = "";
+    }
+
+    fn write(s: String) {
+        if self.dest == "string" {
+            self.buf = self.buf + s;
+        } else {
+            print(s);
+        }
+    }
+
+    fn line(s: String) {
+        if self.dest == "string" {
+            self.buf = self.buf + s + "\n";
+        } else {
+            println(s);
+        }
+    }
+
+    // Emit a bare newline. Useful for section spacing.
+    fn newline() {
+        if self.dest == "string" {
+            self.buf = self.buf + "\n";
+        } else {
+            println("");
+        }
+    }
+
+    // String-mode only: return everything written so far.
+    // In stdout mode the buffer is empty by construction.
+    fn result() -> String {
+        return self.buf;
+    }
+}
