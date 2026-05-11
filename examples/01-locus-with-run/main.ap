@@ -15,7 +15,7 @@ locus TickerL {
         let mut i: Int = 0;
         while i < self.n {
             println("tick ", i);
-            time::sleep(self.interval);
+            std::time::sleep(self.interval);
             i = i + 1;
         }
     }

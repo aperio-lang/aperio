@@ -43,7 +43,7 @@ locus PinnedWorker : schedule pinned {
         // first deterministically. Without this, the print
         // order would be non-deterministic — pinned really
         // runs in parallel.
-        time::sleep(50ms);
+        std::time::sleep(50ms);
         println("pinned: ran on its own pthread");
     }
 }

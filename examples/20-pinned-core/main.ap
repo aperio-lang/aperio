@@ -22,14 +22,14 @@
 
 locus CoreZeroWorker : schedule pinned(core = 0) {
     run() {
-        time::sleep(20ms);
+        std::time::sleep(20ms);
         println("worker: ran on core 0 (or fallback if unavailable)");
     }
 }
 
 locus CoreOneWorker : schedule pinned(core = 1) {
     run() {
-        time::sleep(20ms);
+        std::time::sleep(20ms);
         println("worker: ran on core 1 (or fallback if unavailable)");
     }
 }

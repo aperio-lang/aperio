@@ -361,11 +361,15 @@ pub fn time_monotonic(args: &[Value]) -> Result<Value, String> {
 
 pub fn resolve_path(segments: &[&str]) -> Option<Value> {
     match segments {
-        ["time", "sleep"] => Some(Value::Builtin(BuiltinRef {
+        // Canonical `std::time::*` paths (matches the codegen
+        // dispatcher's m79 std-aliases). The bare `time::*` form
+        // is preserved below as a legacy alias for the pre-m79
+        // examples; both route to the same builtin implementations.
+        ["std", "time", "sleep"] | ["time", "sleep"] => Some(Value::Builtin(BuiltinRef {
             name: "time::sleep",
             func: Rc::new(time_sleep),
         })),
-        ["time", "monotonic"] => Some(Value::Builtin(BuiltinRef {
+        ["std", "time", "monotonic"] | ["time", "monotonic"] => Some(Value::Builtin(BuiltinRef {
             name: "time::monotonic",
             func: Rc::new(time_monotonic),
         })),

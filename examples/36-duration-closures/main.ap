@@ -87,15 +87,15 @@ locus Pulser {
         // elapsed time per fire boundary.
         "tick" <- Tick { value: 1 };
         yield;
-        time::sleep(7ms);
+        std::time::sleep(7ms);
 
         "tick" <- Tick { value: 2 };
         yield;
-        time::sleep(7ms);
+        std::time::sleep(7ms);
 
         "tick" <- Tick { value: 3 };
         yield;
-        time::sleep(7ms);
+        std::time::sleep(7ms);
 
         "tick" <- Tick { value: 4 };
         // No yield after the last publish — the post-run

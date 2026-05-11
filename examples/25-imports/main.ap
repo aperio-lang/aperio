@@ -1,25 +1,25 @@
-// 25-imports — multi-file lotus project linked by `import`.
+// 25-imports — multi-file Aperio project under the F.19 per-
+// directory seed model.
 //
 // Three files in this directory:
-//   - types.lt       — `type Trade` definition
-//   - notional.lt    — `fn notional(Trade) -> Decimal` helper,
-//                      itself importing types.lt
-//   - main.lt        — this file, with `fn main()` driving it
+//   - types.ap       — `type Trade` definition
+//   - notional.ap    — `fn notional(Trade) -> Decimal` helper
+//   - main.ap        — this file, with `fn main()` driving it
 //
-// `import "..."` paths resolve relative to the importing
-// file's directory. Cycles short-circuit (re-importing the
-// same canonical path adds nothing). The merged compilation
-// unit is one logical Program; downstream typecheck + codegen
-// see all top-level decls together.
+// F.19 (shipped 2026-05-11) collapses the old per-file `import`
+// shape: every `.ap` file in the directory is part of one seed,
+// every top-level decl is visible to every other file in the
+// same directory in one shared scope. Same shape Go gets from
+// per-package visibility. Build via `aperio build examples/
+// 25-imports` (directory target); the binary lands at
+// `examples/25-imports/25-imports`. Cross-seed imports (one
+// directory reaching into another) are still deferred.
 //
-// Per The Design / lotus, multi-file projects are organisational
+// Per The Design / Aperio, multi-file projects are organisational
 // — the framework's coordination primitives don't change shape
 // because a type lives in a sibling file. The bus and the
 // region allocator stay one unit; what's different is just
 // where the source TEXT lives.
-
-import "types";
-import "notional";
 
 fn main() {
     let t = Trade { symbol: "GOOG", price: 170.5d, qty: 100.0d };

@@ -73,7 +73,7 @@ fn main() {
     // them — pending cells flush before the loop returns 0
     // — but a tiny sleep here makes the output ordering
     // deterministic vs main's println).
-    time::sleep(20ms);
+    std::time::sleep(20ms);
 
     println("main: returning; pinned subscriber will drain + dissolve");
 }

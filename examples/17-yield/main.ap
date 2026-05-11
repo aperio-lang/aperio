@@ -2,7 +2,7 @@
 //
 // Per spec/runtime.md::Schedule classes, the cooperative yield
 // points are: handler exit, lifecycle transition, bus dispatch,
-// `time::sleep`, and explicit `yield`. The first four are
+// `std::time::sleep`, and explicit `yield`. The first four are
 // implicit (the substrate does the right thing automatically).
 // `yield;` is the escape hatch for the rare case where you have
 // a long-internal-loop that wants to let pending bus events

@@ -39,7 +39,7 @@ locus Heartbeat : schedule pinned {
         // Sleep so post-run duration sees ample elapsed time
         // (well past 20ms). The fire happens when run() returns
         // and the pinned thread invokes __duration_closures_wrapper.
-        time::sleep(50ms);
+        std::time::sleep(50ms);
     }
 }
 

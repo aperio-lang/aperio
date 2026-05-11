@@ -28,7 +28,7 @@ locus PinnedJob : schedule pinned {
     }
     run() {
         // Sleep so main can race ahead and print before us.
-        time::sleep(30ms);
+        std::time::sleep(30ms);
         println("pinned.run: doing work on the pinned thread");
     }
     drain() {
