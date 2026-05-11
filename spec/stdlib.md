@@ -194,10 +194,11 @@ in `crates/aperio-codegen/tests/interface_dispatch.rs`.
 **Phase B follow-ups (deferred):** returning an interface value
 from a fn, storing one in a locus param/field, or putting
 interfaces in arrays/tuples — all need fat-pointer deep-copy
-across arena boundaries. The `std::text::Sink` migration
-(separate StdoutSink / StringSink / FileSink loci behind one
-Sink interface) is unblocked but ships in a follow-up
-milestone to keep this commit's blast radius bounded.
+across arena boundaries. The `std::text::Sink` stdlib
+migration (split into `StdoutSink` / `StringSink` / `FileSink`
+loci behind one `Sink` interface) shipped 2026-05-11 as a
+separate commit — see `std::text` in `spec/stdlib.md` and the
+`sink-as-tagged-locus` friction log entry.
 
 Resolves (partial) `notes/aperio-friction.md` 2026-05-10
 sink-as-tagged-locus. Spec entry: F.20 in

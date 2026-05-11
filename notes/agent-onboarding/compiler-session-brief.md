@@ -314,13 +314,11 @@ Real shape-debt the v0 surface carries that future work will
 relieve. Listed here so a fresh compiler session doesn't
 re-rediscover the antipatterns or attempt premature fixes.
 
-### Sink-as-tagged-locus (`std::text::Sink`) [PARTIAL — F.20 Phase A + B shipped; stdlib migration pending]
+### Sink-as-tagged-locus (`std::text::Sink`) [RESOLVED 2026-05-11]
 
-`__StdTextSink` in `crates/aperio-codegen/runtime/stdlib/text.ap`
-still uses `if self.dest == "string" { ... } else { ... }` to
-branch between an in-memory buffer and stdout streaming. The
-language-level blocker is gone; the stdlib migration itself
-remains as a follow-up.
+Originally the canonical example of the no-interfaces-in-Aperio
+friction (one locus with `dest: String` branching inside every
+method). Now fully resolved across three commits:
 
 - **F.20 Phase A (shipped 2026-05-10).** Structural interface
   declarations (`interface Sink { fn write(s: String); ... }`)
@@ -344,12 +342,19 @@ remains as a follow-up.
   fields, arrays/tuples of interfaces) are a Phase B follow-up
   — the data pointer would dangle without fat-pointer
   deep-copy.
-- **Sink stdlib migration (pending).** Replace the tagged
-  `__StdTextSink` with separate StdoutSinkL / StringSinkL /
-  FileSinkL loci behind one `Sink` interface. Unblocked at
-  the language level; lands in its own commit so the codegen
-  commit and the stdlib seed shake-up stay independently
-  reviewable.
+- **Sink stdlib migration (shipped 2026-05-11).**
+  `__StdTextSink` is now a structural interface (`fn write`,
+  `fn line`, `fn newline`); three concrete loci satisfy it —
+  `__StdTextStdoutSink`, `__StdTextStringSink` (carries a buf,
+  exposes `result() -> String`), `__StdTextFileSink` (uses
+  `std::io::fs::write_file_append` for streaming append).
+  User-facing paths: `std::text::{Sink, StdoutSink, StringSink,
+  FileSink}`. End-to-end coverage in
+  `crates/aperio-codegen/tests/sink_polymorphism.rs`. Source-
+  incompatible change: existing callers using
+  `std::text::Sink { dest: "stdout" }` must use
+  `std::text::StdoutSink { }`. One known call site in
+  `apps/ferryman/main.ap`, owned by the app-dev session.
 - **F.21 cascading-dimension interface (sketch).** Paired
   follow-up for the substrate-aware n-dim case (the
   `std::lotus::Grow` family). Spec entry; no implementation.

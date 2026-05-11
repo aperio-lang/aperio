@@ -461,6 +461,9 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "source", "Walk"], "__StdSourceWalk"),
     (&["std", "tagged", "Accumulator"], "__StdTaggedAccumulator"),
     (&["std", "text", "Sink"], "__StdTextSink"),
+    (&["std", "text", "StdoutSink"], "__StdTextStdoutSink"),
+    (&["std", "text", "StringSink"], "__StdTextStringSink"),
+    (&["std", "text", "FileSink"], "__StdTextFileSink"),
     (&["std", "yaml", "Builder"], "__StdYamlBuilder"),
     (&["std", "yaml", "Reader"], "__StdYamlReader"),
 ];
@@ -3522,12 +3525,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     // `std::http::Request` in a fn signature
                     // resolves to TypeRef("__StdHttpRequest").
                     Ok(CodegenTy::TypeRef(mangled.to_string()))
+                } else if self.user_interfaces.contains(mangled) {
+                    // F.20 Phase B + Sink-migration follow-up:
+                    // path-qualified stdlib interface — e.g.
+                    // `std::text::Sink` in a fn signature resolves
+                    // to Interface("__StdTextSink"). Mirrors the
+                    // unqualified-name branch above; the lookup
+                    // table maps the user-facing path to the
+                    // mangled interface name and codegen treats it
+                    // as a fat-pointer-typed slot.
+                    Ok(CodegenTy::Interface(mangled.to_string()))
                 } else {
                     Err(CodegenError::Unsupported(format!(
                         "qualified type `{}` (mangled `{}`) declared in stdlib \
-                         path-renames table but not registered in user_loci or \
-                         user_types yet — sequencing issue: type_expr_to_codegen_ty \
-                         called before pass A0/A1 populated this name",
+                         path-renames table but not registered in user_loci, \
+                         user_types, or user_interfaces yet — sequencing issue: \
+                         type_expr_to_codegen_ty called before pass A0/A1 \
+                         populated this name",
                         segs.join("::"),
                         mangled,
                     )))

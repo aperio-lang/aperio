@@ -127,13 +127,14 @@ value lower as indirect calls through `vtable[i]` with the
 data pointer passed as the implicit self arg.
 
 Interface values are usable as fn parameters and as receivers
-for method calls. The `std::text::Sink` migration (separate
-StdoutSink / StringSink / FileSink loci behind one Sink
-interface) is a stdlib follow-up: now unblocked, but ships in
-a later milestone. Returning an interface value from a fn,
-storing one in a locus param/field, or putting interfaces in
-arrays/tuples is not yet supported — deep-copy across arena
-boundaries for the fat pointer is a Phase B follow-up.
+for method calls. The `std::text::Sink` stdlib migration (split
+`__StdTextSink` into `StdoutSink` / `StringSink` / `FileSink`
+loci behind one `Sink` interface) shipped 2026-05-11; see
+`spec/stdlib.md` and `crates/aperio-codegen/tests/sink_polymorphism.rs`.
+Returning an interface value from a fn, storing one in a locus
+param/field, or putting interfaces in arrays/tuples is not yet
+supported — deep-copy across arena boundaries for the fat
+pointer is a Phase B follow-up.
 
 Interfaces have no default methods at v0; the body is signature-
 only. No interface inheritance, no multi-interface bounds on
