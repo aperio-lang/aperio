@@ -1345,14 +1345,54 @@ impl Parser {
     fn parse_block(&mut self) -> Result<Block, Diag> {
         let lb = self.expect(TokenKind::LBrace, "{")?;
         let mut stmts = Vec::new();
+        let mut tail: Option<Box<Expr>> = None;
         while !self.at(&TokenKind::RBrace) && !matches!(self.peek(), TokenKind::Eof) {
-            stmts.push(self.parse_stmt()?);
+            if let Some(t) = self.parse_block_item(&mut stmts)? {
+                tail = Some(Box::new(t));
+                break;
+            }
         }
         let rb = self.expect(TokenKind::RBrace, "}")?;
         Ok(Block {
             stmts,
+            tail,
             span: lb.span.merge(rb.span),
         })
+    }
+
+    /// Parse a single item inside a block. Pushes the result onto
+    /// `stmts` if it's a statement, or returns the trailing
+    /// expression when an expression-led item ends without `;`
+    /// immediately before the closing `}`. Keyword-led items
+    /// (let / if / match / loops / control flow / nested blocks /
+    /// recovery) always parse as statements — using `if` / `match`
+    /// in tail position is spelled `let x = if ...` at the
+    /// outer let.
+    fn parse_block_item(
+        &mut self,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<Option<Expr>, Diag> {
+        match self.peek() {
+            TokenKind::Let
+            | TokenKind::If
+            | TokenKind::Match
+            | TokenKind::While
+            | TokenKind::For
+            | TokenKind::Return
+            | TokenKind::Break
+            | TokenKind::Continue
+            | TokenKind::Yield
+            | TokenKind::LBrace
+            | TokenKind::Restart
+            | TokenKind::RestartInPlace
+            | TokenKind::Quarantine
+            | TokenKind::Reorganize
+            | TokenKind::Bubble => {
+                stmts.push(self.parse_stmt()?);
+                Ok(None)
+            }
+            _ => self.parse_expr_or_tail(stmts),
+        }
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, Diag> {
@@ -1404,7 +1444,19 @@ impl Parser {
             | TokenKind::Quarantine
             | TokenKind::Reorganize
             | TokenKind::Bubble => self.parse_recovery_stmt(),
-            _ => self.parse_expr_or_assign_stmt(),
+            // Expression-led items go through parse_block_item /
+            // parse_expr_or_tail at the call site so they can become
+            // a trailing-tail expression instead of a stmt. Reaching
+            // this fallthrough means parse_stmt was called with an
+            // expression-led peek, which the dispatcher should have
+            // routed elsewhere.
+            other => Err(Diag::parse(
+                self.peek_token().span,
+                format!(
+                    "internal: parse_stmt called with non-statement token {:?}",
+                    other
+                ),
+            )),
         }
     }
 
@@ -1689,20 +1741,24 @@ impl Parser {
         matches!(self.peek(), TokenKind::Ident(s) if s == "until")
     }
 
-    fn parse_expr_or_assign_stmt(&mut self) -> Result<Stmt, Diag> {
-        // Parse an expression; if followed by `<-`, build a send
-        // statement; if followed by an assignment op, build an
-        // assign statement; else expr-stmt.
+    /// Expression-led block-item: returns Some(expr) if the item turned
+    /// out to be the block's trailing tail (no `;`, immediately before
+    /// `}`); otherwise pushes a Send / Assign / Expr stmt onto `stmts`.
+    fn parse_expr_or_tail(
+        &mut self,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<Option<Expr>, Diag> {
         let expr = self.parse_expr()?;
         if matches!(self.peek(), TokenKind::LeftArrow) {
             self.bump();
             let value = self.parse_expr()?;
             let semi = self.expect(TokenKind::Semi, ";")?;
-            return Ok(Stmt::Send {
+            stmts.push(Stmt::Send {
                 span: expr.span().merge(semi.span),
                 subject: expr,
                 value,
             });
+            return Ok(None);
         }
         if let Some(op) = self.peek_assign_op() {
             let op_span = self.peek_token().span;
@@ -1710,15 +1766,25 @@ impl Parser {
             let value = self.parse_expr()?;
             let semi = self.expect(TokenKind::Semi, ";")?;
             let target = expr_to_lvalue(expr, op_span)?;
-            return Ok(Stmt::Assign {
+            stmts.push(Stmt::Assign {
                 span: target.span.merge(semi.span),
                 target,
                 op,
                 value,
             });
+            return Ok(None);
         }
+        if self.eat(&TokenKind::Semi) {
+            stmts.push(Stmt::Expr(expr));
+            return Ok(None);
+        }
+        if self.at(&TokenKind::RBrace) {
+            return Ok(Some(expr));
+        }
+        // Neither `;` nor `}` — same error shape as the prior
+        // `expect(Semi)` so error messages stay consistent.
         let _ = self.expect(TokenKind::Semi, ";")?;
-        Ok(Stmt::Expr(expr))
+        unreachable!("expect(Semi) at non-Semi non-RBrace token must error")
     }
 
     fn peek_assign_op(&self) -> Option<AssignOp> {

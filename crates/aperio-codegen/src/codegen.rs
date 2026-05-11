@@ -3465,7 +3465,56 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 BlockEnd::Terminated => return Ok(BlockEnd::Terminated),
             }
         }
+        // Stmt-context: the trailing expression (if any) is evaluated
+        // for side effects; its value is discarded. Callers that want
+        // the value (Expr::If / Expr::Block lowering) use
+        // lower_block_as_expr instead.
+        if let Some(tail) = &block.tail {
+            let _ = self.lower_expr(tail, scope)?;
+        }
         Ok(BlockEnd::Open)
+    }
+
+    /// Lower a block in expression-context: lower its statements for
+    /// side effects, then lower the trailing expression and return its
+    /// value. Errors if the block has no trailing expression. Returns
+    /// `(value, ty, BlockEnd)` where BlockEnd reports whether either
+    /// the statements terminated control flow (in which case `value`
+    /// is a poison undef and callers should branch to merge based on
+    /// the reported BlockEnd).
+    fn lower_block_as_expr(
+        &mut self,
+        block: &Block,
+        scope: &mut Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy, BlockEnd), CodegenError> {
+        for stmt in &block.stmts {
+            match self.lower_stmt(stmt, scope)? {
+                BlockEnd::Open => continue,
+                BlockEnd::Terminated => {
+                    // Statements terminated control flow before reaching
+                    // the tail. Synthesize a placeholder value so the
+                    // caller can build the phi shape; it will not be
+                    // selected at runtime because the branch is closed.
+                    let i32_ty = self.context.i32_type();
+                    let undef = i32_ty.get_undef();
+                    return Ok((
+                        undef.into(),
+                        CodegenTy::Int,
+                        BlockEnd::Terminated,
+                    ));
+                }
+            }
+        }
+        match &block.tail {
+            Some(tail) => {
+                let (v, ty) = self.lower_expr(tail, scope)?;
+                Ok((v, ty, BlockEnd::Open))
+            }
+            None => Err(CodegenError::Unsupported(
+                "block used as expression has no trailing expression"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Map a `TypeExpr` to the codegen's `CodegenTy`. Scalar
@@ -4423,6 +4472,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .collect();
         Block {
             stmts: new_stmts,
+            tail: block.tail.clone(),
             span: block.span.clone(),
         }
     }
@@ -11193,11 +11243,132 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     ))),
                 }
             }
+            Expr::If(ifs) => self.lower_if_expr(ifs, scope),
+            Expr::Block(block) => {
+                let mut inner = Scope {
+                    locals: scope.locals.clone(),
+                };
+                let (v, ty, _end) = self.lower_block_as_expr(block, &mut inner)?;
+                Ok((v, ty))
+            }
             _ => Err(CodegenError::Unsupported(format!(
                 "expression form {:?}",
                 std::mem::discriminant(e)
             ))),
         }
+    }
+
+    /// Lower an `if`-as-expression. The then- and else- blocks must
+    /// each have a trailing expression; the values are phi-merged at
+    /// the join point and the phi is the if-expression's value. An
+    /// if without an else (e.g. `if cond { 1 }`) is rejected — there
+    /// is no value to merge on the missing branch.
+    fn lower_if_expr(
+        &mut self,
+        ifs: &IfStmt,
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        let (cond_v, cond_ty) = self.lower_expr(&ifs.cond, scope)?;
+        if cond_ty != CodegenTy::Bool {
+            return Err(CodegenError::Unsupported(format!(
+                "if condition must be Bool; got {:?}",
+                cond_ty
+            )));
+        }
+        let func = self
+            .current_fn
+            .expect("current_fn set while lowering an if-expression");
+        let then_bb = self.context.append_basic_block(func, "ifx.then");
+        let else_bb = self.context.append_basic_block(func, "ifx.else");
+        let merge_bb = self.context.append_basic_block(func, "ifx.end");
+        self.builder
+            .build_conditional_branch(cond_v.into_int_value(), then_bb, else_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // then-branch: lower then-block as expr, capture incoming bb
+        // for the phi (lowering may have created intermediate bbs).
+        self.builder.position_at_end(then_bb);
+        let mut then_scope = Scope {
+            locals: scope.locals.clone(),
+        };
+        let (then_v, then_ty, then_end) =
+            self.lower_block_as_expr(&ifs.then_block, &mut then_scope)?;
+        let then_incoming = self.builder.get_insert_block().unwrap_or(then_bb);
+        if then_end == BlockEnd::Open {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
+        // else-branch: an if-as-expression requires an else with a
+        // trailing expression; lower it through the same expr helper.
+        self.builder.position_at_end(else_bb);
+        let mut else_scope = Scope {
+            locals: scope.locals.clone(),
+        };
+        let (else_v, else_ty, else_end) = match &ifs.else_block {
+            Some(eb) => match eb.as_ref() {
+                ElseBranch::Else(b) => self.lower_block_as_expr(b, &mut else_scope)?,
+                ElseBranch::ElseIf(nested) => {
+                    let (v, ty) = self.lower_if_expr(nested, &else_scope)?;
+                    (v, ty, BlockEnd::Open)
+                }
+            },
+            None => {
+                return Err(CodegenError::Unsupported(
+                    "if-as-expression requires an else branch with a \
+                     trailing expression"
+                        .to_string(),
+                ));
+            }
+        };
+        let else_incoming = self.builder.get_insert_block().unwrap_or(else_bb);
+        if else_end == BlockEnd::Open {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
+        if then_ty != else_ty
+            && then_end == BlockEnd::Open
+            && else_end == BlockEnd::Open
+        {
+            return Err(CodegenError::Unsupported(format!(
+                "if-expression arms have mismatched types: then={:?}, else={:?}",
+                then_ty, else_ty
+            )));
+        }
+
+        // Both arms terminated — value path is unreachable. Build a
+        // placeholder phi shape so callers can keep going, but mark
+        // the merge block as unreachable.
+        if then_end == BlockEnd::Terminated && else_end == BlockEnd::Terminated {
+            self.builder.position_at_end(merge_bb);
+            let undef = self.context.i32_type().get_undef();
+            self.builder
+                .build_unreachable()
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            return Ok((undef.into(), then_ty));
+        }
+
+        self.builder.position_at_end(merge_bb);
+        let result_ty = if then_end == BlockEnd::Open {
+            then_ty
+        } else {
+            else_ty
+        };
+        let llvm_ty = self.llvm_basic_type(&result_ty);
+        let phi = self
+            .builder
+            .build_phi(llvm_ty, "ifx.phi")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        if then_end == BlockEnd::Open {
+            phi.add_incoming(&[(&then_v, then_incoming)]);
+        }
+        if else_end == BlockEnd::Open {
+            phi.add_incoming(&[(&else_v, else_incoming)]);
+        }
+        Ok((phi.as_basic_value(), result_ty))
     }
 
     fn const_param(

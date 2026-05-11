@@ -514,7 +514,27 @@ impl<'a> Checker<'a> {
         for stmt in &block.stmts {
             self.check_stmt(stmt);
         }
+        if let Some(tail) = &block.tail {
+            let _ = self.check_expr(tail);
+        }
         self.locals.pop();
+    }
+
+    /// Block-as-expression typecheck: walks stmts then returns the
+    /// trailing expression's type. Returns `Ty::Unit` if the block
+    /// has no trailing expression (caller decides whether that's an
+    /// error — for if-expression arms it is).
+    fn check_block_as_expr(&mut self, block: &Block) -> Ty {
+        self.locals.push();
+        for stmt in &block.stmts {
+            self.check_stmt(stmt);
+        }
+        let ty = match &block.tail {
+            Some(tail) => self.check_expr(tail),
+            None => Ty::Unit,
+        };
+        self.locals.pop();
+        ty
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -681,6 +701,43 @@ impl<'a> Checker<'a> {
                 ElseBranch::ElseIf(s) => self.check_if(s),
             }
         }
+    }
+
+    /// If-as-expression: cond checked as Bool; then/else arms checked
+    /// as block-expressions; the result type is the unified arm type.
+    /// Returns `Ty::Unknown` if arms disagree (with a diagnostic).
+    fn check_if_as_expr(&mut self, stmt: &IfStmt) -> Ty {
+        let ct = self.check_expr(&stmt.cond);
+        if !ct.assignable_from(&Ty::Prim(PrimType::Bool)) {
+            self.diags.push(Diag::ty(
+                stmt.cond.span(),
+                format!("if condition must be Bool; got `{}`", ct.display()),
+            ));
+        }
+        let then_ty = self.check_block_as_expr(&stmt.then_block);
+        let else_ty = match &stmt.else_block {
+            Some(b) => match b.as_ref() {
+                ElseBranch::Else(blk) => self.check_block_as_expr(blk),
+                ElseBranch::ElseIf(nested) => self.check_if_as_expr(nested),
+            },
+            None => Ty::Unit,
+        };
+        if then_ty.display() != else_ty.display()
+            && !then_ty.assignable_from(&else_ty)
+            && !else_ty.assignable_from(&then_ty)
+        {
+            self.diags.push(Diag::ty(
+                stmt.span,
+                format!(
+                    "if-expression arms have mismatched types: \
+                     then=`{}`, else=`{}`",
+                    then_ty.display(),
+                    else_ty.display()
+                ),
+            ));
+            return Ty::Unknown;
+        }
+        then_ty
     }
 
     fn check_match(&mut self, stmt: &MatchStmt) {
@@ -1184,14 +1241,8 @@ impl<'a> Checker<'a> {
                 Ty::Array(Box::new(elem), Some(*count))
             }
             Expr::Struct { path, inits, span } => self.check_struct_literal(path, inits, *span),
-            Expr::Block(b) => {
-                self.check_block(b);
-                Ty::Unit
-            }
-            Expr::If(s) => {
-                self.check_if(s);
-                Ty::Unit
-            }
+            Expr::Block(b) => self.check_block_as_expr(b),
+            Expr::If(s) => self.check_if_as_expr(s),
             Expr::Match(m) => {
                 self.check_match(m);
                 Ty::Unit

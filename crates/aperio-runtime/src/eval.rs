@@ -280,6 +280,13 @@ impl Interpreter {
             for stmt in &block.stmts {
                 self.exec_stmt(stmt)?;
             }
+            // Stmt-context block: the trailing expression (if any) is
+            // evaluated for side effects; its value is discarded.
+            // Block-as-expression contexts call eval_block_as_expr
+            // instead.
+            if let Some(tail) = &block.tail {
+                let _ = self.eval_expr(tail)?;
+            }
             Ok(())
         })();
         self.env.pop();
@@ -576,6 +583,40 @@ impl Interpreter {
             }
         } else {
             Ok(())
+        }
+    }
+
+    /// Block-as-expression: run stmts then return the trailing
+    /// expression's value. If the block has no trailing expression,
+    /// returns `Value::Unit`.
+    fn eval_block_as_expr(&mut self, block: &Block) -> Result<Value, Signal> {
+        self.env.push();
+        let result = (|| -> Result<Value, Signal> {
+            for stmt in &block.stmts {
+                self.exec_stmt(stmt)?;
+            }
+            match &block.tail {
+                Some(tail) => self.eval_expr(tail),
+                None => Ok(Value::Unit),
+            }
+        })();
+        self.env.pop();
+        result
+    }
+
+    /// If-as-expression: cond gates which arm runs; the chosen arm's
+    /// trailing expression value is the result.
+    fn eval_if_as_expr(&mut self, stmt: &IfStmt) -> Result<Value, Signal> {
+        let cond = self.eval_expr(&stmt.cond)?;
+        if cond.truthy() {
+            self.eval_block_as_expr(&stmt.then_block)
+        } else if let Some(else_branch) = &stmt.else_block {
+            match else_branch.as_ref() {
+                ElseBranch::Else(b) => self.eval_block_as_expr(b),
+                ElseBranch::ElseIf(s) => self.eval_if_as_expr(s),
+            }
+        } else {
+            Ok(Value::Unit)
         }
     }
 
@@ -1088,14 +1129,8 @@ impl Interpreter {
                 Ok(Value::Array(Rc::new(RefCell::new(vs))))
             }
             Expr::Struct { path, inits, .. } => self.eval_struct_or_locus(path, inits),
-            Expr::Block(b) => {
-                self.exec_block(b)?;
-                Ok(Value::Unit)
-            }
-            Expr::If(s) => {
-                self.exec_if(s)?;
-                Ok(Value::Unit)
-            }
+            Expr::Block(b) => self.eval_block_as_expr(b),
+            Expr::If(s) => self.eval_if_as_expr(s),
             Expr::Match(m) => {
                 self.exec_match(m)?;
                 Ok(Value::Unit)

@@ -447,6 +447,14 @@ pub struct QualifiedName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
+    /// Trailing expression (no `;`, immediately before the closing
+    /// `}`). When the block is used as an expression (Expr::Block
+    /// body, Expr::If arm body), this is the block's value. When
+    /// the block is used in stmt-context (function body, loop
+    /// body, etc.), the tail is lowered for side effects and its
+    /// value is discarded — symmetric with how Rust treats a
+    /// trailing expression at the end of a statement-context block.
+    pub tail: Option<Box<Expr>>,
     pub span: Span,
 }
 
