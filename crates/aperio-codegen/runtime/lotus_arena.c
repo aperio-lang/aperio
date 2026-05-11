@@ -217,6 +217,218 @@ void lotus_arena_destroy(lotus_arena_t *a) {
 }
 
 /*
+ * F.22 capacity slot — Pool of T (fixed-size cell recycling).
+ *
+ * A pool holds a singly-linked list of chunks; each chunk is one
+ * malloc holding N contiguous cells. Live cells are handed out
+ * via acquire(); released cells get pushed onto an embedded
+ * free-list (each free cell stores the next-free pointer at its
+ * own base). When acquire() finds an empty free-list, it grows
+ * by malloc'ing a fresh chunk and threading its cells onto the
+ * list.
+ *
+ * Lifetime: wholesale teardown at slot destroy; individual
+ * acquire/release rolls memory through the population without
+ * touching the OS. The locus's parent arena is irrelevant — Pool
+ * owns its own chunks and frees them in destroy.
+ *
+ * Cell stride = max(cell_size, sizeof(void*)) aligned to
+ * cell_align. The sizeof(void*) floor ensures the embedded
+ * free-list pointer fits inside any free cell, even if T's
+ * own size is smaller than a pointer (e.g. Int8 in a future
+ * narrow-int extension).
+ *
+ * Chunks grow geometrically (16, 32, 64, ...) capped at 4096
+ * cells so peak-cells-alive populations don't all malloc on the
+ * same boundary. The cap is tunable; the geometric ramp matches
+ * the arena's "one big chunk amortizes many small allocs"
+ * principle adapted to fixed-stride cells.
+ *
+ * Spec: spec/design-rationale.md §F.22 — "Pool of T — *I hold
+ * a bounded shape of recyclable state.*"
+ */
+
+#define LOTUS_POOL_INITIAL_CELLS 16
+#define LOTUS_POOL_MAX_CHUNK_CELLS 4096
+
+typedef struct lotus_pool_chunk {
+    struct lotus_pool_chunk *next;
+    size_t                   cells;
+    /* cell data follows in the same allocation — first cell
+     * starts at (char *)(chunk) + header_stride. */
+} lotus_pool_chunk_t;
+
+typedef struct lotus_pool {
+    size_t              cell_stride;
+    size_t              cell_align;
+    size_t              header_stride;     /* aligned sizeof(chunk header) */
+    size_t              next_chunk_cells;
+    lotus_pool_chunk_t *chunks;
+    void               *free_head;
+} lotus_pool_t;
+
+lotus_pool_t *lotus_pool_create(size_t cell_size, size_t cell_align) {
+    if (cell_align == 0) cell_align = 8;
+    size_t min_size = cell_size > sizeof(void *) ? cell_size : sizeof(void *);
+    size_t stride   = lotus_align_up(min_size, cell_align);
+    size_t hdr      = lotus_align_up(sizeof(lotus_pool_chunk_t), cell_align);
+    lotus_pool_t *p = (lotus_pool_t *)malloc(sizeof(lotus_pool_t));
+    if (!p) return NULL;
+    p->cell_stride       = stride;
+    p->cell_align        = cell_align;
+    p->header_stride     = hdr;
+    p->next_chunk_cells  = LOTUS_POOL_INITIAL_CELLS;
+    p->chunks            = NULL;
+    p->free_head         = NULL;
+    return p;
+}
+
+static int lotus_pool_grow(lotus_pool_t *p) {
+    size_t n          = p->next_chunk_cells;
+    size_t data_bytes = n * p->cell_stride;
+    void  *raw        = malloc(p->header_stride + data_bytes);
+    if (!raw) return 0;
+    lotus_pool_chunk_t *c = (lotus_pool_chunk_t *)raw;
+    c->next   = p->chunks;
+    c->cells  = n;
+    p->chunks = c;
+    /* Thread the new cells onto the free-list in reverse so the
+     * lowest-address cell ends up at the head — gives acquire-
+     * order locality (first acquire after grow lands on the
+     * lowest address, next acquire lands one stride above, etc.). */
+    char *base = (char *)raw + p->header_stride;
+    for (size_t i = n; i > 0; i--) {
+        char *cell       = base + (i - 1) * p->cell_stride;
+        *(void **)cell   = p->free_head;
+        p->free_head     = cell;
+    }
+    if (p->next_chunk_cells < LOTUS_POOL_MAX_CHUNK_CELLS) {
+        size_t doubled = p->next_chunk_cells * 2;
+        p->next_chunk_cells = doubled > LOTUS_POOL_MAX_CHUNK_CELLS
+                                  ? LOTUS_POOL_MAX_CHUNK_CELLS
+                                  : doubled;
+    }
+    return 1;
+}
+
+void *lotus_pool_acquire(lotus_pool_t *p) {
+    if (!p) return NULL;
+    if (!p->free_head) {
+        if (!lotus_pool_grow(p)) return NULL;
+    }
+    void *cell    = p->free_head;
+    p->free_head  = *(void **)cell;
+    /* Caller treats the cell as uninitialized — we don't memset.
+     * Aperio's let-binding rule says every binding is the type's
+     * initial declaration; the caller writes fields before any
+     * read can observe the stale free-list pointer that still
+     * sits in the cell's first sizeof(void*) bytes. */
+    return cell;
+}
+
+void lotus_pool_release(lotus_pool_t *p, void *cell) {
+    if (!p || !cell) return;
+    *(void **)cell = p->free_head;
+    p->free_head   = cell;
+}
+
+void lotus_pool_destroy(lotus_pool_t *p) {
+    if (!p) return;
+    lotus_pool_chunk_t *c = p->chunks;
+    while (c) {
+        lotus_pool_chunk_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    free(p);
+}
+
+/*
+ * F.22 capacity slot — Heap of T (individually-freed cells with
+ * locus-bounded lifetime).
+ *
+ * Each alloc is one malloc; the heap struct holds a doubly-linked
+ * list of every live cell so free() is O(1) (unlink the cell)
+ * and destroy() can free every still-live cell wholesale.
+ *
+ * The list lives in a per-cell header sitting just before the
+ * returned pointer in the same allocation. Cell payload starts
+ * at base + header_stride, where header_stride is the aligned-up
+ * size of the header. On free(), the header is recovered by
+ * subtracting header_stride from the user pointer.
+ *
+ * Alignment: malloc returns alignof(max_align_t) (typically 16)
+ * regardless of request. Aperio v1 types have alignment ≤ 8
+ * (Int/Float = 8; user structs default to 8 or 16). For
+ * cell_align > alignof(max_align_t) the substrate would need
+ * posix_memalign; v1 doesn't generate such types so we don't
+ * implement the fallback. If a cell_align larger than 16 ever
+ * lands, the assertion path is to extend create() to record an
+ * "oversized align" flag and route alloc through posix_memalign.
+ *
+ * Spec: spec/design-rationale.md §F.22 — "Heap of T — *I hold
+ * growable state bounded by my own lifetime.*"
+ */
+
+typedef struct lotus_heap_cell {
+    struct lotus_heap_cell *prev;
+    struct lotus_heap_cell *next;
+    /* cell payload follows at (char *)(cell) + header_stride. */
+} lotus_heap_cell_t;
+
+typedef struct lotus_heap {
+    size_t              cell_size;
+    size_t              cell_align;
+    size_t              header_stride;
+    lotus_heap_cell_t  *live_head;
+} lotus_heap_t;
+
+lotus_heap_t *lotus_heap_create(size_t cell_size, size_t cell_align) {
+    if (cell_align == 0) cell_align = 8;
+    size_t hdr = lotus_align_up(sizeof(lotus_heap_cell_t), cell_align);
+    lotus_heap_t *h = (lotus_heap_t *)malloc(sizeof(lotus_heap_t));
+    if (!h) return NULL;
+    h->cell_size     = cell_size;
+    h->cell_align    = cell_align;
+    h->header_stride = hdr;
+    h->live_head     = NULL;
+    return h;
+}
+
+void *lotus_heap_alloc(lotus_heap_t *h) {
+    if (!h) return NULL;
+    void *raw = malloc(h->header_stride + h->cell_size);
+    if (!raw) return NULL;
+    lotus_heap_cell_t *cell = (lotus_heap_cell_t *)raw;
+    cell->prev = NULL;
+    cell->next = h->live_head;
+    if (h->live_head) h->live_head->prev = cell;
+    h->live_head = cell;
+    return (char *)raw + h->header_stride;
+}
+
+void lotus_heap_free(lotus_heap_t *h, void *cell) {
+    if (!h || !cell) return;
+    lotus_heap_cell_t *hdr =
+        (lotus_heap_cell_t *)((char *)cell - h->header_stride);
+    if (hdr->prev) hdr->prev->next = hdr->next;
+    else            h->live_head    = hdr->next;
+    if (hdr->next) hdr->next->prev = hdr->prev;
+    free(hdr);
+}
+
+void lotus_heap_destroy(lotus_heap_t *h) {
+    if (!h) return;
+    lotus_heap_cell_t *c = h->live_head;
+    while (c) {
+        lotus_heap_cell_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    free(h);
+}
+
+/*
  * Cooperative scheduler — bus dispatch queue (m26 + m28b stage 1).
  *
  * Per The Design / lotus, every bus dispatch is a substrate

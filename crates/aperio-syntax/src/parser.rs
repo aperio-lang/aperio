@@ -496,6 +496,7 @@ impl Parser {
             TokenKind::Params => self.parse_params_block().map(LocusMember::Params),
             TokenKind::Contract => self.parse_contract_block().map(LocusMember::Contract),
             TokenKind::Bus => self.parse_bus_block().map(LocusMember::Bus),
+            TokenKind::Capacity => self.parse_capacity_block().map(LocusMember::Capacity),
             TokenKind::Birth | TokenKind::Accept | TokenKind::Run | TokenKind::Drain | TokenKind::Dissolve => {
                 self.parse_lifecycle_decl().map(LocusMember::Lifecycle)
             }
@@ -510,6 +511,54 @@ impl Parser {
                 format!("expected locus member, got {:?}", other),
             )),
         }
+    }
+
+    /// F.22 `capacity { pool X of T; heap Y of T; ... }`.
+    /// `pool` and `heap` lex as plain idents (not reserved); the
+    /// parser recognizes them contextually so the surrounding
+    /// identifier pool stays unreserved.
+    fn parse_capacity_block(&mut self) -> Result<CapacityBlock, Diag> {
+        let kw = self.expect(TokenKind::Capacity, "capacity")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut slots = Vec::new();
+        while !self.at(&TokenKind::RBrace)
+            && !matches!(self.peek(), TokenKind::Eof)
+        {
+            slots.push(self.parse_capacity_slot()?);
+        }
+        let close = self.expect(TokenKind::RBrace, "}")?;
+        Ok(CapacityBlock {
+            slots,
+            span: kw.span.merge(close.span),
+        })
+    }
+
+    fn parse_capacity_slot(&mut self) -> Result<CapacitySlot, Diag> {
+        let kind_ident =
+            self.expect_ident("slot kind (`pool` or `heap`)")?;
+        let kind = match kind_ident.name.as_str() {
+            "pool" => CapacitySlotKind::Pool,
+            "heap" => CapacitySlotKind::Heap,
+            other => {
+                return Err(Diag::parse(
+                    kind_ident.span,
+                    format!(
+                        "expected `pool` or `heap` slot kind, got `{}`",
+                        other
+                    ),
+                ));
+            }
+        };
+        let name = self.expect_ident("slot name")?;
+        self.expect(TokenKind::Of, "of")?;
+        let elem_ty = self.parse_type_expr()?;
+        let semi = self.expect(TokenKind::Semi, ";")?;
+        Ok(CapacitySlot {
+            span: kind_ident.span.merge(semi.span),
+            name,
+            kind,
+            elem_ty,
+        })
     }
 
     fn parse_params_block(&mut self) -> Result<ParamsBlock, Diag> {

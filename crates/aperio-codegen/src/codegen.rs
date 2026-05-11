@@ -12,7 +12,7 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
     TargetTriple,
 };
-use inkwell::types::StructType;
+use inkwell::types::{BasicType, StructType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
 };
@@ -1003,6 +1003,33 @@ struct LocusInfo<'ctx> {
     /// dedicated threads for pinned loci.
     #[allow(dead_code)]
     schedule_class: ScheduleClass,
+    /// F.22 capacity-tuple slots declared on this locus. Order is
+    /// declaration order: init runs in this order at instantiation
+    /// (after slot 0 / arena is set); destroy runs in reverse at
+    /// dissolve (before slot 0 / arena destroy). Each entry's
+    /// `struct_field_idx` points at the `__slot_<name>: ptr` field
+    /// appended to the locus struct layout.
+    capacity_slots: Vec<CapacitySlotLayout>,
+}
+
+/// F.22 slot record carried on every LocusInfo. v1 surface:
+/// records name, kind, cell type, and the struct slot where the
+/// allocator pointer lives. Task #17 will widen this to participate
+/// in `self.X.acquire()` / `self.X.alloc()` method dispatch.
+#[derive(Debug, Clone)]
+struct CapacitySlotLayout {
+    name: String,
+    kind: CapacitySlotKind,
+    /// Cell element type (T from `pool/heap X of T`). Used at
+    /// instantiation time to derive cell_size for the
+    /// `lotus_*_create(size, align)` call via inkwell's
+    /// `size_of()` on the LLVM type.
+    elem_ty: CodegenTy,
+    /// Index of the `__slot_<name>: ptr` field in the locus
+    /// struct's LLVM body. Used at instantiation (store the
+    /// create()-returned ptr here) and at dissolve (load the
+    /// ptr and call destroy()).
+    struct_field_idx: u32,
 }
 
 /// Maximum number of children any locus struct's built-in
@@ -1144,6 +1171,52 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let arena_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_arena_destroy", arena_destroy_ty, None);
+
+        // F.22 capacity-tuple substrate primitives.
+        //
+        // declare ptr  @lotus_pool_create(i64 cell_size, i64 cell_align)
+        // declare ptr  @lotus_pool_acquire(ptr pool)
+        // declare void @lotus_pool_release(ptr pool, ptr cell)
+        // declare void @lotus_pool_destroy(ptr pool)
+        // declare ptr  @lotus_heap_create(i64 cell_size, i64 cell_align)
+        // declare ptr  @lotus_heap_alloc(ptr heap)
+        // declare void @lotus_heap_free(ptr heap, ptr cell)
+        // declare void @lotus_heap_destroy(ptr heap)
+        //
+        // Pool of T: fixed-size cell recycling. acquire returns a
+        // cell pointer; release puts it back on the free-list.
+        // Heap of T: individually-freed cells; destroy frees all
+        // still-live cells wholesale. Both type-erased at the C
+        // ABI — codegen passes cell_size and cell_align as i64
+        // params at create time, computed from T's struct layout.
+        let pool_create_ty =
+            ptr_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_pool_create", pool_create_ty, None);
+        let pool_acquire_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_pool_acquire", pool_acquire_ty, None);
+        let pool_release_ty =
+            void_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_pool_release", pool_release_ty, None);
+        let pool_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_pool_destroy", pool_destroy_ty, None);
+        let heap_create_ty =
+            ptr_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_heap_create", heap_create_ty, None);
+        let heap_alloc_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_heap_alloc", heap_alloc_ty, None);
+        let heap_free_ty =
+            void_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_heap_free", heap_free_ty, None);
+        let heap_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_heap_destroy", heap_destroy_ty, None);
 
         // m36: string runtime helpers. Each takes a `ptr` for the
         // destination arena (where the result lives) plus the
@@ -5278,6 +5351,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | LocusMember::Failure(_)
             | LocusMember::Closure(_)
             | LocusMember::Type(_) => {}
+            LocusMember::Capacity(_) => {
+                // F.22 slot cell types are concrete in v1; no
+                // generic-template use sites. Future generic Pool/
+                // Heap (`pool entries of T;` with locus generic
+                // T) would walk slot.elem_ty here.
+            }
         }
         Ok(())
     }
@@ -5888,6 +5967,56 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .insert(c.name.name.clone(), persists);
             }
         }
+
+        // F.22 capacity slots: walk every `capacity { ... }` block
+        // on this locus and append one `__slot_<name>: ptr` field
+        // per declared slot. Order is declaration order across all
+        // capacity blocks (concatenated). The slot's allocator
+        // pointer (lotus_pool_t* or lotus_heap_t*) lives in this
+        // field; per-slot create/destroy live in lower_locus_
+        // instantiation and emit_locus_arena_destroy.
+        //
+        // Restriction 1 (locus cell rejection) is also enforced
+        // here at codegen — typecheck duplicates the check for
+        // better diagnostics, but routing the rejection through
+        // codegen catches the case where typecheck is bypassed
+        // (e.g. internal-test paths) AND grounds the error in
+        // the same CodegenTy world the rest of codegen reasons
+        // in.
+        let mut capacity_slots: Vec<CapacitySlotLayout> = Vec::new();
+        let mut seen_slot_names: BTreeSet<String> = BTreeSet::new();
+        for member in &l.members {
+            let LocusMember::Capacity(cb) = member else {
+                continue;
+            };
+            for slot in &cb.slots {
+                if !seen_slot_names.insert(slot.name.name.clone()) {
+                    return Err(CodegenError::Unsupported(format!(
+                        "locus `{}`: duplicate capacity slot `{}`",
+                        l.name.name, slot.name.name
+                    )));
+                }
+                let elem_ty = self.type_expr_to_codegen_ty(&slot.elem_ty)?;
+                if matches!(elem_ty, CodegenTy::LocusRef(_)) {
+                    return Err(CodegenError::Unsupported(format!(
+                        "locus `{}`: capacity slot `{}` cell type is a \
+                         locus reference; F.22 restriction 1 rejects \
+                         locus-typed cells — route locus membership \
+                         through `accept(c: ...)` instead",
+                        l.name.name, slot.name.name
+                    )));
+                }
+                let slot_field_idx = idx;
+                llvm_field_tys.push(ptr_t.into());
+                idx += 1;
+                capacity_slots.push(CapacitySlotLayout {
+                    name: slot.name.name.clone(),
+                    kind: slot.kind,
+                    elem_ty,
+                    struct_field_idx: slot_field_idx,
+                });
+            }
+        }
         let _ = idx;
 
         let struct_ty = self
@@ -5928,6 +6057,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 mailbox_field_idx,
                 projection_class,
                 schedule_class,
+                capacity_slots,
             },
         );
         Ok(())
@@ -6386,6 +6516,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         "locus `{}` member kind not yet lowered to codegen",
                         l.name.name
                     )));
+                }
+                LocusMember::Capacity(_) => {
+                    // F.22 slots have no method-decl phase — the
+                    // struct layout, slot init, and slot destroy
+                    // are already wired in declare_locus_struct,
+                    // lower_locus_instantiation, and
+                    // emit_locus_arena_destroy. The user-facing
+                    // `self.X.acquire()` dispatch lands in #17.
                 }
             }
         }
@@ -16230,6 +16368,55 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_store(arena_field, new_arena)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
+        // F.22 capacity slots: after slot 0 (arena) is set, init
+        // each declared slot in declaration order by calling
+        // `lotus_pool_create(size, 8)` or `lotus_heap_create(size,
+        // 8)` and storing the returned allocator pointer into the
+        // slot's struct field. Per spec §F.22 §"Slot lifetime",
+        // slot init runs after slot 0 and before the locus's own
+        // field initializers. The 8-byte alignment matches Aperio
+        // v0's universal scalar alignment — every value-shape
+        // type lays out at 8-byte alignment in the locus struct,
+        // so cells inherit the same.
+        for slot in &info.capacity_slots {
+            let cell_size = self
+                .llvm_basic_type(&slot.elem_ty)
+                .size_of()
+                .expect("cell type has known size at LLVM level");
+            let align_const = self.context.i64_type().const_int(8, false);
+            let create_fn_name = match slot.kind {
+                CapacitySlotKind::Pool => "lotus_pool_create",
+                CapacitySlotKind::Heap => "lotus_heap_create",
+            };
+            let create_fn = self
+                .module
+                .get_function(create_fn_name)
+                .expect("F.22 allocator extern declared");
+            let allocator_ptr = self
+                .builder
+                .build_call(
+                    create_fn,
+                    &[cell_size.into(), align_const.into()],
+                    &format!("{}.{}.create", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .try_as_basic_value()
+                .left()
+                .expect("F.22 allocator create returns ptr");
+            let slot_field_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    slot.struct_field_idx,
+                    &format!("{}.__slot_{}.ptr", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(slot_field_ptr, allocator_ptr)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
         // Initialize each field. Overrides go through lower_expr in
         // the caller's scope so any expression — not just literals —
         // can be passed. Defaults are either pre-resolved scalar
@@ -20200,6 +20387,48 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
+        // F.22: tear down capacity slots in reverse declaration
+        // order, before slot 0 / arena destroy. Each slot loads
+        // its allocator pointer from `__slot_<name>` and calls
+        // the matching destroy fn. Per spec §F.22, slot teardown
+        // sits between drain/dissolve closures and the arena's
+        // wholesale free, so cells outlive everything except
+        // the arena itself during dissolve.
+        for slot in info.capacity_slots.iter().rev() {
+            let slot_field_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    slot.struct_field_idx,
+                    &format!("{}.__slot_{}.ptr", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let allocator = self
+                .builder
+                .build_load(
+                    ptr_t,
+                    slot_field_ptr,
+                    &format!("{}.__slot_{}", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let destroy_fn_name = match slot.kind {
+                CapacitySlotKind::Pool => "lotus_pool_destroy",
+                CapacitySlotKind::Heap => "lotus_heap_destroy",
+            };
+            let destroy_fn = self
+                .module
+                .get_function(destroy_fn_name)
+                .expect("F.22 allocator destroy extern declared");
+            self.builder
+                .build_call(
+                    destroy_fn,
+                    &[allocator.into()],
+                    &format!("{}.{}.destroy", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+
         let arena_field_ptr = self
             .builder
             .build_struct_gep(

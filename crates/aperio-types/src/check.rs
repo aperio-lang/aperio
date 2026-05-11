@@ -491,6 +491,53 @@ impl<'a> Checker<'a> {
                 }
             }
             LocusMember::Type(_) => {}
+            LocusMember::Capacity(cb) => {
+                // F.22 restriction 1: cell type must be a value-shape,
+                // not a LocusRef. Loci have lifecycle; recycling
+                // (Pool.release) or individual free (Heap.free) would
+                // orphan the locus. The spec routes locus-membership
+                // through `accept(c: SomeL)`; slots are for types.
+                let mut seen: BTreeMap<String, Span> = BTreeMap::new();
+                for slot in &cb.slots {
+                    if let Some(prev) = seen.insert(
+                        slot.name.name.clone(),
+                        slot.name.span,
+                    ) {
+                        self.diags.push(Diag::ty(
+                            slot.name.span,
+                            format!(
+                                "duplicate capacity slot name `{}` \
+                                 (first declared at {:?})",
+                                slot.name.name, prev
+                            ),
+                        ));
+                    }
+                    let elem_ty = resolve_type_expr(&slot.elem_ty, self.known);
+                    let kind_word = match slot.kind {
+                        CapacitySlotKind::Pool => "pool",
+                        CapacitySlotKind::Heap => "heap",
+                    };
+                    if let Ty::Named(n) = &elem_ty {
+                        if matches!(
+                            self.top.symbols.get(n),
+                            Some(TopSymbol::Locus(_))
+                        ) {
+                            self.diags.push(Diag::ty(
+                                slot.span,
+                                format!(
+                                    "capacity slot `{} {} of {}`: cell \
+                                     type cannot be a locus (locus \
+                                     recycling/free would orphan the \
+                                     locus — route locus membership \
+                                     through `accept(c: {})` instead; \
+                                     see spec §F.22 restriction 1)",
+                                    kind_word, slot.name.name, n, n
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 

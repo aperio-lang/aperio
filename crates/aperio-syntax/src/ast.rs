@@ -147,6 +147,41 @@ pub enum LocusMember {
     Fn(FnDecl),
     Const(ConstDecl),
     Type(TypeDecl),
+    /// F.22 capacity-tuple: zero or more named storage slots
+    /// (`pool X of T;` / `heap Y of T;`) declared inside a
+    /// `capacity { ... }` block. Slot 0 (the locus's own Arena)
+    /// stays implicit — capacity declarations cover slots 1..N.
+    Capacity(CapacityBlock),
+}
+
+/// F.22 `capacity { ... }` block: a flat list of slot
+/// declarations. Order is significant — slot init runs in
+/// declaration order at instantiation; slot teardown runs in
+/// reverse declaration order at dissolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapacityBlock {
+    pub slots: Vec<CapacitySlot>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapacitySlot {
+    pub name: Ident,
+    pub kind: CapacitySlotKind,
+    pub elem_ty: TypeExpr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacitySlotKind {
+    /// Fixed-size cell recycling (`pool entries of Int;`).
+    /// Population is bounded; release-acquire rolls memory
+    /// through cells without touching the OS.
+    Pool,
+    /// Individually-freed cells with locus-bounded lifetime
+    /// (`heap registry of Command;`). Wholesale teardown at
+    /// slot destroy frees any still-live cells.
+    Heap,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -50,6 +50,12 @@ pub enum TokenKind {
     Params,
     Contract,
     Bus,
+    /// F.22 `capacity { ... }` block introducer. Inside the
+    /// block, `pool` and `heap` (slot kinds) stay as plain
+    /// idents and are recognized contextually by the parser —
+    /// frees the math-shaped identifier pool outside this block
+    /// (matches the `approx`/`within` precedent from F.10).
+    Capacity,
 
     // Keywords — lifecycle
     Birth,
@@ -369,6 +375,7 @@ impl<'a> Lexer<'a> {
             "params" => TokenKind::Params,
             "contract" => TokenKind::Contract,
             "bus" => TokenKind::Bus,
+            "capacity" => TokenKind::Capacity,
 
             // Lifecycle
             "birth" => TokenKind::Birth,
