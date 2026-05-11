@@ -583,6 +583,41 @@ locus __StdLangMorpheme {
         return "";
     }
 
+    // Recognize per-flavor language builtins — `len`, `make`,
+    // `panic`, etc. for Go. The outward-tower walker uses this
+    // to short-circuit motion rewriting for calls into the
+    // language's own primitive operations: those calls aren't
+    // domain vocabulary and shouldn't surface as `<unknown:X>`
+    // noise in the report.
+    //
+    // Maintained as a flat per-flavor table for now. Per the
+    // styleguide's rolling-the-design rule: this is the same
+    // shape as `lookup_morpheme` — flavor switch + literal
+    // matches, no foreign machinery.
+    fn is_builtin(name: String) -> Bool {
+        if self.flavor == "go" {
+            if name == "append"  { return true; }
+            if name == "cap"     { return true; }
+            if name == "clear"   { return true; }
+            if name == "close"   { return true; }
+            if name == "complex" { return true; }
+            if name == "copy"    { return true; }
+            if name == "delete"  { return true; }
+            if name == "imag"    { return true; }
+            if name == "len"     { return true; }
+            if name == "make"    { return true; }
+            if name == "max"     { return true; }
+            if name == "min"     { return true; }
+            if name == "new"     { return true; }
+            if name == "panic"   { return true; }
+            if name == "print"   { return true; }
+            if name == "println" { return true; }
+            if name == "real"    { return true; }
+            if name == "recover" { return true; }
+        }
+        return false;
+    }
+
     // Agent-noun suffix rule with min-stem guard. See the design
     // note for why min-morpheme-6 (= min-stem-4) is the right
     // threshold.

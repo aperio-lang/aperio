@@ -458,6 +458,16 @@ fn __walk_outward(calls: String, fn_defs: String,
         let callee = it.line_at(callees, from);
         from = it.next_idx(callees, from);
         if len(callee) == 0 { continue; }
+        // Language builtins (`len`, `make`, `panic`, ...) aren't
+        // domain vocabulary — skip the morpheme rewrite that
+        // would otherwise emit `<unknown:len>` etc., and tag the
+        // row as `{builtin}` so the reader sees a leaf with
+        // language-level meaning. Don't recurse — no fn_def.
+        if r.is_builtin(callee) {
+            out = out + __render_call_row(depth, callee,
+                                          "{builtin}", "");
+            continue;
+        }
         let callee_file = __lookup_fn_file(fn_defs, callee);
         let motion = r.name_to_motion(callee);
         if len(callee_file) == 0 {
