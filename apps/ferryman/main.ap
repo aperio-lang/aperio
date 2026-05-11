@@ -1405,10 +1405,612 @@ locus FerrymanL {
     }
 }
 
+// ============================================================
+// Skeleton stage — emits the lotus.yaml document for ferryman's
+// pivot to a two-pass (skeleton + agent enrichment + render)
+// pipeline. The walker is a fork of `__unified_walk` that
+// preserves call receivers; emitted rows are translated to YAML
+// by the build helpers below. The morpheme rewriter is NOT
+// invoked here — that's the agent's job during enrichment.
+// ============================================================
+
+// Tree-sitter walk that emits RCALL rows (receiver-preserving)
+// in place of CALL rows. Other tagged rows (PKG/IMP/FN_DEF/
+// OP_*/TYPE/WIRE) are identical to __unified_walk's.
+fn __skeleton_walk(lang: std::lang::Lang, node: Int, in_import: Bool,
+                   caller: String) -> String {
+    if node == 0 { return ""; }
+    let mut acc = "";
+    if lang.is_package_clause(node) {
+        acc = acc + "PKG:" + lang.extract_package_name(node) + "\n";
+    }
+    let mut now_in_import = in_import;
+    if lang.is_import_decl(node) { now_in_import = true; }
+    if now_in_import && lang.is_string_literal(node) {
+        let raw = std::ts::node_text(node);
+        acc = acc + "IMP:" + lang.strip_string_quotes(raw) + "\n";
+    }
+    let mut now_caller = caller;
+    if lang.is_fn_decl(node) {
+        acc = acc + "FN_DEF:" + lang.extract_fn_name(node) + "\n";
+        if lang.is_main_fn(node) {
+            acc = acc + "OP_MAIN:1\n";
+        } else if lang.is_init_fn(node) {
+            acc = acc + "OP_INIT:1\n";
+        } else if lang.is_http_handler(node) {
+            acc = acc + "OP_HANDLER:" + lang.extract_fn_name(node) + "\n";
+        }
+        now_caller = lang.extract_fn_name(node);
+    }
+    if lang.is_concurrent_spawn(node) {
+        let kind = lang.spawn_kind(node);
+        let target = lang.extract_spawn_target(node);
+        acc = acc + "OP_SPAWN:" + kind + ":" + target + "\n";
+    }
+    if lang.is_infinite_loop(node) {
+        acc = acc + "OP_LOOP:1\n";
+    }
+    if lang.is_type_spec(node) {
+        acc = acc + "TYPE:" + lang.extract_type_name(node) + "\n";
+    }
+    if lang.is_handler_registration(node) {
+        let route = lang.extract_handler_route(node);
+        let target = lang.extract_handler_target(node);
+        if len(route) > 0 && len(target) > 0 {
+            acc = acc + "WIRE:" + target + "->" + route + "\n";
+        }
+    }
+    if lang.is_call_expression(node) && len(now_caller) > 0
+            && !lang.is_handler_registration(node) {
+        let receiver = lang.extract_call_receiver(node);
+        let cname = lang.extract_call_name(node);
+        if len(cname) > 0 {
+            acc = acc + "RCALL:" + now_caller + ":"
+                + receiver + "|" + cname + "\n";
+        }
+    }
+    let n = std::ts::node_named_child_count(node);
+    let mut i = 0;
+    while i < n {
+        let c = std::ts::node_named_child(node, i);
+        acc = acc + __skeleton_walk(lang, c, now_in_import, now_caller);
+        i = i + 1;
+    }
+    return acc;
+}
+
+// Cross-dir Walk callback. Mirrors __cross_dir_callback but
+// routes RCALL: rows through (and drops the legacy CALL: tag,
+// which __skeleton_walk doesn't emit).
+fn __skel_cross_dir_callback(lang: std::lang::Lang, name: String,
+                             root: Int) -> String {
+    let walk = __skeleton_walk(lang, root, false, "");
+    let it = std::iter::Lines { };
+    let mut out = "";
+    let mut from = 0;
+    while from >= 0 {
+        let line = it.line_at(walk, from);
+        from = it.next_idx(walk, from);
+        if len(line) == 0 { continue; }
+        if len(line) > 4 {
+            if line[0..4] == "IMP:" {
+                let imp = line[4..len(line)];
+                out = out + "IMP_FILE:" + name + ":" + imp + "\n";
+                continue;
+            }
+        }
+        if len(line) > 5 {
+            if line[0..5] == "WIRE:" { out = out + line + "\n"; continue; }
+        }
+        if len(line) > 6 {
+            if line[0..6] == "RCALL:" { out = out + line + "\n"; continue; }
+        }
+        if len(line) > 7 {
+            if line[0..7] == "FN_DEF:" {
+                let fname = line[7..len(line)];
+                out = out + "FN_DEF:" + fname + ":" + name + "\n";
+                continue;
+            }
+        }
+        if len(line) >= 8 {
+            if line[0..8] == "OP_MAIN:" {
+                out = out + "OP_MAIN:" + name + "\n";
+                continue;
+            }
+        }
+    }
+    return out;
+}
+
+// Pure-syntactic call classifier. Receiver shape + fn_defs
+// presence + builtin table determine kind. NO morpheme calls.
+//   bare name + builtin           → "builtin"
+//   bare name + defined here      → "internal"
+//   bare name + not defined here  → "external"
+//   lowercase recv                → "method"  (local var, likely)
+//   uppercase recv                → "external" (PkgName.Func)
+// The lowercase-vs-PkgName ambiguity (lowercase can be either a
+// local var or a Go package name) is left to the agent to
+// resolve during enrichment. v0 reports "method" for lowercase
+// and lets the agent reclassify if needed.
+fn __classify_callee(receiver: String, name: String,
+                     fn_defs: String, lang: std::lang::Lang) -> String {
+    if len(receiver) == 0 {
+        if lang.is_builtin(name) { return "builtin"; }
+        if len(__lookup_fn_file(fn_defs, name)) > 0 { return "internal"; }
+        return "external";
+    }
+    let first = receiver[0..1];
+    let upper = std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", first) >= 0;
+    if upper { return "external"; }
+    return "method";
+}
+
+// Like __callees_of but for RCALL rows. Returns each callee
+// encoded as "<receiver>|<name>" on its own line.
+fn __rcallees_of(rcalls: String, caller: String) -> String {
+    let needle = "RCALL:" + caller + ":";
+    let nlen = len(needle);
+    let it = std::iter::Lines { };
+    let mut out = "";
+    let mut from = 0;
+    while from >= 0 {
+        let line = it.line_at(rcalls, from);
+        from = it.next_idx(rcalls, from);
+        if len(line) <= nlen { continue; }
+        if line[0..nlen] == needle {
+            out = out + line[nlen..len(line)] + "\n";
+        }
+    }
+    return out;
+}
+
+fn __split_recv(rcallee: String) -> String {
+    let idx = std::str::index_of(rcallee, "|");
+    if idx < 0 { return ""; }
+    return rcallee[0..idx];
+}
+
+fn __split_name(rcallee: String) -> String {
+    let idx = std::str::index_of(rcallee, "|");
+    if idx < 0 { return rcallee; }
+    return rcallee[idx+1..len(rcallee)];
+}
+
+// Emit one outward-tower node + recurse on its callees.
+// `level` is the yaml indent level of the node's content (the
+// column where `call:` starts, divided by 2). Children list
+// items live at level + 2.
+fn __build_outward_node_yaml(b: std::yaml::Builder, lang: std::lang::Lang,
+                             rcalls: String, fn_defs: String,
+                             recv: String, name: String,
+                             visited: String,
+                             level: Int, max_depth: Int,
+                             depth: Int) -> String {
+    let kind = __classify_callee(recv, name, fn_defs, lang);
+    let mut site_val = "{external}";
+    if kind == "internal" {
+        site_val = "(" + __lookup_fn_file(fn_defs, name) + ")";
+    }
+    if kind == "builtin" { site_val = "{builtin}"; }
+    if kind == "method"  { site_val = "{method}";  }
+    let mut out = "";
+    out = out + b.list_item_first_q(level, "call", name);
+    out = out + b.field_q(level, "receiver", recv);
+    out = out + b.field_q(level, "site", site_val);
+    out = out + b.field_q(level, "kind", kind);
+    // Leaves: anything non-internal or at depth cap or already
+    // visited in this branch.
+    let mut recurse = true;
+    if kind != "internal" { recurse = false; }
+    if depth >= max_depth { recurse = false; }
+    if __visited_contains(visited, name) { recurse = false; }
+    if !recurse {
+        out = out + b.empty_list(level, "children");
+        return out;
+    }
+    let callees = __rcallees_of(rcalls, name);
+    if len(callees) == 0 {
+        out = out + b.empty_list(level, "children");
+        return out;
+    }
+    out = out + b.nested_open(level, "children");
+    let new_visited = visited + name + "\n";
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    while from >= 0 {
+        let entry = it.line_at(callees, from);
+        from = it.next_idx(callees, from);
+        if len(entry) == 0 { continue; }
+        let crecv = __split_recv(entry);
+        let cname = __split_name(entry);
+        out = out + __build_outward_node_yaml(b, lang, rcalls, fn_defs,
+                                              crecv, cname, new_visited,
+                                              level + 2, max_depth,
+                                              depth + 1);
+    }
+    return out;
+}
+
+// Emit the outward_tower section as yaml. `level` is the indent
+// level at which `outward_tower:` is placed.
+fn __build_outward_tower_yaml(b: std::yaml::Builder, lang: std::lang::Lang,
+                              rcalls: String, fn_defs: String,
+                              main_file: String, level: Int) -> String {
+    let mut out = "";
+    out = out + b.nested_open(level, "outward_tower");
+    out = out + b.field_q(level + 1, "root", "main");
+    out = out + b.field_q(level + 1, "root_file", main_file);
+    let callees = __rcallees_of(rcalls, "main");
+    if len(callees) == 0 {
+        out = out + b.empty_list(level + 1, "nodes");
+        return out;
+    }
+    out = out + b.nested_open(level + 1, "nodes");
+    let visited = "main\n";
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    while from >= 0 {
+        let entry = it.line_at(callees, from);
+        from = it.next_idx(callees, from);
+        if len(entry) == 0 { continue; }
+        let crecv = __split_recv(entry);
+        let cname = __split_name(entry);
+        // Children items live at (level+1)+2 = level+3.
+        out = out + __build_outward_node_yaml(b, lang, rcalls, fn_defs,
+                                              crecv, cname, visited,
+                                              level + 3, 4, 0);
+    }
+    return out;
+}
+
+// Walk IMP_FILE rows and return a newline-separated list of
+// unique file names, in first-seen order.
+fn __unique_files_in_imports(imports_by_file: String) -> String {
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    let mut seen = "";
+    let mut out = "";
+    let prefix = "IMP_FILE:";
+    let plen = len(prefix);
+    while from >= 0 {
+        let line = it.line_at(imports_by_file, from);
+        from = it.next_idx(imports_by_file, from);
+        if len(line) <= plen { continue; }
+        if line[0..plen] != prefix { continue; }
+        let rest = line[plen..len(line)];
+        let col = std::str::index_of(rest, ":");
+        if col < 0 { continue; }
+        let f = rest[0..col];
+        if !__visited_contains(seen, f) {
+            seen = seen + f + "\n";
+            out = out + f + "\n";
+        }
+    }
+    return out;
+}
+
+// Emit the inward_tower section as yaml.
+fn __build_inward_tower_yaml(b: std::yaml::Builder,
+                             imports_by_file: String,
+                             module_name: String, level: Int) -> String {
+    let mut out = "";
+    out = out + b.nested_open(level, "inward_tower");
+    let files = __unique_files_in_imports(imports_by_file);
+    if len(files) == 0 {
+        out = out + b.empty_list(level + 1, "files");
+        return out;
+    }
+    out = out + b.nested_open(level + 1, "files");
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    while from >= 0 {
+        let f = it.line_at(files, from);
+        from = it.next_idx(files, from);
+        if len(f) == 0 { continue; }
+        // File item content at level+3.
+        out = out + b.list_item_first_q(level + 3, "file", f);
+        let imps = __imports_of(imports_by_file, f);
+        if len(imps) == 0 {
+            out = out + b.empty_list(level + 3, "imports");
+            continue;
+        }
+        out = out + b.nested_open(level + 3, "imports");
+        let it2 = std::iter::Lines { };
+        let mut from2 = 0;
+        while from2 >= 0 {
+            let imp = it2.line_at(imps, from2);
+            from2 = it2.next_idx(imps, from2);
+            if len(imp) == 0 { continue; }
+            let kind = __classify_import(imp, module_name);
+            // Import item content at level+5.
+            out = out + b.list_item_first_q(level + 5, "path", imp);
+            out = out + b.field_q(level + 5, "kind", kind);
+        }
+    }
+    return out;
+}
+
+// Per-file yaml emission. Parses `name` once and extracts the
+// mechanical signals the renderer needs: package, has_main,
+// has_init, n_handlers, n_spawns, n_loops.
+fn __build_per_file_yaml(b: std::yaml::Builder, lang: std::lang::Lang,
+                         binary_dir: String, name: String,
+                         level: Int) -> String {
+    let path = binary_dir + "/" + name;
+    let src = std::io::fs::read_file(path);
+    let mut out = "";
+    out = out + b.list_item_first_q(level, "file", name);
+    if len(src) == 0 {
+        out = out + b.field_q(level, "package", "");
+        out = out + b.field_b(level, "has_main", false);
+        out = out + b.field_b(level, "has_init", false);
+        out = out + b.field_i(level, "n_handlers", 0);
+        out = out + b.field_i(level, "n_spawns", 0);
+        out = out + b.field_i(level, "n_loops", 0);
+        return out;
+    }
+    let tree = lang.parse(src);
+    if tree == 0 {
+        out = out + b.field_q(level, "package", "");
+        out = out + b.field_b(level, "has_main", false);
+        out = out + b.field_b(level, "has_init", false);
+        out = out + b.field_i(level, "n_handlers", 0);
+        out = out + b.field_i(level, "n_spawns", 0);
+        out = out + b.field_i(level, "n_loops", 0);
+        return out;
+    }
+    let root = std::ts::root_node(tree);
+    let walk = __skeleton_walk(lang, root, false, "");
+    let ta = std::tagged::Accumulator { };
+    let pkg = ta.first_body(walk, "PKG");
+    let has_main = ta.count(walk, "OP_MAIN") > 0;
+    let has_init = ta.count(walk, "OP_INIT") > 0;
+    let n_handlers = ta.count(walk, "OP_HANDLER");
+    let n_spawns = ta.count(walk, "OP_SPAWN");
+    let n_loops = ta.count(walk, "OP_LOOP");
+    out = out + b.field_q(level, "package", pkg);
+    out = out + b.field_b(level, "has_main", has_main);
+    out = out + b.field_b(level, "has_init", has_init);
+    out = out + b.field_i(level, "n_handlers", n_handlers);
+    out = out + b.field_i(level, "n_spawns", n_spawns);
+    out = out + b.field_i(level, "n_loops", n_loops);
+    return out;
+}
+
+// Aggregate cross-dir rows for one binary into the per-binary
+// yaml block. Caller already extracted `name`, `rel_path`, etc.
+fn __build_binary_yaml(b: std::yaml::Builder, lang: std::lang::Lang,
+                       binary_dir: String, rel_path: String,
+                       module_name: String, module_root: String,
+                       flavor: String, level: Int) -> String {
+    let mut out = "";
+    // Binary list item first field at content level `level`.
+    // Continuation fields use plain field calls at the same level.
+    let bin_name = rel_path;  // Use rel_path as the binary name for v0.
+    out = out + b.list_item_first_q(level, "name", bin_name);
+    out = out + b.field_q(level, "rel_path", rel_path);
+
+    // Cross-dir walk to aggregate cross-file FN_DEF, RCALL,
+    // IMP_FILE rows. Same shape as __drive_one_binary's
+    // pre-render pass, but with the skeleton callback.
+    let w = std::source::Walk {
+        flavor: flavor,
+        on_file: __skel_cross_dir_callback,
+    };
+    let user_walk = w.each_file(binary_dir);
+    let mut combined = user_walk;
+    if len(module_name) > 0 {
+        let local_imps = __collect_local_imports(user_walk, module_name);
+        let it_li = std::iter::Lines { };
+        let mut lfrom = 0;
+        while lfrom >= 0 {
+            let imp = it_li.line_at(local_imps, lfrom);
+            lfrom = it_li.next_idx(local_imps, lfrom);
+            if len(imp) == 0 { continue; }
+            let sib_dir = __local_import_to_dir(module_root,
+                                                module_name, imp);
+            let ml = len(module_name);
+            let mut sib_prefix = "";
+            if len(imp) > ml { sib_prefix = imp[ml+1..len(imp)] + "/"; }
+            let sib_walk = w.each_file(sib_dir);
+            combined = combined + __prefix_stamp(sib_walk, sib_prefix);
+        }
+    }
+
+    let mut fn_defs = "";
+    let mut rcalls = "";
+    let mut main_file = "";
+    let mut imports_by_file = "";
+    let it_c = std::iter::Lines { };
+    let mut cfrom = 0;
+    while cfrom >= 0 {
+        let sline = it_c.line_at(combined, cfrom);
+        cfrom = it_c.next_idx(combined, cfrom);
+        if len(sline) == 0 { continue; }
+        if len(sline) > 6 {
+            if sline[0..6] == "RCALL:" {
+                rcalls = rcalls + sline + "\n";
+                continue;
+            }
+        }
+        if len(sline) > 7 {
+            if sline[0..7] == "FN_DEF:" {
+                fn_defs = fn_defs + sline + "\n";
+                continue;
+            }
+        }
+        if len(sline) > 9 {
+            if sline[0..9] == "IMP_FILE:" {
+                imports_by_file = imports_by_file + sline + "\n";
+                continue;
+            }
+        }
+        if len(sline) >= 8 {
+            if sline[0..8] == "OP_MAIN:" {
+                let body = sline[8..len(sline)];
+                if std::str::index_of(body, "/") < 0 {
+                    if len(main_file) == 0 { main_file = body; }
+                }
+            }
+        }
+    }
+
+    // entrypoint_file + package come from the resolved main_file's
+    // own walk. If no main was found, leave entrypoint empty.
+    let mut entry_file = main_file;
+    if len(entry_file) == 0 { entry_file = "main.go"; }
+    out = out + b.field_q(level, "entrypoint_file", entry_file);
+
+    // Re-parse main_file to extract package name. Cheap.
+    let mut pkg = "main";
+    if len(main_file) > 0 {
+        let src = std::io::fs::read_file(binary_dir + "/" + main_file);
+        if len(src) > 0 {
+            let tree = lang.parse(src);
+            if tree != 0 {
+                let r2 = std::ts::root_node(tree);
+                let w2 = __skeleton_walk(lang, r2, false, "");
+                let ta = std::tagged::Accumulator { };
+                let p = ta.first_body(w2, "PKG");
+                if len(p) > 0 { pkg = p; }
+            }
+        }
+    }
+    out = out + b.field_q(level, "package", pkg);
+
+    // files: list of per-file blocks (mechanical signals only —
+    // fns/types/imports lists deferred; agent enrichment adds
+    // classification + contributes_to).
+    let entries = std::io::fs::list_dir(binary_dir);
+    if len(entries) == 0 {
+        out = out + b.empty_list(level, "files");
+    } else {
+        out = out + b.nested_open(level, "files");
+        let it_e = std::iter::Lines { };
+        let mut efrom = 0;
+        let mut any_file = false;
+        while efrom >= 0 {
+            let fname = it_e.line_at(entries, efrom);
+            efrom = it_e.next_idx(entries, efrom);
+            if len(fname) == 0 { continue; }
+            if std::io::fs::extension(fname) != ".go" { continue; }
+            any_file = true;
+            // File item content at level + 2.
+            out = out + __build_per_file_yaml(b, lang, binary_dir,
+                                              fname, level + 2);
+        }
+        if !any_file {
+            // header was emitted with no items — patch with empty
+            // marker. Easiest: leave as-is; readers will see
+            // list_count = 0.
+            out = out + "";
+        }
+    }
+
+    // outward_tower at indent `level`.
+    out = out + __build_outward_tower_yaml(b, lang, rcalls, fn_defs,
+                                           entry_file, level);
+
+    // inward_tower at indent `level`.
+    out = out + __build_inward_tower_yaml(b, imports_by_file,
+                                          module_name, level);
+
+    return out;
+}
+
+// Top-level codebase header.
+fn __build_codebase_header_yaml(b: std::yaml::Builder, root: String,
+                                flavor: String, module_name: String,
+                                module_root: String) -> String {
+    let mut out = "";
+    out = out + b.field_q(0, "schema_version", "1");
+    out = out + b.nested_open(0, "codebase");
+    out = out + b.field_q(1, "root", root);
+    out = out + b.field_q(1, "flavor", flavor);
+    out = out + b.field_q(1, "module_name", module_name);
+    out = out + b.field_q(1, "module_root", module_root);
+    return out;
+}
+
+// Drive the whole skeleton emission for a repo.
+fn __build_skeleton(repo: String, flavor: String) -> String {
+    let lang = std::lang::Lang { flavor: flavor };
+    let b = std::yaml::Builder { };
+
+    let mut module_name = "";
+    let mut module_root = "";
+    let mod_root_candidate = __find_module_root(repo);
+    if len(mod_root_candidate) > 0 {
+        module_root = mod_root_candidate;
+        let mod_text = std::io::fs::read_file(module_root + "/go.mod");
+        module_name = __extract_module_name(mod_text);
+    }
+
+    let mut out = "";
+    out = out + __build_codebase_header_yaml(b, repo, flavor,
+                                             module_name, module_root);
+
+    let mains = __find_main_dirs(repo, 0, 6);
+    let n_binaries = __count_lines(mains);
+    if n_binaries == 0 {
+        // No discovered binaries. Treat user-given dir as a single
+        // binary (matches __drive's fallback). For v0, emit an empty
+        // binaries list — the agent or downstream can decide what to
+        // do with a no-binary scan.
+        out = out + b.empty_list(0, "binaries");
+        return out;
+    }
+
+    out = out + b.nested_open(0, "binaries");
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    while from >= 0 {
+        let bin_dir = it.line_at(mains, from);
+        from = it.next_idx(mains, from);
+        if len(bin_dir) == 0 { continue; }
+        let rel = __relativize(bin_dir, repo);
+        // Binary item content level = 2.
+        out = out + __build_binary_yaml(b, lang, bin_dir, rel,
+                                        module_name, module_root,
+                                        flavor, 2);
+    }
+    return out;
+}
+
+locus SkeletonL {
+    params {
+        repo: String = "";
+        out_path: String = "skeleton.lotus.yaml";
+        flavor: String = "go";
+    }
+    run() {
+        let yaml = __build_skeleton(self.repo, self.flavor);
+        std::io::fs::write_file(self.out_path, yaml);
+        println("skeleton written: ", self.out_path,
+                " (", len(yaml), " bytes)");
+    }
+}
+
 // The three-step ritual: instantiate Resolver, collapse
 // FerrymanConfig, hand to FerrymanL. Resolver layers default →
 // env (APERIO_DIR / APERIO_FLAVOR) → CLI (argv[1] / argv[2]).
+//
+// New: when argv[1] is "skeleton", dispatch to SkeletonL with
+// argv[2] = repo and argv[3] = output path (default
+// `skeleton.lotus.yaml`). All other invocations run the legacy
+// FerrymanL renderer.
 fn main() {
+    if std::env::args_count() > 1 {
+        if std::env::arg(1) == "skeleton" {
+            let mut repo = "apps/operational-graph/fixture";
+            let mut out_path = "skeleton.lotus.yaml";
+            if std::env::args_count() > 2 { repo = std::env::arg(2); }
+            if std::env::args_count() > 3 { out_path = std::env::arg(3); }
+            SkeletonL { repo: repo, out_path: out_path, flavor: "go" };
+            return;
+        }
+    }
     let r = std::cli::Resolver {
         env_prefix: "APERIO_",
         argv_keys:  "dir\nflavor\n",
