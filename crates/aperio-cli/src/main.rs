@@ -17,8 +17,10 @@
 //! .ap for file targets (hello-world.ap → hello-world).
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -354,6 +356,16 @@ fn run_program(target: &Path) -> ExitCode {
 }
 
 fn run_build(target: &Path) -> ExitCode {
+    // Phase 2i: warn if the CLI binary was built against an older
+    // codegen+runtime source tree than what's on disk now. Silent
+    // miscompile (stale CLI emitting old lowering against new
+    // source) is the worst failure mode for a cold-context agent —
+    // see `apps/log-router/FRICTION.md` 2026-05-10. The check is
+    // best-effort: it skips when source files aren't locatable
+    // (installed binary, moved workspace), or when the user
+    // explicitly opts out via `APERIO_SKIP_STALE_CHECK=1`.
+    check_stale_cli();
+
     // File targets follow `import "..."` directives starting from
     // the entry's directory; directory targets bundle every .ap
     // file in the directory as one seed (the per-dir package
@@ -464,4 +476,86 @@ where
         merged.items.extend(p.items.clone());
     }
     Some(merged)
+}
+
+/// Phase 2i: warn when the CLI binary's bundled codegen + runtime
+/// source snapshots are stale relative to the workspace's on-disk
+/// source. Both the baked-in hash (set at build time by
+/// `build.rs`) and the runtime-recomputed hash use the same
+/// algorithm — DefaultHasher over each file's bytes, salted with
+/// the relative path — so they match exactly when the on-disk
+/// tree is the one the binary was built against.
+///
+/// Skipped silently when:
+///  - `APERIO_SKIP_STALE_CHECK=1` is set,
+///  - the baked codegen directory doesn't exist on this host
+///    (installed binary, moved workspace),
+///  - `build.rs` couldn't locate the workspace at build time
+///    (the env vars are empty).
+fn check_stale_cli() {
+    if env::var_os("APERIO_SKIP_STALE_CHECK")
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_some()
+    {
+        return;
+    }
+    let baked_hash = env!("APERIO_CODEGEN_SRC_HASH");
+    let baked_dir = env!("APERIO_CODEGEN_DIR");
+    if baked_hash.is_empty() || baked_dir.is_empty() {
+        return;
+    }
+    let codegen_dir = Path::new(baked_dir);
+    if !codegen_dir.exists() {
+        return;
+    }
+    let current = compute_codegen_src_hash(codegen_dir);
+    if current != baked_hash {
+        eprintln!(
+            "warning: aperio CLI binary was built against an older \
+             codegen+runtime source tree."
+        );
+        eprintln!(
+            "         {} has changed since the CLI was built; the \
+             emitted binary may use stale lowering.",
+            codegen_dir.display()
+        );
+        eprintln!(
+            "         Rebuild with: cargo build -p aperio-cli"
+        );
+        eprintln!(
+            "         (Set APERIO_SKIP_STALE_CHECK=1 to silence \
+             this warning.)"
+        );
+    }
+}
+
+fn compute_codegen_src_hash(codegen_dir: &Path) -> String {
+    let mut paths: Vec<PathBuf> = vec![
+        codegen_dir.join("src").join("codegen.rs"),
+        codegen_dir.join("runtime").join("lotus_arena.c"),
+    ];
+    let stdlib_dir = codegen_dir.join("runtime").join("stdlib");
+    if let Ok(entries) = fs::read_dir(&stdlib_dir) {
+        let mut stdlib_files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    == Some("ap")
+            })
+            .map(|e| e.path())
+            .collect();
+        stdlib_files.sort();
+        paths.extend(stdlib_files);
+    }
+    let mut hasher = DefaultHasher::new();
+    for path in &paths {
+        if let Ok(bytes) = fs::read(path) {
+            hasher.write(path.to_string_lossy().as_bytes());
+            hasher.write(&[0u8]);
+            hasher.write(&bytes);
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }

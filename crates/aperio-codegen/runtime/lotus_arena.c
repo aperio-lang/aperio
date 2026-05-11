@@ -1861,6 +1861,13 @@ void *lotus_bytes_from_str(const char *s);
 int64_t lotus_bytes_at(const void *b, int64_t i);
 void *lotus_bytes_slice(const void *b, int64_t lo, int64_t hi);
 
+/* Phase 2e + 2f: list_dir index API + read_file errno surface.
+ * Same forward-decl pattern; bodies live with the other global-
+ * payload-arena wrappers below. */
+int64_t lotus_fs_list_dir_count(const char *path);
+const char *lotus_fs_list_dir_at(const char *path, int64_t idx);
+int32_t lotus_fs_read_file_status(const char *path);
+
 /*
  * m74: filesystem primitives (`std::io::fs::*` substrate).
  *
@@ -2902,6 +2909,118 @@ void *lotus_bytes_slice(const void *b, int64_t lo, int64_t hi) {
         (const char *)b + sizeof(int64_t) + lo,
         (size_t)out_len);
     return blob;
+}
+
+/*
+ * Phase 2e: index-API surface over the existing
+ * lotus_fs_list_dir_global() cache. Returning a real `[String]`
+ * waits on dynamic-array codegen support; meanwhile the
+ * count + at pair drops every list_dir caller's iteration loop
+ * from the manual `index_of("\n") + slice + advance` pattern to
+ * a clean while-loop bounded by count. Both walk the cached
+ * newline-joined blob, so amortised cost is linear in total
+ * bytes once across both calls (no re-stat per entry).
+ *
+ * Filenames with embedded `\n` are still ill-defined at this
+ * substrate — same limitation as list_dir itself (POSIX permits
+ * `\n` in path segments; v0 documents the limitation and chooses
+ * the simpler newline-joined cache).
+ */
+int64_t lotus_fs_list_dir_count(const char *path) {
+    if (!path) return 0;
+    const char *blob = lotus_fs_list_dir_global(path);
+    if (!blob || !*blob) return 0;
+    /* The cache shape is `entry\nentry\n...\n`. Count the newlines;
+     * the last entry always carries a trailing newline (see
+     * lotus_fs_list_dir's emit loop). */
+    int64_t n = 0;
+    for (const char *p = blob; *p; p++) {
+        if (*p == '\n') n++;
+    }
+    return n;
+}
+
+const char *lotus_fs_list_dir_at(const char *path, int64_t idx) {
+    static const char empty[1] = { 0 };
+    if (!path || idx < 0) return empty;
+    const char *blob = lotus_fs_list_dir_global(path);
+    if (!blob || !*blob) return empty;
+    /* Walk to the start of the idx-th entry. */
+    const char *p = blob;
+    for (int64_t k = 0; k < idx; k++) {
+        const char *nl = strchr(p, '\n');
+        if (!nl) return empty;
+        p = nl + 1;
+        if (!*p) return empty;
+    }
+    /* p points at the start of the idx-th entry. Find its
+     * terminating newline and copy the slice into the global
+     * payload arena so the returned String outlives the call. */
+    const char *end = strchr(p, '\n');
+    if (!end) return empty;
+    size_t len = (size_t)(end - p);
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return empty;
+        }
+    }
+    char *out = (char *)lotus_arena_alloc(
+        g_bus_payload_arena, len + 1, 1);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    if (!out) return empty;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
+
+/*
+ * Phase 2f: errno-style status for read_file. Mirrors the
+ * open/stat/read shape of lotus_fs_read_file but returns the
+ * platform errno on failure (or 0 on success) so callers can
+ * distinguish "file is genuinely empty" from "the read failed."
+ * This is paired with `read_file(path)` for the content — both
+ * calls share the global payload arena, so the stat+open+read
+ * work runs twice but every page hit is hot from the kernel
+ * dentry/page cache.
+ *
+ * Returns:
+ *   0      — file opened, fstat'd, and read to EOF without error.
+ *   errno  — open / fstat / read failed; the value matches
+ *            <errno.h> (ENOENT, EACCES, EISDIR, EIO, ...).
+ */
+int32_t lotus_fs_read_file_status(const char *path) {
+    if (!path) return EINVAL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return errno ? errno : EIO;
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int saved = errno;
+        close(fd);
+        return saved ? saved : EIO;
+    }
+    /* Drain the file; partial / mid-read failures surface as
+     * errno here. The actual content is supplied by read_file;
+     * this call cares only about success/failure status. */
+    size_t left = (size_t)st.st_size;
+    char buf[4096];
+    while (left > 0) {
+        size_t want = left < sizeof(buf) ? left : sizeof(buf);
+        ssize_t got = read(fd, buf, want);
+        if (got > 0) {
+            left -= (size_t)got;
+            continue;
+        }
+        if (got == 0) break;          /* short file vs stat — OK */
+        if (errno == EINTR) continue;
+        int saved = errno;
+        close(fd);
+        return saved ? saved : EIO;
+    }
+    close(fd);
+    return 0;
 }
 
 void lotus_bus_remote_destroy_all(void) {

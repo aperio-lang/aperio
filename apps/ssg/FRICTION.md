@@ -20,7 +20,7 @@ non-self-contained. Pairs naturally with a future
 `std::io::fs::mkdir(path) -> Int` and/or
 `write_file_p(path, content)` that creates intermediate dirs.
 
-## 2026-05-10 read_file-empty-vs-error
+## 2026-05-10 read_file-empty-vs-error [FIXED 2026-05-11]
 
 **Tried:** Distinguish "the input markdown file is genuinely
 empty" from "the read failed" so the program can warn rather
@@ -38,8 +38,9 @@ treated the same way.
 yields an empty `.html`, which is mostly fine) but harder for
 programs that need to fail loudly on a partial read. Tied to the
 broader "no errno surface" Blocked entry on `ready-today.md`.
+**Resolution (2026-05-11, Phase 2f):** `std::io::fs::read_file_status(path) -> Int` returns 0 on success or the platform errno on failure (ENOENT=2 for missing, EACCES=13 for unreadable, EISDIR=21 for path-is-dir, EIO for partial-read failures). Pairs with the existing `read_file` for content. Both calls share the kernel cache, so the cost of the second call is the hot-cache stat+open+read. Callers now distinguish "intentionally empty" (`status=0 && len(content)==0`) from "missing/unreadable" (`status != 0`). End-to-end coverage in `crates/aperio-codegen/tests/fs_index_and_status.rs`.
 
-## 2026-05-10 list_dir-newline-string
+## 2026-05-10 list_dir-newline-string [FIXED 2026-05-11]
 
 **Tried:** Iterate filenames with a clean
 `for name in entries { ... }` shape after
@@ -61,3 +62,4 @@ overload" as the unblock. Reaffirming: every list_dir caller in
 the repo (docs-server, ssg, presumably the next one) writes the
 same loop. A `List<T>` / split-on-char primitive would let the
 helper land naturally.
+**Resolution (2026-05-11, Phase 2e):** Real `[String]` return still waits on dynamic-array codegen support, but the canonical iteration friction lands now via `std::io::fs::list_dir_count(path) -> Int` + `std::io::fs::list_dir_at(path, i) -> String`. Both walk the same global-arena cache; iteration becomes `let n = list_dir_count(p); while i < n { let name = list_dir_at(p, i); ... i = i + 1; }` — 4 lines, no manual newline-scanning, no conflation of "blank line" with "no more entries". The newline-joined `list_dir(path) -> String` shape stays for backwards compatibility. End-to-end coverage in `crates/aperio-codegen/tests/fs_index_and_status.rs`.

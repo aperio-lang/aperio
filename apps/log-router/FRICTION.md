@@ -11,7 +11,7 @@ Append-only. Format per the app-dev brief:
 **Why it matters:** <feature gated, or "minor papercut">
 ```
 
-## 2026-05-10 stale-cli-silent-drops-subscribers
+## 2026-05-10 stale-cli-silent-drops-subscribers [FIXED 2026-05-11]
 
 **Tried:** Build a custom log sink (`DbAuditSinkL` subscribing to
 `log.app.db.**`) with `target/debug/aperio build apps/log-router/main.ap`
@@ -44,6 +44,7 @@ against (cheap: rebuild-on-stale check, or version stamp), or
 the brief's "running and testing" section should say "if you
 ever changed `crates/`, rerun `cargo build -p aperio-cli`
 before `aperio build`."
+**Resolution (2026-05-11, Phase 2i):** Cheap rebuild-on-stale check shipped via `crates/aperio-cli/build.rs`. At CLI-binary build time, build.rs hashes `crates/aperio-codegen/src/codegen.rs`, `crates/aperio-codegen/runtime/lotus_arena.c`, and every `.ap` file under `crates/aperio-codegen/runtime/stdlib/`; the hash plus the absolute crate path bake into the binary as `APERIO_CODEGEN_SRC_HASH` / `APERIO_CODEGEN_DIR` via `cargo:rustc-env`. On every `aperio build` invocation, `check_stale_cli()` in main.rs recomputes the hash from the on-disk source and emits a four-line warning when they disagree, pointing the agent at `cargo build -p aperio-cli`. Silent on fresh builds; skipped silently when the crate dir doesn't exist (installed binary, moved workspace) or `APERIO_SKIP_STALE_CHECK=1` is set. Manually verified: edit codegen.rs without rebuilding the CLI, run `target/debug/aperio build foo.ap` → warning fires.
 
 ## 2026-05-10 write-file-truncates-no-append
 

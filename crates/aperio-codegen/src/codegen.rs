@@ -1653,6 +1653,29 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_bytes_slice", bytes_slice_ty, None);
 
+        // Phase 2e: list_dir index API. count + at over the
+        // cached newline-blob; both share the global payload arena.
+        // declare i64 @lotus_fs_list_dir_count(ptr path)
+        let list_dir_count_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_list_dir_count", list_dir_count_ty, None);
+        // declare ptr @lotus_fs_list_dir_at(ptr path, i64 idx)
+        let list_dir_at_ty =
+            ptr_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_fs_list_dir_at", list_dir_at_ty, None);
+
+        // Phase 2f: errno-style status for read_file. Returns 0
+        // on success or the platform errno on failure.
+        // declare i32 @lotus_fs_read_file_status(ptr path)
+        let read_file_status_ty = i32_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function(
+                "lotus_fs_read_file_status",
+                read_file_status_ty,
+                None,
+            );
+
         // m75: filesystem primitives reachable from Aperio source
         // via the `std::io::fs::*` magic-path calls. The C-level
         // surface is in lotus_arena.c (m74 ship); these
@@ -12557,6 +12580,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_bytes_slice(args, scope)?;
                 Ok(())
             }
+            // Phase 2e: list_dir index API.
+            ["std", "io", "fs", "list_dir_count"] => {
+                let _ = self.lower_std_io_fs_list_dir_count(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "fs", "list_dir_at"] => {
+                let _ = self.lower_std_io_fs_list_dir_at(args, scope)?;
+                Ok(())
+            }
+            // Phase 2f: read_file errno status.
+            ["std", "io", "fs", "read_file_status"] => {
+                let _ = self.lower_std_io_fs_read_file_status(args, scope)?;
+                Ok(())
+            }
             ["std", "io", "fs", "read_file"] => {
                 let _ = self.lower_std_io_fs_read_file(args, scope)?;
                 Ok(())
@@ -12848,6 +12885,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "bytes", "slice"] => {
                 self.lower_std_bytes_slice(args, scope)
+            }
+            // Phase 2e: list_dir index API.
+            ["std", "io", "fs", "list_dir_count"] => {
+                self.lower_std_io_fs_list_dir_count(args, scope)
+            }
+            ["std", "io", "fs", "list_dir_at"] => {
+                self.lower_std_io_fs_list_dir_at(args, scope)
+            }
+            // Phase 2f: read_file errno status.
+            ["std", "io", "fs", "read_file_status"] => {
+                self.lower_std_io_fs_read_file_status(args, scope)
             }
             ["std", "io", "fs", "read_file"] => {
                 self.lower_std_io_fs_read_file(args, scope)
@@ -14755,6 +14803,141 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("returns ptr");
         Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// Phase 2e: lower `std::io::fs::list_dir_count(path: String)
+    /// -> Int`. Returns the number of entries in `path` (skipping
+    /// `.` / `..`), 0 on error or empty directory. Shares the
+    /// global payload arena cache with `list_dir_at` so the
+    /// directory read amortises across both calls.
+    fn lower_std_io_fs_list_dir_count(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_count takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_count: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_fs_list_dir_count")
+            .expect("lotus_fs_list_dir_count declared");
+        let call = self
+            .builder
+            .build_call(f, &[path_val.into()], "ld.count.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((ret, CodegenTy::Int))
+    }
+
+    /// Phase 2e: lower `std::io::fs::list_dir_at(path: String,
+    /// idx: Int) -> String`. Returns the `idx`-th entry name
+    /// (0-indexed), or the empty string if out of range. Shares
+    /// the global payload arena cache with `list_dir_count`.
+    fn lower_std_io_fs_list_dir_at(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_at takes 2 args (path, idx), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_at: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let (idx_val, idx_ty) = self.lower_expr(&args[1], scope)?;
+        if idx_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_at: idx must be Int, got {:?}",
+                idx_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_fs_list_dir_at")
+            .expect("lotus_fs_list_dir_at declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[path_val.into(), idx_val.into()],
+                "ld.at.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::String))
+    }
+
+    /// Phase 2f: lower `std::io::fs::read_file_status(path:
+    /// String) -> Int`. Returns 0 on success or the platform
+    /// errno on failure — distinguishes "empty file" (status=0,
+    /// `read_file(path)` returns "") from "missing / unreadable
+    /// file" (status=errno, `read_file(path)` returns ""). Paired
+    /// with the existing `read_file` for content; both walk the
+    /// same kernel cache, so the cost of the second call is the
+    /// hot-cache stat+open+read.
+    fn lower_std_io_fs_read_file_status(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_file_status takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_file_status: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let f = self
+            .module
+            .get_function("lotus_fs_read_file_status")
+            .expect("lotus_fs_read_file_status declared");
+        let call = self
+            .builder
+            .build_call(f, &[path_val.into()], "rfs.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i32 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let _ = i32_t;
+        let ret_i64 = self
+            .builder
+            .build_int_s_extend(ret_i32, i64_t, "rfs.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((ret_i64.into(), CodegenTy::Int))
     }
 
     /// Lower `std::io::tcp::__close_fd(fd: Int) -> Int`. Returns

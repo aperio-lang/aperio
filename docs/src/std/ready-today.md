@@ -21,11 +21,12 @@ Tiers:
 | Write entire file | Shipped | `std::io::fs::write_file(path, content) -> Int` |
 | File exists / size | Shipped | `file_exists`, `file_size` |
 | Read raw bytes | Shipped | `std::io::fs::read_bytes(path) -> Bytes` (m89) |
-| List directory entries | Shipped | `std::io::fs::list_dir(path) -> String` (newline-separated; m90) |
+| List directory entries | Shipped | `std::io::fs::list_dir(path) -> String` (newline-separated; m90); also `list_dir_count(p)` + `list_dir_at(p, i)` index API (Phase 2e, 2026-05-11) |
+| `read_file` errno disambiguation | Shipped | `std::io::fs::read_file_status(path) -> Int` returns 0 / errno; distinguishes "intentionally empty" from "missing/unreadable" (Phase 2f, 2026-05-11) |
 | Append to file | Workaround | `read_file` + concat + `write_file`. No O_APPEND surface. |
 | Stream / line-by-line read | Blocked | No streaming `Reader` type yet. |
 | Filesystem watch (inotify) | Blocked | m94 (planned). |
-| `errno` disambiguation | Blocked | All errors collapse to `-1` / `false` / `""`. |
+| `errno` disambiguation (general) | Partial | `read_file_status` covers read; `list_dir_count`=0 covers list_dir; other fs primitives still collapse to `-1` / `false` / `""`. |
 
 ## Networking
 

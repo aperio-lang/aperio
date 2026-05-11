@@ -362,8 +362,97 @@ fn main() {
 
 The newline-separated `String` shape is the v0 representation
 because Aperio doesn't yet have a generic `List<T>` for
-returning `[String]`. A `[String]` overload lands when generics
-do.
+returning `[String]`. A `[String]` overload lands when dynamic
+arrays do; in the meantime the **index API** (`list_dir_count`
++ `list_dir_at` below) provides the canonical iteration shape.
+
+### `std::io::fs::list_dir_count` / `list_dir_at`
+
+#### Synopsis
+
+```aperio
+fn list_dir_count(path: String) -> Int
+fn list_dir_at(path: String, idx: Int) -> String
+```
+
+Phase 2e (2026-05-11). Index-based iteration over the same
+directory listing `list_dir` produces. `list_dir_count` returns
+the number of entries (skipping `.` / `..`); `list_dir_at`
+returns the `idx`-th entry (0-indexed) or the empty string if
+out of range. Both walk the same global-arena cache, so the
+directory read amortises across both calls — no re-stat per
+entry.
+
+#### Examples
+
+The canonical iteration shape — 4 lines, no manual
+newline-scanning, no conflation of "blank line" with "no more
+entries":
+
+```aperio
+fn main() {
+    let p = "docs/";
+    let n = std::io::fs::list_dir_count(p);
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(p, i);
+        println("entry: ", name);
+        i = i + 1;
+    }
+}
+```
+
+Out-of-range indexing is well-defined:
+
+```aperio
+fn main() {
+    let p = "docs/";
+    let n = std::io::fs::list_dir_count(p);
+    let missing = std::io::fs::list_dir_at(p, n);
+    // missing is "" — len(missing) == 0
+}
+```
+
+A missing or non-directory `path` returns `count == 0`; no
+errno surface yet (use `file_exists` first if you need to
+disambiguate).
+
+### `std::io::fs::read_file_status`
+
+#### Synopsis
+
+```aperio
+fn read_file_status(path: String) -> Int
+```
+
+Phase 2f (2026-05-11). Returns 0 on success or the platform
+errno on failure (ENOENT = 2 for missing, EACCES = 13 for
+permission denied, EISDIR = 21 for path-is-dir, EIO for partial
+read). Pairs with the existing `read_file(path)` for the content
+itself — both calls share the kernel cache, so the cost of the
+second call is the hot-cache stat + open + read.
+
+Use this when `read_file` returning `""` could mean either
+"intentionally empty file" or "the read failed" and the program
+needs to branch on which.
+
+#### Examples
+
+```aperio
+fn main() {
+    let content = std::io::fs::read_file("config.toml");
+    let status = std::io::fs::read_file_status("config.toml");
+    if status != 0 {
+        println("read failed: errno=", status);
+        return;
+    }
+    if len(content) == 0 {
+        println("config is intentionally empty");
+        return;
+    }
+    println("loaded ", len(content), " bytes");
+}
+```
 
 ## Limitations (Phase 1 + m89/m90)
 
@@ -375,8 +464,10 @@ do.
 - **`mkdir` is single-level**: no recursive `mkdir -p` shape.
   Walk the path and call `mkdir` per segment for recursive
   creation.
-- **`list_dir` returns String, not [String]**: caller splits
-  on `\n`. Generic-backed sibling waits on `List<T>`.
+- **`list_dir` returns String, not [String]**: the canonical
+  iteration today uses `list_dir_count` + `list_dir_at` (Phase
+  2e); a real `[String]` return waits on dynamic-array codegen
+  support.
 - **No recursive directory walk**: `list_dir` is one level.
   Recursion is hand-rolled by the caller.
 - **No filesystem watch**: m94 (planned) will add
@@ -386,8 +477,10 @@ do.
   embedded NULs truncates at the first NUL. Use
   `read_bytes` + (future) `write_bytes` for binary I/O.
   Currently there is no `write_bytes`.
-- **No errno surface**: errors collapse to -1 / `false` /
-  empty. A future milestone surfaces errno-style detail.
+- **Partial errno surface**: `read_file_status` (Phase 2f)
+  disambiguates read failures; other primitives (`write_file`,
+  `mkdir`, ...) still collapse to `-1` / `false` / `""`. A
+  future milestone widens the errno surface to the rest.
 - **Lazy global arena growth**: every read call (text or
   bytes) allocates from a process-lifetime arena. Long-running
   processes that re-read files repeatedly grow memory
