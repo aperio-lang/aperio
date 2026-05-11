@@ -17,7 +17,7 @@ document tells you what's *meaningfully* valid.
 | `Bool` | i1 | `true` / `false` |
 | `Time` | ptr (string-shaped, v0) | v0 codegen stores `Time` as a pointer to the literal's source-spelling String — a placeholder shape that the typechecker keeps distinct from `String`. Real `i64`-since-epoch lowering deferred. |
 | `Duration` | i64 | Nanoseconds. Suffix literals (`5s`, `100ms`). |
-| `Bytes` (m89) | ptr → `[i64 len][u8 data[len]]` | Binary-safe. Single-pointer ABI like String, but the underlying blob carries an explicit length prefix so embedded NUL bytes don't truncate. `len(b)` reads the prefix. Operations: `std::io::fs::read_bytes`, `Stream.send_bytes`. Distinct from `String` at the type level; the typechecker keeps them apart. |
+| `Bytes` (m89) | ptr → `[i64 len][u8 data[len]]` | Binary-safe. Single-pointer ABI like String, but the underlying blob carries an explicit length prefix so embedded NUL bytes don't truncate. `len(b)` reads the prefix. Distinct from `String` at the type level; the typechecker keeps them apart. Operations: `std::io::fs::read_bytes` (m89), `Stream.send_bytes` (m89), `Stream.recv_bytes` (Phase 2g), `std::bytes::at` / `std::bytes::slice` / `std::bytes::from_string` (Phase 2g), `std::str::from_bytes` for the inverse direction (Phase 2g). |
 
 **FnPtr (m80):** First-class function values, type-spelled
 `fn(T1, T2) -> R` (or `fn(T1, T2)` for void-returning). LLVM
@@ -151,6 +151,26 @@ A `Rich<int>` is not assignable to a `Chunked<int>` even though
 both wrap `int`; explicit conversion required.
 
 Exception: contract-graded subtyping (next section).
+
+### Numeric coercion: Int → Float (Phase 2c)
+
+A single documented one-way widening fires at two surfaces:
+
+- **let-binding type ascription:** `let nf: Float = self.n;`
+  where `self.n: Int` widens `n` to a Float at the binding
+  site (codegen `sitofp`).
+- **fn-arg coercion:** when a parameter is typed `Float` and
+  the call-site argument is typed `Int`, the argument widens
+  at the call site. Same rule applies to user-declared fns
+  and to stdlib path-calls (`std::math::sqrt(n)` with `n: Int`
+  works without `2.0` literals).
+
+The widening is **strictly one-way**. `Float → Int` narrowing
+remains explicit (round + cast). `Decimal` never participates
+in implicit cross-type conversion. The rule was added 2026-05-11
+as part of the float-surface-gaps friction-log resolution; see
+F.23 in `spec/design-rationale.md` and the Phase 2c entry in
+`spec/stdlib.md`.
 
 ### Contract compatibility
 

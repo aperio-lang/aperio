@@ -56,6 +56,41 @@ The four recovery primitives (`restart`, `restart_in_place`,
 runtime-resolved built-in functions called from `on_failure`
 bodies.
 
+### Contextual keywords
+
+A few words are recognized as keywords **only inside specific
+syntactic contexts**; outside those contexts they lex as
+ordinary identifiers and may appear in any identifier position
+(fn names, variable bindings, struct fields, etc.).
+
+| Word     | Active inside              | Spec |
+|----------|-----------------------------|------|
+| `approx` | `closure { ... }` body — assertion long-form (`a approx b within e`); equivalent to `~~` | `spec/tokens.md`; F.10-style narrowing, 2026-05-11 |
+| `within` | `closure { ... }` body — tolerance clause of an assertion | same |
+
+So:
+
+```aperio
+fn approx(a: Float, b: Float, eps: Float) -> Bool {
+    // `approx` is a perfectly legal fn name outside closure
+    // bodies — and inside this body it is just a binding.
+    return a - b < eps;
+}
+
+locus L {
+    closure tolerance {
+        // Inside a closure body, `approx` / `within` are
+        // recognised as assertion long-form keywords.
+        epoch tick;
+        self.signal approx self.target within 0.01;
+    }
+}
+```
+
+Pre-2026-05-11 these were lexer-level reserved words; the
+narrowing was made to free up natural math-shaped helper
+names (`approx`, `within` as a fn).
+
 ## Predefined type names
 
 Per **F.15**, primitive type names are PascalCase identifiers

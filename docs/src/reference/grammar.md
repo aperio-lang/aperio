@@ -98,7 +98,12 @@ publish-decl   ::= "publish" string-literal "of" "type" type-expr ";"
 
 closure-decl   ::= "closure" snake_case-Ident "{" closure-clause+ "}"
 closure-clause ::= assertion | epoch-clause
-assertion      ::= expr "~~" expr "within" expr ";"
+assertion      ::= expr ("~~" | "approx") expr "within" expr ";"
+                ; The long-form spellings `approx` / `within` are
+                ; CONTEXTUAL — they lex as ordinary idents outside
+                ; closure bodies; the parser recognizes them as
+                ; assertion keywords only inside `closure { ... }`
+                ; bodies (F.10-style narrowing, 2026-05-11).
 epoch-clause   ::= "epoch" epoch-name ";"
 epoch-name     ::= "birth" | "dissolve" | "tick" | "duration" | "explicit"
 
@@ -173,7 +178,29 @@ bus-send-stmt  ::= string-literal "<-" expr ";"
 match-stmt     ::= "match" expr "{" match-arm ("," match-arm)* ","? "}"
 match-arm      ::= pattern ("if" expr)? "->" arm-body
 arm-body       ::= expr | block
-block          ::= "{" statement* "}"
+
+; Phase 2b (2026-05-11): a block's last item may be an expression
+; without a trailing `;`. That trailing expression is the block's
+; *value* when the block is used in expression position (Expr::If
+; arm body, Expr::Block at let-RHS, fn-call argument). In
+; statement position (function body, loop body, Stmt::If/Match
+; block) the trailing expression is evaluated for side effects
+; and the value is discarded.
+block          ::= "{" statement* expr? "}"
+
+; Phase 2b: `if` is dual-position. As a statement (`if-stmt`
+; above) it carries no value; as an expression it requires an
+; else branch with a trailing value, and the then- and else-
+; branches' tail values are phi-merged at the join. The same
+; block-as-expression form lets `let x = { let t = 1; t + 1 };`
+; work directly.
+if-expr        ::= "if" expr block "else" (if-expr | block)
+
+; Phase 2d (2026-05-11): `[val; N]` repeats a single expression
+; N times. `val` is evaluated exactly once; the result is
+; broadcast to all N slots. N is a non-negative Int literal
+; at v0 (const-eval is a future addition).
+array-repeat   ::= "[" expr ";" integer-literal "]"
 
 pattern ::= "_"
          | literal

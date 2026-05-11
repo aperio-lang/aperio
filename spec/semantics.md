@@ -37,6 +37,82 @@ A `fn name(args) -> ret { body }` invocation:
    return, the implicit locus drains and dissolves (waits for
    all children to finish; depth-first cascade per F.4).
 
+### Implicit Int → Float widening at call sites
+
+When a function parameter has type `Float` and the call-site
+argument has type `Int`, codegen inserts an implicit
+`sitofp` widening at the call site. The same rule fires at
+let-binding type ascriptions: `let nf: Float = self.n;`
+where `self.n: Int` succeeds. The widening is **one-way
+only** — `Float → Int` narrowing remains explicit, and
+`Decimal` never participates in implicit cross-type
+conversion. Phase 2c (2026-05-11). See F.23 in
+`spec/design-rationale.md` and the Phase 2c entry in
+`spec/stdlib.md`.
+
+## Expressions — `if` and block tails
+
+A `{ ... }` block whose last item is an expression *without*
+a trailing `;` carries that expression as its **value**. In
+expression position (let-RHS, fn-call argument, if-arm body)
+the value is consumed; in statement position (function body,
+loop body, `Stmt::If` / `Stmt::Match` block) the trailing
+expression is evaluated for side effects and the value is
+discarded — semantically equivalent to having added the `;`.
+
+`if cond { ... } else { ... }` is dual-position:
+
+- **As statement** (`if` not at let-RHS / argument / arm-body):
+  no value; trailing expressions in either arm are evaluated
+  for side effects.
+- **As expression** (e.g., `let x = if cond { i } else { j };`):
+  the then- and else-arms' trailing expressions are
+  phi-merged at the join basic block. The else branch is
+  **required**; arm trailing-expression types must match;
+  arms may carry their own let-bindings before the tail (the
+  bindings are scoped to the arm).
+
+`else if` chains carry through the value path —
+`ElseBranch::ElseIf` recurses and the innermost arm's tail
+feeds the phi at the outermost merge.
+
+Phase 2b (2026-05-11). See F.24 in `spec/design-rationale.md`
+and the Phase 2b entry in `spec/stdlib.md`.
+
+## Binary data — Bytes and conversion
+
+`Bytes` is the binary-safe sibling of `String`. Same
+single-pointer ABI; the underlying blob is
+`[i64 len][u8 data[len]]`. The `i64 len` prefix means
+embedded NUL bytes survive, unlike `String`'s strlen-based
+view.
+
+Producing a `Bytes`:
+
+- `std::io::fs::read_bytes(path) -> Bytes` (m89).
+- `Stream.recv_bytes(max: Int) -> Bytes` — binary-safe TCP
+  receive (Phase 2g).
+- `std::bytes::from_string(s: String) -> Bytes` — copies the
+  strlen-measured body into a length-prefixed blob (Phase 2g).
+- `std::bytes::slice(b, lo, hi) -> Bytes` — half-open range
+  copy with bound clamping (Phase 2g).
+
+Consuming a `Bytes`:
+
+- `len(b) -> Int` reads the length prefix.
+- `std::bytes::at(b, i) -> Int` — byte-as-Int (0..255) with
+  -1 sentinel for OOB (Phase 2g).
+- `Stream.send_bytes(b)` — length-preserving TCP send (m89).
+- `std::str::from_bytes(b) -> String` — copies into a
+  NUL-terminated buffer; embedded NULs persist but downstream
+  strlen-based String operations truncate at the first
+  (Phase 2g).
+
+All returned `Bytes` values from the path-call surface are
+anchored in the lazy global payload arena, so callers can
+stash the pointer past the call site without m49 deep-copy
+plumbing.
+
 ## Locus instantiation
 
 `LocusName { params }`:

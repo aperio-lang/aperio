@@ -175,6 +175,12 @@ closure_decl      = "closure" , IDENTIFIER , "{" ,
                     { closure_clause } ,
                     "}" ;
 
+(* The long-form spellings `approx` and `within` are
+   *contextual* keywords (F.10-style narrowing, 2026-05-11):
+   the lexer emits them as IDENTIFIER tokens; the parser
+   recognizes them as assertion vocabulary only inside a
+   `closure { ... }` body. Outside closure bodies they are
+   ordinary identifiers and may name fns / vars / fields. *)
 closure_assertion = expression , ( "~~" | "approx" ) , expression ,
                     "within" , expression ;
 
@@ -283,7 +289,16 @@ parameter         = IDENTIFIER , ":" , type_expr , [ "=" , expression ] ;
 
 (* === 14. Statements =========================================== *)
 
-block             = "{" , { statement } , "}" ;
+(* Phase 2b (2026-05-11): a block's last item may be an
+   expression without a trailing `;`. That trailing expression
+   is the block's *value* when the block is used in expression
+   position (if-as-expression arm body, block-as-expression at
+   let-RHS, fn-call argument). In statement position (function
+   body, loop body, Stmt::If/Match block) the trailing
+   expression is evaluated for side effects and the value is
+   discarded — same semantics as pre-Phase-2b code that
+   terminates every line with `;`. *)
+block             = "{" , { statement } , [ expression ] , "}" ;
 
 statement         = let_stmt
                   | assign_stmt
@@ -460,15 +475,33 @@ literal           = INT_LIT
 tuple_expr        = "(" , expression , "," , expression ,
                     { "," , expression } , ")" ;
 
-array_expr        = "[" , [ expression , { "," , expression } ] , "]" ;
+(* Phase 2d (2026-05-11): the second form is the repetition
+   literal `[val; N]`. `val` is evaluated exactly once; the
+   result is stored into N slots of an arena-allocated array.
+   N is a non-negative integer literal at v0 (const-eval is a
+   future addition). *)
+array_expr        = "[" , [ expression , { "," , expression } ] , "]"
+                  | "[" , expression , ";" , INTEGER_LIT , "]"
+                  ;
 
 struct_expr       = qualified_name , "{" ,
                     [ struct_init , { "," , struct_init } , [ "," ] ] ,
                     "}" ;
 struct_init       = IDENTIFIER , ":" , expression ;
 
+(* Phase 2b (2026-05-11): when a block-as-expression is used
+   in expression position (at let-RHS, fn-call argument, etc.)
+   its trailing expression — see the `block` production — is
+   the value. *)
 block_expr        = block ;
-if_expr           = if_stmt ;
+
+(* Phase 2b: `if` is dual-position. As a statement (`if_stmt`)
+   it carries no value. As an expression it REQUIRES an else
+   branch with a trailing value, and the then- and else-arms'
+   trailing-expression types must match; codegen phi-merges
+   them at the join. *)
+if_expr           = "if" , expression , block , "else" ,
+                    ( if_expr | block ) ;
 match_expr        = match_stmt ;
 
 (* Reduction expressions are language-native because they

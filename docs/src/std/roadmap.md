@@ -178,19 +178,20 @@ when the surface settles and the path-rewrite list is updated.
 | Sketch | Surface | Status |
 | --- | --- | --- |
 | `examples/51-geom-segment` | `Segment` online linear-regression accumulator (`push` / `slope` / `intercept` / `count` / `clear`) | green |
-| `examples/52-window-decay` | `Ema` exponential moving average (`push` / `value` / `count` / `clear`) — discrete per-push `alpha`; time-weighted variant deferred until `std::math::exp` ships | green |
+| `examples/52-window-decay` | `Ema` exponential moving average (`push` / `value` / `count` / `clear`) — discrete per-push `alpha`; time-weighted variant via `std::math::exp(-dt / tau)` is unblocked as of Phase 2c (2026-05-11) | green |
 | `examples/53-window-ring` | `Ring` 8-cap (t, v) ring buffer (`push` / `len` / `time_at` / `value_at` / `clear`); fixed cap until generic `Ring<N>` lands | green |
 | `examples/54-geom-leading-edge` | `LeadingEdge` windowed regression (ring + ephemeral Segment via `fit()`); `slope` / `intercept` / `extrapolate` | green |
 | `examples/55-geom-triangulate` | `Triangulator` parent locus accepting `LeadingEdge` children; modes `bulk` (mean) / `harmonic` (spread) / `resolution` (closest-to-mean) — the canonical hourglass-waist shape | green |
 | `examples/56-io-frame-line` | `LineFrame` line-oriented stream parser (`feed` / `next` / `lines_emitted` / `pending`); decoupled from TCP — same parser drives stdin, sockets, test buffers | green |
 | `examples/57-geom-velocity` | `Velocity` finite-difference d/dt + d²/dt² with EMA smoothing (`push` / `velocity` / `acceleration` / `count` / `clear`) | green |
-| `examples/58-stat-correlate` | `Correlator` online Pearson r² (`push` / `r_squared` / `covariance` / `count` / `clear`); `r` reported as `r²` until `std::math::sqrt` ships | green |
+| `examples/58-stat-correlate` | `Correlator` online Pearson r² (`push` / `r_squared` / `covariance` / `count` / `clear`); the `r = sqrt(r²)` step is unblocked as of Phase 2c (`std::math::sqrt` shipped 2026-05-11) | green |
 
 Friction surfaced during this round logged at
 `notes/aperio-friction.md` (three entries dated 2026-05-10):
 closure-keyword-shadows-helper-ident, if-needs-block-value,
-float-surface-gaps. None blocked the sketches; each is a small
-ergonomics gap that compounds.
+float-surface-gaps. None blocked the sketches; each was a
+small ergonomics gap that compounded — all three landed on
+2026-05-11 as Phase 2a / 2b / 2c respectively.
 
 ## How priorities are set
 

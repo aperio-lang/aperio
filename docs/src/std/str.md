@@ -140,6 +140,63 @@ fn main() {
 presence — e.g., for splitting on a delimiter or extracting
 a header before / after a separator.
 
+### `std::str::from_bytes`
+
+#### Synopsis
+
+```aperio
+fn from_bytes(b: Bytes) -> String
+```
+
+Phase 2g — copies the body of a `Bytes` value into a fresh
+NUL-terminated String allocated in the global payload arena.
+The inverse of `std::bytes::from_string`.
+
+#### Semantics
+
+- The Bytes body is memcpy'd verbatim into a `(len + 1)`-byte
+  buffer; the trailing byte is set to `\0` so the result is a
+  well-formed String for downstream `len(s)` / slicing.
+- Embedded NUL bytes in the source persist in the buffer but
+  the resulting String's strlen-based view will truncate at
+  the first one. Callers who need NUL-safe handling should
+  stay in Bytes.
+- An empty or null Bytes value yields the stable empty-string
+  sentinel.
+
+#### Examples
+
+Round-tripping a known-text payload through the binary-safe
+surface — useful when shipping text through `Stream.send_bytes`
+or storing it as a `Bytes` field for length-explicit reasons:
+
+```aperio
+fn main() {
+    let original = "hello world";
+    let b = std::bytes::from_string(original);
+    println("len in bytes = ", len(b));
+    let restored = std::str::from_bytes(b);
+    println("restored = ", restored);
+}
+```
+
+Reading a known-UTF-8 file as `Bytes`, then promoting to
+`String` once length is known:
+
+```aperio
+fn main() {
+    let raw = std::io::fs::read_bytes("config.txt");
+    if len(raw) > 0 {
+        let text = std::str::from_bytes(raw);
+        println("config = ", text);
+    }
+}
+```
+
+See also [`std::bytes`](./bytes.md) for the Bytes-side
+operations (`at`, `slice`, `from_string`) and the
+binary-safe TCP surface (`Stream.recv_bytes`).
+
 ## Bare-name builtins
 
 The most common string operations are bare-name builtins (no

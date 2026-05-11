@@ -23,6 +23,16 @@ predefined type names are PascalCase, not keywords).
 | `String` | UTF-8 bytes, arena-resident | yes (string literals) | `"hello"` |
 | `Time` | 8 bytes, monotonic instant | — | `time::monotonic()` |
 | `Duration` | 8 bytes, time interval | suffix literals | `5s`, `100ms` |
+| `Bytes` | 8 bytes, length-prefixed blob ref | — (no literal codegen yet) | see [`std::bytes`](../std/bytes.md) |
+
+`Bytes` is the binary-safe sibling of `String` — same single-pointer
+ABI, but the underlying blob carries an explicit length prefix so
+embedded NUL bytes survive. Reach for `Bytes` whenever a payload
+might contain a zero byte (binary protocols, image bodies, file
+uploads, masked WebSocket frames). The full surface
+(`read_bytes`, `recv_bytes`, `at`, `slice`, `from_string`,
+`from_bytes`) lives under [`std::bytes`](../std/bytes.md) and
+[`std::str`](../std/str.md).
 
 Numeric literals without a suffix default to `Int` (whole numbers)
 or `Float` (with a decimal point). The `d` suffix on a numeric
@@ -260,8 +270,13 @@ Aperio's operator surface is conventional. Full precedence and
 associativity tables live in `spec/precedence.md` in the source
 tree; the headlines:
 
-- **Arithmetic.** `+ - * / %` on `Int`, `Float`, `Decimal`. No
-  implicit cross-type conversion.
+- **Arithmetic.** `+ - * / %` on `Int`, `Float`, `Decimal`. One
+  implicit widening: `Int → Float` fires at let-binding type
+  ascriptions (`let nf: Float = n;` where `n: Int`) and at
+  function-argument sites where the parameter is `Float` and
+  the argument is `Int`. The widening is one-way only —
+  `Float → Int` narrowing stays explicit, and `Decimal` never
+  participates in implicit cross-type conversion.
 - **Comparison.** `< > <= >=` are *non-associative* — `a < b < c`
   is a parse error. Use `a < b && b < c`. This avoids the C
   chained-comparison surprise.
@@ -282,6 +297,49 @@ substrate; both are introduced in their own chapters:
   [chapter 7](./07-closures.md).
 - **`<-`** — bus send, statement position only. See
   [chapter 6](./06-the-bus.md).
+
+## Block-value expressions
+
+An `{ ... }` block ending in an expression *without* a trailing
+`;` is itself an expression — the trailing expression is the
+block's value. `if` works the same way when both arms have a
+value-shaped tail: the result of the chosen arm is the if's
+value.
+
+```aperio
+fn main() {
+    let cond: Bool = true;
+    let x: Int = if cond { 10 } else { 20 };
+    println("x=", x);
+}
+```
+
+A block can carry its own let-bindings before the tail —
+they're scoped to the block:
+
+```aperio
+let r: Int = if cond {
+    let t: Int = 21;
+    t * 2          // block tail — `t` doesn't escape
+} else {
+    0
+};
+```
+
+If-as-expression requires an `else` branch (an `if` without
+`else` has no value to merge on the missing path); the two
+arms' tail types must match. Mixed-type arms are a typecheck
+error.
+
+The same trailing-expression form also lets `{ }` be used as
+an expression directly:
+
+```aperio
+let phase: Int = { let n = step + 1; n % 4 };
+```
+
+Use this when a short multi-statement computation feeds one
+let-binding; for anything larger, factor into a free fn.
 
 ## What this chapter does not cover
 

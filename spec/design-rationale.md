@@ -1530,6 +1530,106 @@ The user-visible shape mirrors Go's per-package model.
   becomes interesting if we add cross-seed imports or external
   dependencies.
 
+### F.22 Capacity-tuple as N-D allocator surface (planned)
+
+The substrate-conditioned tuple form of capacity, instantiated at
+Aperio's allocator surface. Each locus's capacity is an N-D tuple
+of allocator slots (Arena, Pool, Heap at v0); parents override
+slots at accept hooks; the current 1D collapse (one arena at
+slot 0) is the v0 baseline. Operationalizes The Design's
+multi-dimensional capacity principle at Aperio's substrate.
+F-number reserved here so 2026-05-11 ergonomics-arc entries
+(F.23, F.24) don't overlap with the planned arc; concrete spec
+text lands when implementation begins.
+
+### F.23 Int → Float widening at let/arg sites (Phase 2c, 2026-05-11)
+
+Codegen inserts an implicit `sitofp` widening at two surfaces:
+
+- **let-binding type ascription** — `let nf: Float = self.n;`
+  with `self.n: Int` succeeds. The ascription tells the lowerer
+  to coerce the RHS at the binding site.
+- **fn-arg coercion** — when the parameter type is `Float` and
+  the call-site argument type is `Int`, the argument widens at
+  the call site. Same rule applies to user-declared fns and to
+  stdlib path-calls (`std::math::sqrt(n)` with `n: Int` works
+  without `2.0` literals).
+
+**Strictly one-way.** `Float → Int` narrowing remains explicit;
+`Decimal` never participates in implicit cross-type conversion;
+other numeric pairs (Int↔Decimal, Float↔Decimal) still reject.
+
+**Why.** The friction-log entry
+`notes/aperio-friction.md` 2026-05-10 `float-surface-gaps`
+documented the cost of forcing every Float-heavy library to
+carry parallel Int+Float counters and explicit conversion
+plumbing. Phase 2c also shipped `std::math::{sqrt, exp, log,
+floor, ceil, pow}`; the widening makes those libm primitives
+ergonomic by removing the per-callsite `to_float()` ceremony.
+
+**Considered and rejected.**
+
+- *Symmetric widening (Float → Decimal, Int → Decimal).*
+  Reject; the Decimal substrate is intentionally invariant to
+  preserve financial-math precision guarantees. A `1.50d` value
+  is not the same as `1.5` (Float), and silent promotion would
+  break the F.3 commitment to type-level shape distinctions.
+- *Narrowing (Float → Int) at let/arg sites.* Reject; the
+  rounding semantics ambiguity (round / floor / ceil / truncate)
+  is non-obvious enough that explicit operator surface is the
+  right answer when it lands.
+
+### F.24 Block-tail expression / `if` as expression (Phase 2b, 2026-05-11)
+
+A block's last item may be an expression *without* a trailing
+`;`. In expression position (let-RHS, fn-call argument, if-arm
+body) that trailing expression is the block's **value**; in
+statement position (function body, loop body, statement-form
+`if` / `match` blocks) the tail is evaluated for side effects
+and discarded — pre-Phase-2b code keeps its semantics
+unchanged.
+
+`if cond { ... } else { ... }` becomes dual-position:
+
+- **Statement form** — no value; pre-2b semantics preserved.
+- **Expression form** — the then- and else-arms' trailing
+  expressions are phi-merged at the join basic block. The
+  `else` branch is required (Unit-typed missing-else is
+  rejected); arm trailing-expression types must match; arms
+  may carry their own let-bindings before the tail.
+
+`else if` chains carry through the value path —
+`ElseBranch::ElseIf` recurses and the innermost arm's tail
+feeds the phi at the outermost merge.
+
+**Why.** The friction-log entry
+`notes/aperio-friction.md` 2026-05-10 `if-needs-block-value`
+documented the canonical case: index selection, default
+fallbacks, and ternary-ish expressions all need a small
+conditional value, and the pre-2b workaround
+(`let mut x = i; if cond { x = j; }`) is verbose and obscures
+intent.
+
+The shape is form-completeness within the expression-evaluation
+substrate: match-arm direct expressions
+(`MatchArmBody::Expr(Expr)`) and function-body returns already
+produced values; if-blocks were the lone holdout. Phase 2b
+closes the form-asymmetry — same shape as Rust, which is what
+the friction-log entry asked for.
+
+**Considered and rejected.**
+
+- *Trailing expression as function return value
+  (`fn f() -> Int { 42 }`).* Reject for v0; the user-visible
+  surface is unchanged from pre-2b (typed fns require explicit
+  `return`). Adding it would be a separate spec move, not
+  load-bearing for the friction this entry resolves.
+- *if-without-else as expression (Unit-typed).* Reject; the
+  Unit-merge form silently passes a unit-typed block-value to
+  the caller, which is rarely what the writer intended.
+  Requiring `else` at the value-form makes the writer's
+  intent (this is a value, not a side-effect) explicit.
+
 ## 16. What's deferred
 
 The grammar in v0 does **not** specify:

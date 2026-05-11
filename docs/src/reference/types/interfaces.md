@@ -1,12 +1,19 @@
 # Interfaces
 
-> **Status (v0.1).** Phase A — typecheck-only. Codegen vtable
-> dispatch (Phase B) is the next milestone; until then, calling
-> a fn that takes an interface-typed param errors at codegen
-> with a friendly Phase-B-pending message. Library design
-> proceeds against the locked syntax today; binaries that
-> actually pass loci across interface boundaries wait for Phase
-> B.
+> **Status (v0.1).** Phase A + Phase B shipped (2026-05-11).
+> Typecheck enforces structural conformance at coercion sites;
+> codegen lowers interface values as fat pointers `{data,
+> vtable}` arena-allocated at the coercion site, with
+> per-(locus, interface) static globals `__vt.<locus>.<iface>`
+> holding fn pointers in interface-method-decl order. A method
+> call on an interface receiver indirects through `vtable[i]`
+> with `data` as the implicit `self` arg. End-to-end binaries
+> that pass loci across interface boundaries work today;
+> `std::text::Sink` is the first stdlib instance — Stdout /
+> String / File variants coexist as separate loci behind the
+> one interface. Deferred follow-up: cross-arena fat-pointer
+> deep-copy for interface returns / locus fields / array
+> elements.
 
 A **structural interface** is a named set of method signatures.
 Any locus whose declared methods are a superset of the

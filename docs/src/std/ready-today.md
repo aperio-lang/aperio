@@ -1,8 +1,9 @@
 # What you can build today
 
 A capability-tier overview of the Aperio stdlib surface as of
-m93. This page is the entry point for app-dev sessions and
-should be skimmed before opening any other reference page.
+the Phase 2 ergonomics arc (2026-05-11; Phase 2b/c/d/g shipped).
+This page is the entry point for app-dev sessions and should
+be skimmed before opening any other reference page.
 
 Tiers:
 
@@ -33,6 +34,7 @@ Tiers:
 | TCP listener (multi-accept) | Shipped | `std::io::tcp::Listener { host, port, max_accepts, on_connection }` (m83) |
 | TCP stream send / recv | Shipped | `Stream.send(s)`, `Stream.recv(n)` (m81) |
 | TCP send raw bytes | Shipped | `Stream.send_bytes(b)` (m89) |
+| TCP recv raw bytes (NUL-safe) | Shipped | `Stream.recv_bytes(max) -> Bytes` (Phase 2g, 2026-05-11) |
 | HTTP request parse | Shipped | `std::http::parse_request(raw) -> Request` (m84) |
 | HTTP response write | Shipped | `std::http::write_response(stream, resp)` (m85) |
 | Custom HTTP headers | Blocked | No header-map type. Phase 3 v1.0 follow-up. |
@@ -40,7 +42,7 @@ Tiers:
 | HTTP bodies > 8 KB | Blocked | Single recv assumed. Phase 3 v1.0 follow-up. |
 | TLS / HTTPS | Blocked | No TLS substrate. |
 | UDP | Blocked | TCP only in v0. |
-| WebSocket | Blocked | Not on the roadmap. |
+| WebSocket | Substrate shipped | Phase 2g's `Stream.recv_bytes` + `std::bytes::at`/`slice` + `std::bytes::from_string` together cover the WS frame parser substrate (RFC 6455 §5.3 masking is straight-line Aperio); the protocol library itself is not yet written. |
 
 ## Process / environment
 
@@ -65,6 +67,10 @@ Tiers:
 | Int to String | Shipped | `to_string(n)` (bare-name builtin) |
 | Float to String | Shipped | `to_string(f)` (bare-name builtin) |
 | Bytes type / length | Shipped | `Bytes` primitive + `len(b)` (m89) |
+| Bytes byte-at / slice | Shipped | `std::bytes::at(b, i) -> Int`, `std::bytes::slice(b, lo, hi) -> Bytes` (Phase 2g) |
+| Bytes ↔ String conversion | Shipped | `std::bytes::from_string(s)`, `std::str::from_bytes(b)` (Phase 2g) |
+| Float math (sqrt / exp / log / pow / floor / ceil) | Shipped | `std::math::*` libm primitives (Phase 2c, 2026-05-11) |
+| Int → Float widening | Shipped | Implicit at let-binding and fn-arg sites (Phase 2c) |
 | Slice / split | Workaround | Hand-roll using `index_of` + char loop. No native split yet. |
 | Regex | Blocked | No regex library. |
 | Decimal arithmetic | Shipped | `Decimal` type with `1.50d` literals |
@@ -117,6 +123,9 @@ Tiers:
 | Capability | Tier | Notes |
 |---|---|---|
 | Locus lifecycle (birth / accept / run / drain / dissolve) | Shipped | Core language since m1. |
+| If / block as expression (trailing-expr value) | Shipped | `let x = if c { i } else { j };` and `let x = { let t = 1; t + 1 };` (Phase 2b, 2026-05-11) |
+| Array-literal repetition (`[val; N]`) | Shipped | `let r: [Float; 8] = [0.0; 8];` (Phase 2d, 2026-05-11) |
+| Structural interfaces (typecheck + vtable dispatch) | Shipped | F.20 Phase A + Phase B; `std::text::Sink` is the first stdlib instance (2026-05-11) |
 | Bus pub/sub (typed subjects) | Shipped | Single-process and TCP transports. |
 | Cross-process bus | Shipped | TCP framing in `lotus_tcp_*` (m72). |
 | Closures (closure { ... } blocks) | Shipped | epoch / within / approx vocabulary. |

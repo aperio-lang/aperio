@@ -1,8 +1,9 @@
 # `Bytes`
 
-The binary-safe sibling of `String`. m89 ships the type plus
-two production paths (`read_bytes`, `send_bytes`) and one
-inspection primitive (`len`).
+The binary-safe sibling of `String`. m89 shipped the type plus
+`read_bytes` / `send_bytes` / `len`. Phase 2g (2026-05-11)
+filled in the rest: binary-safe receive, byte-level inspection,
+slice, and explicit Bytes ↔ String conversions.
 
 `Bytes` exists because Aperio Strings are NUL-terminated in
 memory: any payload containing an embedded `\x00` silently
@@ -27,28 +28,49 @@ The shipped sources of `Bytes` values:
 - **`std::io::fs::read_bytes(path: String) -> Bytes`** — reads
   a file as raw bytes, length-preserved. Returns a zero-length
   `Bytes` on error (missing file, etc.). m89.
-- **`Stream.recv_bytes(n)`** — *not yet shipped.* The Stream
-  surface today returns `String` from `recv`; binary-safe
-  receive is a follow-up. Use `read_bytes` for now if you need
-  binary-safe input.
+- **`Stream.recv_bytes(max: Int) -> Bytes`** — Phase 2g —
+  reads up to `max` bytes from a connected TCP fd into a
+  length-prefixed blob. Embedded NULs survive, unlike `recv`'s
+  String shape. Returns a zero-length `Bytes` on EOF or read
+  error.
+- **`std::bytes::from_string(s: String) -> Bytes`** — Phase 2g
+  — copies the source string's bytes (strlen-measured) into a
+  fresh length-prefixed blob. The inverse of
+  `std::str::from_bytes`.
+- **`std::bytes::slice(b: Bytes, lo: Int, hi: Int) -> Bytes`**
+  — Phase 2g — half-open range copy `[lo, hi)`. Out-of-range
+  bounds clamp to the source length; `hi <= lo` yields an
+  empty `Bytes`. The result is a copy, not a view, so it
+  composes with deep-copy lifetime conventions.
 
 ### Bytes literals
 
 The lexer recognizes `b"..."` literals (per
 `spec/tokens.md`), but codegen lowering for them is **not
 shipped**. Writing `let b = b"abc";` will fail at compile
-time. Use `read_bytes` to get a real `Bytes` value.
+time. Use `read_bytes` or `std::bytes::from_string("...")`
+to get a real `Bytes` value.
 
-This will land in a future milestone alongside the other
-gaps (Bytes in struct fields, Bytes equality).
+`b"..."` literal codegen lands in a future milestone alongside
+the other gaps (Bytes in struct fields, Bytes equality).
 
 ## Consuming a Bytes
 
 - **`len(b: Bytes) -> Int`** — number of bytes in the blob.
   Bare-name builtin (no `std::*` path).
+- **`std::bytes::at(b: Bytes, i: Int) -> Int`** — Phase 2g —
+  byte-as-Int accessor; returns the i-th byte's unsigned value
+  (0..255). Out-of-range (i < 0 or i >= len) returns -1 as a
+  clean sentinel. Use this for byte-level protocol parsing
+  (WebSocket frame headers, framing length fields, etc.).
 - **`Stream.send_bytes(b: Bytes)`** — sends the blob's bytes
   through a TCP Stream. Length-preserving — embedded NULs
   survive. m89.
+- **`std::str::from_bytes(b: Bytes) -> String`** — Phase 2g —
+  copies the body into a NUL-terminated String. Embedded NULs
+  persist in the buffer but the resulting String's strlen-based
+  view will truncate at the first one — callers who need
+  NUL-safe handling should stay in Bytes.
 - **`println(..., b)`** — prints `<bytes len=N>` rather than
   the byte content, so logs stay readable when binary data is
   involved.
@@ -85,31 +107,46 @@ body, so binary-content responses route through raw
 `Stream.send` + `Stream.send_bytes` until a `Bytes`-aware
 response writer ships. Phase 3 v1.0 follow-up.)
 
-Round-trip a binary file with embedded NULs:
+Parse a two-byte frame header on a TCP Stream — the
+WebSocket / HTTP/2 / custom-RPC shape:
 
 ```aperio
-fn main() {
-    // Bytes returned from read_bytes preserves all bytes
-    // including embedded NULs. The same payload through
-    // String would truncate at the first NUL.
-    let b = std::io::fs::read_bytes("data.bin");
-    let n = len(b);
-    println("loaded ", n, " bytes");
+fn read_frame_header(s: std::io::tcp::Stream) {
+    let hdr = s.recv_bytes(2);
+    if len(hdr) < 2 {
+        println("short read");
+        return;
+    }
+    let b0 = std::bytes::at(hdr, 0);
+    let b1 = std::bytes::at(hdr, 1);
+    let fin = b0 / 128;           // top bit of byte 0
+    let opcode = b0 % 16;         // low nibble
+    let masked = b1 / 128;        // top bit of byte 1
+    let len7 = b1 % 128;          // low 7 bits
+    println("fin=", fin, " opcode=", opcode,
+            " masked=", masked, " len=", len7);
 }
 ```
 
-## Limitations (m89)
+Round-trip a String through Bytes (e.g. to ship a known-text
+payload via the binary-safe `send_bytes` surface):
+
+```aperio
+fn main() {
+    let body = std::bytes::from_string("hello world");
+    println("blen=", len(body));
+    let back = std::str::from_bytes(body);
+    println("back=", back);
+}
+```
+
+## Limitations
 
 - **No `Bytes` literals.** `b"..."` parses but does not
-  codegen. Use `read_bytes`.
-- **No `Bytes` indexing or slicing.** Strings support
-  `s[start..end]`; Bytes does not. Pending milestone.
-- **No `Bytes` ↔ `String` conversion in source.** If you have
-  a `Bytes` and know it's UTF-8, there's no `to_string(b)`
-  path that gives you a `String` — the bare-name `to_string`
-  on `Bytes` prints the `<bytes len=N>` summary instead. Read
-  with `read_file` if you want a `String`, with `read_bytes`
-  if you want a `Bytes`.
+  codegen. Use `read_bytes`, `recv_bytes`, or
+  `std::bytes::from_string`.
+- **No `Bytes` equality / hashing.** Equality is not yet
+  shipped — compare via `std::bytes::at` byte-by-byte for now.
 - **No `Bytes` in struct fields, no `Bytes` arrays** — the
   field-storage / array-element story for `Bytes` is not
   implemented yet.
@@ -120,7 +157,10 @@ fn main() {
 ## See Also
 
 - [`std::io::fs`](./io/fs.md) — `read_bytes` lives here.
-- [`std::io::tcp`](./io/tcp.md) — `Stream.send_bytes` ships
-  raw bytes over TCP.
-- [Roadmap](./roadmap.md) — `Bytes` literals and full surface
-  parity with `String` are tracked under language paper-cuts.
+- [`std::io::tcp`](./io/tcp.md) — `Stream.send_bytes` /
+  `Stream.recv_bytes` ship raw bytes over TCP.
+- [`std::str`](./str.md) — `from_bytes` for the inverse
+  conversion.
+- [Roadmap](./roadmap.md) — `Bytes` literals, equality, and
+  field-storage parity with `String` are tracked under language
+  paper-cuts.
