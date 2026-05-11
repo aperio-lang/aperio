@@ -2265,7 +2265,13 @@ fn __do_render(yaml_path: String) {
         println("error: yaml file empty or unreadable: ", yaml_path);
         return;
     }
-    let sink = std::text::Sink { dest: "stdout" };
+    // F.20 Phase B (2026-05-11) replaced the tagged `Sink`
+    // locus with an interface plus three concrete impls. The
+    // renderer's fn signatures still take `sink: std::text::Sink`
+    // (interface-typed param → fat-pointer coercion at the call
+    // site); the instantiation here picks the concrete
+    // StdoutSink because RenderL streams to stdout.
+    let sink = std::text::StdoutSink { };
     __render_report(sink, text);
 }
 
@@ -2354,15 +2360,33 @@ fn __drive_pipeline(repo_in: String, flavor_in: String) {
     PromptL { dest_path: prompt_path };
 
     println("");
-    println("Next steps:");
-    println("  1. Point an agent at ", prompt_path);
-    println("  2. The agent reads 00-tree.yaml + source files, picks");
-    println("     which binaries to deep-dive based on the FS shape");
-    println("  3. For each pick: `ferryman skeleton <repo>/<bin-dir> ",
-            out_dir, "/01-<bin>-skel.yaml`");
-    println("  4. The agent enriches each skeleton → 04-<bin>-enriched.yaml");
-    println("  5. `ferryman render <enriched.yaml>` per binary to see");
-    println("     the recognition report");
+    println("Next steps");
+    println("==========");
+    println("");
+    println("The easy path — let an agent drive:");
+    println("");
+    println("  Open Claude Code, Cursor, aider, or a claude.ai chat");
+    println("  with file-read + shell access to this repo. Send it:");
+    println("");
+    println("    Read .ferryman/PROMPT.md and .ferryman/00-tree.yaml.");
+    println("    Pick 2-4 binaries to deep-dive based on the FS shape,");
+    println("    then for each pick run `ferryman skeleton`, write");
+    println("    enrichment cells, and run `ferryman render`. Save");
+    println("    enriched yamls and reports under .ferryman/.");
+    println("");
+    println("  Reports land in .ferryman/recognition-<binary>.txt.");
+    println("");
+    println("The manual path — drive it yourself:");
+    println("");
+    println("  1. Read ", prompt_path);
+    println("     and ", out_dir, "/00-tree.yaml");
+    println("  2. Pick 2-4 entrypoint binaries to deep-dive");
+    println("  3. ferryman skeleton <repo>/<bin-dir> \\");
+    println("       ", out_dir, "/01-<bin>-skel.yaml");
+    println("  4. Read the skeleton + source; add enrichment cells");
+    println("     and save as ", out_dir, "/04-<bin>-enriched.yaml");
+    println("  5. ferryman render ", out_dir, "/04-<bin>-enriched.yaml");
+    println("       > ", out_dir, "/recognition-<bin>.txt");
 }
 
 // Scan argv for `--lang=<value>`. Returns the value or "" if
