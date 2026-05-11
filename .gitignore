@@ -36,6 +36,7 @@ apps/ferryman/ferryman
 apps/reload-demo/reload-demo
 apps/market-book/market-book
 apps/ws-echo/ws-echo
+apps/cli-demo/cli-demo
 
 # Aperio example build artifacts (compiled binaries sit next
 # to main.ap after `aperio build`).
