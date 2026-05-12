@@ -2505,6 +2505,36 @@ int lotus_str_can_parse_int(const char *s) {
 }
 
 /*
+ * v1.x-16: parse_float / can_parse_float.
+ * Strict trailing-NUL parse — empty / non-numeric / partial-tail
+ * inputs return 0.0 and 0 respectively. Matches the parse_int
+ * contract: a "soft" check function lets callers gate on
+ * parseability and the parser returns 0 on failure for surface
+ * code that wants a defaulting shape.
+ */
+double lotus_str_parse_float(const char *s) {
+    if (!s || !*s) return 0.0;
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || !end || *end != '\0') {
+        return 0.0;
+    }
+    return v;
+}
+
+int lotus_str_can_parse_float(const char *s) {
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    errno = 0;
+    (void)strtod(s, &end);
+    if (errno != 0 || !end || *end != '\0') {
+        return 0;
+    }
+    return 1;
+}
+
+/*
  * m58: deployment-config subject binding.
  *
  * Layered on top of the m57 AF_UNIX transport: a startup config
@@ -3333,6 +3363,92 @@ const char *lotus_text_base64_encode(const void *b) {
     }
     out[j] = '\0';
     return out;
+}
+
+/*
+ * v1.x-16: base64::decode. Inverse of lotus_text_base64_encode.
+ * Returns a Bytes blob anchored in the bus payload arena.
+ * Whitespace inside the input is ignored (RFC 4648 §3.3 — many
+ * MIME-style encoders insert line breaks). Strictly rejects any
+ * non-alphabet, non-whitespace, non-padding character by
+ * returning a zero-length Bytes blob. Returns the empty blob for
+ * empty / NULL input as well — callers should treat that as
+ * either "empty source" or "decode failed".
+ */
+static int b64_decode_char(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+void *lotus_text_base64_decode(const char *s) {
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+
+    if (!s) {
+        return lotus_bytes_create(g_bus_payload_arena, 0);
+    }
+
+    /* Count alphabet chars only (skip whitespace). Padding counts
+     * toward the group-of-4 alignment check. */
+    size_t alpha_count = 0;
+    size_t pad_count = 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        if (c == '=') { pad_count++; continue; }
+        if (b64_decode_char(c) < 0) {
+            return lotus_bytes_create(g_bus_payload_arena, 0);
+        }
+        alpha_count++;
+    }
+    /* Total chars including padding must be a multiple of 4. */
+    if ((alpha_count + pad_count) % 4 != 0) {
+        return lotus_bytes_create(g_bus_payload_arena, 0);
+    }
+    /* At most 2 padding chars. */
+    if (pad_count > 2) {
+        return lotus_bytes_create(g_bus_payload_arena, 0);
+    }
+    /* Decoded length: each 4 input chars yield 3 bytes, minus padding. */
+    int64_t total_chars = (int64_t)(alpha_count + pad_count);
+    int64_t out_len = (total_chars / 4) * 3 - (int64_t)pad_count;
+    if (out_len < 0) out_len = 0;
+
+    void *blob = lotus_bytes_create(g_bus_payload_arena, out_len);
+    if (!blob || out_len == 0) {
+        return blob;
+    }
+    unsigned char *out = (unsigned char *)lotus_bytes_data(blob);
+
+    uint32_t buf = 0;
+    int bits = 0;
+    int64_t j = 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        if (c == '=') break;
+        int v = b64_decode_char(c);
+        buf = (buf << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (j < out_len) {
+                out[j++] = (unsigned char)((buf >> bits) & 0xFF);
+            }
+        }
+    }
+    return blob;
 }
 
 /*

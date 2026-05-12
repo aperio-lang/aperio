@@ -1798,6 +1798,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let b64_encode_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_text_base64_encode", b64_encode_ty, None);
+        // v1.x-16: declare ptr @lotus_text_base64_decode(ptr s)
+        let b64_decode_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_text_base64_decode", b64_decode_ty, None);
         // ws-echo: cheap RNG (xorshift64*) for nonces / jitter.
         let void_t = self.context.void_type();
         let rand_seed_ty = void_t.fn_type(&[], false);
@@ -1944,6 +1948,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_str_can_parse_int",
             can_parse_ty,
+            None,
+        );
+        // v1.x-16: declare double @lotus_str_parse_float(ptr s)
+        let parse_float_ty =
+            self.context.f64_type().fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_str_parse_float", parse_float_ty, None);
+        // declare i32 @lotus_str_can_parse_float(ptr s)
+        let can_parse_float_ty = i32_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_str_can_parse_float",
+            can_parse_float_ty,
             None,
         );
 
@@ -13597,6 +13613,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_text_base64_encode(args, scope)?;
                 Ok(())
             }
+            ["std", "text", "base64", "decode"] => {
+                let _ = self.lower_std_text_base64_decode(args, scope)?;
+                Ok(())
+            }
             ["std", "rand", "seed_from_time"] => {
                 self.lower_std_rand_seed_from_time(args)?;
                 Ok(())
@@ -13669,6 +13689,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "parse_int"] => {
                 let _ = self.lower_std_str_parse_int(args, scope)?;
+                Ok(())
+            }
+            ["std", "str", "parse_float"] => {
+                let _ = self.lower_std_str_parse_float(args, scope)?;
+                Ok(())
+            }
+            ["std", "str", "can_parse_float"] => {
+                let _ = self.lower_std_str_can_parse_float(args, scope)?;
                 Ok(())
             }
             // m84: parse_request also reachable in statement
@@ -13923,6 +13951,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "text", "base64", "encode"] => {
                 self.lower_std_text_base64_encode(args, scope)
             }
+            ["std", "text", "base64", "decode"] => {
+                self.lower_std_text_base64_decode(args, scope)
+            }
             ["std", "rand", "next_int"] => {
                 self.lower_std_rand_next_int(args, scope)
             }
@@ -13969,6 +14000,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "parse_int"] => {
                 self.lower_std_str_parse_int(args, scope)
+            }
+            ["std", "str", "parse_float"] => {
+                self.lower_std_str_parse_float(args, scope)
+            }
+            ["std", "str", "can_parse_float"] => {
+                self.lower_std_str_can_parse_float(args, scope)
             }
             // m84: std::http::parse_request(raw: String) -> Request.
             // Implementation lives in stdlib.ap as the bare-name
@@ -14605,6 +14642,87 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 ret_i32,
                 i32_t.const_zero(),
                 "can.parse.bool",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((ret_bool.into(), CodegenTy::Bool))
+    }
+
+    /// v1.x-16: `std::str::parse_float(s: String) -> Float`. Strict
+    /// trailing-NUL parse; empty / non-numeric / partial-tail inputs
+    /// return 0.0. Disambiguate via `std::str::can_parse_float`.
+    fn lower_std_str_parse_float(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::parse_float takes 1 arg (s), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::parse_float: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_str_parse_float")
+            .expect("lotus_str_parse_float declared");
+        let call = self
+            .builder
+            .build_call(f, &[s_val.into()], "parse.float.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns f64");
+        Ok((v, CodegenTy::Float))
+    }
+
+    /// v1.x-16: `std::str::can_parse_float(s: String) -> Bool`.
+    fn lower_std_str_can_parse_float(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::can_parse_float takes 1 arg (s), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::can_parse_float: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let f = self
+            .module
+            .get_function("lotus_str_can_parse_float")
+            .expect("lotus_str_can_parse_float declared");
+        let call = self
+            .builder
+            .build_call(f, &[s_val.into()], "can.parse.float.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i32 = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let ret_bool = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                ret_i32,
+                i32_t.const_zero(),
+                "can.parse.float.bool",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok((ret_bool.into(), CodegenTy::Bool))
@@ -16025,6 +16143,45 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("returns ptr");
         Ok((ptr, CodegenTy::String))
+    }
+
+    /// v1.x-16: lower
+    /// `std::text::base64::decode(s: String) -> Bytes`. Standard
+    /// alphabet, padding tolerated, whitespace ignored. Returns
+    /// the empty Bytes blob on parse failure (non-alphabet char,
+    /// wrong length, too much padding). Anchored in the payload
+    /// arena.
+    fn lower_std_text_base64_decode(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::text::base64::decode takes 1 arg (s), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::text::base64::decode: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_text_base64_decode")
+            .expect("lotus_text_base64_decode declared");
+        let call = self
+            .builder
+            .build_call(f, &[s_val.into()], "b64.decode.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::Bytes))
     }
 
     /// ws-echo `random-seed-missing`: lower

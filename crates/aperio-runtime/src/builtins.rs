@@ -287,6 +287,7 @@ fn builtin_len(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::String(s) => Ok(Value::Int(s.len() as i64)),
         Value::Array(a) => Ok(Value::Int(a.borrow().len() as i64)),
+        Value::Bytes(b) => Ok(Value::Int(b.len() as i64)),
         other => Err(format!(
             "`len` not supported for {}",
             other.type_name()
@@ -442,6 +443,134 @@ pub fn resolve_path(segments: &[&str]) -> Option<Value> {
             name: "time::monotonic",
             func: Rc::new(time_monotonic),
         })),
+        // v1.x-16: parse_float / can_parse_float / base64::decode.
+        // String-parsing primitives (interpreter parity with codegen).
+        ["std", "str", "parse_float"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::str::parse_float",
+            func: Rc::new(std_str_parse_float),
+        })),
+        ["std", "str", "can_parse_float"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::str::can_parse_float",
+            func: Rc::new(std_str_can_parse_float),
+        })),
+        ["std", "text", "base64", "decode"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::text::base64::decode",
+            func: Rc::new(std_text_base64_decode),
+        })),
         _ => None,
     }
+}
+
+fn std_str_parse_float(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "std::str::parse_float expects 1 arg, got {}",
+            args.len()
+        ));
+    }
+    match &args[0] {
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) => Ok(Value::Float(v)),
+            // Match codegen contract: empty / non-numeric / partial
+            // tail returns 0.0 rather than an error, so callers can
+            // gate on can_parse_float and use a defaulting shape.
+            Err(_) => Ok(Value::Float(0.0)),
+        },
+        other => Err(format!(
+            "std::str::parse_float expects String, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn std_str_can_parse_float(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "std::str::can_parse_float expects 1 arg, got {}",
+            args.len()
+        ));
+    }
+    match &args[0] {
+        Value::String(s) => Ok(Value::Bool(
+            !s.is_empty() && s.parse::<f64>().is_ok(),
+        )),
+        other => Err(format!(
+            "std::str::can_parse_float expects String, got {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn std_text_base64_decode(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "std::text::base64::decode expects 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let s = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(format!(
+                "std::text::base64::decode expects String, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    Ok(Value::Bytes(base64_decode(&s)))
+}
+
+/// Standard-alphabet base64 decoder. Whitespace is ignored.
+/// Non-alphabet, non-padding chars or wrong padding-aligned length
+/// yields an empty Vec — the same "failure → empty" contract the
+/// C runtime uses.
+fn base64_decode(s: &str) -> Vec<u8> {
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut alpha_count = 0usize;
+    let mut pad_count = 0usize;
+    for &c in s.as_bytes() {
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+            continue;
+        }
+        if c == b'=' {
+            pad_count += 1;
+            continue;
+        }
+        if decode_char(c).is_none() {
+            return Vec::new();
+        }
+        alpha_count += 1;
+    }
+    if (alpha_count + pad_count) % 4 != 0 || pad_count > 2 {
+        return Vec::new();
+    }
+    let out_cap = (alpha_count + pad_count) / 4 * 3 - pad_count;
+    let mut out = Vec::with_capacity(out_cap);
+    let mut buf: u32 = 0;
+    let mut bits = 0i32;
+    for &c in s.as_bytes() {
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+            continue;
+        }
+        if c == b'=' {
+            break;
+        }
+        let v = decode_char(c).unwrap();
+        buf = (buf << 6) | (v as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    out
 }
