@@ -80,6 +80,7 @@
   - [The four properties](./moa/properties.md)
   - [Audit checklist](./moa/audit-checklist.md)
   - [Glossary](./moa/glossary.md)
+  - [v0 → v1.x roadmap](./moa/roadmap.md)
   - [Patterns]()
     - [Broadcast + on-demand snapshot](./moa/patterns/broadcast-snapshot.md)
     - [Config-loading orchestrator](./moa/patterns/config-loader.md)
@@ -90,6 +91,8 @@
     - [`moa::Clock`](./moa/reference/clock.md)
     - [`moa::Recorder`](./moa/reference/recorder.md)
     - [`moa::Replayer`](./moa/reference/replayer.md)
+  - [Walkthroughs]()
+    - [`apps/market-book/`](./moa/walkthroughs/market-book.md)
 
 - [Standard Library](./std/roadmap.md)
   - [What you can build today](./std/ready-today.md)
