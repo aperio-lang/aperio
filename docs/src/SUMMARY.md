@@ -80,6 +80,7 @@
   - [Quickstart](./moa/quickstart.md)
   - [The four properties](./moa/properties.md)
   - [Audit checklist](./moa/audit-checklist.md)
+  - [FAQ](./moa/faq.md)
   - [Glossary](./moa/glossary.md)
   - [v0 → v1.x roadmap](./moa/roadmap.md)
   - [Patterns]()
