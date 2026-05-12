@@ -1,13 +1,31 @@
 # `std::str`
 
-Minimal string-processing primitives. m78 added the integer
-parsers (`parse_int`, `can_parse_int`); m84 added `index_of`
-for substring search. v0 scope is small by design — most
-string work in Aperio uses bare-name builtins (`len`,
+String-processing primitives. m78 added the integer parsers
+(`parse_int`, `can_parse_int`); m84 added `index_of` for
+substring search. v1.x landed the float parsers, case folding,
+trim / replace, repeat / padding, and the string-builder
+primitive — these resolve the long-running
+`reader-list_item-quadratic-concat` friction and the
+case-insensitive HTTP-header lookup gap.
+
+Most string work in Aperio uses bare-name builtins (`len`,
 `starts_with`, `contains`, `to_string`) plus the `+` operator
-for concatenation and `s[start..end]` for slicing. The path-
-qualified surface here covers the cases that need a real
-function call.
+for concatenation, `s[start..end]` for slicing, and `f"..."`
+f-strings for interpolation. The path-qualified surface here
+covers the cases that need a real function call: parsing,
+transformation, formatting, and amortized-O(N) accumulation.
+
+## Quick reference
+
+| Family | Functions | When to reach for it |
+|---|---|---|
+| Parsing | `parse_int` / `can_parse_int` / `parse_float` / `can_parse_float` | Strings → numbers, paired "soft" predicate. |
+| Search | `index_of` | Byte offset of first occurrence; `-1` for absent. |
+| Case folding | `lower` / `upper` | ASCII-only; non-ASCII passes through. |
+| Trimming + substitution | `trim` / `replace` | Whitespace strip; greedy substring replace. |
+| Formatting | `repeat` / `pad_left` / `pad_right` | Separator lines + column alignment. |
+| Accumulation | `builder_new` / `builder_append` / `builder_len` / `builder_finish` | Amortized O(N) build-by-pieces; replaces the O(N²) `buf = buf + chunk` shape. |
+| Conversion | `from_bytes` | Bytes → String. |
 
 ## Functions
 
@@ -140,6 +158,163 @@ fn main() {
 presence — e.g., for splitting on a delimiter or extracting
 a header before / after a separator.
 
+### `std::str::parse_float` / `can_parse_float`
+
+#### Synopsis
+
+```aperio
+fn parse_float(s: String) -> Float
+fn can_parse_float(s: String) -> Bool
+```
+
+Same shape as `parse_int` / `can_parse_int`, but for IEEE 754
+doubles. `parse_float` returns `0.0` on parse failure or empty
+input; `can_parse_float` returns the bool predicate. Strict
+trailing-NUL — `"3.14abc"` rejects.
+
+#### Examples
+
+```aperio
+fn main() {
+    let raw = "3.14159";
+    if std::str::can_parse_float(raw) {
+        let pi = std::str::parse_float(raw);
+        println(f"pi ~= {pi}");
+    }
+}
+```
+
+### `std::str::lower` / `std::str::upper`
+
+#### Synopsis
+
+```aperio
+fn lower(s: String) -> String
+fn upper(s: String) -> String
+```
+
+ASCII case folding. Non-ASCII bytes pass through unchanged
+(no Unicode case tables in the runtime at v1).
+
+#### Examples
+
+Case-insensitive comparison without library help:
+
+```aperio
+fn main() {
+    let user_input = "Yes";
+    if std::str::lower(user_input) == "yes" {
+        println("confirmed");
+    }
+}
+```
+
+### `std::str::trim` / `std::str::replace`
+
+#### Synopsis
+
+```aperio
+fn trim(s: String) -> String
+fn replace(s: String, needle: String, replacement: String) -> String
+```
+
+`trim(s)` strips ASCII whitespace (space, tab, `\r`, `\n`) from
+both ends. `replace(s, needle, replacement)` does greedy
+non-overlapping substring replacement.
+
+#### Semantics
+
+- `replace` advances by `len(needle)` after each match (no
+  overlap), and the empty-needle case is a no-op to avoid the
+  infinite-replace footgun.
+- Both anchor results in the bus payload arena.
+
+#### Examples
+
+```aperio
+fn main() {
+    let v = std::str::trim("   hello world   \r\n");
+    println(f"[{v}]");                              // [hello world]
+
+    let r = std::str::replace("foo bar foo", "foo", "FOO");
+    println(r);                                     // FOO bar FOO
+}
+```
+
+### `std::str::repeat` / `pad_left` / `pad_right`
+
+#### Synopsis
+
+```aperio
+fn repeat(s: String, n: Int) -> String
+fn pad_left(s: String, width: Int, pad: String) -> String
+fn pad_right(s: String, width: Int, pad: String) -> String
+```
+
+`repeat` returns N copies of `s` concatenated (N ≤ 0 → empty).
+`pad_left` / `pad_right` align `s` to `width` using the first
+byte of `pad` as the fill character. **No truncation** —
+strings already at or over `width` come back unchanged.
+
+#### Examples
+
+Drawing a separator line + right-aligned numeric columns:
+
+```aperio
+fn main() {
+    println(std::str::repeat("─", 40));
+    println(std::str::pad_left("42",   8, " ") + " widgets");
+    println(std::str::pad_left("1024", 8, " ") + " sprockets");
+    println(std::str::repeat("─", 40));
+}
+```
+
+### `std::str::builder_*`
+
+#### Synopsis
+
+```aperio
+fn builder_new() -> Bytes              // opaque handle
+fn builder_append(b: Bytes, s: String) // statement-position only
+fn builder_len(b: Bytes) -> Int
+fn builder_finish(b: Bytes) -> String  // materializes + frees
+```
+
+Amortized O(N) string accumulation, replacing the O(N²) shape
+that `buf = buf + chunk` collapsed to under Aperio's
+arena-anchored immutable Strings. The handle is `Bytes`-shaped
+(opaque — users only pass it between the `builder_*` fns).
+
+#### Semantics
+
+- The buffer doubles on overflow (initial cap 64 bytes).
+- `builder_finish` copies the accumulated bytes into the bus
+  payload arena, frees the builder, and returns the
+  NUL-terminated String. The handle must NOT be reused after
+  `builder_finish`.
+- Forgetting to call `builder_finish` leaks the builder. The
+  shape fences this off in practice — every `builder_new` is
+  dominated by a `builder_finish` in the same scope.
+
+#### Examples
+
+Streaming a CSV row out of a loop without quadratic concat:
+
+```aperio
+fn join_csv_row(values: [String; 8]) -> String {
+    let b = std::str::builder_new();
+    let mut i = 0;
+    while i < 8 {
+        if i > 0 {
+            std::str::builder_append(b, ",");
+        }
+        std::str::builder_append(b, values[i]);
+        i = i + 1;
+    }
+    return std::str::builder_finish(b);
+}
+```
+
 ### `std::str::from_bytes`
 
 #### Synopsis
@@ -217,17 +392,22 @@ uses `+`.
 
 - **Base 10 only.** `parse_int` rejects `0x`, `0o`, `0b`
   prefixes.
-- **No whitespace trimming.** `parse_int` rejects any leading
-  or trailing whitespace.
-- **No floating-point parsing.** `parse_float` lands when
-  there's a use case forcing it.
+- **No whitespace trimming in the parsers.** `parse_int` /
+  `parse_float` reject any leading or trailing whitespace.
+  Call `std::str::trim` first if your inputs are whitespace-
+  noisy.
 - **No `int_to_str` path-call.** Use the bare-name builtin
   `to_string(n)` for the Int → String direction.
 - **`index_of` is byte-wise, not codepoint-wise.** Fine for
   ASCII; surprising for multi-byte UTF-8 if the search needle
-  could split a codepoint.
-- **No `split` / `replace` / `trim` / `to_lower` / `to_upper`.**
-  Hand-roll using `index_of` + slicing for now.
+  could split a codepoint. Same applies to `replace`.
+- **`lower` / `upper` are ASCII-only.** Non-ASCII bytes pass
+  through unchanged — no Unicode case folding in v1.
+- **No `split`.** Hand-roll using `index_of` + slicing for now;
+  splitting needs growable-vec-of-strings which gates on the
+  generics design call.
+- **No `last_index_of`, `replace_first`, `lines`.** All
+  hand-roll until a workload forces the issue.
 
 ## See Also
 
