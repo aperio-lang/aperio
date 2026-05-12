@@ -157,18 +157,19 @@ fn __parse_http_request(raw: String) -> std::http::Request {
 // Header lookup. Walks the packed `req.headers` block looking
 // for a line whose prefix matches `name:` (case-sensitive at
 // v1). Returns the value with leading whitespace trimmed, or
-// an empty String if the header isn't present. WebSocket
-// upgrade and most modern HTTP clients send fixed-case names,
-// so this lookup form covers the common case; callers needing
-// RFC-7230 case-insensitive lookup can normalize the input or
-// scan multiple casings.
+// an empty String if the header isn't present. Lookup is now
+// case-insensitive per RFC 7230 §3.2 — both the needle and each
+// scanned header name are lowercased via std::str::lower before
+// comparison, so `req.header("Host")` and `req.header("host")`
+// resolve identically and the WebSocket-upgrade case is no
+// longer the only supported shape.
 fn __http_request_header(req: std::http::Request, name: String) -> String {
     let headers = req.headers;
     let total = len(headers);
     if total <= 0 {
         return "";
     }
-    let needle = name + ":";
+    let needle = std::str::lower(name) + ":";
     let needle_len = len(needle);
     let mut cursor = 0;
     while cursor < total {
@@ -180,7 +181,7 @@ fn __http_request_header(req: std::http::Request, name: String) -> String {
         let line = headers[cursor..line_end];
         let line_len = len(line);
         if line_len >= needle_len {
-            let head = line[0..needle_len];
+            let head = std::str::lower(line[0..needle_len]);
             if head == needle {
                 // Trim leading whitespace on the value side.
                 let mut vstart = needle_len;

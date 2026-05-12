@@ -43,6 +43,34 @@ fn header_lookup_returns_value_or_empty() {
 }
 
 #[test]
+fn header_lookup_is_case_insensitive() {
+    // RFC 7230 §3.2 says header names are case-insensitive.
+    // Pre-v1.x lookup was case-sensitive — only worked because
+    // WebSocket-upgrade clients send fixed-case names. Now that
+    // std::str::lower exists, the lookup folds both sides.
+    let src = r#"
+        fn main() {
+            let raw = "GET / HTTP/1.1\r\nContent-Type: application/json\r\nUser-Agent: curl/8\r\n\r\n";
+            let r = std::http::parse_request(raw);
+            // Same name, different casing — should all match.
+            println("ct1=", std::http::header(r, "Content-Type"));
+            println("ct2=", std::http::header(r, "content-type"));
+            println("ct3=", std::http::header(r, "CONTENT-TYPE"));
+            println("ua=",  std::http::header(r, "user-agent"));
+        }
+    "#;
+    let bin = build("case_insensitive", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ct1=application/json"), "got: {:?}", stdout);
+    assert!(stdout.contains("ct2=application/json"), "got: {:?}", stdout);
+    assert!(stdout.contains("ct3=application/json"), "got: {:?}", stdout);
+    assert!(stdout.contains("ua=curl/8"), "got: {:?}", stdout);
+}
+
+#[test]
 fn parse_request_still_returns_method_path_body() {
     // Pin the existing surface — adding the `headers` field
     // shouldn't break callers that ignore it.
