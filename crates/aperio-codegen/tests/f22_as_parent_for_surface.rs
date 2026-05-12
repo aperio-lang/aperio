@@ -1,17 +1,31 @@
-//! v1.x-4: F.22 `as_parent_for ChildL` slot trailing clause —
-//! language surface only at v1. Typecheck validates the
-//! reference; codegen explicitly rejects with a "v1.x-4b
-//! pending" diagnostic so users don't get silent
-//! miscompilation. The runtime mechanic (parent's allocator
-//! handed to the child at accept-time + skip-destroy on
-//! borrowed slots) ships in v1.x-4b.
+//! v1.x-4 (surface) + v1.x-4b (runtime): F.22
+//! `as_parent_for ChildL` slot trailing clause. The parser
+//! shipped in v1.x-4; the typecheck (cross-locus validation)
+//! shipped in v1.x-4; the runtime mechanic — copy parent's
+//! allocator pointer into the child's same-named slot at
+//! instantiation, skip-destroy on borrowed slots at the child's
+//! dissolve — shipped in v1.x-4b.
+
+use std::process::Command;
 
 use aperio_codegen::build_executable;
 
+fn build(name: &str, src: &str) -> std::path::PathBuf {
+    let program = aperio_syntax::parse_source(src).expect("parse");
+    let mut bin = std::env::temp_dir();
+    bin.push(format!("aperio_test_f22_apf_{}", name));
+    build_executable(&program, &bin).expect("build");
+    bin
+}
+
+/// A well-formed `as_parent_for` declaration compiles end-to-end
+/// and runs cleanly. The parent owns the allocator; the child
+/// borrows it at instantiation; both dissolve without leaking
+/// (verified by clean process exit — a double-free or leak in
+/// the child's dissolve would surface as a non-zero exit / ASAN
+/// trip in debug builds).
 #[test]
-fn as_parent_for_parses() {
-    // The clause parses cleanly; the failure mode at v1 is
-    // codegen-side, not parse-side.
+fn as_parent_for_compiles_and_runs() {
     let src = r#"
         locus ChildL {
             capacity { pool entries of Int; }
@@ -20,31 +34,32 @@ fn as_parent_for_parses() {
             capacity {
                 pool entries of Int as_parent_for ChildL;
             }
-            accept(c: ChildL) { }
+            accept(c: ChildL) {
+                println("accept");
+            }
+            run() {
+                ChildL { };
+                println("ok");
+            }
         }
-        fn main() { }
+        fn main() {
+            ParentL { };
+        }
     "#;
-    let program = aperio_syntax::parse_source(src).expect("parse");
-    let mut bin = std::env::temp_dir();
-    bin.push("aperio_test_f22_apf_parses");
-    // Codegen rejection is the v1 outcome — verify the
-    // diagnostic names v1.x-4b.
-    let err = build_executable(&program, &bin)
-        .expect_err("v1 codegen should reject as_parent_for");
-    let msg = format!("{}", err);
-    assert!(
-        msg.contains("v1.x-4b") || msg.contains("as_parent_for"),
-        "expected v1.x-4b deferral diagnostic, got: {}",
-        msg
-    );
+    let bin = build("compiles_and_runs", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("accept"), "missing accept: {:?}", stdout);
+    assert!(stdout.contains("ok"), "missing ok: {:?}", stdout);
 }
 
+/// Typecheck rejects `as_parent_for NonExistentL` when the
+/// referenced locus doesn't exist. The diagnostic mentions the
+/// missing locus name.
 #[test]
-fn as_parent_for_validates_child_locus_exists() {
-    // Typecheck should reject naming a locus that doesn't
-    // exist. Note: typecheck runs before codegen, so the
-    // build error here is the typecheck diagnostic, not the
-    // v1.x-4b codegen reject.
+fn as_parent_for_typecheck_rejects_unknown_locus() {
     let src = r#"
         locus ParentL {
             capacity {
@@ -54,21 +69,23 @@ fn as_parent_for_validates_child_locus_exists() {
         fn main() { }
     "#;
     let program = aperio_syntax::parse_source(src).expect("parse");
-    let mut bin = std::env::temp_dir();
-    bin.push("aperio_test_f22_apf_missing");
-    let err = build_executable(&program, &bin)
-        .expect_err("should reject missing-locus");
-    let msg = format!("{}", err);
+    let diags = aperio_types::check_program(&program);
+    let joined: String = diags
+        .iter()
+        .map(|d| format!("{:?}", d))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        msg.contains("NonExistentL"),
+        diags.iter().any(|d| format!("{:?}", d).contains("NonExistentL")),
         "expected diagnostic mentioning NonExistentL, got: {}",
-        msg
+        joined
     );
 }
 
+/// Typecheck rejects when the named child has no slot with the
+/// matching name.
 #[test]
-fn as_parent_for_validates_child_has_matching_slot() {
-    // Child must have a slot of the same name.
+fn as_parent_for_typecheck_rejects_mismatched_slot() {
     let src = r#"
         locus ChildL {
             capacity { pool other of Int; }
@@ -82,14 +99,100 @@ fn as_parent_for_validates_child_has_matching_slot() {
         fn main() { }
     "#;
     let program = aperio_syntax::parse_source(src).expect("parse");
+    let diags = aperio_types::check_program(&program);
+    let joined: String = diags
+        .iter()
+        .map(|d| format!("{:?}", d))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        diags.iter().any(|d| {
+            let s = format!("{:?}", d);
+            s.contains("no slot named") || s.contains("entries")
+        }),
+        "expected mismatched-slot diagnostic, got: {}",
+        joined
+    );
+}
+
+/// Codegen rejects an `as_parent_for` whose parent slot kind
+/// (Pool) differs from the child's same-named slot kind (Heap).
+/// Typecheck does name-based validation only at v1; codegen has
+/// the defensive kind+ty check that surfaces this mismatch.
+#[test]
+fn as_parent_for_codegen_rejects_kind_mismatch() {
+    let src = r#"
+        locus ChildL {
+            capacity { heap entries of Int; }
+        }
+        locus ParentL {
+            capacity {
+                pool entries of Int as_parent_for ChildL;
+            }
+            accept(c: ChildL) { }
+            run() {
+                ChildL { };
+            }
+        }
+        fn main() {
+            ParentL { };
+        }
+    "#;
+    let program = aperio_syntax::parse_source(src).expect("parse");
     let mut bin = std::env::temp_dir();
-    bin.push("aperio_test_f22_apf_mismatched_slot");
+    bin.push("aperio_test_f22_apf_kind_mismatch");
     let err = build_executable(&program, &bin)
-        .expect_err("should reject mismatched slot");
+        .expect_err("should reject pool/heap kind mismatch");
     let msg = format!("{}", err);
     assert!(
-        msg.contains("no slot named") || msg.contains("entries"),
-        "expected mismatched-slot diagnostic, got: {}",
+        msg.contains("kind mismatch") || msg.contains("kind"),
+        "expected kind-mismatch diagnostic, got: {}",
         msg
+    );
+}
+
+/// End-to-end: child can acquire + release a cell from the
+/// borrowed slot. Verifies the parent's allocator is actually
+/// reachable from the child's slot — a stale ptr would crash
+/// `release` or produce wrong reads.
+#[test]
+fn as_parent_for_child_uses_parent_allocator() {
+    let src = r#"
+        locus ChildL {
+            capacity { pool entries of Int; }
+            run() {
+                let c = self.entries.acquire();
+                self.entries.release(c);
+                println("child-released");
+            }
+        }
+        locus ParentL {
+            capacity {
+                pool entries of Int as_parent_for ChildL;
+            }
+            accept(c: ChildL) { }
+            run() {
+                ChildL { };
+                println("parent-after-child");
+            }
+        }
+        fn main() {
+            ParentL { };
+        }
+    "#;
+    let bin = build("child_uses_parent_alloc", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("child-released"),
+        "missing child-released: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("parent-after-child"),
+        "missing parent-after-child: {:?}",
+        stdout
     );
 }

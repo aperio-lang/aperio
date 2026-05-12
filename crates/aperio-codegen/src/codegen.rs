@@ -1027,6 +1027,20 @@ struct LocusInfo<'ctx> {
     /// `__restart_count` — the kind flag only changes whether
     /// the re-run preserves state.
     restart_in_place_pending_field_idx: u32,
+    /// v1.x-4b: index of the synthetic `__slot_borrowed_mask:
+    /// i64` field. Always present (uniform locus-struct layout).
+    /// Bit N (LSB = slot 0 in declaration order) is set iff this
+    /// locus's Nth capacity slot was borrowed from a parent via
+    /// `as_parent_for ChildL` — the parent's allocator pointer
+    /// was copied into this locus's slot at instantiation
+    /// instead of allocating a fresh allocator. Dissolve reads
+    /// the bit per slot and skips the allocator-destroy call
+    /// when set (the parent still owns the underlying allocator
+    /// and dissolves it via its own slot-destroy pass; per F.4
+    /// depth-first cascade, this child has already dissolved by
+    /// the time the parent's slot-destroy runs). Cap of 64 slots
+    /// per locus is well above the v1 ceiling.
+    slot_borrowed_mask_field_idx: u32,
     /// m42: index of the synthetic `__parent_self: ptr` field.
     /// Set at instantiation time to the resolved parent
     /// self_ptr (from `resolve_failure_route`), or null if no
@@ -1128,6 +1142,14 @@ struct CapacitySlotLayout {
     /// `lotus_*_create(size, align)` call via inkwell's
     /// `size_of()` on the LLVM type.
     elem_ty: CodegenTy,
+    /// v1.x-4 / v1.x-4b: when this slot is declared
+    /// `as_parent_for ChildL`, accepted children of `ChildL` get
+    /// this slot's allocator pointer copied into their same-
+    /// named slot at instantiation (the runtime mechanic shipped
+    /// in v1.x-4b). `None` for ordinary slots that own their
+    /// allocator. Drives the borrow-detection lookup at child
+    /// instantiation time in `lower_locus_instantiation`.
+    as_parent_for: Option<String>,
     /// Index of the slot's field in the locus struct's LLVM body.
     /// For default F.22 slots (form = None) the field is a `ptr`
     /// holding the allocator pointer. For form-vec slots
@@ -6132,6 +6154,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let restart_in_place_pending_field_idx = idx;
         llvm_field_tys.push(i64_t_struct.into());
         idx += 1;
+        // v1.x-4b: synthetic __slot_borrowed_mask — bit N is set
+        // iff the Nth capacity slot was borrowed from a parent
+        // via `as_parent_for`. Zero-init at instantiation; OR-in
+        // happens during slot init when a borrow swap occurs;
+        // read at dissolve to skip the destroy call on borrowed
+        // slots. Always present so the dissolve loop doesn't
+        // need to branch on whether the locus opted into the
+        // borrow surface.
+        let slot_borrowed_mask_field_idx = idx;
+        llvm_field_tys.push(i64_t_struct.into());
+        idx += 1;
         // m42: synthetic `__parent_self: ptr` and
         // `__parent_on_failure: ptr` fields. Always present
         // (uniform struct shape — the alternative would be
@@ -6325,24 +6358,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         l.name.name, slot.name.name
                     )));
                 }
-                // F.22 v1.x-4: typecheck recognizes the
-                // `as_parent_for ChildL` clause; the runtime
-                // mechanic (passing parent's allocator to the
-                // child at accept-time + skipping destroy on
-                // borrowed slots) is the v1.x-4b followup.
-                // Reject explicitly at codegen so users don't
-                // get silent miscompilation.
-                if let Some(child) = &slot.as_parent_for {
-                    return Err(CodegenError::Unsupported(format!(
-                        "locus `{}`: capacity slot `{} as_parent_for {}` \
-                         parsed and type-checks, but the runtime mechanic \
-                         (slot parent-override at accept-time) is the \
-                         v1.x-4b followup. Remove the `as_parent_for` \
-                         clause until v1.x-4b lands; the slot will own \
-                         its own allocator.",
-                        l.name.name, slot.name.name, child.name
-                    )));
-                }
+                // F.22 v1.x-4 (surface) + v1.x-4b (runtime):
+                // `as_parent_for ChildL` shipped end-to-end. The
+                // surface (parser + typecheck) was wired in
+                // v1.x-4; the runtime mechanic — copy the parent's
+                // allocator pointer into the child's same-named
+                // slot at child instantiation, OR the bit in the
+                // child's __slot_borrowed_mask, skip-destroy in
+                // the child's dissolve — is handled by the slot-
+                // init + slot-destroy loops below. The
+                // declaration's `as_parent_for` field flows into
+                // `CapacitySlotLayout.as_parent_for` so the child
+                // instantiation site can detect a borrowable
+                // parent-slot by name + kind + elem_ty.
                 let slot_field_idx = idx;
                 let form = if is_form_vec
                     && matches!(slot.kind, CapacitySlotKind::Heap)
@@ -6366,6 +6394,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     name: slot.name.name.clone(),
                     kind: slot.kind,
                     elem_ty,
+                    as_parent_for: slot
+                        .as_parent_for
+                        .as_ref()
+                        .map(|i| i.name.clone()),
                     struct_field_idx: slot_field_idx,
                     form,
                 });
@@ -6406,6 +6438,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 restart_count_field_idx,
                 quarantined_field_idx,
                 restart_in_place_pending_field_idx,
+                slot_borrowed_mask_field_idx,
                 parent_self_field_idx,
                 parent_on_failure_field_idx,
                 mailbox_field_idx,
@@ -18475,6 +18508,108 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_store(arena_field, new_arena)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
+        // v1.x-4b: compute a borrow map for each child slot whose
+        // matching parent slot has `as_parent_for ThisLocus`.
+        // Map child-slot-name → (parent_slot_struct_field_idx,
+        // parent_slot_idx_in_decl_order). The bit index in
+        // __slot_borrowed_mask uses the CHILD slot's declaration-
+        // order index (so a child with two slots, second borrowed,
+        // OR-s in bit 1). Validation is codegen-side defensive:
+        // kind + elem_ty must match between parent and child slot
+        // (matching `pool entries of Int` ↔ `pool entries of Int`);
+        // mismatches reject here rather than miscompiling.
+        let borrow_map: BTreeMap<String, (u32, u32)> = if let Some(cs) =
+            self.current_self.as_ref()
+        {
+            let cs_name = cs.locus_name.clone();
+            match self.user_loci.get(&cs_name).cloned() {
+                Some(parent_info) => {
+                    let mut map: BTreeMap<String, (u32, u32)> =
+                        BTreeMap::new();
+                    for parent_slot in &parent_info.capacity_slots {
+                        if let Some(child_locus) =
+                            parent_slot.as_parent_for.as_ref()
+                        {
+                            if child_locus != locus_name {
+                                continue;
+                            }
+                            // Find the child slot with the same
+                            // name; codegen-side kind+elem_ty
+                            // validation.
+                            let (child_idx, child_slot) = match info
+                                .capacity_slots
+                                .iter()
+                                .enumerate()
+                                .find(|(_, s)| s.name == parent_slot.name)
+                            {
+                                Some((i, s)) => (i, s),
+                                None => {
+                                    // Typecheck already rejects
+                                    // this; reach here only on a
+                                    // typecheck/codegen drift —
+                                    // defensive panic-equivalent.
+                                    return Err(CodegenError::Unsupported(format!(
+                                        "as_parent_for `{}`: parent slot `{}` \
+                                         has no match on child — typecheck \
+                                         should have caught this",
+                                        child_locus, parent_slot.name
+                                    )));
+                                }
+                            };
+                            if child_slot.kind != parent_slot.kind {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "as_parent_for `{}`: slot `{}` kind \
+                                     mismatch — parent is `{:?}`, child is \
+                                     `{:?}`",
+                                    child_locus,
+                                    parent_slot.name,
+                                    parent_slot.kind,
+                                    child_slot.kind
+                                )));
+                            }
+                            if child_slot.elem_ty != parent_slot.elem_ty {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "as_parent_for `{}`: slot `{}` cell-type \
+                                     mismatch — parent stores {:?}, child \
+                                     stores {:?}",
+                                    child_locus,
+                                    parent_slot.name,
+                                    parent_slot.elem_ty,
+                                    child_slot.elem_ty
+                                )));
+                            }
+                            // Form-vec slots can't borrow — the
+                            // inline { cap, len, buf } struct is
+                            // by-value, not a pointer. Reject so
+                            // the user gets a clear message.
+                            if child_slot.form.is_some()
+                                || parent_slot.form.is_some()
+                            {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "as_parent_for `{}`: slot `{}` is an \
+                                     `@form(vec)` slot — form-vec slots can't \
+                                     be borrowed (storage is inline, not a \
+                                     pointer)",
+                                    child_locus, parent_slot.name
+                                )));
+                            }
+                            map.insert(
+                                parent_slot.name.clone(),
+                                (
+                                    parent_slot.struct_field_idx,
+                                    child_idx as u32,
+                                ),
+                            );
+                        }
+                    }
+                    map
+                }
+                None => BTreeMap::new(),
+            }
+        } else {
+            BTreeMap::new()
+        };
+
         // F.22 capacity slots: after slot 0 (arena) is set, init
         // each declared slot in declaration order by calling
         // `lotus_pool_create(size, 8)` or `lotus_heap_create(size,
@@ -18485,6 +18620,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // v0's universal scalar alignment — every value-shape
         // type lays out at 8-byte alignment in the locus struct,
         // so cells inherit the same.
+        //
+        // v1.x-4b: slots in `borrow_map` skip the create call and
+        // instead copy the parent's allocator pointer into the
+        // child's slot, OR-ing the bit in __slot_borrowed_mask.
+        // Dissolve will read the bit and skip the destroy call so
+        // the parent's allocator outlives the child (F.4 depth-
+        // first cascade: child dissolves first; parent dissolves
+        // its own slot afterward).
         for slot in &info.capacity_slots {
             let slot_field_ptr = self
                 .builder
@@ -18495,6 +18638,90 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("{}.__slot_{}.ptr", locus_name, slot.name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+            if let Some((parent_field_idx, child_slot_idx)) =
+                borrow_map.get(&slot.name).copied()
+            {
+                // Borrow branch: load parent's slot ptr, store into
+                // child's slot, OR the mask bit.
+                let parent_cs = self
+                    .current_self
+                    .as_ref()
+                    .expect("borrow_map only built when current_self set");
+                let parent_struct_ty = parent_cs.struct_ty;
+                let parent_self_ptr = parent_cs.self_ptr;
+                let parent_slot_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        parent_struct_ty,
+                        parent_self_ptr,
+                        parent_field_idx,
+                        &format!(
+                            "{}.{}.parent_slot.ptr",
+                            locus_name, slot.name
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let ptr_t_local =
+                    self.context.ptr_type(AddressSpace::default());
+                let parent_allocator = self
+                    .builder
+                    .build_load(
+                        ptr_t_local,
+                        parent_slot_field_ptr,
+                        &format!(
+                            "{}.{}.parent_alloc",
+                            locus_name, slot.name
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(slot_field_ptr, parent_allocator)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                // OR the bit into __slot_borrowed_mask.
+                let i64_t_local = self.context.i64_type();
+                let mask_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        self_ptr,
+                        info.slot_borrowed_mask_field_idx,
+                        &format!(
+                            "{}.__slot_borrowed_mask.borrow.ptr",
+                            locus_name
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let prev_mask = self
+                    .builder
+                    .build_load(
+                        i64_t_local,
+                        mask_ptr,
+                        &format!(
+                            "{}.__slot_borrowed_mask.prev",
+                            locus_name
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_int_value();
+                let bit = i64_t_local
+                    .const_int(1u64 << child_slot_idx, false);
+                let new_mask = self
+                    .builder
+                    .build_or(
+                        prev_mask,
+                        bit,
+                        &format!(
+                            "{}.__slot_borrowed_mask.or",
+                            locus_name
+                        ),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(mask_ptr, new_mask)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                continue;
+            }
 
             match slot.form {
                 Some(SlotForm::Vec) => {
@@ -18671,6 +18898,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         self.builder
             .build_store(rip_ptr, zero)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // v1.x-4b: zero-init the synthetic __slot_borrowed_mask.
+        // Bits get OR'd in below during slot init when a parent
+        // has `as_parent_for ThisLocus` for one of this child's
+        // slots.
+        let sbm_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.slot_borrowed_mask_field_idx,
+                &format!("{}.__slot_borrowed_mask.ptr", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(sbm_ptr, zero)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         // m42: init the synthetic __parent_self / __parent_on_failure
@@ -23042,7 +23285,43 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // sits between drain/dissolve closures and the arena's
         // wholesale free, so cells outlive everything except
         // the arena itself during dissolve.
-        for slot in info.capacity_slots.iter().rev() {
+        //
+        // v1.x-4b: slots whose bit in __slot_borrowed_mask is set
+        // were borrowed from a parent (the parent still owns the
+        // underlying allocator and will dissolve it via its own
+        // slot-destroy pass — per F.4 depth-first cascade, this
+        // locus has dissolved by the time the parent's destroy
+        // runs). Skip the destroy call on those slots. Read the
+        // mask once at the top of the destroy pass; per-slot
+        // checks use a const bit mask.
+        let i64_t_local = self.context.i64_type();
+        let bool_t_local = self.context.bool_type();
+        let mask_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.slot_borrowed_mask_field_idx,
+                &format!("{}.__slot_borrowed_mask.dissolve.ptr", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let borrowed_mask = self
+            .builder
+            .build_load(
+                i64_t_local,
+                mask_field_ptr,
+                &format!("{}.__slot_borrowed_mask.dissolve", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let destroy_func = self
+            .current_fn
+            .ok_or_else(|| {
+                CodegenError::Unsupported(
+                    "slot destroy emit requires a current fn context".into(),
+                )
+            })?;
+        for (child_idx, slot) in info.capacity_slots.iter().enumerate().rev() {
             let slot_field_ptr = self
                 .builder
                 .build_struct_gep(
@@ -23052,6 +23331,43 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("{}.__slot_{}.ptr", locus_name, slot.name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // Per-slot borrowed-bit check. AND with the bit mask;
+            // compare != 0 → i1; conditional branch around the
+            // destroy. Form-vec slots can't be borrowed (we reject
+            // that at slot init), so the bit is always 0 for them
+            // and the destroy always fires — the conditional is
+            // cheap (one AND + one cmp + one cond_br) and uniform.
+            let bit = i64_t_local.const_int(1u64 << child_idx, false);
+            let masked = self
+                .builder
+                .build_and(
+                    borrowed_mask,
+                    bit,
+                    &format!("{}.__slot_{}.is_borrowed.masked", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let is_borrowed = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    masked,
+                    i64_t_local.const_int(0, false),
+                    &format!("{}.__slot_{}.is_borrowed", locus_name, slot.name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let _ = bool_t_local;
+            let destroy_bb = self.context.append_basic_block(
+                destroy_func,
+                &format!("{}.__slot_{}.destroy_path", locus_name, slot.name),
+            );
+            let cont_bb = self.context.append_basic_block(
+                destroy_func,
+                &format!("{}.__slot_{}.destroy_cont", locus_name, slot.name),
+            );
+            self.builder
+                .build_conditional_branch(is_borrowed, cont_bb, destroy_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(destroy_bb);
             match slot.form {
                 Some(SlotForm::Vec) => {
                     // v1.x-FORM-2: free the vec's malloc'd buffer
@@ -23095,6 +23411,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
             }
+            self.builder
+                .build_unconditional_branch(cont_bb)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder.position_at_end(cont_bb);
         }
 
         let arena_field_ptr = self
