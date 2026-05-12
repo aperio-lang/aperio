@@ -1280,6 +1280,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_arena_destroy", arena_destroy_ty, None);
 
+        // v1.x-FORM-2 PR6: root-locus value-error panic. Called
+        // when an `or raise` propagates past every enclosing
+        // fallible(E) frame — the value error has escaped the
+        // implicit main locus's body. Today the runtime fn
+        // dprintf+exit(1)s; architecturally it's the seat for a
+        // future routing-through-main-locus-on_failure extension,
+        // hence the typename arg + opaque payload ptr/size.
+        let root_panic_ty = void_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_root_panic", root_panic_ty, None);
+
         // F.22 capacity-tuple substrate primitives.
         //
         // declare ptr  @lotus_pool_create(i64 cell_size, i64 cell_align)

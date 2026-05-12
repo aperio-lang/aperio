@@ -4179,3 +4179,29 @@ const char *lotus_str_builder_finish(void *handle) {
     free(b);
     return out;
 }
+
+/*
+ * v1.x-FORM-2 PR6: root-locus value-error panic.
+ *
+ * Called by codegen when an `or raise` is reached past every
+ * enclosing fallible(E) frame — i.e., the value error has
+ * escaped the implicit main locus's body. Today: report to
+ * stderr and exit(1), reusing the same shape the closure-
+ * violation bare-handler fallback uses. Architecturally the
+ * seat for a future routing-through-main-locus-on_failure
+ * extension; the typename arg is the discriminator a future
+ * dispatch would key on, and the payload ptr / size are
+ * carried opaquely now so that extension doesn't need an ABI
+ * bump.
+ */
+void lotus_root_panic(
+    const void *payload,
+    size_t payload_size,
+    const char *payload_typename
+) {
+    (void)payload;
+    (void)payload_size;
+    const char *tn = payload_typename ? payload_typename : "<unknown>";
+    dprintf(2, "Aperio panic: unhandled %s escaping main locus\n", tn);
+    exit(1);
+}
