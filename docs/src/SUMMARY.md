@@ -79,6 +79,7 @@
 - [Memory-Owner Architecture](./moa/introduction.md)
   - [Quickstart](./moa/quickstart.md)
   - [The four properties](./moa/properties.md)
+  - [Bus subject conventions](./moa/subjects.md)
   - [Audit checklist](./moa/audit-checklist.md)
   - [FAQ](./moa/faq.md)
   - [Glossary](./moa/glossary.md)
