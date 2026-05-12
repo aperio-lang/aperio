@@ -244,12 +244,50 @@ void lotus_arena_destroy(lotus_arena_t *a) {
  * the arena's "one big chunk amortizes many small allocs"
  * principle adapted to fixed-stride cells.
  *
+ * v1.x-17: initial chunk size adapts to the host page size at
+ * runtime — when one full page fits more than 16 cells of T,
+ * the initial chunk holds page_size / cell_stride cells (so
+ * the chunk is approximately one page including the chunk
+ * header) instead of a hardcoded 16. Tiny T (single-byte cells
+ * etc.) get a tighter initial chunk than the static 16 would
+ * produce; large T (cell_stride > page/16) keep the static 16.
+ * Falls back to LOTUS_POOL_INITIAL_CELLS when sysconf is
+ * unavailable or returns nonsense.
+ *
  * Spec: spec/design-rationale.md §F.22 — "Pool of T — *I hold
  * a bounded shape of recyclable state.*"
  */
 
 #define LOTUS_POOL_INITIAL_CELLS 16
 #define LOTUS_POOL_MAX_CHUNK_CELLS 4096
+
+/* v1.x-17: page-size-aware initial chunk sizing. Cached after
+ * first sysconf — page size doesn't change during program
+ * lifetime, so a one-shot global is fine without locking
+ * (the only race window writes the same value).
+ */
+static size_t lotus_host_page_size(void) {
+    static size_t cached = 0;
+    if (cached) return cached;
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0 || ps > (1L << 20)) {
+        /* Implausible — fall back to the canonical 4 KiB. */
+        cached = 4096;
+    } else {
+        cached = (size_t)ps;
+    }
+    return cached;
+}
+
+static size_t lotus_pool_initial_cells_for(size_t cell_stride) {
+    if (cell_stride == 0) return LOTUS_POOL_INITIAL_CELLS;
+    size_t page = lotus_host_page_size();
+    if (page < cell_stride) return LOTUS_POOL_INITIAL_CELLS;
+    size_t n = page / cell_stride;
+    if (n < LOTUS_POOL_INITIAL_CELLS) n = LOTUS_POOL_INITIAL_CELLS;
+    if (n > LOTUS_POOL_MAX_CHUNK_CELLS) n = LOTUS_POOL_MAX_CHUNK_CELLS;
+    return n;
+}
 
 typedef struct lotus_pool_chunk {
     struct lotus_pool_chunk *next;
@@ -277,7 +315,9 @@ lotus_pool_t *lotus_pool_create(size_t cell_size, size_t cell_align) {
     p->cell_stride       = stride;
     p->cell_align        = cell_align;
     p->header_stride     = hdr;
-    p->next_chunk_cells  = LOTUS_POOL_INITIAL_CELLS;
+    /* v1.x-17: initial chunk sized to host page size when that
+     * fits more cells than the static-16 floor. */
+    p->next_chunk_cells  = lotus_pool_initial_cells_for(stride);
     p->chunks            = NULL;
     p->free_head         = NULL;
     return p;

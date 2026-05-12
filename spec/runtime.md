@@ -40,7 +40,7 @@ the model: runtime is automatic; stdlib is explicit.
 
   | Family | Surface | Backing |
   |---|---|---|
-  | `lotus_pool_*` | `create(cell_size, cell_align) -> pool*`, `acquire(pool) -> cell*`, `release(pool, cell)`, `destroy(pool)` | Linked list of chunks; each chunk is one malloc holding N contiguous cells. Free-list threads through the cells themselves (each free cell stores the next-free pointer at its base). Chunks grow geometrically (initial 16 cells, doubling, capped at 4096). Cell stride = max(cell_size, sizeof(void*)) aligned to cell_align. |
+  | `lotus_pool_*` | `create(cell_size, cell_align) -> pool*`, `acquire(pool) -> cell*`, `release(pool, cell)`, `destroy(pool)` | Linked list of chunks; each chunk is one malloc holding N contiguous cells. Free-list threads through the cells themselves (each free cell stores the next-free pointer at its base). Chunks grow geometrically (initial sized so one chunk fits in a host page when stride permits, else 16 cells; doubling; capped at 4096). Cell stride = max(cell_size, sizeof(void*)) aligned to cell_align. v1.x-17: initial chunk cell count is `max(16, page_size / cell_stride)` capped at 4096 — sysconf(_SC_PAGESIZE) queried once and cached; falls back to 4 KiB on systems where sysconf returns implausible values. |
   | `lotus_heap_*` | `create(cell_size, cell_align) -> heap*`, `alloc(heap) -> cell*`, `free(heap, cell)`, `destroy(heap)` | Doubly-linked live list with intrusive header (prev/next pointers) sitting just before each cell. `free()` unlinks in O(1); `destroy()` walks the list and frees every still-live cell wholesale. |
 
   Both allocator families are type-erased at the C ABI (sizes
