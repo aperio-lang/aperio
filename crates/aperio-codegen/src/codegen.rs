@@ -238,6 +238,7 @@ pub fn build_executable(
         current_user_fn_arena: None,
         current_user_fn_exit_bb: None,
         current_user_fn_ret_alloca: None,
+        current_user_fn_fallible: None,
         accumulator_ctx: None,
         serializers: BTreeMap::new(),
         generic_fn_templates: BTreeMap::new(),
@@ -630,6 +631,13 @@ struct Cx<'ctx, 'p> {
     current_user_fn_arena: Option<PointerValue<'ctx>>,
     current_user_fn_exit_bb: Option<inkwell::basic_block::BasicBlock<'ctx>>,
     current_user_fn_ret_alloca: Option<PointerValue<'ctx>>,
+    /// v1.x-FORM-2 PR6: per-call fallible-fn state. Set in
+    /// `lower_user_fn_body` when `sig.fallible` is `Some`; cleared
+    /// when the body finishes. `Stmt::Fail` writes the payload
+    /// into `err_alloca` + flips `path_alloca` to i1 1, then
+    /// branches to the unified exit block which sret-copies the
+    /// right slot and emits `ret i1 path`.
+    current_user_fn_fallible: Option<FallibleCtx<'ctx>>,
     /// m46: closure-accumulator substitution context. Set by
     /// `lower_closure_check` right before lowering the assertion
     /// expressions; cleared after. When set, `lower_expr`'s Call
@@ -835,6 +843,35 @@ struct FnSig<'ctx> {
     defaults: Vec<Option<Expr>>,
     /// `None` = void (no return type in the Aperio declaration).
     ret: Option<CodegenTy>,
+    /// v1.x-FORM-2 PR6: when the source declares `fallible(E)`,
+    /// the fn's LLVM signature grows two sret-style ptr params
+    /// (out_val, out_err) and returns i1 (true = err path taken;
+    /// false = ok). `fallible` carries the payload type for body
+    /// lowering (`Stmt::Fail` writes here) and call-site plumbing.
+    fallible: Option<CodegenTy>,
+}
+
+/// v1.x-FORM-2 PR6: per-call fallible-fn lowering state. See
+/// `current_user_fn_fallible` for usage.
+#[derive(Debug, Clone)]
+struct FallibleCtx<'ctx> {
+    /// Local stage for the error payload. `Stmt::Fail` lowers
+    /// into here; the exit epilogue sret-copies into
+    /// `out_err_param`.
+    err_alloca: PointerValue<'ctx>,
+    /// i1 path indicator. `Stmt::Fail` stores 1; `Stmt::Return`
+    /// stores 0 (alongside its existing ret_alloca write); the
+    /// exit epilogue branches on this to pick which sret slot
+    /// to deep-copy into and to set the LLVM `ret` value.
+    path_alloca: PointerValue<'ctx>,
+    /// Caller-provided sret slot for the success value. `None`
+    /// only if the fn has no declared return type — rejected
+    /// at declare time in v1, so practically always `Some`.
+    out_val_param: Option<PointerValue<'ctx>>,
+    /// Caller-provided sret slot for the error payload.
+    out_err_param: PointerValue<'ctx>,
+    /// Payload type — drives the err alloca size and the deep-copy.
+    payload_ty: CodegenTy,
 }
 
 /// Compiled locus type. Lifecycle methods take `self_ptr` as their
@@ -7757,51 +7794,88 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some(t) => Some(self.type_expr_to_codegen_ty(t)?),
             None => None,
         };
-        let fn_ty = match &ret_ty {
-            Some(CodegenTy::Int) | Some(CodegenTy::Duration) => self
-                .context
-                .i64_type()
-                .fn_type(&llvm_param_tys, false),
-            Some(CodegenTy::Float) => {
-                self.context.f64_type().fn_type(&llvm_param_tys, false)
-            }
-            Some(CodegenTy::Decimal) => {
-                self.context.i128_type().fn_type(&llvm_param_tys, false)
-            }
-            Some(CodegenTy::Bool) => {
-                self.context.bool_type().fn_type(&llvm_param_tys, false)
-            }
-            Some(CodegenTy::Enum(name)) => {
-                if self
-                    .user_enums
-                    .get(name.as_str())
-                    .map(|i| i.has_payload)
-                    .unwrap_or(false)
-                {
-                    self.context
-                        .ptr_type(AddressSpace::default())
-                        .fn_type(&llvm_param_tys, false)
-                } else {
-                    self.context.i32_type().fn_type(&llvm_param_tys, false)
+
+        // v1.x-FORM-2 PR6: fallible(E) lowering. The Aperio-level
+        // return type T becomes an `T*` sret param; payload type E
+        // becomes a second `E*` sret param. The LLVM-level return
+        // becomes `i1` (true = err path, false = ok). Caller
+        // allocates both slots and branches on the i1; see
+        // commit-3 call-site plumbing.
+        //
+        // v1 reject void+fallible: every fallible fn the stdlib
+        // and interpreter parity tests produce has a declared ret
+        // type, so the path is unreachable; surface a clear
+        // diagnostic instead of silently emitting a half-shape.
+        let fallible_payload_ty: Option<CodegenTy> =
+            match (&f.fallible, &ret_ty) {
+                (Some(payload_te), Some(_)) => {
+                    let pt = self.type_expr_to_codegen_ty(payload_te)?;
+                    let ptr_t = self.context.ptr_type(AddressSpace::default());
+                    // out_val sret slot.
+                    llvm_param_tys.push(ptr_t.into());
+                    // out_err sret slot.
+                    llvm_param_tys.push(ptr_t.into());
+                    Some(pt)
                 }
+                (Some(_), None) => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "fn `{}`: v1 requires fallible(E) fns to declare a \
+                         return type",
+                        f.name.name
+                    )));
+                }
+                (None, _) => None,
+            };
+
+        let fn_ty = if fallible_payload_ty.is_some() {
+            self.context.bool_type().fn_type(&llvm_param_tys, false)
+        } else {
+            match &ret_ty {
+                Some(CodegenTy::Int) | Some(CodegenTy::Duration) => self
+                    .context
+                    .i64_type()
+                    .fn_type(&llvm_param_tys, false),
+                Some(CodegenTy::Float) => {
+                    self.context.f64_type().fn_type(&llvm_param_tys, false)
+                }
+                Some(CodegenTy::Decimal) => {
+                    self.context.i128_type().fn_type(&llvm_param_tys, false)
+                }
+                Some(CodegenTy::Bool) => {
+                    self.context.bool_type().fn_type(&llvm_param_tys, false)
+                }
+                Some(CodegenTy::Enum(name)) => {
+                    if self
+                        .user_enums
+                        .get(name.as_str())
+                        .map(|i| i.has_payload)
+                        .unwrap_or(false)
+                    {
+                        self.context
+                            .ptr_type(AddressSpace::default())
+                            .fn_type(&llvm_param_tys, false)
+                    } else {
+                        self.context.i32_type().fn_type(&llvm_param_tys, false)
+                    }
+                }
+                Some(CodegenTy::String)
+                | Some(CodegenTy::Bytes)
+                | Some(CodegenTy::Time)
+                | Some(CodegenTy::LocusRef(_))
+                | Some(CodegenTy::TypeRef(_))
+                | Some(CodegenTy::Array(_, _))
+                | Some(CodegenTy::Tuple(_))
+                | Some(CodegenTy::FnPtr { .. })
+                | Some(CodegenTy::Interface(_))
+                | Some(CodegenTy::Cell(_, _)) => self
+                    .context
+                    .ptr_type(AddressSpace::default())
+                    .fn_type(&llvm_param_tys, false),
+                None => self
+                    .context
+                    .void_type()
+                    .fn_type(&llvm_param_tys, false),
             }
-            Some(CodegenTy::String)
-            | Some(CodegenTy::Bytes)
-            | Some(CodegenTy::Time)
-            | Some(CodegenTy::LocusRef(_))
-            | Some(CodegenTy::TypeRef(_))
-            | Some(CodegenTy::Array(_, _))
-            | Some(CodegenTy::Tuple(_))
-            | Some(CodegenTy::FnPtr { .. })
-            | Some(CodegenTy::Interface(_))
-            | Some(CodegenTy::Cell(_, _)) => self
-                .context
-                .ptr_type(AddressSpace::default())
-                .fn_type(&llvm_param_tys, false),
-            None => self
-                .context
-                .void_type()
-                .fn_type(&llvm_param_tys, false),
         };
         let func = self.module.add_function(&f.name.name, fn_ty, None);
         self.user_fns.insert(
@@ -7811,6 +7885,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 params: param_tys,
                 defaults,
                 ret: ret_ty,
+                fallible: fallible_payload_ty,
             },
         );
         Ok(())
@@ -7910,10 +7985,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         };
         let exit_bb = self.context.append_basic_block(func, "fn.exit");
 
+        // v1.x-FORM-2 PR6: fallible-fn state. Allocate a local err
+        // stage (Stmt::Fail writes here; epilogue sret-copies it
+        // into out_err_param) and an i1 path indicator (false = ok
+        // path; true = fail path). The two extra ptr params at
+        // slots (params.len() + 1, +2) are the caller-provided
+        // sret slots. Path defaults to ok (0) so a body that
+        // never hits `fail` still has a defined path on the
+        // exit-path load.
+        let fallible_ctx = if let Some(payload_ty) = sig.fallible.clone() {
+            let err_alloca = self.alloca_for(&payload_ty, "fn.err.slot")?;
+            let bool_t = self.context.bool_type();
+            let path_alloca = self
+                .builder
+                .build_alloca(bool_t, "fn.fail.path")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(path_alloca, bool_t.const_int(0, false))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let n_declared = f.params.len() as u32;
+            // Slot 0 = __caller_arena; slots 1..=n_declared = user
+            // params; slot n_declared+1 = out_val; slot
+            // n_declared+2 = out_err.
+            let out_val_param = if sig.ret.is_some() {
+                Some(
+                    func.get_nth_param(n_declared + 1)
+                        .expect("out_val sret param")
+                        .into_pointer_value(),
+                )
+            } else {
+                None
+            };
+            let out_err_slot_idx =
+                if sig.ret.is_some() { n_declared + 2 } else { n_declared + 1 };
+            let out_err_param = func
+                .get_nth_param(out_err_slot_idx)
+                .expect("out_err sret param")
+                .into_pointer_value();
+            Some(FallibleCtx {
+                err_alloca,
+                path_alloca,
+                out_val_param,
+                out_err_param,
+                payload_ty,
+            })
+        } else {
+            None
+        };
+
         self.current_user_fn_caller_arena = Some(caller_arena_alloca);
         self.current_user_fn_arena = Some(fn_arena_alloca);
         self.current_user_fn_exit_bb = Some(exit_bb);
         self.current_user_fn_ret_alloca = ret_alloca;
+        self.current_user_fn_fallible = fallible_ctx;
 
         let mut scope = Scope::default();
         for (i, p) in f.params.iter().enumerate() {
@@ -7968,6 +8092,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.current_user_fn_arena = None;
         self.current_user_fn_exit_bb = None;
         self.current_user_fn_ret_alloca = None;
+        self.current_user_fn_fallible = None;
         self.current_fn = None;
         self.current_user_fn_ret = None;
         Ok(())
@@ -7995,6 +8120,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let fn_arena_alloca = self
             .current_user_fn_arena
             .expect("fn_arena_alloca set during fn body lowering");
+
+        // v1.x-FORM-2 PR6: fallible-fn epilogue. Branches on the
+        // i1 path indicator: ok path deep-copies ret_alloca into
+        // the caller-provided out_val sret slot; fail path
+        // deep-copies err_alloca into out_err. Both branches then
+        // converge on the shared cleanup block (flush dissolves +
+        // destroy subregion + `ret i1 path`). flush_dissolve_frame
+        // must run exactly once, hence the unified cleanup.
+        if let Some(fallible) = self.current_user_fn_fallible.clone() {
+            return self.emit_fallible_fn_exit_epilogue(
+                sig,
+                &fallible,
+                caller_arena_alloca,
+                fn_arena_alloca,
+            );
+        }
 
         // Deep-copy BEFORE flush_dissolve_frame. The return value
         // can point into a let-bound sub-locus's arena (e.g. when
@@ -8082,6 +8223,129 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }
         }
+        Ok(())
+    }
+
+    /// v1.x-FORM-2 PR6: fallible-fn exit epilogue. Branches on
+    /// the i1 path indicator. Both branches deep-copy their
+    /// respective local stage into caller_arena and store the
+    /// resulting SSA into the caller-provided sret slot
+    /// (`out_val_param` / `out_err_param`). The branches then
+    /// converge on a cleanup block that runs the shared
+    /// deferred-dissolves flush + subregion destroy + `ret i1
+    /// path`.
+    fn emit_fallible_fn_exit_epilogue(
+        &mut self,
+        sig: &FnSig<'ctx>,
+        fallible: &FallibleCtx<'ctx>,
+        caller_arena_alloca: PointerValue<'ctx>,
+        fn_arena_alloca: PointerValue<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let bool_t = self.context.bool_type();
+        let func = self
+            .current_fn
+            .expect("current_fn set during fn body lowering");
+
+        let ok_bb = self.context.append_basic_block(func, "fn.exit.ok");
+        let fail_bb = self.context.append_basic_block(func, "fn.exit.fail");
+        let cleanup_bb =
+            self.context.append_basic_block(func, "fn.exit.cleanup");
+
+        // Builder is positioned at exit_bb on entry (caller did so).
+        // Load the path indicator and conditional-branch.
+        let path_v = self
+            .builder
+            .build_load(bool_t, fallible.path_alloca, "fn.fail.path.load")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(path_v, fail_bb, ok_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // OK branch: deep-copy ret_alloca → caller_arena, store
+        // into out_val. v1 rejects void+fallible at declare time
+        // (out_val_param is always Some when fallible).
+        self.builder.position_at_end(ok_bb);
+        if let (Some(ret_ty), Some(out_val_param)) =
+            (&sig.ret, fallible.out_val_param)
+        {
+            let ret_alloca = self
+                .current_user_fn_ret_alloca
+                .expect("ret_alloca set when ret type is Some");
+            let llvm_ret_ty = self.llvm_basic_type(ret_ty);
+            let raw_ret = self
+                .builder
+                .build_load(llvm_ret_ty, ret_alloca, "fn.ret.load")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let dest_arena = self
+                .builder
+                .build_load(ptr_t, caller_arena_alloca, "caller_arena.load")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_pointer_value();
+            let copied =
+                self.emit_return_value_deep_copy(raw_ret, ret_ty, dest_arena)?;
+            self.builder
+                .build_store(out_val_param, copied)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        self.builder
+            .build_unconditional_branch(cleanup_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // FAIL branch: deep-copy err_alloca → caller_arena, store
+        // into out_err.
+        self.builder.position_at_end(fail_bb);
+        {
+            let llvm_err_ty = self.llvm_basic_type(&fallible.payload_ty);
+            let raw_err = self
+                .builder
+                .build_load(llvm_err_ty, fallible.err_alloca, "fn.err.load")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let dest_arena = self
+                .builder
+                .build_load(ptr_t, caller_arena_alloca, "caller_arena.fail.load")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_pointer_value();
+            let copied_err = self.emit_return_value_deep_copy(
+                raw_err,
+                &fallible.payload_ty,
+                dest_arena,
+            )?;
+            self.builder
+                .build_store(fallible.out_err_param, copied_err)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        self.builder
+            .build_unconditional_branch(cleanup_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // CLEANUP: same shared work the non-fallible epilogue does
+        // — drain deferred dissolves and destroy the per-call
+        // subregion — then `ret i1 path`. Doing flush exactly
+        // once here is why the branches don't run their own
+        // cleanup. `path_v` dominates this block (exit_bb is the
+        // only predecessor of ok/fail/exit_bb chain).
+        self.builder.position_at_end(cleanup_bb);
+        self.flush_dissolve_frame()?;
+        let arena_destroy = self
+            .module
+            .get_function("lotus_arena_destroy")
+            .expect("lotus_arena_destroy declared");
+        let fn_arena_loaded = self
+            .builder
+            .build_load(ptr_t, fn_arena_alloca, "fn.arena.load")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_call(
+                arena_destroy,
+                &[fn_arena_loaded.into()],
+                "fn.arena.destroy",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_return(Some(&path_v))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(())
     }
 
@@ -9478,11 +9742,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok(BlockEnd::Open)
             }
             Stmt::Match(m) => self.lower_match_stmt(m, scope),
-            Stmt::Fail { .. } => Err(CodegenError::Unsupported(
-                "Stmt::Fail not yet lowered (v1.x-FORM-1 PR1 is parser-only; \
-                 codegen ships in PR6)"
-                    .into(),
-            )),
+            Stmt::Fail { value, .. } => self.lower_fail(value, scope),
             Stmt::Expr(_) => Err(CodegenError::Unsupported(
                 "expression statement other than locus literal or builtin call"
                     .to_string(),
@@ -11444,6 +11704,82 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 ));
             }
         }
+        Ok(BlockEnd::Terminated)
+    }
+
+    /// v1.x-FORM-2 PR6: lower `fail <expr>;` inside a fallible(E)
+    /// fn. Symmetric to `return e;` but writes the payload into
+    /// the local err stage + flips the path indicator to i1 1,
+    /// then branches to the unified fn.exit block. The fail
+    /// branch of the epilogue deep-copies the payload into the
+    /// caller-provided out_err sret slot.
+    fn lower_fail(
+        &mut self,
+        value: &Expr,
+        scope: &Scope<'ctx>,
+    ) -> Result<BlockEnd, CodegenError> {
+        let fallible = self
+            .current_user_fn_fallible
+            .clone()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(
+                    "`fail` outside a fallible(E) fn".into(),
+                )
+            })?;
+        let exit_bb = self.current_user_fn_exit_bb.ok_or_else(|| {
+            CodegenError::Unsupported(
+                "`fail` outside a free-fn body".into(),
+            )
+        })?;
+
+        // m67-style rewrite: a bare-name struct literal in fail
+        // position resolves against the declared payload type, so
+        // `fail Foo { ... }` lowers as `fail Foo_T_U { ... }` when
+        // the payload is `Foo<T, U>`. Mirrors the lower_return shape.
+        let rewritten;
+        let payload_ty = fallible.payload_ty.clone();
+        let e_to_lower: &Expr = match value {
+            Expr::Struct { path, inits, span } => {
+                match self.resolve_generic_struct_path_for_codegen_ty(
+                    path,
+                    &payload_ty,
+                ) {
+                    Some(new_path) => {
+                        rewritten = Expr::Struct {
+                            path: new_path,
+                            inits: inits.clone(),
+                            span: *span,
+                        };
+                        &rewritten
+                    }
+                    None => value,
+                }
+            }
+            _ => value,
+        };
+
+        let (v, got_ty) = self.lower_expr(e_to_lower, scope)?;
+        if got_ty != payload_ty {
+            return Err(CodegenError::Unsupported(format!(
+                "`fail` payload type mismatch: fallible declared {:?}, \
+                 got {:?}",
+                payload_ty, got_ty
+            )));
+        }
+
+        self.builder
+            .build_store(fallible.err_alloca, v)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let bool_t = self.context.bool_type();
+        self.builder
+            .build_store(fallible.path_alloca, bool_t.const_int(1, false))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder
+            .build_unconditional_branch(exit_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
         Ok(BlockEnd::Terminated)
     }
 
