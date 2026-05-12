@@ -77,6 +77,7 @@
     - [Glossary](./reference/glossary.md)
 
 - [Memory-Owner Architecture](./moa/introduction.md)
+  - [Quickstart](./moa/quickstart.md)
   - [The four properties](./moa/properties.md)
   - [Audit checklist](./moa/audit-checklist.md)
   - [Glossary](./moa/glossary.md)

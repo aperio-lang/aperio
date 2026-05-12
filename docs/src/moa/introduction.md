@@ -57,12 +57,16 @@ schema-matching, no glue.
 
 ## Reading order
 
+If you have ten minutes and want the shortest viable path:
+- `quickstart.md` — the one-page summary; five-step authoring,
+  three patterns, anti-patterns.
+
 If you have never composed a stateful Aperio app:
-1. `properties.md` — the four-property statement.
-2. `patterns/broadcast-snapshot.md` — the most common shape.
-3. `patterns/config-loader.md` — how `main()` stays an orchestrator.
-4. `apps/market-book/` (in the repo) — worked example of the
-   recording / projection / orchestrator split.
+1. `quickstart.md` — orient.
+2. `properties.md` — the four-property statement.
+3. `patterns/broadcast-snapshot.md` — the most common shape.
+4. `patterns/config-loader.md` — how `main()` stays an orchestrator.
+5. `walkthroughs/market-book.md` — worked example.
 
 If you are designing a new Aperio app right now:
 1. `properties.md` — re-read the four properties.
@@ -72,6 +76,14 @@ If you are designing a new Aperio app right now:
 4. Reach for `reference/` modules when their concerns match yours
    (need a clock? `clock.md`. Want to record traffic for replay?
    `recorder.md`).
+5. Before merge, walk `audit-checklist.md`.
+
+If you are auditing existing code:
+- `audit-checklist.md` — seven sections, ~30 min walkthrough.
+- `glossary.md` — when terminology is unclear.
+
+If you are confused by what's actually available vs. pending:
+- `roadmap.md` — v0 / v0.x / v1.x / v2 status of every surface.
 
 ## Cross-references
 
