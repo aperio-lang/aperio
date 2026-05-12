@@ -185,6 +185,41 @@ The agent and human collaborate by following the same five steps.
 The substrate is the same for both; the process is the same for
 both.
 
+## Common patterns
+
+Three recurring shapes are documented as standalone patterns in
+the mdbook subtree at `docs/src/moa/patterns/`:
+
+- **Broadcast + on-demand snapshot**
+  (`docs/src/moa/patterns/broadcast-snapshot.md`) — the default
+  request/response shape under MOA. Public delta + snapshot
+  streams; clients subscribe first and ping a public request
+  channel to trigger a snapshot. No correlation ids, no
+  per-recipient streams; all subscribers are equal.
+- **Config-loading orchestrator**
+  (`docs/src/moa/patterns/config-loader.md`) — small CLI
+  memory-owner (typically `std::cli::Resolver` or a domain-specific
+  variant) sits as a leaf in the orchestrator's child set. Keeps
+  `main()` stateless even when argv handling is non-trivial.
+- **Private response streams**
+  (`docs/src/moa/patterns/private-streams.md`) — the carve-out
+  for privacy / volume / per-client owner state. Per-recipient
+  subject suffixes; layered on top of the broadcast default, not
+  replacing it.
+
+The library code under `moa/` implements substrate-level helpers
+that several of these patterns can reach for:
+- `moa::Snapshotable` (`moa/snapshotable.ap`) — F.20 interface
+  that broadcast-snapshot's memory-owners structurally satisfy.
+- `moa::Clock` (`moa/clock.ap`) — centralizes the tick substrate
+  so timed loci subscribe instead of running their own sleep.
+- `moa::Recorder` + `moa::Replayer` (`moa/recorder.ap`,
+  `moa/replayer.ap`) — record-then-replay for debugging and
+  simulator modes.
+
+Each library piece carries v0 wiring instructions in its file
+header; see `moa/README.md` for the current bundled/pending status.
+
 ## How this differs from neighboring architectures
 
 Briefly, because the contrast sharpens what's distinctive:
@@ -233,10 +268,27 @@ choices the pieces individually don't.
 
 ## Cross-references
 
+In-repo source:
 - `moa/subjects.md` — bus subject naming conventions for
   interoperable MOA apps
+- `moa/README.md` — file inventory and v0 wiring backlog
 - `moa/types.ap` — the substrate payload types (`LocusId`,
   `BraidId`, `Tick`, `RuntimeEvent`)
+- `moa/snapshotable.ap`, `moa/clock.ap`, `moa/recorder.ap`,
+  `moa/replayer.ap` — library declarations (declarative
+  artifacts pending v0 wiring)
+
+Navigable mdbook:
+- `docs/src/moa/introduction.md` — landing page for the docs
+  subtree; same axiom from a different reading angle
+- `docs/src/moa/properties.md` — the four properties as a
+  navigable page
+- `docs/src/moa/patterns/` — broadcast-snapshot, config-loader,
+  private-streams
+- `docs/src/moa/reference/` — per-type and per-locus reference
+  pages
+
+Foundational notes and spec:
 - `notes/aperio-types-vs-loci.md` — the axiom MOA builds on
 - `notes/aperio-seed.md` — the seed model; MOA shapes any
   stateful seed
@@ -246,6 +298,7 @@ choices the pieces individually don't.
   brief; routes state-bearing apps to MOA
 - `spec/design-rationale.md` §F.22 — capacity slots, which MOA
   depends on for storage discipline
-- `apps/market-book/` — worked-example MOA app: `MdGatewayL` =
-  recording memory-owner, `BookL` = projection memory-owner,
-  `main()` = orchestrator
+
+Worked examples:
+- `apps/market-book/` — `MdGatewayL` = recording memory-owner,
+  `BookL` = projection memory-owner, `main()` = orchestrator

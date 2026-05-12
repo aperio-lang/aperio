@@ -124,5 +124,10 @@ None of these ships at v1; the conventions land as words first.
 - `MOA.md` — the architecture this serves
 - `types.ap` — `RuntimeEvent`, `Tick`, the substrate payloads these
   conventions wrap
+- `docs/src/moa/patterns/broadcast-snapshot.md` — the canonical
+  application of these conventions: public delta + snapshot families
+  with the many-to-one request channel asymmetry
+- `docs/src/moa/patterns/private-streams.md` — the carve-out: when
+  per-recipient subject suffixes are warranted
 - `spec/runtime.md` — bus router, m94 wildcard semantics
 - `spec/stdlib.md` — m94 stdlib bus changes
