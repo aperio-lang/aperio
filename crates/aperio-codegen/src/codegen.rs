@@ -192,8 +192,22 @@ pub fn build_executable(
                 .join("; ");
             CodegenError::Unsupported(format!("stdlib parse: {}", summary))
         })?;
+    // MOA substrate (moa::* path prefix) — same parse-and-merge as
+    // stdlib, with its own source constant and path-rename table.
+    // Bundled into every binary alongside stdlib. See `moa/MOA.md`
+    // for the architectural pattern these types support.
+    let moa_program = aperio_syntax::parse_source(MOA_AP_SOURCE)
+        .map_err(|diags| {
+            let summary = diags
+                .iter()
+                .map(|d| format!("{:?}", d))
+                .collect::<Vec<_>>()
+                .join("; ");
+            CodegenError::Unsupported(format!("moa parse: {}", summary))
+        })?;
     let mut merged = program.clone();
     merged.items.extend(stdlib_program.items);
+    merged.items.extend(moa_program.items);
 
     let context = Context::create();
     let module = context.create_module("lotus_main");
@@ -478,14 +492,41 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "yaml", "Reader"], "__StdYamlReader"),
 ];
 
-/// Look up the mangled name for a stdlib path (locus or type).
-/// Returns `None` when the path isn't recognized; callers then
-/// surface the path-as-typed in their error message. The legacy
-/// alias `stdlib_locus_for_path` is preserved by callers via the
-/// downstream `user_loci` check, which still gates the locus-only
-/// code paths.
+/// MOA substrate source — bundled into every binary, parses + merges
+/// alongside `STDLIB_AP_SOURCE`. Resolves under the `moa::*` path
+/// prefix via `MOA_PATH_RENAMES`. Lives in `/moa/` at the repo root,
+/// not in `crates/aperio-codegen/runtime/stdlib/`, because it is
+/// conceptually one layer below the language and above stdlib — the
+/// architectural substrate apps build on. See `moa/README.md`.
+const MOA_AP_SOURCE: &str = concat!(
+    include_str!("../../../moa/types.ap"),
+);
+
+/// Maps each user-facing `moa::*` path to the mangled name declared
+/// in `MOA_AP_SOURCE`. Same shape as `STDLIB_PATH_RENAMES` — flat
+/// after the namespace prefix (`moa::RuntimeEvent`, not
+/// `moa::types::RuntimeEvent`) per the stdlib precedent. Keep sorted
+/// by path for review.
+const MOA_PATH_RENAMES: &[(&[&str], &str)] = &[
+    (&["moa", "BraidId"], "__MoaBraidId"),
+    (&["moa", "LocusId"], "__MoaLocusId"),
+    (&["moa", "RuntimeEvent"], "__MoaRuntimeEvent"),
+    (&["moa", "Tick"], "__MoaTick"),
+];
+
+/// Look up the mangled name for a bundled-substrate path (`std::*`
+/// stdlib or `moa::*` substrate). Returns `None` when the path isn't
+/// recognized; callers then surface the path-as-typed in their error
+/// message. Dispatches by first segment so the two path-rename tables
+/// stay independent; behavior for `std::*` is unchanged from the
+/// pre-moa world.
 fn stdlib_mangled_for_path(segs: &[&str]) -> Option<&'static str> {
-    STDLIB_PATH_RENAMES
+    let table: &[(&[&str], &str)] = match segs.first() {
+        Some(&"std") => STDLIB_PATH_RENAMES,
+        Some(&"moa") => MOA_PATH_RENAMES,
+        _ => return None,
+    };
+    table
         .iter()
         .find(|(p, _)| *p == segs)
         .map(|(_, name)| *name)
@@ -6014,6 +6055,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                          locus-typed cells — route locus membership \
                          through `accept(c: ...)` instead",
                         l.name.name, slot.name.name
+                    )));
+                }
+                // F.22 v1.x-4: typecheck recognizes the
+                // `as_parent_for ChildL` clause; the runtime
+                // mechanic (passing parent's allocator to the
+                // child at accept-time + skipping destroy on
+                // borrowed slots) is the v1.x-4b followup.
+                // Reject explicitly at codegen so users don't
+                // get silent miscompilation.
+                if let Some(child) = &slot.as_parent_for {
+                    return Err(CodegenError::Unsupported(format!(
+                        "locus `{}`: capacity slot `{} as_parent_for {}` \
+                         parsed and type-checks, but the runtime mechanic \
+                         (slot parent-override at accept-time) is the \
+                         v1.x-4b followup. Remove the `as_parent_for` \
+                         clause until v1.x-4b lands; the slot will own \
+                         its own allocator.",
+                        l.name.name, slot.name.name, child.name
                     )));
                 }
                 let slot_field_idx = idx;

@@ -169,6 +169,13 @@ pub struct CapacitySlot {
     pub name: Ident,
     pub kind: CapacitySlotKind,
     pub elem_ty: TypeExpr,
+    /// F.22 v1.x-4 slot parent-override: when a slot is declared
+    /// with `as_parent_for ChildL`, any `ChildL` accepted by this
+    /// locus gets its same-named slot pointer overridden with
+    /// this parent's allocator at accept time. Generalizes the
+    /// chunked-class slot-0 sub-region handoff to slots 1..N.
+    /// `None` for ordinary slots that own their allocator.
+    pub as_parent_for: Option<Ident>,
     pub span: Span,
 }
 

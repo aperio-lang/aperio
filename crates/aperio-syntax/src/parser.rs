@@ -552,12 +552,20 @@ impl Parser {
         let name = self.expect_ident("slot name")?;
         self.expect(TokenKind::Of, "of")?;
         let elem_ty = self.parse_type_expr()?;
+        // F.22 v1.x-4 optional trailing clause:
+        //   `as_parent_for <ChildLocus>`
+        let as_parent_for = if self.eat(&TokenKind::AsParentFor) {
+            Some(self.expect_ident("child locus name after `as_parent_for`")?)
+        } else {
+            None
+        };
         let semi = self.expect(TokenKind::Semi, ";")?;
         Ok(CapacitySlot {
             span: kind_ident.span.merge(semi.span),
             name,
             kind,
             elem_ty,
+            as_parent_for,
         })
     }
 

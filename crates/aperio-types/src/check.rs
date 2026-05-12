@@ -536,6 +536,66 @@ impl<'a> Checker<'a> {
                             ));
                         }
                     }
+                    // F.22 v1.x-4: `as_parent_for ChildL` clause —
+                    // validate that ChildL exists, is a locus, and
+                    // has a slot with matching name/kind/elem_ty.
+                    // The mechanic (handing the parent's allocator
+                    // to the child at accept-time) is the v1.x-4b
+                    // runtime followup; this pass just gates the
+                    // surface so a malformed override fails at
+                    // typecheck.
+                    if let Some(child_ident) = &slot.as_parent_for {
+                        let child_name = &child_ident.name;
+                        match self.top.symbols.get(child_name) {
+                            Some(TopSymbol::Locus(child_info)) => {
+                                if !child_info
+                                    .capacity_slot_names
+                                    .iter()
+                                    .any(|n| n == &slot.name.name)
+                                {
+                                    self.diags.push(Diag::ty(
+                                        child_ident.span,
+                                        format!(
+                                            "capacity slot `{} {}` declared \
+                                             `as_parent_for {}`, but `{}` \
+                                             has no slot named `{}` — \
+                                             override needs a matching \
+                                             slot on the child",
+                                            kind_word,
+                                            slot.name.name,
+                                            child_name,
+                                            child_name,
+                                            slot.name.name
+                                        ),
+                                    ));
+                                }
+                                // TODO v1.x-4b: also verify
+                                // kind + elem_ty match — needs
+                                // capacity-slot kind/ty info in
+                                // the symbol-level LocusInfo.
+                            }
+                            Some(_) => {
+                                self.diags.push(Diag::ty(
+                                    child_ident.span,
+                                    format!(
+                                        "`as_parent_for {}`: `{}` is not \
+                                         a locus",
+                                        child_name, child_name
+                                    ),
+                                ));
+                            }
+                            None => {
+                                self.diags.push(Diag::ty(
+                                    child_ident.span,
+                                    format!(
+                                        "`as_parent_for {}`: locus `{}` \
+                                         not declared",
+                                        child_name, child_name
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }

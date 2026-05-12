@@ -56,6 +56,10 @@ pub enum TokenKind {
     /// frees the math-shaped identifier pool outside this block
     /// (matches the `approx`/`within` precedent from F.10).
     Capacity,
+    /// F.22 v1.x-4: slot-decl trailing clause introducer.
+    /// `pool entries of T as_parent_for ChildL;` overrides
+    /// accepted ChildL's same-named slot to share this allocator.
+    AsParentFor,
 
     // Keywords — lifecycle
     Birth,
@@ -376,6 +380,7 @@ impl<'a> Lexer<'a> {
             "contract" => TokenKind::Contract,
             "bus" => TokenKind::Bus,
             "capacity" => TokenKind::Capacity,
+            "as_parent_for" => TokenKind::AsParentFor,
 
             // Lifecycle
             "birth" => TokenKind::Birth,
