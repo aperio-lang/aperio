@@ -558,30 +558,11 @@ locus __StdLangMorpheme {
         return s[sl-xl..sl] == suffix;
     }
 
-    // Trim ASCII whitespace from both ends of `s`. Aperio
-    // doesn't yet ship std::str::trim; this open-codes the
-    // common case (space + tab + CR).
+    // Trim ASCII whitespace from both ends of `s`. Routes through
+    // the std::str::trim C-runtime primitive (added in the v1.x
+    // stdlib followup batch) — the local open-coded loop is gone.
     fn trim(s: String) -> String {
-        let n = len(s);
-        let mut lo = 0;
-        let mut hi = n;
-        while lo < hi {
-            let c = s[lo..lo+1];
-            if c == " " || c == "\t" || c == "\r" {
-                lo = lo + 1;
-            } else {
-                break;
-            }
-        }
-        while hi > lo {
-            let c = s[hi-1..hi];
-            if c == " " || c == "\t" || c == "\r" {
-                hi = hi - 1;
-            } else {
-                break;
-            }
-        }
-        return s[lo..hi];
+        return std::str::trim(s);
     }
 
     // Look up `m` in the per-codebase overrides text. Returns
