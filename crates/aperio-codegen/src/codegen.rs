@@ -14,7 +14,7 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicType, StructType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
 use inkwell::{AddressSpace, OptimizationLevel};
 
@@ -849,6 +849,18 @@ struct FnSig<'ctx> {
     /// false = ok). `fallible` carries the payload type for body
     /// lowering (`Stmt::Fail` writes here) and call-site plumbing.
     fallible: Option<CodegenTy>,
+}
+
+/// v1.x-FORM-2 PR6: result of lowering a fallible call inside
+/// `Expr::Or`. Carries the i1 path SSA plus the two sret slot
+/// pointers and the types they point to, so the Or arm can
+/// branch, load the success value, or propagate the error.
+struct FallibleCallResult<'ctx> {
+    i1_path: IntValue<'ctx>,
+    out_val_slot: PointerValue<'ctx>,
+    out_err_slot: PointerValue<'ctx>,
+    success_ty: CodegenTy,
+    payload_ty: CodegenTy,
 }
 
 /// v1.x-FORM-2 PR6: per-call fallible-fn lowering state. See
@@ -8966,6 +8978,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .ok_or_else(|| {
                 CodegenError::Unsupported(format!("call to unknown fn `{}`", name))
             })?;
+        if sig.fallible.is_some() {
+            return Err(CodegenError::Unsupported(format!(
+                "fallible fn `{}`: call must be addressed via `or raise` / \
+                 `or <expr>` / `or handler(err)`",
+                name
+            )));
+        }
         if args.len() > sig.params.len() {
             return Err(CodegenError::Unsupported(format!(
                 "fn `{}` expects at most {} args, got {}",
@@ -9058,6 +9077,384 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok(Some((v, lt)))
             }
         }
+    }
+
+    /// v1.x-FORM-2 PR6: lower an `inner or disposition` expression
+    /// where `inner` resolves to a fallible call. Allocates the
+    /// sret slots, emits the call (i1 path return), and branches:
+    /// ok branch loads the success slot; err branch either
+    /// substitutes per `or <expr>` / `or handler(err)` or
+    /// propagates per `or raise` (sret-copy into enclosing
+    /// fallible fn OR `lotus_root_panic` if escaping the
+    /// implicit main locus). Substitute joins via phi; raise
+    /// terminates the err branch, so the join only has the ok
+    /// branch as predecessor.
+    fn lower_or_expr(
+        &mut self,
+        inner: &Expr,
+        disposition: &OrDisposition,
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        let call = self.lower_fallible_call(inner, scope)?;
+        let func = self
+            .current_fn
+            .ok_or_else(|| {
+                CodegenError::Unsupported(
+                    "`or` expression outside a fn body".into(),
+                )
+            })?;
+        let ok_bb = self.context.append_basic_block(func, "or.ok");
+        let err_bb = self.context.append_basic_block(func, "or.err");
+        self.builder
+            .build_conditional_branch(call.i1_path, err_bb, ok_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // OK branch: load the success value out of the sret slot.
+        // The br to join_bb is added after we know whether the err
+        // branch joins us (Substitute) or terminates (Raise).
+        self.builder.position_at_end(ok_bb);
+        let llvm_succ_ty = self.llvm_basic_type(&call.success_ty);
+        let ok_v = self
+            .builder
+            .build_load(llvm_succ_ty, call.out_val_slot, "or.ok.val")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ok_end_bb = self
+            .builder
+            .get_insert_block()
+            .expect("ok branch open");
+
+        // ERR branch.
+        self.builder.position_at_end(err_bb);
+        let err_join: Option<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+            match disposition {
+                OrDisposition::Raise(_) => {
+                    self.lower_or_raise(&call)?;
+                    None
+                }
+                OrDisposition::Substitute(rhs) => {
+                    // `err` binding implicit on substitute RHS, per
+                    // AST docstring (`Expr::Or`). The binding's
+                    // alloca is the inner call's out_err_slot, so
+                    // reads of `err.field` GEP through it the same
+                    // way reads of any locally-bound TypeRef would.
+                    let mut sub_scope = Scope {
+                        locals: scope.locals.clone(),
+                    };
+                    sub_scope.locals.insert(
+                        "err".to_string(),
+                        (call.out_err_slot, call.payload_ty.clone()),
+                    );
+                    let (sub_v, sub_ty) =
+                        self.lower_expr(rhs, &sub_scope)?;
+                    if sub_ty != call.success_ty {
+                        return Err(CodegenError::Unsupported(format!(
+                            "`or` substitute type mismatch: expected {:?}, \
+                             got {:?}",
+                            call.success_ty, sub_ty
+                        )));
+                    }
+                    // The rhs lowering may have created intermediate
+                    // blocks; the current insert block is where we
+                    // need to br from for the phi to see the right
+                    // predecessor.
+                    let sub_end_bb = self
+                        .builder
+                        .get_insert_block()
+                        .expect("substitute branch open");
+                    Some((sub_v, sub_end_bb))
+                }
+            };
+
+        // JOIN.
+        let join_bb = self.context.append_basic_block(func, "or.join");
+        self.builder.position_at_end(ok_end_bb);
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        match err_join {
+            None => {
+                // Raise: err branch terminated. Only ok flows to
+                // the join. Result is the ok-branch SSA directly.
+                self.builder.position_at_end(join_bb);
+                Ok((ok_v, call.success_ty))
+            }
+            Some((sub_v, sub_end_bb)) => {
+                self.builder.position_at_end(sub_end_bb);
+                self.builder
+                    .build_unconditional_branch(join_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(join_bb);
+                let phi = self
+                    .builder
+                    .build_phi(llvm_succ_ty, "or.result")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                phi.add_incoming(&[
+                    (&ok_v, ok_end_bb),
+                    (&sub_v, sub_end_bb),
+                ]);
+                Ok((phi.as_basic_value(), call.success_ty))
+            }
+        }
+    }
+
+    /// v1.x-FORM-2 PR6: lower the inner expression of an `or`,
+    /// emitting the fallible-ABI call. Today only handles direct
+    /// `Expr::Ident(fn_name)` callees that resolve to a fallible
+    /// user fn. Synthesized form-vec methods (`l.get(i)`,
+    /// `l.pop()`) lower as-if-fallible inline in commit 4 (PR5
+    /// finale); other shapes (path calls, generic-fn callees)
+    /// reject with a clear diagnostic.
+    fn lower_fallible_call(
+        &mut self,
+        inner: &Expr,
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        let (callee, args) = match inner {
+            Expr::Call { callee, args, .. } => (callee.as_ref(), args),
+            _ => {
+                return Err(CodegenError::Unsupported(format!(
+                    "`or` requires a fallible call expression; got {:?}",
+                    std::mem::discriminant(inner)
+                )));
+            }
+        };
+        let id = match callee {
+            Expr::Ident(id) => id,
+            Expr::Field { .. } => {
+                return Err(CodegenError::Unsupported(
+                    "`or` over a method call lands in PR5 finale (commit 4 \
+                     wires synthesized @form(vec) get/pop)"
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err(CodegenError::Unsupported(format!(
+                    "`or` callee shape not yet supported: {:?}",
+                    std::mem::discriminant(callee)
+                )));
+            }
+        };
+        let sig = self
+            .user_fns
+            .get(&id.name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "`or` over call to unknown fn `{}`",
+                    id.name
+                ))
+            })?;
+        let payload_ty = sig.fallible.clone().ok_or_else(|| {
+            CodegenError::Unsupported(format!(
+                "`or` applied to non-fallible fn `{}`",
+                id.name
+            ))
+        })?;
+        let success_ty = sig.ret.clone().ok_or_else(|| {
+            CodegenError::Unsupported(format!(
+                "fallible fn `{}` has no declared return type",
+                id.name
+            ))
+        })?;
+        if args.len() > sig.params.len() {
+            return Err(CodegenError::Unsupported(format!(
+                "fallible fn `{}` expects at most {} args, got {}",
+                id.name,
+                sig.params.len(),
+                args.len()
+            )));
+        }
+        for (i, default) in sig.defaults.iter().enumerate() {
+            if i >= args.len() && default.is_none() {
+                return Err(CodegenError::Unsupported(format!(
+                    "fallible fn `{}`: required param at position {} not \
+                     provided (only {} args given)",
+                    id.name,
+                    i,
+                    args.len()
+                )));
+            }
+        }
+
+        // Allocate the sret slots BEFORE lowering args so the
+        // alloca lands in the entry block (LLVM's mem2sem treats
+        // entry-block allocas specially) and the slot pointers
+        // are stable across arg-expression lowering.
+        let out_val_slot = self.alloca_for(&success_ty, "or.out_val.slot")?;
+        let out_err_slot = self.alloca_for(&payload_ty, "or.out_err.slot")?;
+
+        let caller_arena_at_call = self.current_arena_ptr()?;
+        let mut llvm_args: Vec<BasicMetadataValueEnum<'ctx>> =
+            Vec::with_capacity(sig.params.len() + 3);
+        llvm_args.push(caller_arena_at_call.into());
+        for i in 0..sig.params.len() {
+            let (v, ty) = if i < args.len() {
+                self.lower_expr(&args[i], scope)?
+            } else {
+                let default = sig
+                    .defaults[i]
+                    .as_ref()
+                    .expect("checked above");
+                self.lower_expr(default, scope)?
+            };
+            // Same arg-coercion shape as lower_user_fn_call.
+            let v = if let (CodegenTy::Interface(iface), CodegenTy::LocusRef(l)) =
+                (&sig.params[i], &ty)
+            {
+                let fat = self.coerce_to_interface(
+                    v.into_pointer_value(),
+                    l,
+                    iface,
+                )?;
+                fat.into()
+            } else if sig.params[i] == CodegenTy::Float && ty == CodegenTy::Int {
+                let widened = self.coerce_to_float(
+                    v,
+                    &ty,
+                    &format!("fallible fn `{}` arg {}", id.name, i),
+                )?;
+                widened.into()
+            } else if ty != sig.params[i] {
+                return Err(CodegenError::Unsupported(format!(
+                    "fallible fn `{}` arg {} type mismatch: expected {:?}, \
+                     got {:?}",
+                    id.name, i, sig.params[i], ty
+                )));
+            } else {
+                v
+            };
+            llvm_args.push(v.into());
+        }
+        llvm_args.push(out_val_slot.into());
+        llvm_args.push(out_err_slot.into());
+
+        let call = self
+            .builder
+            .build_call(
+                sig.func,
+                &llvm_args,
+                &format!("{}.fallible.call", id.name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let i1_path = call
+            .try_as_basic_value()
+            .left()
+            .expect("fallible fn returns i1")
+            .into_int_value();
+
+        Ok(FallibleCallResult {
+            i1_path,
+            out_val_slot,
+            out_err_slot,
+            success_ty,
+            payload_ty,
+        })
+    }
+
+    /// v1.x-FORM-2 PR6: lower the err branch of an `or raise`.
+    /// Inside a fallible(E) fn: sret-copy the inner payload into
+    /// the enclosing fn's err alloca, flip its path indicator to
+    /// 1, branch to the enclosing exit. Otherwise (the implicit
+    /// main locus's body or any non-fallible frame reachable
+    /// from it): call `lotus_root_panic` and emit unreachable.
+    /// Either way the err branch terminates — the caller's join
+    /// block has only the ok branch as a predecessor.
+    fn lower_or_raise(
+        &mut self,
+        call: &FallibleCallResult<'ctx>,
+    ) -> Result<(), CodegenError> {
+        match self.current_user_fn_fallible.clone() {
+            Some(enclosing) => {
+                if call.payload_ty != enclosing.payload_ty {
+                    return Err(CodegenError::Unsupported(format!(
+                        "`or raise` payload type mismatch: inner is {:?}, \
+                         enclosing fn declared fallible({:?})",
+                        call.payload_ty, enclosing.payload_ty
+                    )));
+                }
+                let llvm_err_ty = self.llvm_basic_type(&call.payload_ty);
+                let v = self
+                    .builder
+                    .build_load(
+                        llvm_err_ty,
+                        call.out_err_slot,
+                        "or.raise.payload.load",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(enclosing.err_alloca, v)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let bool_t = self.context.bool_type();
+                self.builder
+                    .build_store(
+                        enclosing.path_alloca,
+                        bool_t.const_int(1, false),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let exit_bb = self
+                    .current_user_fn_exit_bb
+                    .expect("exit_bb set inside a fn body");
+                self.builder
+                    .build_unconditional_branch(exit_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+            None => {
+                // Implicit-main-locus escape: value error past every
+                // fallible frame → panic via the runtime fn. The
+                // typename arg is the discriminator a future
+                // routing-through-main-locus-on_failure extension
+                // would key on; today the runtime fn just dprintf
+                // + exit(1).
+                let typename_ptr =
+                    self.payload_typename_global(&call.payload_ty);
+                let llvm_err_ty = self.llvm_basic_type(&call.payload_ty);
+                let payload_size = llvm_err_ty
+                    .size_of()
+                    .expect("payload type has known size");
+                let root_panic_fn = self
+                    .module
+                    .get_function("lotus_root_panic")
+                    .expect("lotus_root_panic declared in declare_builtins");
+                self.builder
+                    .build_call(
+                        root_panic_fn,
+                        &[
+                            call.out_err_slot.into(),
+                            payload_size.into(),
+                            typename_ptr.into(),
+                        ],
+                        "or.raise.root_panic",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// v1.x-FORM-2 PR6: return a `ptr` SSA pointing at a global
+    /// NUL-terminated C string with the payload type's display
+    /// name (for `lotus_root_panic`'s diagnostic + future routing
+    /// discriminator). Mangled names are kept as-is in v1 — the
+    /// extra readability of a pretty-printer isn't worth the
+    /// surface area today.
+    fn payload_typename_global(&mut self, ty: &CodegenTy) -> PointerValue<'ctx> {
+        let name = match ty {
+            CodegenTy::TypeRef(n) | CodegenTy::Enum(n) | CodegenTy::LocusRef(n)
+            | CodegenTy::Interface(n) => n.clone(),
+            CodegenTy::Int => "Int".to_string(),
+            CodegenTy::Float => "Float".to_string(),
+            CodegenTy::Bool => "Bool".to_string(),
+            CodegenTy::String => "String".to_string(),
+            CodegenTy::Bytes => "Bytes".to_string(),
+            CodegenTy::Decimal => "Decimal".to_string(),
+            CodegenTy::Time => "Time".to_string(),
+            CodegenTy::Duration => "Duration".to_string(),
+            other => format!("{:?}", other),
+        };
+        self.global_string(&name)
     }
 
     fn lower_stmt(
@@ -12795,6 +13192,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 };
                 let (v, ty, _end) = self.lower_block_as_expr(block, &mut inner)?;
                 Ok((v, ty))
+            }
+            Expr::Or { inner, disposition, .. } => {
+                self.lower_or_expr(inner, disposition, scope)
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "expression form {:?}",
