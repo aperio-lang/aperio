@@ -484,6 +484,7 @@ literal           = INT_LIT
                   | FLOAT_LIT
                   | DECIMAL_LIT
                   | STRING_LIT
+                  | FSTRING_LIT       (* v1.x-10: f"... {expr} ..." *)
                   | BYTES_LIT
                   | DURATION_LIT
                   | TIME_LIT
@@ -491,6 +492,14 @@ literal           = INT_LIT
                   | "false"
                   | "nil"
                   ;
+
+(* v1.x-10: f-strings are lex-level primitives that pre-split the
+   body into Lit / Interp segments. The parser sub-parses each
+   Interp body as a full expression and lowers the literal to a
+   left-folded `Lit + to_string(expr) + Lit + ...` chain. `{{` and
+   `}}` are literal braces; `\{` and `\}` are escape forms. *)
+FSTRING_LIT       = "f" , STRING_LIT (* with `{expr}` interpolation
+                                        and `{{` / `}}` escapes *) ;
 
 tuple_expr        = "(" , expression , "," , expression ,
                     { "," , expression } , ")" ;
