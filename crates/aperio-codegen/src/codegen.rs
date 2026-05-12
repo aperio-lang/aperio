@@ -1981,6 +1981,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         );
         self.module
             .add_function("lotus_str_replace", replace_ty, None);
+        // declare ptr @lotus_str_repeat(ptr s, i64 n)
+        let repeat_ty = ptr_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_str_repeat", repeat_ty, None);
+        // declare ptr @lotus_str_pad_left(ptr s, i64 width, ptr pad)
+        let pad_ty = ptr_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_str_pad_left", pad_ty, None);
+        // declare ptr @lotus_str_pad_right(ptr s, i64 width, ptr pad)
+        self.module
+            .add_function("lotus_str_pad_right", pad_ty, None);
 
         // v1.x-15: string-builder primitive. Doubling realloc-backed
         // buffer that turns O(N²) accumulation into amortized O(N).
@@ -13763,6 +13777,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_replace(args, scope)?;
                 Ok(())
             }
+            ["std", "str", "repeat"] => {
+                let _ = self.lower_std_str_repeat(args, scope)?;
+                Ok(())
+            }
+            ["std", "str", "pad_left"] => {
+                let _ = self.lower_std_str_pad(args, scope, "pad_left")?;
+                Ok(())
+            }
+            ["std", "str", "pad_right"] => {
+                let _ = self.lower_std_str_pad(args, scope, "pad_right")?;
+                Ok(())
+            }
             // v1.x-15: string-builder primitive.
             ["std", "str", "builder_new"] => {
                 let _ = self.lower_std_str_builder_new(args)?;
@@ -14098,6 +14124,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "replace"] => {
                 self.lower_std_str_replace(args, scope)
+            }
+            ["std", "str", "repeat"] => {
+                self.lower_std_str_repeat(args, scope)
+            }
+            ["std", "str", "pad_left"] => {
+                self.lower_std_str_pad(args, scope, "pad_left")
+            }
+            ["std", "str", "pad_right"] => {
+                self.lower_std_str_pad(args, scope, "pad_right")
             }
             ["std", "str", "builder_new"] => {
                 self.lower_std_str_builder_new(args)
@@ -14826,6 +14861,103 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .try_as_basic_value()
             .left()
             .expect("returns ptr");
+        Ok((v, CodegenTy::String))
+    }
+
+    /// v1.x: `std::str::repeat(s, n) -> String`. Concatenates `s`
+    /// with itself n times. n <= 0 returns empty.
+    fn lower_std_str_repeat(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::repeat takes 2 args (s, n), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::repeat: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let (n_val, n_ty) = self.lower_expr(&args[1], scope)?;
+        if n_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::repeat: n must be Int, got {:?}",
+                n_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_str_repeat")
+            .expect("lotus_str_repeat declared");
+        let call = self
+            .builder
+            .build_call(f, &[s_val.into(), n_val.into()], "str.repeat.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call.try_as_basic_value().left().expect("returns ptr");
+        Ok((v, CodegenTy::String))
+    }
+
+    /// v1.x: `std::str::pad_left(s, width, pad) -> String` and
+    /// `pad_right`. `pad` is a single-char String; only the first
+    /// byte is used. If s is already >= width, returns s unchanged.
+    fn lower_std_str_pad(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        which: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::{} takes 3 args (s, width, pad), got {}",
+                which,
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        let (w_val, w_ty) = self.lower_expr(&args[1], scope)?;
+        let (p_val, p_ty) = self.lower_expr(&args[2], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::{}: s must be String, got {:?}",
+                which, s_ty
+            )));
+        }
+        if w_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::{}: width must be Int, got {:?}",
+                which, w_ty
+            )));
+        }
+        if p_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::{}: pad must be String, got {:?}",
+                which, p_ty
+            )));
+        }
+        let extern_name = match which {
+            "pad_left" => "lotus_str_pad_left",
+            "pad_right" => "lotus_str_pad_right",
+            _ => unreachable!(),
+        };
+        let f = self
+            .module
+            .get_function(extern_name)
+            .expect("pad extern declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[s_val.into(), w_val.into(), p_val.into()],
+                &format!("str.{}.ret", which),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call.try_as_basic_value().left().expect("returns ptr");
         Ok((v, CodegenTy::String))
     }
 

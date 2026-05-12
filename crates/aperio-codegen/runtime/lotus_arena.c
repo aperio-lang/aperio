@@ -3843,6 +3843,113 @@ const char *lotus_str_replace(const char *s, const char *needle,
     return out;
 }
 
+/*
+ * Repeat `s` n times, concatenated. Negative or zero n returns
+ * the empty string. NULL s is treated as "". Result is anchored
+ * in the bus payload arena.
+ */
+const char *lotus_str_repeat(const char *s, int64_t n) {
+    if (!s || n <= 0) {
+        return "";
+    }
+    size_t sl = strlen(s);
+    if (sl == 0) return "";
+    size_t total = sl * (size_t)n;
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return "";
+        }
+    }
+    char *out = (char *)lotus_arena_alloc(g_bus_payload_arena, total + 1, 1);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    if (!out) return "";
+    for (int64_t i = 0; i < n; i++) {
+        memcpy(out + i * sl, s, sl);
+    }
+    out[total] = '\0';
+    return out;
+}
+
+/*
+ * Pad `s` on the LEFT with `pad` until total length is `width`.
+ * If `s` is already >= width, returns `s` unchanged (no truncation).
+ * `pad` must be a single ASCII char (uses first byte). Common
+ * shape for right-aligning numbers in column output.
+ */
+const char *lotus_str_pad_left(const char *s, int64_t width, const char *pad) {
+    if (!s) s = "";
+    size_t sl = strlen(s);
+    if ((int64_t)sl >= width) {
+        /* Already wide enough — return unchanged (arena-copy so the
+         * caller doesn't need to distinguish own-vs-borrow). */
+        size_t n = sl;
+        pthread_mutex_lock(&g_bus_payload_arena_mutex);
+        if (!g_bus_payload_arena) {
+            g_bus_payload_arena = lotus_arena_create();
+            if (!g_bus_payload_arena) {
+                pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+                return "";
+            }
+        }
+        char *out = (char *)lotus_arena_alloc(g_bus_payload_arena, n + 1, 1);
+        pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+        if (!out) return "";
+        memcpy(out, s, n);
+        out[n] = '\0';
+        return out;
+    }
+    char ch = (pad && *pad) ? *pad : ' ';
+    size_t pad_count = (size_t)width - sl;
+    size_t total = (size_t)width;
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return "";
+        }
+    }
+    char *out = (char *)lotus_arena_alloc(g_bus_payload_arena, total + 1, 1);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    if (!out) return "";
+    memset(out, ch, pad_count);
+    memcpy(out + pad_count, s, sl);
+    out[total] = '\0';
+    return out;
+}
+
+/*
+ * Pad `s` on the RIGHT with `pad` until total length is `width`.
+ * Same shape as pad_left but the pad bytes go on the trailing side.
+ * Common for left-aligning columns in table output.
+ */
+const char *lotus_str_pad_right(const char *s, int64_t width, const char *pad) {
+    if (!s) s = "";
+    size_t sl = strlen(s);
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return "";
+        }
+    }
+    size_t total = ((int64_t)sl >= width) ? sl : (size_t)width;
+    char *out = (char *)lotus_arena_alloc(g_bus_payload_arena, total + 1, 1);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    if (!out) return "";
+    memcpy(out, s, sl);
+    if (total > sl) {
+        char ch = (pad && *pad) ? *pad : ' ';
+        memset(out + sl, ch, total - sl);
+    }
+    out[total] = '\0';
+    return out;
+}
+
 const char *lotus_str_upper(const char *s) {
     if (!s) return "";
     size_t n = strlen(s);

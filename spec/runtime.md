@@ -441,6 +441,13 @@ and modes; specific transports come from stdlib (`std::bus::*`).
   non-overlapping substring replace. Two-pass (count, then
   fill) so the output is right-sized in one arena alloc.
   Empty needle is a no-op.
+- `lotus_str_repeat(s, n) -> char*` — n copies of s
+  concatenated; n <= 0 returns empty. Single arena alloc.
+- `lotus_str_pad_left(s, width, pad) -> char*` /
+  `lotus_str_pad_right(s, width, pad) -> char*` — width-aligned
+  output using the first byte of `pad` (default space) as
+  the fill char. No truncation: `len(s) >= width` returns
+  s unchanged.
 
 ### Process control
 

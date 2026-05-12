@@ -474,6 +474,18 @@ pub fn resolve_path(segments: &[&str]) -> Option<Value> {
             name: "std::str::replace",
             func: Rc::new(std_str_replace),
         })),
+        ["std", "str", "repeat"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::str::repeat",
+            func: Rc::new(std_str_repeat),
+        })),
+        ["std", "str", "pad_left"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::str::pad_left",
+            func: Rc::new(std_str_pad_left),
+        })),
+        ["std", "str", "pad_right"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::str::pad_right",
+            func: Rc::new(std_str_pad_right),
+        })),
         // v1.x-15: string-builder primitive. The interpreter
         // uses a Bytes-shaped carrier — the first 8 bytes of the
         // backing Vec<u8> are a sentinel `"_sb_v1__"` so attempts
@@ -563,6 +575,77 @@ fn std_str_trim(args: &[Value]) -> Result<Value, String> {
             other.type_name()
         )),
     }
+}
+
+fn std_str_repeat(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "std::str::repeat expects 2 args, got {}",
+            args.len()
+        ));
+    }
+    let (s, n) = match (&args[0], &args[1]) {
+        (Value::String(s), Value::Int(n)) => (s, *n),
+        (a, b) => {
+            return Err(format!(
+                "std::str::repeat expects (String, Int); got ({}, {})",
+                a.type_name(), b.type_name()
+            ));
+        }
+    };
+    if n <= 0 {
+        return Ok(Value::String(String::new()));
+    }
+    Ok(Value::String(s.repeat(n as usize)))
+}
+
+fn pad_helper(
+    args: &[Value],
+    name: &str,
+    on_left: bool,
+) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "std::str::{} expects 3 args, got {}",
+            name,
+            args.len()
+        ));
+    }
+    let (s, w, pad) = match (&args[0], &args[1], &args[2]) {
+        (Value::String(s), Value::Int(w), Value::String(p)) => (s, *w, p),
+        (a, b, c) => {
+            return Err(format!(
+                "std::str::{} expects (String, Int, String); got ({}, {}, {})",
+                name,
+                a.type_name(), b.type_name(), c.type_name()
+            ));
+        }
+    };
+    let sl = s.len() as i64;
+    if sl >= w {
+        return Ok(Value::String(s.clone()));
+    }
+    let ch = pad.chars().next().unwrap_or(' ');
+    let pad_count = (w - sl) as usize;
+    let padding: String = std::iter::repeat(ch).take(pad_count).collect();
+    let out = if on_left {
+        let mut t = padding;
+        t.push_str(s);
+        t
+    } else {
+        let mut t = s.clone();
+        t.push_str(&padding);
+        t
+    };
+    Ok(Value::String(out))
+}
+
+fn std_str_pad_left(args: &[Value]) -> Result<Value, String> {
+    pad_helper(args, "pad_left", true)
+}
+
+fn std_str_pad_right(args: &[Value]) -> Result<Value, String> {
+    pad_helper(args, "pad_right", false)
 }
 
 fn std_str_replace(args: &[Value]) -> Result<Value, String> {
