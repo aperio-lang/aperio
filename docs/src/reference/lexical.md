@@ -138,13 +138,47 @@ between `Float` and `Decimal`. Decimal semantics match the
 ## String literals
 
 ```text
-string ::= "\"" character* "\""
-escape ::= "\"" | "\\" | "n" | "t" | "r" | "0" | "x" hex hex | "u{" hex+ "}"
+string  ::= "\"" character* "\""
+fstring ::= "f\"" (text-part | interpolation)* "\""
+escape  ::= "\"" | "\\" | "n" | "t" | "r" | "0" | "x" hex hex | "u{" hex+ "}"
 ```
 
 Strings are UTF-8 byte sequences at runtime. The literal
 itself is interned in a static region; runtime concatenations
 and slicings land in the current arena.
+
+### F-strings (v1.x-10)
+
+Prefixing a string literal with `f` enables interpolation:
+`{ expression }` inside the body is evaluated and inserted
+into the result via `to_string`. Plain double-quoted strings
+keep their old semantics — `{` and `}` are ordinary characters
+there, so existing source containing literal `{...}` content
+(JSON snippets, placeholder tokens, etc.) is unchanged.
+
+```aperio
+let name = "world";
+let n = 42;
+println(f"hello {name}, n={n}");
+//        ↑              ↑
+//        interpolation pieces lower to:
+//        "hello " + to_string(name) + ", n=" + to_string(n)
+```
+
+Inside `{...}`:
+
+- The body is parsed as a regular Aperio expression
+  (arithmetic, field access, function calls all work).
+- `{{` and `}}` are literal braces inside the surrounding
+  literal text.
+- An inline string literal uses escaped quotes:
+  `f"got: {std::str::upper(\"abc\")}"`. The lexer tracks
+  quote state via `\"` toggles so `{` / `}` inside the inner
+  string don't perturb depth counting.
+- A literal `"` inside the nested string isn't supported at
+  v1 (would require triple-escape and conflicts with the
+  `\"` boundary marker).
+- Empty interpolation `{}` is a lex error.
 
 ## Time and duration literals
 
