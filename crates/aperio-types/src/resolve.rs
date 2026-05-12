@@ -204,6 +204,38 @@ fn register_locus(
         }
     }
 
+    // v1.x-3: surface the "v1.x pending" rejection for the two
+    // sub-modes we parse + typecheck but haven't shipped a runtime
+    // for yet. Mirrors v1.x-4's surface-then-runtime split — the
+    // user gets a clear "spelled correctly but not yet implemented"
+    // diagnostic at typecheck rather than discovering it during
+    // codegen. v1 ships fixed_cell + shared_slab.
+    if let Some(ProjectionClass::Recognition(Some(params))) = annotations.projection {
+        match params.sub_mode {
+            RecognitionSubMode::Spillover { .. } => {
+                diags.push(Diag::ty(
+                    decl.name.span,
+                    "recognition sub-mode `spillover` is parsed but not yet \
+                     shipped — v1.x pending. Use `fixed_cell(bytes=K)` for \
+                     hard-bounded cells or `shared_slab(bytes=K)` for a \
+                     wholesale-freed bump arena."
+                        .to_string(),
+                ));
+            }
+            RecognitionSubMode::SummaryOnly => {
+                diags.push(Diag::ty(
+                    decl.name.span,
+                    "recognition sub-mode `summary_only` is parsed but not \
+                     yet shipped — v1.x pending. The \"no child arena \
+                     allocation\" type-system rule isn't in tree yet. Use \
+                     `fixed_cell(bytes=K)` or `shared_slab(bytes=K)` for v1."
+                        .to_string(),
+                ));
+            }
+            RecognitionSubMode::FixedCell { .. } | RecognitionSubMode::SharedSlab { .. } => {}
+        }
+    }
+
     for member in &decl.members {
         match member {
             LocusMember::Params(pb) => {
