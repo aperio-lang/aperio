@@ -78,6 +78,8 @@
 
 - [Memory-Owner Architecture](./moa/introduction.md)
   - [The four properties](./moa/properties.md)
+  - [Audit checklist](./moa/audit-checklist.md)
+  - [Glossary](./moa/glossary.md)
   - [Patterns]()
     - [Broadcast + on-demand snapshot](./moa/patterns/broadcast-snapshot.md)
     - [Config-loading orchestrator](./moa/patterns/config-loader.md)
