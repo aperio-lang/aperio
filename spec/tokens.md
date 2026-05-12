@@ -304,6 +304,12 @@ arguments. The parser disambiguates contextually.)
   `\t`, `\\`, `\"`, `\u{NNNN}`).
 - Raw strings: `r"..."` — no escape processing.
 - Multi-line strings: `"""..."""`.
+- F-strings (v1.x-10): `f"hello {name}"` — interpolates Aperio
+  expressions inside `{...}`, each rendered via the same
+  formatter `println` uses. `{{` and `}}` are literal braces.
+  Plain `"..."` strings keep `{` and `}` as ordinary characters
+  for back-compat (no breaking change). Interpolation accepts
+  any expression; types are converted with `to_string`.
 
 ### Boolean literals
 

@@ -19,6 +19,19 @@ impl Token {
     }
 }
 
+/// v1.x-10: one segment of an f-string body. The lexer splits an
+/// `f"..."` literal into a sequence of these so the parser doesn't
+/// have to rescan for `{...}` boundaries (and `{{` / `}}` escapes
+/// are already resolved into the Lit variant).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStringPart {
+    /// Literal text fragment (escape-processed; braces unescaped).
+    Lit(String),
+    /// Raw text between `{` and `}`. Parsed as an Aperio expression
+    /// at parse time; an empty Interp is a lex error.
+    Interp(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Identifiers and literals
@@ -29,6 +42,11 @@ pub enum TokenKind {
     DecimalLit(String),
     /// String literal payload (already escape-processed).
     StringLit(String),
+    /// v1.x-10 f-string: pre-split sequence of literal text + raw
+    /// interpolation-body parts. The parser sub-parses each Interp
+    /// part as a small expression and desugars the whole token to
+    /// `Lit + to_string(expr) + Lit + ...` joined by `+`.
+    FStringLit(Vec<FStringPart>),
     /// Bytes literal payload.
     BytesLit(Vec<u8>),
     /// Duration literal in nanoseconds.
@@ -328,6 +346,14 @@ impl<'a> Lexer<'a> {
 
         let start = self.pos;
         let b = self.peek().unwrap();
+
+        // v1.x-10 f-string literal: `f"..."`. Must precede the
+        // generic ident path so the lone `f` doesn't lex as an
+        // identifier when followed by an opening quote.
+        if b == b'f' && self.source.as_bytes().get(self.pos + 1) == Some(&b'"') {
+            self.pos += 1; // consume the leading `f`
+            return self.lex_fstring(start).map(Some);
+        }
 
         // Identifier or keyword
         if b.is_ascii_alphabetic() || b == b'_' {
@@ -744,6 +770,121 @@ impl<'a> Lexer<'a> {
                     self.pos += ch.len_utf8();
                     s.push(ch);
                     let _ = b;
+                }
+            }
+        }
+    }
+
+    /// v1.x-10 lex an `f"..."` f-string. Same escape table as
+    /// lex_string (`\n`, `\t`, `\r`, `\\`, `\"`, `\0`) plus `\{`
+    /// and `\}` for literal braces; bare `{` opens interpolation,
+    /// `{{` / `}}` are literal braces. The body is returned
+    /// pre-split into FStringParts so the parser doesn't rescan.
+    fn lex_fstring(&mut self, start: usize) -> Result<Token, Diag> {
+        // Consume opening quote.
+        self.pos += 1;
+        let mut parts: Vec<FStringPart> = Vec::new();
+        let mut buf = String::new();
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(Diag::lex(
+                        Span::new(start, self.pos),
+                        "unterminated f-string literal",
+                    ));
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    if !buf.is_empty() || parts.is_empty() {
+                        parts.push(FStringPart::Lit(std::mem::take(&mut buf)));
+                    }
+                    let span = Span::new(start, self.pos);
+                    return Ok(Token::new(TokenKind::FStringLit(parts), span));
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(b'n') => { buf.push('\n'); self.pos += 1; }
+                        Some(b't') => { buf.push('\t'); self.pos += 1; }
+                        Some(b'r') => { buf.push('\r'); self.pos += 1; }
+                        Some(b'\\') => { buf.push('\\'); self.pos += 1; }
+                        Some(b'"') => { buf.push('"'); self.pos += 1; }
+                        Some(b'0') => { buf.push('\0'); self.pos += 1; }
+                        Some(b'{') => { buf.push('{'); self.pos += 1; }
+                        Some(b'}') => { buf.push('}'); self.pos += 1; }
+                        Some(other) => {
+                            return Err(Diag::lex(
+                                Span::new(self.pos - 1, self.pos + 1),
+                                format!("unknown f-string escape: \\{}", other as char),
+                            ));
+                        }
+                        None => {
+                            return Err(Diag::lex(
+                                Span::new(self.pos - 1, self.pos),
+                                "f-string ended after backslash",
+                            ));
+                        }
+                    }
+                }
+                Some(b'{') => {
+                    if self.source.as_bytes().get(self.pos + 1) == Some(&b'{') {
+                        buf.push('{');
+                        self.pos += 2;
+                    } else {
+                        // Enter interpolation. Flush any pending literal.
+                        parts.push(FStringPart::Lit(std::mem::take(&mut buf)));
+                        let interp_start = self.pos + 1;
+                        self.pos += 1;
+                        let mut depth = 1usize;
+                        while depth > 0 {
+                            match self.peek() {
+                                None => {
+                                    return Err(Diag::lex(
+                                        Span::new(interp_start - 1, self.pos),
+                                        "unterminated interpolation in f-string",
+                                    ));
+                                }
+                                Some(b'}') => {
+                                    depth -= 1;
+                                    if depth == 0 { break; }
+                                    self.pos += 1;
+                                }
+                                Some(b'{') => {
+                                    depth += 1;
+                                    self.pos += 1;
+                                }
+                                Some(_) => {
+                                    let ch = self.source[self.pos..].chars().next().unwrap();
+                                    self.pos += ch.len_utf8();
+                                }
+                            }
+                        }
+                        let body = self.source[interp_start..self.pos].trim().to_string();
+                        if body.is_empty() {
+                            return Err(Diag::lex(
+                                Span::new(interp_start - 1, self.pos + 1),
+                                "empty interpolation `{}` in f-string",
+                            ));
+                        }
+                        parts.push(FStringPart::Interp(body));
+                        self.pos += 1; // consume `}`
+                    }
+                }
+                Some(b'}') => {
+                    if self.source.as_bytes().get(self.pos + 1) == Some(&b'}') {
+                        buf.push('}');
+                        self.pos += 2;
+                    } else {
+                        return Err(Diag::lex(
+                            Span::new(self.pos, self.pos + 1),
+                            "stray `}` in f-string — use `}}` for a literal brace",
+                        ));
+                    }
+                }
+                Some(_) => {
+                    let ch = self.source[self.pos..].chars().next().unwrap();
+                    self.pos += ch.len_utf8();
+                    buf.push(ch);
                 }
             }
         }

@@ -10,7 +10,7 @@
 
 use crate::ast::*;
 use crate::error::Diag;
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{FStringPart, Token, TokenKind};
 use crate::span::Span;
 
 /// Parse a token stream into a Program. Source string is needed
@@ -2043,6 +2043,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Literal(Literal::String(s), span))
             }
+            TokenKind::FStringLit(parts) => {
+                self.bump();
+                self.lower_fstring_parts(parts, span)
+            }
             TokenKind::True => {
                 self.bump();
                 Ok(Expr::Literal(Literal::Bool(true), span))
@@ -2257,6 +2261,105 @@ impl Parser {
             TokenKind::Shr => BinOp::Shr,
             _ => return None,
         })
+    }
+
+    /// v1.x-10: lower a pre-split f-string into a chain of
+    /// `Lit + to_string(expr) + Lit + ...` concatenations.
+    ///
+    /// Each `Interp(body)` substring is re-lexed + re-parsed as an
+    /// Aperio expression via a fresh inner parser. That lets `f"{a + b * 2}"`
+    /// and `f"{user.name}"` work without growing this routine.
+    /// Empty bodies are rejected at the lexer; an Interp here is
+    /// always non-empty.
+    fn lower_fstring_parts(
+        &mut self,
+        parts: Vec<FStringPart>,
+        span: Span,
+    ) -> Result<Expr, Diag> {
+        let mut pieces: Vec<Expr> = Vec::new();
+        for part in parts {
+            match part {
+                FStringPart::Lit(s) => {
+                    if !s.is_empty() {
+                        pieces.push(Expr::Literal(Literal::String(s), span));
+                    }
+                }
+                FStringPart::Interp(body) => {
+                    // Sub-parse the interpolation body as an expression.
+                    let tokens = crate::lexer::lex(&body).map_err(|diags| {
+                        let msg = diags
+                            .iter()
+                            .map(|d| d.message.clone())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        Diag::parse(
+                            span,
+                            format!("f-string interpolation `{{{}}}`: {}", body, msg),
+                        )
+                    })?;
+                    let mut sub = Parser::new(tokens);
+                    let expr = sub.parse_expr().map_err(|d| {
+                        Diag::parse(
+                            span,
+                            format!(
+                                "f-string interpolation `{{{}}}`: {}",
+                                body, d.message
+                            ),
+                        )
+                    })?;
+                    // Reject trailing tokens — interpolation must be one expr.
+                    if !sub.at_eof() {
+                        return Err(Diag::parse(
+                            span,
+                            format!(
+                                "f-string interpolation `{{{}}}`: unexpected trailing tokens",
+                                body
+                            ),
+                        ));
+                    }
+                    // Wrap in `to_string(expr)` so any printable
+                    // type renders the same way println would render it.
+                    let to_str_callee = Expr::Ident(Ident {
+                        name: "to_string".to_string(),
+                        span,
+                    });
+                    pieces.push(Expr::Call {
+                        callee: Box::new(to_str_callee),
+                        args: vec![expr],
+                        span,
+                    });
+                }
+            }
+        }
+
+        // Ensure there is at least one String piece so the type of
+        // the whole expression is String — `f""` → "", `f"{x}"` →
+        // "" + to_string(x).
+        if pieces.is_empty()
+            || !matches!(&pieces[0], Expr::Literal(Literal::String(_), _))
+        {
+            pieces.insert(
+                0,
+                Expr::Literal(Literal::String(String::new()), span),
+            );
+        }
+
+        // Fold via left-associative `+`.
+        let mut iter = pieces.into_iter();
+        let mut acc = iter.next().unwrap();
+        for next in iter {
+            acc = Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(acc),
+                right: Box::new(next),
+                span,
+            };
+        }
+        Ok(acc)
+    }
+
+    fn at_eof(&self) -> bool {
+        matches!(self.peek(), TokenKind::Eof)
     }
 }
 
