@@ -12,12 +12,21 @@
 
 ## The axiom this whole guide flows from
 
-> **Types are for shapes. Loci are for flow.**
+> **Every named structural thing is a locus.** Types are
+> loci-in-waiting — the smallest growth stage on the locus
+> gradient.
 
 If a thing has lifecycle, contracts, bus participation, or
-projection, it is a **locus**. If it is pure data (record,
-returnable by value, no flow), it is a **type**. There is no
-third category.
+projection, it is a fully-grown **locus**. If it is pure data
+(record, returnable by value, no flow), it is a **type** — a
+locus that's still proto-form. The two are points on one
+gradient, not separate categories.
+
+> For the full design philosophy this axiom unpacks — the
+> locus gradient, the three axes (capacity / projection / form),
+> the form-annotation framing, the locked-in v1 form library —
+> see `aperio-design-philosophy.md` in this directory. That
+> doc is the **why**; this one is the **how**.
 
 A seed exports loci, types, and **free fns**. Within one seed
 (one directory; per the per-dir seed model — see app-dev brief),
@@ -540,6 +549,12 @@ not from speculation.
 
 ## Cross-references
 
+- `notes/agent-onboarding/aperio-design-philosophy.md` — the
+  **why**. The everything-is-a-locus axiom this styleguide's
+  patterns realize, the form-annotation framing, and the
+  locked-in v1 decisions. Read alongside this file; the
+  philosophy doc is prescriptive at the design level, this
+  one is descriptive at the code level.
 - `notes/aperio-types-vs-loci.md` — the source axiom.
 - `notes/aperio-seed.md` — what a seed is and what it exports.
 - `notes/onboarding-shape-rules.md` — the agent-driven model
