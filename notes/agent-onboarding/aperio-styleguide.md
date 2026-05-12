@@ -59,6 +59,29 @@ recursion bottoms at primitive operations — arithmetic, single
 field reads, primitive calls. Everything above the floor is
 loci nested in loci.
 
+## Memory-Owner Architecture — the composition discipline
+
+The six patterns below are *shape primitives* — how you write any
+one locus. **Memory-Owner Architecture (MOA)** is one level up:
+*how those primitives compose* into a stateful app. The discipline
+is implicit in the framework's commitments (vertical-only contracts,
+typed lateral bus, copy-at-boundary, F.22 capacity slots); it
+becomes explicit when an app has state to organize.
+
+Four properties: (1) state lives at one memory-owner per concern;
+(2) every memory-owner declares two disciplines — `capacity` for
+storage, ingest classification (`discard | save | transform`) per
+subscription for consumption; (3) orchestrators carry no state, only
+routing and lifecycle; (4) the bus is the only inter-concern
+channel. Two memory-owner kinds: *recording* (save deltas verbatim
+— log) and *projection* (transform deltas into derived state —
+view).
+
+If your app will own any state (caches, books, projections,
+counters, registries), read `moa/MOA.md` before sketching loci.
+The patterns below are *how* you write each locus; MOA is *which
+loci to write*.
+
 ## The pattern catalog
 
 Six patterns; one example each. If your code doesn't match one
@@ -523,6 +546,11 @@ not from speculation.
   that informs how the codebase-onboarder treats foreign code.
 - `notes/agent-onboarding/app-dev-brief.md` — the **what** brief
   this styleguide complements.
+- `moa/MOA.md` — Memory-Owner Architecture; the composition
+  discipline above the six-pattern catalog. Required reading
+  before composing any stateful app.
+- `moa/subjects.md` — bus subject naming conventions for
+  interoperable MOA apps.
 - `docs/src/grimoire/06-the-same-shape.md` — the perceptual
   primer for "every axis is the same shape, including
   inward."

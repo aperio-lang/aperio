@@ -174,8 +174,49 @@ Each of these is one or two milestone movements away. The
 shape of the library is what it should be; the workarounds
 are local.
 
+## What this app teaches — Memory-Owner Architecture
+
+market-book is the canonical worked example of **Memory-Owner
+Architecture** (`moa/MOA.md`). The three loci map to the three
+MOA roles cleanly:
+
+- **`MdGatewayL`** = **recording memory-owner**. State: one Int
+  seq counter. Publishes four subject families (`book.snapshot.*`
+  and `book.delta`). Ingest: none — gateway is a pure egress
+  publisher in v0. It *records* the synthetic feed it generates
+  by stamping each event with a monotonically-increasing seq.
+- **`BookL`** = **projection memory-owner**. State: 8-level price
+  ladder per side, plus `in_snapshot` / `crossed` / `last_seq`
+  / counts. Subscribes to the four `book.*` subjects. Ingest
+  classifications above each subscribe line: three `transform`
+  (fold ladder state), one `save` (flip in_snapshot). It
+  *projects* the gateway's delta stream into a cohesive ladder
+  view; downstream consumers see the result, not the log.
+- **`main()`** = **orchestrator**. Holds no state. Routes argv,
+  instantiates the three memory-owners, kicks the feed. Every
+  assertion in `main()` reads through `BookL`'s contract
+  surface, never directly into state.
+
+Reading the source in MOA order: start with `gateway.ap`
+(simplest memory-owner — recording shape), then `book.ap`
+(projection memory-owner — the interesting case, where the
+ladder-mutation logic lives), then `main.ap` (orchestrator —
+how the two compose). The MOA header comment at the top of
+each file names the role explicitly.
+
+The F.22 `capacity { pool ... }` lift for BookL's ladder
+arrays is documented inline in `book.ap` as a v1.x migration —
+deferred because `Cell<T>` is opaque round-trip at v1 and
+BookL's indexed-access pattern (`bid_prices[i] = px`) needs
+the load/store-through-cell surface that lands when Map/Vec
+stdlib ships.
+
 ## Cross-references
 
+- `moa/MOA.md` — the Memory-Owner Architecture pattern this
+  app realizes
+- `moa/subjects.md` — bus subject conventions; `book.*` is an
+  app-defined family but follows the recording-stream shape
 - `apps/reload-demo/` — the model hot-swap pattern (paired
   with this demo: reload-demo is the kernel-overlay shipping
   path, market-book is the substrate it'd hot-swap models

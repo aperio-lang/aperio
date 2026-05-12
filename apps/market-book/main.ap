@@ -1,5 +1,12 @@
 // main.ap — orchestration for market-book.
 //
+// MOA role: orchestrator (top-level). Holds NO state — every
+// assertion in this body reads through the BookL contract surface
+// (bid_n, ask_n, crossed, last_seq, in_snapshot). Routes argv,
+// instantiates MdGatewayL + two BookLs, kicks the feed, exits.
+// The orchestrator-vs-memory-owner separation per moa/MOA.md:
+// state lives in BookL/MdGatewayL; main() routes.
+//
 // Wires the two-lotus simulation: one MdGatewayL publishing
 // the synthetic feed, two BookL subscribers reconstructing the
 // book independently. Both books receive every message; both

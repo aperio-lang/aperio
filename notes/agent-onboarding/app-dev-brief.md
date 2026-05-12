@@ -452,18 +452,28 @@ correct program."
 ## First-step protocol
 
 1. Read this brief. Re-read the counter-hallucination table.
-2. Read the four reference programs (`hello-world`,
+2. **If your app will own any state** (caches, books,
+   projections, counters, registries, conversation history,
+   anything that lives across more than one bus event), read
+   `moa/MOA.md` before sketching loci. State-bearing apps
+   must follow Memory-Owner Architecture shape and should
+   reach for `moa::*` substrate types (`LocusId`, `BraidId`,
+   `Tick`, `RuntimeEvent`) where applicable. Stateless
+   converters / formatters / one-shot tools can skip this
+   step.
+3. Read the four reference programs (`hello-world`,
    `http-hello`, `docs-server`, plus one of `01-` through
-   `05-`).
-3. Skim the `std::*` reference pages for the namespaces you
+   `05-`). If you read `moa/MOA.md`, also read
+   `apps/market-book/` as the MOA worked-example.
+4. Skim the `std::*` reference pages for the namespaces you
    expect to need.
-4. **Propose a small target to the human** before writing
+5. **Propose a small target to the human** before writing
    code. Shape: "I propose to build `<app>` in `apps/<app>/`.
    It will use `<list of std namespaces>`. Estimated friction
    areas: `<two or three things you suspect>`. OK to start?"
-5. Wait for OK.
-6. Build. Log friction as you hit it.
-7. When the app works end-to-end (or hits a wall), write its
+6. Wait for OK.
+7. Build. Log friction as you hit it.
+8. When the app works end-to-end (or hits a wall), write its
    `README.md` and a friction-summary entry pointing back to
    the per-app FRICTION log.
 
@@ -502,6 +512,13 @@ correct program."
 - `notes/agent-onboarding/aperio-styleguide.md` — the **how**
   to this brief's **what**. Pattern catalog with one example
   each, naming conventions, composition guidance.
+- `moa/MOA.md` — Memory-Owner Architecture; the composition
+  discipline for any stateful app. Required reading before
+  composing loci that own state. References the substrate
+  types in `moa::*` (path prefix parallel to `std::*`).
+- `moa/subjects.md` — bus subject naming conventions for
+  MOA-shaped apps. Following them makes apps interoperable
+  by construction.
 - `notes/agent-onboarding/compiler-session-brief.md` — the
   brief for the *other* kind of session: agents that work on
   the compiler proper (`crates/`, `spec/`, `docs/src/reference/`).

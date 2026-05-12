@@ -180,3 +180,14 @@ codebase explicitly names it." One-tower presence is
   `notes/agent-onboarding/aperio-styleguide.md`. New primitives
   earn their slot by sharpening the existing contract, not by
   inventing a third category.
+
+## See also
+
+- `moa/MOA.md` — Memory-Owner Architecture; the composition
+  discipline that builds on this axiom. The recursive lotus
+  this note names becomes a practical authoring rule when an
+  app has state to organize: state lives at one memory-owner
+  per concern, with capacity + ingest disciplines declared per
+  memory-owner, and the bus carrying typed deltas between
+  concerns. The architecture ships as a top-level substrate
+  with its own `moa::*` path prefix.

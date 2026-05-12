@@ -1,5 +1,19 @@
 // book.ap — embeddable market-book lotus.
 //
+// MOA role: projection memory-owner.
+// Memory: 8-level price ladder per side (Int parallel arrays;
+//         capacity-block lift to F.22 `pool of Int` deferred per
+//         the indexed-access friction below).
+// Publishes: nothing — BookL is a pure consumer. Downstream tools
+//         observe its state via the contract surface or by
+//         subscribing to `book.*` events upstream.
+// Ingest: per subscription, see classifications above each
+//         subscribe line. `on_snap_end` is the lone `save`
+//         (records the snapshot-complete signal as a bool flip);
+//         the other three are `transform` (fold deltas into
+//         ladder state).
+// See moa/MOA.md for the architectural pattern.
+//
 // BookL is the library layer any application embeds when it
 // wants cohesive market state. It subscribes to four bus
 // subjects (the snapshot / delta envelope established by
@@ -49,6 +63,31 @@
 // notes/aperio-friction.md.
 
 locus BookL {
+    // MOA capacity discipline:
+    // Per-side ladder = 8 cells of Int (price) + 8 cells of Int
+    // (qty), per side. The natural F.22 declaration would be:
+    //
+    //   capacity {
+    //       pool bid_prices of Int;
+    //       pool bid_qtys   of Int;
+    //       pool ask_prices of Int;
+    //       pool ask_qtys   of Int;
+    //   }
+    //
+    // Deferred at v1 because F.22's `Cell<T>` is opaque round-trip
+    // only — no direct load/store through the cell handle. BookL's
+    // ladder requires indexed read/write (`bid_prices[i] = px`),
+    // which lands when v1.x ships Cell load/store (per spec/types.md
+    // F.22 v1.x follow-up: "Direct load/store through a Cell handle
+    // (*cell for primitive cells, cell.field for struct cells).
+    // Lands when Map/Vec stdlib drive the surface.").
+    //
+    // Until then, the v0 idiom of fixed-cap params arrays carries
+    // the same capacity commitment in a different syntactic form:
+    // "I hold 8 levels per side, all freed at locus dissolve, no
+    // individual cell lifetime." The migration to `capacity {
+    // pool ... }` will be additive when v1.x lands.
+
     params {
         coord: String = "book";
 
@@ -79,9 +118,13 @@ locus BookL {
     }
 
     bus {
+        /// ingest: transform — clears ladder state; folds snapshot epoch start into self
         subscribe "book.snapshot.begin" as on_snap_begin of type SnapshotBeginMsg;
+        /// ingest: transform — inserts level into sorted ladder at correct index
         subscribe "book.snapshot.level" as on_snap_level of type SnapshotLevelMsg;
+        /// ingest: save — flips in_snapshot flag; no ladder mutation
         subscribe "book.snapshot.end"   as on_snap_end   of type SnapshotEndMsg;
+        /// ingest: transform — applies delta to ladder; updates crossed-state
         subscribe "book.delta"          as on_delta      of type DeltaMsg;
     }
 

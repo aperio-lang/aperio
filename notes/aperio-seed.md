@@ -249,3 +249,16 @@ seeds doesn't relitigate them:
 These are deferred. The seed concept lands first; its
 implementation details get hammered out when the multi-file-
 module milestone arrives.
+
+## See also
+
+- `moa/MOA.md` — Memory-Owner Architecture; the composition
+  discipline that shapes any stateful seed. The architecture
+  ships as a separate top-level path prefix `moa::*`, parallel
+  to `std::*`, with its source-of-truth directory at `/moa/`
+  in the repo root.
+- `lib/README.md` — domain types shared across MOA apps;
+  populated when cross-seed imports unblock the sharing
+  question Q18 above.
+- `notes/aperio-types-vs-loci.md` — the foundational axiom
+  these layers build on.

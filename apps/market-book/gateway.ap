@@ -1,5 +1,15 @@
 // gateway.ap — the market-data gateway, as a lotus.
 //
+// MOA role: recording memory-owner.
+// Memory: a single Int seq counter; everything else is pure egress.
+// Publishes: book.snapshot.begin / book.snapshot.level /
+//            book.snapshot.end / book.delta (one publisher per
+//            family per moa/subjects.md).
+// Ingest: none — gateway is a pure publisher in v0. Real venue
+//         integration would add an "ingest: transform" handler
+//         on raw socket bytes.
+// See moa/MOA.md for the architectural pattern.
+//
 // MdGatewayL owns the connectivity layer (in production: TCP
 // sockets to a venue, FIX/ITCH parsers, normalization). Its
 // public surface is bus-only: it publishes typed messages onto

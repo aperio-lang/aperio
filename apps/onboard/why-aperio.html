@@ -1056,6 +1056,57 @@
     discover. It is something the source has already declared.
   </p>
 
+  <p>
+    The recursion is not metaphor for what senior engineers already
+    do in their heads. It is a usable design rule. When you sit down
+    to write an Aperio app, the recursion takes a specific
+    architectural shape — call it
+    <em class="term">memory-owner architecture</em>. The four
+    primitives the language has named (regions, contracts, the typed
+    bus, capacity slots) do not compose freely; they compose into one
+    shape, and the shape is what an app of any size becomes when its
+    author stops fighting it.
+  </p>
+
+  <p>
+    The shape is this:
+    <span class="ink">state lives at one memory-owner per concern,
+    and everything above it is routing.</span> Every memory-owner
+    declares two disciplines — its
+    <span class="sage">capacity</span> (where state lives) and its
+    <span class="sage">ingest</span> (how deltas change it).
+    Orchestrators above carry no state, only routing and lifecycle.
+    The bus is the only inter-concern channel; pointers stay within
+    a single memory-owner's arena tree, and deltas cross by copy.
+    The four properties are not a checklist — each one forces the
+    others, so the architecture is what falls out, not what gets
+    added.
+  </p>
+
+  <p>
+    Two shapes of memory-owner appear. A
+    <em class="term">recording</em> saves incoming deltas verbatim;
+    its state <em class="term">is</em> the log of what it has
+    received. A <em class="term">projection</em> folds incoming
+    deltas into a derived view; its state is consistent with the
+    stream, not the stream itself. Either way, the locus is the
+    canonical source of truth for its concern, and every observer
+    sees its state by reading a copied delta off the bus. There is
+    no shared mutable state anywhere; nothing reaches across to
+    nothing.
+  </p>
+
+  <p>
+    The architecture is not invented. It is what the framework's
+    commitments force when you stop fighting them.
+    <span class="ink">"Everything in the world is a lotus"</span>
+    is not slogan. It is the observation that this shape — recursive
+    hierarchy of regions, vertical contracts, lateral typed bus,
+    copy at every boundary — names what every senior engineer was
+    already reconstructing in their head, every time, by hand. The
+    compiler enforces it now.
+  </p>
+
   <p class="drain">— what does this look like in code? —</p>
 </section>
 

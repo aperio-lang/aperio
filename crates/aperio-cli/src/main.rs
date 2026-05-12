@@ -549,6 +549,27 @@ fn compute_codegen_src_hash(codegen_dir: &Path) -> String {
         stdlib_files.sort();
         paths.extend(stdlib_files);
     }
+    // MOA substrate at workspace root (parallel to stdlib). Mirrors
+    // the build.rs hash inputs so build-time and runtime hashes
+    // stay in sync. codegen_dir is <root>/crates/aperio-codegen, so
+    // workspace_root is its grandparent.
+    if let Some(workspace_root) = codegen_dir.parent().and_then(|p| p.parent()) {
+        let moa_dir = workspace_root.join("moa");
+        if let Ok(entries) = fs::read_dir(&moa_dir) {
+            let mut moa_files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        == Some("ap")
+                })
+                .map(|e| e.path())
+                .collect();
+            moa_files.sort();
+            paths.extend(moa_files);
+        }
+    }
     let mut hasher = DefaultHasher::new();
     for path in &paths {
         if let Ok(bytes) = fs::read(path) {
