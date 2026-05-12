@@ -514,15 +514,35 @@ Synchronization primitives at the locus boundary:
 - `Mutex<T>` — locks; rarely needed because of locus structure
 - `WaitGroup` — coordination across multiple sub-loci
 
-### `std::panic`
+### ~~`std::panic`~~ — not a thing
 
-Panic introspection (rare; usually you use the locus tower's
-`on_failure` instead — that's the Design-aligned shape, and
-panic catching at the value level is anti-pattern). If a
-need surfaces, the surface would be a locus that wraps the
-operation and exposes `failed: Bool` / `error_msg: String`
-fields after run completes — not a Result-typed return.
-- `panic(msg)` — explicit panic (always available).
+Aperio doesn't have `panic(msg)`, `assert(cond)`, or any other
+value-level "bail from this function" primitive. Failure is
+structural, not parametric:
+
+1. Declare a **closure** in the relevant locus asserting the
+   invariant you want enforced.
+2. When the assertion fails at the closure's epoch, the
+   runtime constructs a `ClosureViolation` and routes it to
+   the parent's `on_failure` handler per **F.9**.
+3. The parent picks one of `restart` / `restart_in_place` /
+   `quarantine` / `reorganize` / `bubble`, or absorbs the
+   violation by returning without calling any of them.
+4. A violation that bubbles past `main` exits the process
+   non-zero with the violation report on stderr.
+
+That covers every legitimate use of `panic`. "Impossible state"
+becomes "a closure asserting state is possible." "Bail from
+this function" is a category error in Aperio — functions return
+values, failure lives at the locus level. The earlier
+speculative `panic(msg)` / `catch_panic` surface here was
+inherited from Rust convention and doesn't match Aperio's
+Design-aligned failure shape; cut from the roadmap on
+2026-05-12 alongside `Result + ?`.
+
+See [closures/index](../docs/src/reference/closures/index.md)
+and [recovery/index](../docs/src/reference/recovery/index.md)
+for the operational details.
 
 ## What's not in stdlib (third-party territory)
 

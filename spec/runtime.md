@@ -353,8 +353,11 @@ and modes; specific transports come from stdlib (`std::bus::*`).
   At dissolve, if exploded, the parent's
   `on_failure(self, ClosureViolation { ... })` is invoked with
   a typed event carrying closure name, epoch, left/right
-  values, tolerance, diff. Distinct from structural failures
-  (panic). See design-rationale §F.9.
+  values, tolerance, diff. Distinct from hard substrate
+  failures (OOM, divide-by-zero, null-deref from
+  miscompilation) — those terminate the process directly
+  without the ClosureViolation routing path. See
+  design-rationale §F.9.
 - **Recovery-event interaction.** `persists_through(...)` and
   `resets_on(...)` clauses are honored at recovery time; the
   accumulator is preserved or zeroed per declaration. The
@@ -374,14 +377,22 @@ and modes; specific transports come from stdlib (`std::bus::*`).
   installs it. Old perspective is preserved until the new one
   is committed (no torn read).
 
-### Failure & panic handling
+### Failure handling
 
-- **Panic = framework failure.** Any unrecovered panic in a
-  locus body becomes a failure event the parent observes via
-  `on_failure`. The default at the root is process exit with
-  full stack trace.
-- **No exceptions.** Failures are values; recovery is
-  parent-policy. Mirrors Erlang's let-it-crash + supervisor.
+- **Failure = `ClosureViolation` propagation.** Any `closure`
+  assertion that fails in a locus body produces a
+  `ClosureViolation` record routed to the parent's
+  `on_failure(child, err)` handler per **F.9**. The parent
+  picks one of `restart` / `restart_in_place` / `quarantine` /
+  `reorganize` / `bubble`, or absorbs (returns without calling
+  any). A violation that bubbles past the root exits the
+  process non-zero with the violation report on stderr.
+- **No value-level panic / exceptions.** Aperio does not have
+  `panic(msg)`, `assert(cond)`, or value-level error types.
+  Failure is structural — locus state is wrong, the violation
+  cascades. Functions return values; recovery is parent-policy.
+  Mirrors Erlang's let-it-crash + supervisor, but the
+  supervisor is the parent locus itself, not a separate role.
 
 ### Time
 
