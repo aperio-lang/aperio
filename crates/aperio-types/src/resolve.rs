@@ -381,9 +381,16 @@ fn register_locus(
     // Ty::Unknown for T) so downstream typechecks don't
     // cascade additional errors past the form-shape diag.
     if let Some(form) = &decl.form {
-        if form.name.name == "vec" {
-            let cell_ty = form_vec_cell_ty(decl, known);
-            synthesize_form_vec_methods(&mut methods, &cell_ty);
+        match form.name.name.as_str() {
+            "vec" => {
+                let cell_ty = form_vec_cell_ty(decl, known);
+                synthesize_form_vec_methods(&mut methods, &cell_ty);
+            }
+            "hashmap" => {
+                let (value_ty, key_ty) = form_hashmap_value_and_key_ty(decl, known, scope);
+                synthesize_form_hashmap_methods(&mut methods, &value_ty, &key_ty);
+            }
+            _ => {}
         }
     }
 
@@ -651,6 +658,54 @@ fn form_vec_cell_ty(decl: &LocusDecl, known: &BTreeMap<String, Span>) -> Ty {
     Ty::Unknown
 }
 
+/// v1.x-FORM-4 PR3: extract the value type S (= cell type) and
+/// key type K (= type of the indexed-by field on the cell
+/// struct) from a `@form(hashmap)` locus. Returns
+/// `(Ty::Unknown, Ty::Unknown)` when the shape is invalid —
+/// shape verification (PR2) has already reported diagnostics in
+/// that case, so we don't double-report; method synthesis just
+/// falls back to Unknown so downstream typechecks don't cascade.
+fn form_hashmap_value_and_key_ty(
+    decl: &LocusDecl,
+    known: &BTreeMap<String, Span>,
+    scope: &TopScope,
+) -> (Ty, Ty) {
+    let unknown = (Ty::Unknown, Ty::Unknown);
+    let cb = match decl.members.iter().find_map(|m| match m {
+        LocusMember::Capacity(cb) => Some(cb),
+        _ => None,
+    }) {
+        Some(cb) => cb,
+        None => return unknown,
+    };
+    let slot = match cb.slots.first() {
+        Some(s) => s,
+        None => return unknown,
+    };
+    let value_ty = resolve_type_expr(&slot.elem_ty, known);
+    let field_ident = match &slot.indexed_by {
+        Some(i) => i,
+        None => return (value_ty, Ty::Unknown),
+    };
+    let cell_name = match &value_ty {
+        Ty::Named(n) => n.clone(),
+        _ => return (value_ty, Ty::Unknown),
+    };
+    let key_ty = match scope.symbols.get(&cell_name) {
+        Some(TopSymbol::Type(info)) => match &info.kind {
+            TypeKind::Struct(fields) => {
+                match fields.iter().find(|f| f.name == field_ident.name) {
+                    Some(f) => f.ty.clone(),
+                    None => Ty::Unknown,
+                }
+            }
+            _ => Ty::Unknown,
+        },
+        _ => Ty::Unknown,
+    };
+    (value_ty, key_ty)
+}
+
 /// v1.x-FORM-1 PR3b: synthesize the standard `@form(vec)`
 /// method set over cell type T. Method signatures match
 /// `spec/forms.md`:
@@ -697,48 +752,131 @@ fn synthesize_form_vec_methods(methods: &mut Vec<MethodInfo>, cell_ty: &Ty) {
     });
 }
 
+/// v1.x-FORM-4 PR3: synthesize the standard `@form(hashmap)`
+/// method set over value type S (= cell struct) and key type K
+/// (= type of the indexed-by field). Method signatures match
+/// `spec/forms.md`:
+///   `get(key: K) -> S fallible(KeyError)`
+///   `set(value: S) -> ()`                       (infallible; insert/replace)
+///   `has(key: K) -> Bool`                       (infallible)
+///   `remove(key: K) -> () fallible(KeyError)`
+///   `len() -> Int`                              (infallible)
+///   `is_empty() -> Bool`                        (infallible)
+///
+/// `KeyError` is a synthesized stdlib type injected by
+/// `inject_form_stdlib_types` alongside `IndexError`.
+///
+/// The key-by-field intrusive shape (the cell carries its own
+/// key as one of its fields) means `set(value: S)` takes the
+/// whole struct rather than a `(K, V)` pair — the substrate
+/// extracts the key from the value at insertion time.
+fn synthesize_form_hashmap_methods(
+    methods: &mut Vec<MethodInfo>,
+    value_ty: &Ty,
+    key_ty: &Ty,
+) {
+    let key_err = Ty::Named("KeyError".to_string());
+    methods.push(MethodInfo {
+        name: "get".to_string(),
+        params: vec![key_ty.clone()],
+        ret: value_ty.clone(),
+        fallible: Some(key_err.clone()),
+    });
+    methods.push(MethodInfo {
+        name: "set".to_string(),
+        params: vec![value_ty.clone()],
+        ret: Ty::Unit,
+        fallible: None,
+    });
+    methods.push(MethodInfo {
+        name: "has".to_string(),
+        params: vec![key_ty.clone()],
+        ret: Ty::Prim(PrimType::Bool),
+        fallible: None,
+    });
+    methods.push(MethodInfo {
+        name: "remove".to_string(),
+        params: vec![key_ty.clone()],
+        ret: Ty::Unit,
+        fallible: Some(key_err),
+    });
+    methods.push(MethodInfo {
+        name: "len".to_string(),
+        params: Vec::new(),
+        ret: Ty::Prim(PrimType::Int),
+        fallible: None,
+    });
+    methods.push(MethodInfo {
+        name: "is_empty".to_string(),
+        params: Vec::new(),
+        ret: Ty::Prim(PrimType::Bool),
+        fallible: None,
+    });
+}
+
 /// v1.x-FORM-1 PR3b: inject form-specific stdlib types into the
 /// top scope so synthesized method signatures' payload types
-/// resolve. v1 injects `IndexError` (used by `@form(vec)`);
-/// future forms will inject their own payload types here.
+/// resolve. v1 injects `IndexError` (used by `@form(vec)`)
+/// and `KeyError` (used by `@form(hashmap)`); future forms
+/// will inject their own payload types here.
 ///
-/// Idempotent: if `IndexError` already exists in the scope
-/// (declared by user code or a stdlib `.ap` file), the
-/// injection is a no-op. This keeps the form machinery
-/// non-breaking for projects that already shipped their own
-/// IndexError shape.
+/// Idempotent per name: if a name already exists in the scope
+/// (declared by user code or a stdlib `.ap` file), that
+/// injection is a no-op. Keeps the form machinery non-breaking
+/// for projects that already shipped their own error shapes.
 pub(crate) fn inject_form_stdlib_types(scope: &mut TopScope) {
-    if scope.symbols.contains_key("IndexError") {
-        return;
-    }
     let zero = Span::new(0, 0);
-    scope.symbols.insert(
-        "IndexError".to_string(),
-        TopSymbol::Type(TypeInfo {
-            name: "IndexError".to_string(),
-            kind: TypeKind::Struct(vec![
-                FieldInfo {
+    if !scope.symbols.contains_key("IndexError") {
+        scope.symbols.insert(
+            "IndexError".to_string(),
+            TopSymbol::Type(TypeInfo {
+                name: "IndexError".to_string(),
+                kind: TypeKind::Struct(vec![
+                    FieldInfo {
+                        name: "kind".to_string(),
+                        ty: Ty::Prim(PrimType::String),
+                        has_default: false,
+                        span: zero,
+                    },
+                    FieldInfo {
+                        name: "index".to_string(),
+                        ty: Ty::Prim(PrimType::Int),
+                        has_default: false,
+                        span: zero,
+                    },
+                    FieldInfo {
+                        name: "len".to_string(),
+                        ty: Ty::Prim(PrimType::Int),
+                        has_default: false,
+                        span: zero,
+                    },
+                ]),
+                span: zero,
+            }),
+        );
+    }
+    // v1.x-FORM-4: KeyError for @form(hashmap) get/remove
+    // fallible methods. Minimal shape — just a kind tag at v1.
+    // The key itself isn't carried because the key type K
+    // varies per hashmap; carrying it would require a generic
+    // KeyError<K> which v1 doesn't have. Users wanting key
+    // context construct it via `or <fallback>` substitution:
+    //   let v = reg.get("foo") or Default { ... };
+    if !scope.symbols.contains_key("KeyError") {
+        scope.symbols.insert(
+            "KeyError".to_string(),
+            TopSymbol::Type(TypeInfo {
+                name: "KeyError".to_string(),
+                kind: TypeKind::Struct(vec![FieldInfo {
                     name: "kind".to_string(),
                     ty: Ty::Prim(PrimType::String),
                     has_default: false,
                     span: zero,
-                },
-                FieldInfo {
-                    name: "index".to_string(),
-                    ty: Ty::Prim(PrimType::Int),
-                    has_default: false,
-                    span: zero,
-                },
-                FieldInfo {
-                    name: "len".to_string(),
-                    ty: Ty::Prim(PrimType::Int),
-                    has_default: false,
-                    span: zero,
-                },
-            ]),
-            span: zero,
-        }),
-    );
+                }]),
+                span: zero,
+            }),
+        );
+    }
 }
 
 /// Best-effort literal-typing for params declared with a value

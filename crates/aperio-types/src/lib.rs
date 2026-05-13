@@ -1140,6 +1140,173 @@ mod tests {
         );
     }
 
+    // === v1.x-FORM-4 PR3 tests: method synthesis ============
+
+    #[test]
+    fn ok_form_hashmap_set_and_has_resolve() {
+        // `set(value: S) -> ()` and `has(key: K) -> Bool` are
+        // synthesized and resolve at call sites. K is String
+        // (Entry.name's type); S is Entry.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() {
+                let r = Registry { };
+                r.set(Entry { name: "k", v: 1 });
+                let h = r.has("k");
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check on set + has, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_get_fallible_addressed() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() {
+                let r = Registry { };
+                let v = r.get("missing") or raise;
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check on get + or raise, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_get_not_addressed() {
+        // `get` returns `S fallible(KeyError)`; calling it as
+        // an expression statement without addressing the
+        // error channel must error.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() {
+                let r = Registry { };
+                let v = r.get("missing");
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("error not addressed")
+                || d.message.contains("fallible")),
+            "expected error-not-addressed diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_remove_substitute_with_err_binding() {
+        // `remove` is fallible(KeyError) with Unit success; the
+        // substitute RHS (`or <expr>`) sees `err: KeyError` in
+        // scope. No explicit `substitute` keyword — `or <expr>`
+        // IS the substitute form; `or raise` is the diverge form.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn report_err(kind: String) { }
+            fn main() {
+                let r = Registry { };
+                r.remove("k") or report_err(err.kind);
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check on remove + or <fallback>, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_len_and_is_empty_synthesized() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() {
+                let r = Registry { };
+                let n: Int = r.len();
+                let e: Bool = r.is_empty();
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check on len + is_empty, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_key_error_in_scope() {
+        // `KeyError` is injected into the bundle scope whenever
+        // any form-locus exists; it's usable as a type in user
+        // code (e.g., to declare a fallible-handler param).
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn describe(e: KeyError) -> String { return e.kind; }
+            fn main() { Registry { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check using KeyError, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_int_key() {
+        // K = Int when the indexed-by field's type is Int.
+        let src = r#"
+            type Entry { id: Int; payload: String; }
+            @form(hashmap)
+            locus ById {
+                capacity { pool entries of Entry indexed_by id; }
+            }
+            fn main() {
+                let r = ById { };
+                r.set(Entry { id: 7, payload: "p" });
+                let v = r.get(7) or raise;
+                let h = r.has(42);
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check on Int-keyed hashmap, got: {:?}",
+            diags
+        );
+    }
+
     #[test]
     fn err_form_unknown_name() {
         let src = r#"
