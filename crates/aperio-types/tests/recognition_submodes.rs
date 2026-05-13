@@ -21,7 +21,7 @@ fn check(src: &str) -> Vec<String> {
 #[test]
 fn fixed_cell_typechecks_clean() {
     let src = r#"
-locus Coord : projection recognition(cap=4, fixed_cell(bytes=64)) {
+locus Coord : projection recognition(cap=4, fixed_cell) {
     accept(c: Leaf) { }
 }
 locus Leaf { }
@@ -37,7 +37,7 @@ locus Leaf { }
 #[test]
 fn shared_slab_typechecks_clean() {
     let src = r#"
-locus Coord : projection recognition(cap=4, shared_slab(bytes=1024)) {
+locus Coord : projection recognition(cap=4, shared_slab) {
     accept(c: Leaf) { }
 }
 locus Leaf { }
@@ -53,7 +53,7 @@ locus Leaf { }
 #[test]
 fn spillover_rejected_with_v1x_pending() {
     let src = r#"
-locus Coord : projection recognition(cap=4, spillover(bytes=64)) {
+locus Coord : projection recognition(cap=4, spillover) {
     accept(c: Leaf) { }
 }
 locus Leaf { }

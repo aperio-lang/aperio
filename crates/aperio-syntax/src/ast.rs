@@ -127,39 +127,43 @@ pub enum ProjectionClass {
     Chunked,
     /// Recognition class. As a locus *annotation* the user MUST
     /// commit to a sub-mode at the declaration site
-    /// (`: projection recognition(cap=N, fixed_cell(bytes=K))`
-    /// and friends), so the variant carries Some(params). As a
+    /// (`: projection recognition(cap=N, fixed_cell)` and
+    /// friends), so the variant carries Some(params). As a
     /// *type expression* (`Recognition<T>` in a signature) no
     /// allocator commitment exists at the use site, so the
-    /// variant carries None. Locked 2026-05-12 per v1.x-3 handoff:
-    /// no default sub-mode at locus declarations; bare
+    /// variant carries None. Locked 2026-05-12 per v1.x-3
+    /// handoff: no default sub-mode at locus declarations; bare
     /// `: projection recognition` is a parse error.
     Recognition(Option<RecognitionParams>),
 }
 
-/// v1.x-3: parameters attached to a `: projection recognition(...)`
-/// locus annotation. `cap` is the child-count cap; `sub_mode` picks
-/// the allocator strategy. Both are commitments the user writes
-/// down at the declaration site — same forcing-function shape as
-/// the 2026-05-12 two-channel rule (name the channel at the
-/// declaration site).
+/// Parameters attached to a `: projection recognition(...)`
+/// locus annotation. `cap` is the child-count cap; `sub_mode`
+/// picks the allocator strategy. The cell stride is *not* a
+/// user knob — it's derived at codegen time from the union of
+/// accept-method param types on this locus. The forcing-function
+/// at the surface is still: user names cap and sub-mode at the
+/// declaration site (same shape as the two-channel rule).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecognitionParams {
     pub cap: u64,
     pub sub_mode: RecognitionSubMode,
 }
 
-/// v1.x-3: storage discipline picked by the user inside
+/// Storage discipline picked by the user inside
 /// `recognition(cap=N, <sub_mode>)`. v1 ships `FixedCell` and
 /// `SharedSlab`; `Spillover` and `SummaryOnly` parse + typecheck
 /// but reject at codegen with a "v1.x pending" diagnostic
 /// (mirrors the v1.x-4 / v1.x-4b surface-then-runtime split).
+/// Cell stride for FixedCell / SharedSlab / Spillover is derived
+/// at codegen time from accept-method param types — not a
+/// user-supplied byte budget.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecognitionSubMode {
-    FixedCell { bytes: u64 },
-    Spillover { bytes: u64 },
+    FixedCell,
+    Spillover,
     SummaryOnly,
-    SharedSlab { bytes: u64 },
+    SharedSlab,
 }
 
 /// Per-locus execution strategy. Same source, two runtime

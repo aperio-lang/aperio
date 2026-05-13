@@ -43,7 +43,7 @@ fn fixed_cell_recognition_round_trip() {
                 expose value: Int;
             }
         }
-        locus RecCoord : projection recognition(cap=4, fixed_cell(bytes=128)) {
+        locus RecCoord : projection recognition(cap=4, fixed_cell) {
             contract { consume value: Int; }
             accept(c: Leaf) { }
             run() {
@@ -84,7 +84,7 @@ fn shared_slab_recognition_round_trip() {
                 expose value: Int;
             }
         }
-        locus SlabCoord : projection recognition(cap=4, shared_slab(bytes=2048)) {
+        locus SlabCoord : projection recognition(cap=4, shared_slab) {
             contract { consume value: Int; }
             accept(c: Leaf) { }
             run() {
@@ -131,7 +131,7 @@ fn recognition_parent_dissolve_after_children_births() {
             }
             birth { println("leaf birth ", self.tag); }
         }
-        locus Parent : projection recognition(cap=2, fixed_cell(bytes=96)) {
+        locus Parent : projection recognition(cap=2, fixed_cell) {
             accept(c: Leaf) { }
             birth { println("parent birth"); }
             run() {
@@ -185,7 +185,7 @@ fn recognition_fixed_cell_slots_reusable_after_release() {
             }
             birth { println("leaf birth ", self.tag); }
         }
-        locus Parent : projection recognition(cap=2, fixed_cell(bytes=96)) {
+        locus Parent : projection recognition(cap=2, fixed_cell) {
             accept(c: Leaf) { }
             run() {
                 // First batch — fills cap=2.

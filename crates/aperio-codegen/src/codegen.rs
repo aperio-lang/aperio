@@ -18583,10 +18583,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 if parent_accepts_us {
                     match parent_info.projection_class {
                         ProjectionClass::Recognition(Some(p)) => match p.sub_mode {
-                            RecognitionSubMode::FixedCell { .. } => {
+                            RecognitionSubMode::FixedCell => {
                                 (AcquireStrategy::RecpoolFixed, Some(cs.self_ptr))
                             }
-                            RecognitionSubMode::SharedSlab { .. } => {
+                            RecognitionSubMode::SharedSlab => {
                                 (AcquireStrategy::RecpoolSlab, Some(cs.self_ptr))
                             }
                             // Spillover + SummaryOnly are typecheck-
@@ -19211,21 +19211,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // alongside the arena teardown, after the F.4 cascade has
         // dissolved every child.
         if let ProjectionClass::Recognition(Some(params)) = info.projection_class {
-            let (create_fn_name, bytes_val) = match params.sub_mode {
-                RecognitionSubMode::FixedCell { bytes } => {
-                    ("lotus_recpool_fixed_create", bytes)
-                }
-                RecognitionSubMode::SharedSlab { bytes } => {
-                    ("lotus_recpool_slab_create", bytes)
-                }
+            let create_fn_name = match params.sub_mode {
+                RecognitionSubMode::FixedCell => Some("lotus_recpool_fixed_create"),
+                RecognitionSubMode::SharedSlab => Some("lotus_recpool_slab_create"),
                 // Spillover + SummaryOnly are typecheck-rejected
                 // before codegen; defense: skip allocation here so
                 // a future code path that gets through doesn't
                 // crash on a missing extern.
-                RecognitionSubMode::Spillover { .. }
-                | RecognitionSubMode::SummaryOnly => ("", 0),
+                RecognitionSubMode::Spillover | RecognitionSubMode::SummaryOnly => None,
             };
-            if !create_fn_name.is_empty() {
+            if let Some(create_fn_name) = create_fn_name {
                 let create_fn = self
                     .module
                     .get_function(create_fn_name)
@@ -19234,10 +19229,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .context
                     .i64_type()
                     .const_int(params.cap, false);
-                let bytes_const = self
-                    .context
-                    .i64_type()
-                    .const_int(bytes_val, false);
+                // Cell stride is derived from the parent's accept-
+                // method param type. v1 ships single-accept-per-
+                // locus; when multi-accept lands, this becomes a
+                // max-of-sizeof over the accept-type union.
+                // Empty accept set on a Recognition locus would be
+                // a typecheck error in principle; defense: pass
+                // size_of(unit) so the recpool allocates a degenerate
+                // block rather than crashing.
+                let bytes_const = match &info.accept_param {
+                    Some((_, child_locus_name)) => {
+                        let child_info = self
+                            .user_loci
+                            .get(child_locus_name)
+                            .expect("accept target locus known");
+                        child_info
+                            .struct_ty
+                            .size_of()
+                            .expect("child locus struct size known")
+                    }
+                    None => self.context.i64_type().const_zero(),
+                };
                 let pool = self
                     .builder
                     .build_call(
@@ -23783,12 +23795,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // to wholesale-free the recpool's storage.
         if let ProjectionClass::Recognition(Some(params)) = info.projection_class {
             let destroy_fn_name = match params.sub_mode {
-                RecognitionSubMode::FixedCell { .. } => {
-                    "lotus_recpool_fixed_destroy"
-                }
-                RecognitionSubMode::SharedSlab { .. } => {
-                    "lotus_recpool_slab_destroy"
-                }
+                RecognitionSubMode::FixedCell => "lotus_recpool_fixed_destroy",
+                RecognitionSubMode::SharedSlab => "lotus_recpool_slab_destroy",
                 _ => "", // typecheck-rejected; defense
             };
             if !destroy_fn_name.is_empty() {

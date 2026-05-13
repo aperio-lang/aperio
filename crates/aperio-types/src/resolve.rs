@@ -212,12 +212,12 @@ fn register_locus(
     // codegen. v1 ships fixed_cell + shared_slab.
     if let Some(ProjectionClass::Recognition(Some(params))) = annotations.projection {
         match params.sub_mode {
-            RecognitionSubMode::Spillover { .. } => {
+            RecognitionSubMode::Spillover => {
                 diags.push(Diag::ty(
                     decl.name.span,
                     "recognition sub-mode `spillover` is parsed but not yet \
-                     shipped — v1.x pending. Use `fixed_cell(bytes=K)` for \
-                     hard-bounded cells or `shared_slab(bytes=K)` for a \
+                     shipped — v1.x pending. Use `fixed_cell` for \
+                     hard-bounded cells or `shared_slab` for a \
                      wholesale-freed bump arena."
                         .to_string(),
                 ));
@@ -228,11 +228,11 @@ fn register_locus(
                     "recognition sub-mode `summary_only` is parsed but not \
                      yet shipped — v1.x pending. The \"no child arena \
                      allocation\" type-system rule isn't in tree yet. Use \
-                     `fixed_cell(bytes=K)` or `shared_slab(bytes=K)` for v1."
+                     `fixed_cell` or `shared_slab` for v1."
                         .to_string(),
                 ));
             }
-            RecognitionSubMode::FixedCell { .. } | RecognitionSubMode::SharedSlab { .. } => {}
+            RecognitionSubMode::FixedCell | RecognitionSubMode::SharedSlab => {}
         }
     }
 

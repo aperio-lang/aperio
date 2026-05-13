@@ -639,18 +639,9 @@ impl Parser {
         };
         self.bump();
         let sub_mode = match sub_name.as_str() {
-            "fixed_cell" => {
-                let bytes = self.parse_bytes_arg("fixed_cell")?;
-                RecognitionSubMode::FixedCell { bytes }
-            }
-            "shared_slab" => {
-                let bytes = self.parse_bytes_arg("shared_slab")?;
-                RecognitionSubMode::SharedSlab { bytes }
-            }
-            "spillover" => {
-                let bytes = self.parse_bytes_arg("spillover")?;
-                RecognitionSubMode::Spillover { bytes }
-            }
+            "fixed_cell" => RecognitionSubMode::FixedCell,
+            "shared_slab" => RecognitionSubMode::SharedSlab,
+            "spillover" => RecognitionSubMode::Spillover,
             "summary_only" => RecognitionSubMode::SummaryOnly,
             other => {
                 return Err(Diag::parse(
@@ -669,45 +660,6 @@ impl Parser {
             cap: cap_val,
             sub_mode,
         })
-    }
-
-    /// Parse `( bytes = <IntLit> )` after a sub-mode keyword that
-    /// takes a bytes argument (fixed_cell / shared_slab / spillover).
-    fn parse_bytes_arg(&mut self, sub_mode_name: &str) -> Result<u64, Diag> {
-        self.expect(
-            TokenKind::LParen,
-            "`(` after recognition sub-mode keyword",
-        )?;
-        let bytes_tok = self.peek_token().clone();
-        let bytes_name = match self.peek() {
-            TokenKind::Ident(s) => s.clone(),
-            other => {
-                return Err(Diag::parse(
-                    bytes_tok.span,
-                    format!(
-                        "expected `bytes` inside `{}(...)`, got {:?}",
-                        sub_mode_name, other
-                    ),
-                ));
-            }
-        };
-        if bytes_name != "bytes" {
-            return Err(Diag::parse(
-                bytes_tok.span,
-                format!(
-                    "expected `bytes` inside `{}(...)`, got `{}`",
-                    sub_mode_name, bytes_name
-                ),
-            ));
-        }
-        self.bump();
-        self.expect(TokenKind::Eq, "`=` after `bytes`")?;
-        let val = self.expect_positive_int_lit("bytes")?;
-        self.expect(
-            TokenKind::RParen,
-            "`)` closing recognition sub-mode args",
-        )?;
-        Ok(val)
     }
 
     fn expect_positive_int_lit(&mut self, field: &str) -> Result<u64, Diag> {
@@ -3228,7 +3180,7 @@ fn main() {
     fn parse_recognition_fixed_cell() {
         let pc = parse_locus_recognition(
             r#"
-locus L : projection recognition(cap=4, fixed_cell(bytes=64)) {
+locus L : projection recognition(cap=4, fixed_cell) {
     accept(c: ChildL) { }
 }
 locus ChildL { }
@@ -3237,10 +3189,7 @@ locus ChildL { }
         match pc {
             ProjectionClass::Recognition(Some(p)) => {
                 assert_eq!(p.cap, 4);
-                assert_eq!(
-                    p.sub_mode,
-                    RecognitionSubMode::FixedCell { bytes: 64 }
-                );
+                assert_eq!(p.sub_mode, RecognitionSubMode::FixedCell);
             }
             other => panic!("expected Recognition(Some), got {:?}", other),
         }
@@ -3250,7 +3199,7 @@ locus ChildL { }
     fn parse_recognition_shared_slab() {
         let pc = parse_locus_recognition(
             r#"
-locus L : projection recognition(cap=8, shared_slab(bytes=1024)) {
+locus L : projection recognition(cap=8, shared_slab) {
     accept(c: ChildL) { }
 }
 locus ChildL { }
@@ -3259,10 +3208,7 @@ locus ChildL { }
         match pc {
             ProjectionClass::Recognition(Some(p)) => {
                 assert_eq!(p.cap, 8);
-                assert_eq!(
-                    p.sub_mode,
-                    RecognitionSubMode::SharedSlab { bytes: 1024 }
-                );
+                assert_eq!(p.sub_mode, RecognitionSubMode::SharedSlab);
             }
             other => panic!("expected Recognition(Some), got {:?}", other),
         }
@@ -3272,7 +3218,7 @@ locus ChildL { }
     fn parse_recognition_spillover() {
         let pc = parse_locus_recognition(
             r#"
-locus L : projection recognition(cap=2, spillover(bytes=128)) {
+locus L : projection recognition(cap=2, spillover) {
     accept(c: ChildL) { }
 }
 locus ChildL { }
@@ -3281,10 +3227,7 @@ locus ChildL { }
         match pc {
             ProjectionClass::Recognition(Some(p)) => {
                 assert_eq!(p.cap, 2);
-                assert_eq!(
-                    p.sub_mode,
-                    RecognitionSubMode::Spillover { bytes: 128 }
-                );
+                assert_eq!(p.sub_mode, RecognitionSubMode::Spillover);
             }
             other => panic!("expected Recognition(Some), got {:?}", other),
         }
@@ -3358,7 +3301,7 @@ locus ChildL { }
     #[test]
     fn parse_recognition_unknown_sub_mode_rejected() {
         let src = r#"
-locus L : projection recognition(cap=4, fancy_mode(bytes=64)) {
+locus L : projection recognition(cap=4, fancy_mode) {
     accept(c: ChildL) { }
 }
 locus ChildL { }
@@ -3376,30 +3319,9 @@ locus ChildL { }
     }
 
     #[test]
-    fn parse_recognition_missing_bytes_arg_rejected() {
-        let src = r#"
-locus L : projection recognition(cap=4, fixed_cell) {
-    accept(c: ChildL) { }
-}
-locus ChildL { }
-"#;
-        let diags = parse_str(src)
-            .expect_err("fixed_cell without (bytes=K) must reject");
-        let msg = diags
-            .iter()
-            .map(|d| d.message.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !msg.is_empty(),
-            "expected non-empty parse diag for missing bytes arg"
-        );
-    }
-
-    #[test]
     fn parse_recognition_zero_cap_rejected() {
         let src = r#"
-locus L : projection recognition(cap=0, fixed_cell(bytes=64)) {
+locus L : projection recognition(cap=0, fixed_cell) {
     accept(c: ChildL) { }
 }
 locus ChildL { }

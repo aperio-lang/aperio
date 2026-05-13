@@ -72,15 +72,19 @@ for you.
 
 A locus annotated `: projection recognition(cap=N, <sub_mode>)`
 commits to a storage discipline for its accepted children at
-the declaration site. v1 ships two sub-modes; the other two
-parse + typecheck but reject at the resolver with a "v1.x
-pending" diagnostic.
+the declaration site. The cell stride (`K` in the table below)
+is *not* a user knob — it is derived at codegen time from the
+union of accept-method param types on the parent locus, taken
+as the max. The contract the author writes is "how many
+children, what discipline"; the layout is the compiler's job.
+v1 ships two sub-modes; the other two parse + typecheck but
+reject at the resolver with a "v1.x pending" diagnostic.
 
 | Sub-mode | Commitment | Backing | Per-child release |
 |---|---|---|---|
-| `fixed_cell(bytes=K)` | "Each child fits in K bytes. Cap of N children. Overflow is a hard runtime error." | `lotus_recpool_fixed_*`. One contiguous block of `N × stride` bytes; each cell holds an inline `lotus_arena_t` + chunk header + K-byte payload. Bitmap-tracked acquire/release. The cell IS the child's arena. | Clears the bitmap bit. Slot is reusable. |
-| `shared_slab(bytes=K)` | "All children share K bytes of bump space. The whole slab frees at parent dissolve." | `lotus_recpool_slab_*`. One `lotus_arena_t` with a single fixed-size chunk of K bytes; `fixed_size=1` so it never grows. Every acquire returns the SAME arena pointer — sibling allocations interleave. | No-op. Slab freed wholesale at parent dissolve. |
-| `spillover(bytes=K)` *(v1.x pending)* | "Each child fits in K bytes; overflow malloc-fallback with one-time warning. Graceful degradation under load." | Future: `lotus_recpool_spillover_*`. Per-cell `fixed_cell` plus a heap-allocated fallback. | TBD. |
+| `fixed_cell` | "Each child fits in a cell sized for the accept-type union. Cap of N children. Overflow is a hard runtime error." | `lotus_recpool_fixed_*`. One contiguous block of `N × stride` bytes; each cell holds an inline `lotus_arena_t` + chunk header + payload. Bitmap-tracked acquire/release. The cell IS the child's arena. | Clears the bitmap bit. Slot is reusable. |
+| `shared_slab` | "All children share a single bump arena sized for the accept-type union × cap. The whole slab frees at parent dissolve." | `lotus_recpool_slab_*`. One `lotus_arena_t` with a single fixed-size chunk; `fixed_size=1` so it never grows. Every acquire returns the SAME arena pointer — sibling allocations interleave. | No-op. Slab freed wholesale at parent dissolve. |
+| `spillover` *(v1.x pending)* | "Each child fits in a cell; overflow malloc-fallback with one-time warning. Graceful degradation under load." | Future: `lotus_recpool_spillover_*`. Per-cell `fixed_cell` plus a heap-allocated fallback. | TBD. |
 | `summary_only` *(v1.x pending)* | "Children carry zero per-instance state; all allocations live in the parent's arena." | Future: type-system rule prohibiting child arena allocation; parent's `__arena` is the only storage. | No-op. |
 
 The arena handle returned by `lotus_recpool_fixed_acquire` /
@@ -371,18 +375,21 @@ Sub-mode-typed at the locus declaration site
 (`recognition(cap=N, <sub_mode>)`); v1 ships two sub-modes:
 
 ```c
-/* fixed_cell(bytes=K) — bitmap-tracked cells; the cell IS
- * the child's arena. Per-child release clears the bit. */
+/* fixed_cell — bitmap-tracked cells; the cell IS the child's
+ * arena. Per-child release clears the bit. The compiler
+ * computes cell_bytes from the parent's accept-method type
+ * union; user code only spells cap. */
 struct lotus_recpool_fixed {
     size_t cap_count, cell_bytes, cell_stride, bitmap_words;
     uint64_t *bitmap;
     char *cells;   /* cap_count * cell_stride bytes;
                     * each cell holds an inline arena
-                    * header + chunk header + K-byte payload */
+                    * header + chunk header + payload */
 };
 
-/* shared_slab(bytes=K) — one shared arena; every acquire
- * returns the same pointer; per-child release is no-op. */
+/* shared_slab — one shared arena; every acquire returns the
+ * same pointer; per-child release is no-op. Slab size also
+ * derived from the accept-type union × cap. */
 struct lotus_recpool_slab {
     size_t cap_count, slab_bytes;
     lotus_arena_t *slab_arena;   /* fixed_size=1 */
@@ -694,11 +701,13 @@ locus accepts coordinatees:
   accepted). Per F.3.
 - **Recognition** parents (v1.x-3): the sub-mode commitment
   spelled at the declaration site picks the allocator family.
-  `fixed_cell(bytes=K)` routes children through
+  `fixed_cell` routes children through
   `lotus_recpool_fixed_acquire` (bitmap-tracked cells, inline
-  arena per cell); `shared_slab(bytes=K)` routes children
-  through `lotus_recpool_slab_acquire` (every child shares
-  one bump arena). At parent instantiation the recpool is
+  arena per cell); `shared_slab` routes children through
+  `lotus_recpool_slab_acquire` (every child shares one bump
+  arena). Cell stride for either sub-mode is derived at
+  codegen time from the parent's accept-method param type
+  union — not a user-supplied byte budget. At parent instantiation the recpool is
   allocated via the matching `_create` fn and stashed on the
   synthetic `__recpool: ptr` struct field; at parent dissolve
   it's torn down via `_destroy`. The child's arena teardown

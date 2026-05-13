@@ -32,7 +32,7 @@ fn fixed_cell_recognition_runs_in_interpreter() {
                 expose value: Int;
             }
         }
-        locus RecCoord : projection recognition(cap=4, fixed_cell(bytes=128)) {
+        locus RecCoord : projection recognition(cap=4, fixed_cell) {
             contract { consume value: Int; }
             accept(c: Leaf) { }
             run() {
@@ -68,7 +68,7 @@ fn shared_slab_recognition_runs_in_interpreter() {
                 expose value: Int;
             }
         }
-        locus SlabCoord : projection recognition(cap=4, shared_slab(bytes=2048)) {
+        locus SlabCoord : projection recognition(cap=4, shared_slab) {
             contract { consume value: Int; }
             accept(c: Leaf) { }
             run() {
