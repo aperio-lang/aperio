@@ -210,7 +210,7 @@ methods (m34) accept defaults as normal.
       `lib/` prefix. Library decls are auto-mangled with
       `__lib_<alias>_<stem>_<name>` and resolved through a
       per-build path-rename table parallel to the static stdlib
-      / moa tables. See `spec/imports.md` and `spec/design-
+      / moa tables. See `spec/projects.md` and `spec/design-
       rationale.md` F.25.
 
     **Still open:** package registry, fetch, versioning,

@@ -725,7 +725,7 @@ References to library decls go through the alias as
 `alias::Name`. Resolution is two-step:
 
 1. **Parse / merge.** The CLI resolves each import's path (per
-   `spec/imports.md` "Resolution order"), parses every `.ap`
+   `spec/projects.md` "Resolution order"), parses every `.ap`
    file in the resolved target, applies the auto-mangler with
    the user's alias + each file's stem, and merges the mangled
    items into the importing program's item list. A per-build
@@ -756,7 +756,7 @@ scope-aware walker leaves shadowed references unrewritten.
 **Strict barrier.** Imports declared inside imported library
 files are not followed by the resolver. Library A importing
 library B does NOT make B visible to A's importers; each
-importer declares its own dependencies. See `spec/imports.md`
+importer declares its own dependencies. See `spec/projects.md`
 for the rationale.
 
 **`aperio run` interaction.** The interpreter path consumes the

@@ -1939,8 +1939,9 @@ rule — same discipline applied at a different layer.
   have to author `__MyLib*` prefixes by hand otherwise — exactly
   the shape std and moa carry today, but now done automatically.
 
-**Implementation entry points.** See `spec/imports.md` § "Implementation
-entry points" for the file paths and primary functions.
+**Implementation entry points.** See `spec/projects.md`
+§ "Implementation entry points" for the file paths and primary
+functions.
 
 ## 16. What's deferred
 

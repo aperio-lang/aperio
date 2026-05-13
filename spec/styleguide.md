@@ -316,8 +316,9 @@ Two additional rules apply:
 The full mangled symbol the compiler emits
 (`__lib_<alias>_<file_stem>_<name>`) is never user-visible
 unless you read disassembly; library authors don't need to
-think about it. See `spec/imports.md` for the mangling
-scheme.
+think about it. See `spec/projects.md` for the mangling
+scheme + the per-directory seed model that imported libraries
+build on.
 
 ## Composition patterns
 
@@ -464,9 +465,10 @@ underlying surface lands.
   write `import "lib/<name>" as <alias>;` at the top of the
   importing file; references read as `<alias>::Name`. v1 has
   no package manager, no fetch, no versioning — the source IS
-  the dependency. See `spec/imports.md` for resolution order
-  and the mangling scheme; the `crates/aperio-codegen/tests/fixtures/lib-toy/`
-  fixture is the worked example.
+  the dependency. See `spec/projects.md` for project shapes,
+  resolution order, and the mangling scheme;
+  `crates/aperio-codegen/tests/fixtures/lib-toy/` is the
+  worked-example fixture.
 - **No parametric collection types** (no `List<T>`, no
   `Map<K, V>`). Use `@form(vec)` on a locus for contiguous
   growable buffers; future `@form(hashmap)` will cover keyed
