@@ -15,7 +15,7 @@
 // (within tolerance for in-flight). This is the audit surface
 // that catches kernel-vs-prod divergence.
 
-import "fitter-applier-pair/shared";
+import "fitter-applier-pair/shared" as shared;
 
 locus ApplierL {
     params {

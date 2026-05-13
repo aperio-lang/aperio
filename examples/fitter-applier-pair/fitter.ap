@@ -12,7 +12,7 @@
 // bulk-mode counterpart that applies these kernels at high
 // frequency.
 
-import "fitter-applier-pair/shared";
+import "fitter-applier-pair/shared" as shared;
 
 locus FitterL {
     params {

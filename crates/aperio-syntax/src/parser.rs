@@ -266,17 +266,27 @@ impl Parser {
                 ));
             }
         };
-        // Optional `as IDENT` alias.
-        let alias = if self.peek_is_kw_as() {
-            self.bump();
-            Some(self.expect_ident("import alias")?.name)
-        } else {
-            None
-        };
+        // v1.x-IMPORT: the `as <alias>` clause is required. The
+        // alias names the namespace at the import site so every
+        // cross-seed reference reads as `alias::Name` — the same
+        // forcing-function discipline as v1.x-3's no-default-sub-
+        // mode rule and v1.x-FORM-2's two-channel rule.
+        if !self.peek_is_kw_as() {
+            return Err(Diag::parse(
+                self.peek_token().span,
+                format!(
+                    "import \"{}\" must declare an alias: `import \"{}\" as <name>;` \
+                     (v1.x-IMPORT requires the namespace to be named at the import site)",
+                    path, path,
+                ),
+            ));
+        }
+        self.bump();
+        let alias = self.expect_ident("import alias")?.name;
         let semi = self.expect(TokenKind::Semi, ";")?;
         Ok(Import {
             path,
-            alias,
+            alias: Some(alias),
             span: kw.span.merge(semi.span),
         })
     }
@@ -3336,6 +3346,69 @@ locus ChildL { }
         assert!(
             msg.contains("`cap` must be a positive integer"),
             "diag should report cap must be positive, got: {msg}"
+        );
+    }
+
+    // === v1.x-IMPORT PR1 tests ============================
+    //
+    // Forcing-function rule: `import "path";` requires `as <alias>`.
+    // Same discipline as v1.x-3 (no default sub-mode on `recognition`)
+    // and v1.x-FORM-2 (locus methods can't declare `fallible(E)`):
+    // the user names the namespace at the import site.
+
+    #[test]
+    fn parse_import_with_alias_ok() {
+        let src = r#"
+import "lib/foo" as foo;
+
+fn main() { }
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        assert_eq!(prog.imports.len(), 1);
+        assert_eq!(prog.imports[0].path, "lib/foo");
+        assert_eq!(prog.imports[0].alias.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn parse_import_rejects_bare() {
+        let src = r#"
+import "lib/foo";
+
+fn main() { }
+"#;
+        let diags = parse_str(src).expect_err("bare import must reject");
+        let msg = diags
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains("must declare an alias"),
+            "diag should explain the alias requirement, got: {msg}"
+        );
+        assert!(
+            msg.contains("lib/foo"),
+            "diag should quote the offending path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_import_rejects_missing_alias_ident() {
+        let src = r#"
+import "lib/foo" as ;
+
+fn main() { }
+"#;
+        let diags =
+            parse_str(src).expect_err("missing alias ident must reject");
+        let msg = diags
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains("import alias"),
+            "diag should mention the missing alias identifier, got: {msg}"
         );
     }
 }
