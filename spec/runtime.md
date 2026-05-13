@@ -53,6 +53,31 @@ the model: runtime is automatic; stdlib is explicit.
   (F.22)" for the language-level surface and `spec/memory.md`
   "Capacity slots (F.22)" for the lotus-substrate framing.
 
+- **Recognition pool allocators (v1.x-3).** A locus with
+  `: projection recognition(cap=N, <sub_mode>)` allocates one
+  recpool at instantiation; child loci accepted by that parent
+  draw their arena from the pool instead of `lotus_arena_create
+  _subregion`. Two symbol families ship in v1:
+
+  | Family | Surface | Backing |
+  |---|---|---|
+  | `lotus_recpool_fixed_*` | `create(cap, cell_bytes) -> recpool*`, `acquire(recpool) -> arena*`, `release(recpool, arena)`, `destroy(recpool)` | One contiguous block of `cap × cell_stride` bytes. Each cell carries an INLINE `lotus_arena_t` + `lotus_arena_chunk_t` header at its front followed by `cell_bytes` of payload — the cell IS the child's arena. Bitmap (`uint64_t[ceil(cap/64)]`) tracks occupancy; acquire scans the lowest unset bit via `__builtin_ctzll`. Release clears the bit so the slot is reusable. The returned arena has `fixed_size=1`, so `lotus_arena_alloc` returns NULL on overflow (caller routes to the closure-violation channel). |
+  | `lotus_recpool_slab_*` | `create(cap, slab_bytes) -> recpool*`, `acquire(recpool) -> arena*`, `release(recpool, arena)`, `destroy(recpool)` | One `lotus_arena_t` with an initial chunk of `slab_bytes` and `fixed_size=1` so it never grows. Every `acquire` returns the SAME arena pointer — children share the bump space and per-child release is a no-op. The whole slab frees at parent dissolve via `lotus_arena_destroy(slab_arena)`. `cap` is recorded but not enforced at the C layer (codegen's birth-cap check bounds concurrent children; the slab is a memory budget). |
+
+  Both families return `lotus_arena_t*` from `acquire` so child
+  body code stays projection-class-agnostic per the F.22
+  architectural invariant — the same `arena_alloc` path handles
+  fresh, subregion, fixed-cell, and shared-slab children. The
+  codegen dispatch at child dissolve picks the matching
+  `release` fn via the synthetic `__recpool_release_kind`
+  discriminator (0 = regular `arena_destroy`, 1 = fixed_cell
+  release, 2 = shared_slab release). v1 ships `fixed_cell` and
+  `shared_slab`; `spillover` and `summary_only` parse + AST
+  through but reject at typecheck with a `v1.x pending`
+  diagnostic (the spillover malloc-fallback machinery and the
+  `summary_only` "no child arena allocation" type-system rule
+  are separate work).
+
 ### Lifecycle
 
 - **Lifecycle dispatcher.** Invokes `birth → run → drain →

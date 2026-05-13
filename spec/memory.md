@@ -56,11 +56,50 @@ generated implementations:
 |---|---|---|
 | **Rich** (proj_rich, N≈4–10) | Per-locus bump arena. | Coordinatees attached as small array; full state per coordinatee; freed wholesale on locus dissolution. Low churn expected. |
 | **Chunked** (proj_chunked, N≈10–30) | Per-locus arena with **per-coordinatee sub-regions**. Each accept allocates a sub-region; each dissolution frees one wholesale. Bookkeeping slots reclaimed via free-list. | Typed-message-header per coordinatee; moderate churn supported. |
-| **Recognition** (proj_recognition, N≈100–500) | Pre-allocated fixed pool. No dynamic allocation in steady state. | Summary-only per coordinatee; many supported; minimal per-coordinatee state. |
+| **Recognition** (proj_recognition, N≈100–500) | Sub-mode-typed recpool selected at the locus declaration site (`fixed_cell`, `shared_slab`, `spillover`, or `summary_only`). v1 ships `fixed_cell` (bitmap-tracked fixed cells; child's arena lives inline in the cell) and `shared_slab` (one bump arena shared across all children; per-child release is a no-op). See **Recognition sub-modes** below. | Summary-only per coordinatee; many supported; minimal per-coordinatee state. |
 
 The compiler picks based on the locus's declared projection
 class. A locus with no explicit `projection` annotation defaults
 to `chunked` if it accepts coordinatees, `rich` if it doesn't.
+Recognition is **explicit-only** — there is no implicit
+recognition fallback, and v1.x-3 made the sub-mode commitment
+required at the declaration site (bare `: projection recognition`
+is a parse error). Same forcing-function discipline as the
+2026-05-12 two-channel rule: the substrate doesn't pick a default
+for you.
+
+### Recognition sub-modes (v1.x-3)
+
+A locus annotated `: projection recognition(cap=N, <sub_mode>)`
+commits to a storage discipline for its accepted children at
+the declaration site. v1 ships two sub-modes; the other two
+parse + typecheck but reject at the resolver with a "v1.x
+pending" diagnostic.
+
+| Sub-mode | Commitment | Backing | Per-child release |
+|---|---|---|---|
+| `fixed_cell(bytes=K)` | "Each child fits in K bytes. Cap of N children. Overflow is a hard runtime error." | `lotus_recpool_fixed_*`. One contiguous block of `N × stride` bytes; each cell holds an inline `lotus_arena_t` + chunk header + K-byte payload. Bitmap-tracked acquire/release. The cell IS the child's arena. | Clears the bitmap bit. Slot is reusable. |
+| `shared_slab(bytes=K)` | "All children share K bytes of bump space. The whole slab frees at parent dissolve." | `lotus_recpool_slab_*`. One `lotus_arena_t` with a single fixed-size chunk of K bytes; `fixed_size=1` so it never grows. Every acquire returns the SAME arena pointer — sibling allocations interleave. | No-op. Slab freed wholesale at parent dissolve. |
+| `spillover(bytes=K)` *(v1.x pending)* | "Each child fits in K bytes; overflow malloc-fallback with one-time warning. Graceful degradation under load." | Future: `lotus_recpool_spillover_*`. Per-cell `fixed_cell` plus a heap-allocated fallback. | TBD. |
+| `summary_only` *(v1.x pending)* | "Children carry zero per-instance state; all allocations live in the parent's arena." | Future: type-system rule prohibiting child arena allocation; parent's `__arena` is the only storage. | No-op. |
+
+The arena handle returned by `lotus_recpool_fixed_acquire` /
+`lotus_recpool_slab_acquire` is a `lotus_arena_t*` so child
+body code stays projection-class-agnostic per the F.22
+architectural invariant. Overflow on the child's
+`arena_alloc` returns NULL (the arena's `fixed_size=1` flag is
+honored); v1.x-3 wires that to a hard NULL return — routing
+through `lotus_root_panic` for value-error escalation is a
+future polish.
+
+The codegen dispatch at child dissolve picks the matching
+`release` fn via a synthetic `__recpool_release_kind: i64`
+discriminator on every locus struct (0 = regular
+`lotus_arena_destroy`, 1 = `lotus_recpool_fixed_release`, 2 =
+`lotus_recpool_slab_release`). Set at the parent's accept
+step; consumed at child dissolve. Uniform layout so the
+dissolve path doesn't branch on whether the locus opted into
+the recognition surface.
 
 ## Capacity slots (F.22)
 
@@ -640,18 +679,25 @@ locus accepts coordinatees:
   returns to a per-arena free-list so peak slot space stays
   O(concurrent children alive), not O(total children ever
   accepted). Per F.3.
-- **Recognition** parents: same code path as chunked at
-  v0 — sub-region allocation with free-list bookkeeping. The
-  spec's pre-allocated bitmap-cell pool is a perf optimization
-  (avoids `malloc` per accept) deliberately deferred until a
-  workload exercises it. The annotation parses + resolves +
-  routes correctly; the `Recognition` arm is *behaviorally*
-  equivalent to `Chunked` until the optimization lands. The
-  surface contract (parent owns a pool of fixed-size cells, no
-  dynamic allocation in steady state) is exercised by
-  `examples/14-projection-classes`.
+- **Recognition** parents (v1.x-3): the sub-mode commitment
+  spelled at the declaration site picks the allocator family.
+  `fixed_cell(bytes=K)` routes children through
+  `lotus_recpool_fixed_acquire` (bitmap-tracked cells, inline
+  arena per cell); `shared_slab(bytes=K)` routes children
+  through `lotus_recpool_slab_acquire` (every child shares
+  one bump arena). At parent instantiation the recpool is
+  allocated via the matching `_create` fn and stashed on the
+  synthetic `__recpool: ptr` struct field; at parent dissolve
+  it's torn down via `_destroy`. The child's arena teardown
+  is dispatched at the C ABI level: a discriminator on the
+  child struct picks `lotus_arena_destroy` (kind=0, regular),
+  `lotus_recpool_fixed_release` (kind=1), or
+  `lotus_recpool_slab_release` (kind=2). The surface contract
+  ("parent owns a pool, no dynamic allocation in steady
+  state for `fixed_cell`; one bump for `shared_slab`") is
+  exercised by `examples/14-projection-classes`.
 
-C runtime ABI as of m22:
+C runtime ABI as of v1.x-3:
 
 ```
 ptr  lotus_arena_create(void)
@@ -660,14 +706,26 @@ ptr  lotus_arena_alloc(ptr arena, i64 size, i64 align)
 void lotus_arena_destroy(ptr arena)             // auto-detects sub-region
                                                 // and returns slot to
                                                 // parent's free-list
+ptr  lotus_recpool_fixed_create(i64 cap, i64 bytes)   // v1.x-3
+ptr  lotus_recpool_fixed_acquire(ptr pool)            // v1.x-3
+void lotus_recpool_fixed_release(ptr pool, ptr arena) // v1.x-3
+void lotus_recpool_fixed_destroy(ptr pool)            // v1.x-3
+ptr  lotus_recpool_slab_create(i64 cap, i64 bytes)    // v1.x-3
+ptr  lotus_recpool_slab_acquire(ptr pool)             // v1.x-3
+void lotus_recpool_slab_release(ptr pool, ptr arena)  // v1.x-3
+void lotus_recpool_slab_destroy(ptr pool)             // v1.x-3
 ```
 
-`lotus_arena_destroy` is unified across kinds — it inspects the
-arena's optional `parent` pointer and slot, and returns the slot
-to the parent's free-list when present. Callers always emit a
-single destroy call regardless of how the arena was created.
-This keeps the codegen side simple: it doesn't have to remember
-which create variant was used.
+`lotus_arena_destroy` is unified across the regular + subregion
+shapes — it inspects the arena's optional `parent` pointer and
+slot, and returns the slot to the parent's free-list when
+present. The recpool variants are NOT unified with
+`lotus_arena_destroy` — their backing storage layout is
+distinct (inline-in-cell for fixed_cell; shared-bump for
+shared_slab) and routing through `lotus_arena_destroy` would
+corrupt the recpool's bookkeeping. The codegen dispatch
+discriminator (`__recpool_release_kind`) is what keeps the
+right release function reachable at child dissolve.
 
 ## Future work
 

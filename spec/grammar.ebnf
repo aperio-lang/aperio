@@ -68,7 +68,15 @@ locus_annotation  = "tier" , INT_LIT
                   | "projection" , projection_class
                   | "schedule" , schedule_class
                   ;
-projection_class  = "rich" | "chunked" | "recognition" ;
+projection_class  = "rich"
+                  | "chunked"
+                  | "recognition" , recognition_params ;
+recognition_params = "(" , "cap" , "=" , INT_LIT , "," ,
+                     recognition_sub_mode , ")" ;
+recognition_sub_mode = "fixed_cell"   , "(" , "bytes" , "=" , INT_LIT , ")"
+                     | "shared_slab"  , "(" , "bytes" , "=" , INT_LIT , ")"
+                     | "spillover"    , "(" , "bytes" , "=" , INT_LIT , ")"
+                     | "summary_only" ;
 schedule_class    = "cooperative"
                   | "pinned" , [ "(" , "core" , "=" , INT_LIT , ")" ] ;
 
