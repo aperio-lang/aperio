@@ -25,8 +25,9 @@ the model: runtime is automatic; stdlib is explicit.
   scope; the allocator just respects it.
 - **Per-projection-class allocation strategy.** Rich → simple
   arena; chunked → arena with per-coordinatee sub-regions;
-  recognition → fixed-size pre-allocated pool. Selected at
-  compile time per locus.
+  recognition → recpool, sub-mode-typed at the declaration
+  site (see "Recognition pool allocators" below). Selected
+  at compile time per locus.
 - **Free-list within parent for bookkeeping reclamation.** When
   a coordinatee dissolves, its bookkeeping slot in the parent's
   arena is reclaimed via a per-arena free-list (chunked-class
@@ -438,7 +439,7 @@ and modes; specific transports come from stdlib (`std::bus::*`).
   Mocking is available for tests via `time::mock_clock(...)`
   (stdlib).
 - **Monotonic-only scheduling.** Every scheduling primitive in
-  lotus — `time::sleep`, `time::tick`, the cooperative
+  Aperio — `time::sleep`, `time::tick`, the cooperative
   scheduler's deadline queue — is grounded on the monotonic
   clock. NTP slewing, leap seconds, and wall-clock jumps cannot
   warp scheduling decisions. `time::sleep` retries on EINTR

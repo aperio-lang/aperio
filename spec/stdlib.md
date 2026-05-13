@@ -87,7 +87,7 @@ Aperio. Plus the Phase 5 prerequisites that landed alongside.
 | Milestone | What it shipped |
 |-----------|-----------------|
 | m89 | `Bytes` codegen — the binary-safe sibling of String. Memory layout `[i64 len][u8 data[len]]`; same single-pointer ABI as String. `len(b)`, `std::io::fs::read_bytes`, `std::io::tcp::__send_bytes`, `Stream.send_bytes` method. Embedded NUL bytes preserved across all three. |
-| m90 | `std::io::fs::list_dir(path) -> String`. Newline-separated entry names (skipping `.` / `..`). v0 shape; sibling `[String]` API waits on a generic `List<T>` type. |
+| m90 | `std::io::fs::list_dir(path) -> String`. Newline-separated entry names (skipping `.` / `..`). v0 shape; the index-API sibling `list_dir_count` / `list_dir_at` (Phase 2e) is the structured alternative — no parametric `List<T>` needed. |
 | m91 | `std::text::md_to_html(md) -> String`. ATX headings, multi-line paragraphs, fenced code blocks, HTML escaping. Inline formatting (bold/italic/code/links) deferred. |
 
 ## Phase 5 — the capstone (sealed m92)
@@ -161,18 +161,27 @@ surface.
 | `std::str::repeat` / `pad_left` / `pad_right` | (follow-up) | `repeat(s, n)` returns n concatenated copies (n <= 0 → empty). `pad_left(s, width, pad)` and `pad_right(s, width, pad)` align to a target width using the first char of `pad` as the fill byte (empty pad → space). No truncation — if `len(s) >= width`, returns `s` unchanged. Common for separator lines, column-aligned table output, and right-aligned numeric formatting. |
 | F-string interpolation supports nested string literals | (follow-up) | The interpolation-capture loop tracks quote state via `\"` toggles, so `f"got: {func(\"abc\")}"` parses cleanly. `{` / `}` inside the interpolated string don't perturb depth counting. Limitation: a `"` inside the nested string can't be re-escaped (would need triple-backslash) — flagged in the lexer source. |
 
+Shipped after the table above:
+
+- v1.x-3 (recognition projection class proper backing) — SHIPPED
+  2026-05-12. Four sub-modes (`fixed_cell`, `shared_slab`,
+  `spillover`, `summary_only`); v1 ships `fixed_cell` and
+  `shared_slab`. `lotus_recpool_fixed_*` and
+  `lotus_recpool_slab_*` extern surfaces in
+  `crates/aperio-codegen/runtime/lotus_arena.c`. See
+  `spec/memory.md` § "Recognition sub-modes (v1.x-3)" for the
+  per-sub-mode commitment table and `spec/runtime.md`
+  § "Recognition pool allocators (v1.x-3)" for the C ABI.
+
 Deferred (gated on design):
 
-- v1.x-3 (recognition projection class proper backing) — design
-  resolved (four named sub-modes); implementation deferred.
 - v1.x-9 (closures with capture) — MS2 invariant says every
   quantity assignable to one locus tower; naive lexical capture
   lets values float. Wait for closure-design pass.
-- v1.x-12 (Map) / v1.x-13 (Vec) — substrate ready (F.22 cells +
-  string-builder for the value side), need generics or
-  fixed-instance design call.
-- v1.x-14 (Rope / chunk-list) — alt path to v1.x-15; lower
-  priority now that the string-builder ships.
+- v1.x-FORM-4 (`@form(hashmap)` + `@form(ring_buffer)`) — surface
+  preview in `spec/forms.md`; FORM-2 shipped `@form(vec)`,
+  FORM-3 is the perf-gate bench protocol, FORM-4 picks up the
+  remaining two named forms once the bench gate clears.
 
 Cut from roadmap (2026-05-12 design pass):
 
@@ -191,6 +200,14 @@ Cut from roadmap (2026-05-12 design pass):
   the appropriate pair — no type-system tax on the common
   case where 0-on-failure is fine. Revisit only if a future
   workload genuinely demands value-level error types.
+- v1.x-12 (Map as parametric stdlib type) / v1.x-13 (Vec as
+  parametric stdlib type) / v1.x-14 (Rope) — replaced by the
+  `@form(...)` machinery. Aperio source code never writes
+  `Map<K, V>` or `Vec<T>` parametrically; collections are loci
+  with form annotations. `@form(vec)` shipped via v1.x-FORM-2;
+  `@form(hashmap)` is v1.x-FORM-4 forward content. Rope is
+  superseded by v1.x-15 string-builder for the immediate
+  driver workload (`reader-list_item-quadratic-concat`).
 - v1.x-17 (machine-sized defaults) — runtime-queried page-size /
   cache-line constants for F.22 chunk sizing.
 
@@ -299,8 +316,8 @@ import-mechanism choice is recorded in
 
 ## Design principles
 
-- **Batteries included.** Go's approach: if a typical lotus
-  program needs it, it ships. A new lotus user shouldn't
+- **Batteries included.** Go's approach: if a typical Aperio
+  program needs it, it ships. A new Aperio user shouldn't
   need third-party packages for trading-system or coordinator-
   system work.
 - **One canonical implementation.** Per Go's "one obvious way":
@@ -313,206 +330,31 @@ import-mechanism choice is recorded in
   third-party module; nothing in stdlib is tied into the
   compiler.
 
-## v0 module map
+## Shipped module surface
 
-### `std::collections`
+The phase tables above are the authoritative list of what's in
+tree. Quick reference grouped by `std::*` namespace prefix:
 
-Common containers. Built atop the language's projection-class
-generics so the same API works across N=10, N=10K, N=10M.
+| Namespace | Surface (shipped) | Source |
+|---|---|---|
+| `std::process` | `pid() -> Int`, `exit(code: Int)` | path-call dispatch in `aperio-codegen` |
+| `std::env` | `args_count()`, `arg(i)`, `var(name)`, `var_exists(name)` | path-call dispatch + main-prelude argv stash |
+| `std::time` | `monotonic() -> Duration`, `sleep(d: Duration)` | `clock_gettime(CLOCK_MONOTONIC)` + EINTR-retrying `clock_nanosleep` |
+| `std::str` | `parse_int` / `can_parse_int` / `parse_float` / `can_parse_float`, `index_of`, `lower` / `upper`, `trim`, `replace`, `repeat`, `pad_left` / `pad_right`, `from_bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` | `lotus_str_*` C runtime primitives |
+| `std::bytes` | `at(b, i) -> Int`, `slice(b, lo, hi) -> Bytes`, `from_string(s) -> Bytes` | `lotus_bytes_*` C runtime primitives |
+| `std::text` | `md_to_html(md) -> String`, `base64::encode` / `base64::decode`, `Sink` interface + `StdoutSink` / `StringSink` / `FileSink` loci | `runtime/stdlib/text.ap` + C runtime |
+| `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `file_exists`, `mkdir`, `list_dir`, `list_dir_count`, `list_dir_at` | `lotus_fs_*` C runtime primitives |
+| `std::io::tcp` | `Listener` locus, `Stream` locus, `send`, `send_bytes`, `recv_bytes` | `lotus_tcp_*` C runtime primitives |
+| `std::http` | `Request` + `Response` types, `parse_request`, `write_response`, case-insensitive `header` lookup | `runtime/stdlib/http.ap` |
+| `std::test` | `assert(cond, msg)`, `assert_eq_int`, `assert_eq_str` | `runtime/stdlib/test.ap` |
+| `std::log` | `Logger`, `LogEvent`, `StdoutSink` (subscribes `log.**`) | `runtime/stdlib/log.ap` |
+| `std::math` | `sqrt`, `exp`, `log`, `floor`, `ceil`, `pow` | path-call dispatch into libm |
 
-- `Map<K, V>`        — hash map
-- `Set<T>`           — hash set
-- `List<T>`          — growable array
-- `Deque<T>`         — double-ended queue
-- `RingBuffer<T>`    — fixed-size circular buffer (recognition-class)
-
-### `std::string`
-
-String manipulation: `split`, `join`, `replace`, `trim`,
-`startswith`, `endswith`, `format`, etc. Uses the language's
-built-in `string` type.
-
-### `std::math`
-
-Beyond the language-native `sum` and `prod`:
-
-**Shipped (Phase 2c, 2026-05-11):**
-- `sqrt(x)`, `exp(x)`, `log(x)`, `floor(x)`, `ceil(x)` — unary
-  libm primitives.
-- `pow(base, exp)` — binary libm primitive.
-- (Implicit Int → Float widening lets `std::math::sqrt(2)` work
-  without `2.0`. The widening is one-way; see the ergonomics-arc
-  table above.)
-
-**Aspirational (not yet shipped):**
-- `min`, `max`, `mean`, `median`, `mode`, `stddev`
-- `round`, `abs`, `sin`, `cos`, `tan`
-- Constants: `pi`, `e`, etc.
-
-### `std::stat`
-
-Statistics needed by the framework's discipline:
-- `correlate(x, y) -> float`
-- `covariance(x, y) -> float`
-- `regression(x, y) -> LinearFit`
-- `convergence(perspectives, tolerance) -> bool`
-- `perspective_distance(p1, p2) -> float`
-
-### `std::numerical`
-
-Numerical primitives for analyst-side curve fitting:
-- `LinAlg`: matrices, vectors, common operations
-- `Solve`: linear systems, optimization
-- `FFT`: frequency-domain transforms (relevant to harmonic-mode
-  projections)
-- `Decimal`: extensions to the built-in `decimal` type
-  (e.g., financial-rounding rules)
-
-### `std::time`
-
-Beyond the language-native `time` and `duration`:
-- `now()`, `monotonic()`
-- `sleep(d)`, `tick(d)`
-- `format`, `parse` (ISO-8601 and common formats)
-- `Calendar` for trading-day arithmetic
-- `mock_clock(d)` for tests
-
-### `std::io`
-
-File and basic I/O:
-- `read_file`, `write_file`, `append_file`
-- `Reader`, `Writer` traits / interfaces
-- `BufferedReader`, `BufferedWriter`
-- stdin / stdout / stderr (richer interface than runtime
-  builtins)
-
-### `std::net`
-
-Networking:
-- TCP, UDP, Unix domain sockets
-- `Listener`, `Connection`
-- HTTP client + server (basic; not a full framework)
-- TLS
-
-### `std::bus`
-
-The framework's view: **a transport is the bus kernel projected
-through a parameter regime.** NATS and UDP multicast (and Unix
-sockets, and shared memory, and TCP) are the same primitive
-— typed pub-sub between loci — operating at different
-(B, c, σ, φ) values. The `std::bus` module exposes this directly:
-one `Adapter` interface; multiple implementations, each with its
-declared parameter envelope.
-
-```
-trait Adapter {
-    // Identifies the parameter regime this adapter operates in.
-    // Used by the runtime to bind channels to transports based
-    // on the channel's mode and declared envelope.
-    fn envelope() -> TransportEnvelope;
-
-    fn subscribe(subject: string, handler: ...) -> Subscription;
-    fn publish(subject: string, msg: T) -> Result<(), Error>;
-    // request_response is optional; some envelopes don't support it.
-    fn request(subject: string, msg: T, timeout: duration) -> Result<R, Error>;
-}
-
-struct TransportEnvelope {
-    latency_typical: duration;       // wire latency under load
-    throughput_messages_per_sec: int;
-    reliability: Reliability;        // BestEffort | AtLeastOnce | ExactlyOnce
-    request_response: bool;
-    fanout_max: int;                 // 1 for unicast, >1 for multicast / broker
-    ordering: Ordering;              // None | PerSubject | Total
-}
-```
-
-Provided implementations:
-
-- `bus::tcp::Adapter` — typed pub-sub over TCP. Ordered, reliable,
-  unicast or many-to-many via broker.
-- `bus::nats::Adapter` — broker-mediated; reliable; supports
-  request-response; per-subject ordering. Higher latency.
-- `bus::udp_multicast::Adapter` — best-effort; line-rate
-  fanout; no request-response. Sub-microsecond at LAN scale.
-- `bus::unix_socket::Adapter` — same-host, ordered, reliable.
-- `bus::in_memory::Adapter` — for tests; deterministic ordering.
-
-Channels declared in Aperio source bind to transports at
-deployment time. The locus's `bus { subscribe "..." as h; }`
-declaration carries the channel's mode (bulk / harmonic /
-resolution); the deployment config maps mode + subject pattern
-to a transport whose envelope satisfies the requirement.
-
-A bulk-mode market-data channel binds to UDP multicast; a
-resolution-mode RFQ-quote channel binds to NATS; a closure-
-test reporting channel binds to TCP or Unix socket. Same
-source code, different transport per channel — chosen by
-parameter fit, not by name.
-
-### `std::encoding`
-
-Serialization:
-- `json::encode`, `json::decode`
-- `protobuf::encode`, `protobuf::decode`
-- `msgpack::encode`, `msgpack::decode`
-- `binary::encode`, `binary::decode` (raw little/big endian)
-
-### `std::perspective`
-
-Infrastructure beyond what the runtime provides:
-- `Versioned<T>` — wrap a perspective with version metadata
-- `serialize<T: Perspective>(p)` — wire format
-- `deserialize<T: Perspective>(bytes) -> T` (returns zero-value
-  on failure; pair with `can_deserialize<T>(bytes) -> Bool`
-  for the explicit predicate — sentinel-with-discriminator
-  idiom, matching `parse_int` / `can_parse_int`).
-- `commit_when(condition)` — declarative commit policy
-
-### `std::observability`
-
-Metrics, logs, tracing:
-- `Metric` (counter, gauge, histogram)
-- `Logger` (structured, level-based)
-- `Span` (tracing context propagation)
-- Built on the bus interface so observability events flow as
-  typed messages, not magic side-channels
-
-### `std::test`
-
-Testing primitives (referenced in `testing.md`):
-- `assert`, `assert_eq`, `assert_neq`, `assert_rejects`
-- `assert_closure(name, tolerance)` — runs the named closure
-  test and asserts within band
-- `mock_locus<T>(...)` — substitute a locus with a mock
-- `bench_iter(n, f)` — controlled benchmark inner loop
-
-### `std::ffi`
-
-Foreign function interface — generic, language-agnostic. No
-specific external runtime is favored.
-
-- `extern fn` declaration syntax (TBD: grammar extension)
-- `c::Callable` for calling into C libraries
-- Marshalling helpers for common types
-- Adapters for other runtimes (Go, Rust, etc.) live as
-  third-party modules, not stdlib. Lotus stdlib provides the
-  generic primitives; team-specific bindings (e.g.
-  domain-specific typed messages) live in their own packages.
-
-### `std::random`
-
-Pseudo-random generation:
-- `Rng` (defaults to a cryptographically-strong source for
-  production; `mock_rng(seed)` for tests)
-- Distributions: uniform, normal, etc.
-
-### `std::sync`
-
-Synchronization primitives at the locus boundary:
-- `Channel<T>` — typed channel (Go-shaped)
-- `Mutex<T>` — locks; rarely needed because of locus structure
-- `WaitGroup` — coordination across multiple sub-loci
+Aperio doesn't use parametric stdlib collection types (`Map<K,
+V>`, `Vec<T>`, `Set<T>`, etc.). Storage is locus-shaped via the
+`@form(...)` annotation machinery — see `spec/forms.md`. v1
+ships `@form(vec)` (the contiguous-buffer container);
+`@form(hashmap)` and `@form(ring_buffer)` arrive in v1.x-FORM-4.
 
 ### ~~`std::panic`~~ — not a thing
 
@@ -555,7 +397,7 @@ for the operational details.
 - Cryptography beyond TLS basics
 - Compression formats beyond ones used in stdlib (gzip for HTTP)
 
-These are the kinds of things that should live in the lotus
+These are the kinds of things that should live in the Aperio
 package ecosystem (TBD: how packages work, where they live).
 
 ## Open decisions

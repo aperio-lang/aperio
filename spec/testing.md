@@ -1,7 +1,7 @@
 # Testing pipeline
 
 The testing pipeline is part of the language toolchain, not an
-add-on. `lotus test` ships in the same binary as `lotus build`.
+add-on. `aperio test` ships in the same binary as `aperio build`.
 Test infrastructure exists from day 1 because the language's
 discipline (closure tests, k_max bounds, projection-class
 invariants, multi-perspective stability commit-rules) needs
@@ -12,7 +12,7 @@ Implementation follows once the compiler exists.
 
 ## Three layers of correctness
 
-Lotus testing distinguishes three layers, each with its own
+Aperio testing distinguishes three layers, each with its own
 tooling:
 
 ### Layer 1 — Language correctness
@@ -22,7 +22,7 @@ language spec says it should?*
 
 - **Parser tests.** Given source, the parser produces the
   expected AST (or rejects with the expected error). Stored as
-  `.lt` files paired with `.expected.json` (or similar) AST
+  `.ap` files paired with `.expected.json` (or similar) AST
   dumps. Driven by the grammar in `spec/grammar.ebnf`.
 - **Typechecker tests.** Given a program, the typechecker
   accepts or rejects with the expected diagnostic. Same shape
@@ -31,7 +31,7 @@ language spec says it should?*
   the program produces the expected output. Driven by the
   operational semantics document (yet to be written).
 
-These run as part of `lotus test` and as part of compiler CI.
+These run as part of `aperio test` and as part of compiler CI.
 A compiler regression should be caught here.
 
 ### Layer 2 — Mathematical / framework correctness
@@ -65,7 +65,7 @@ The framework's commitments need test infrastructure:
   loci are compile-time rejected. Tests assert the compiler
   rejects sibling-to-sibling access.
 
-These tests are written in lotus itself. The standard library
+These tests are written in Aperio itself. The standard library
 provides `assert(...)`, `assert_rejects(...)`, `assert_closure(...)`
 and similar primitives. Test programs are valid Aperio programs;
 the framework discipline applies to them too.
@@ -94,7 +94,7 @@ Output is JSON-serializable for CI consumption. Baselines are
 checkpointed in version control; regressions produce a diff
 the developer must explicitly accept.
 
-#### Comparative benchmarks (lotus vs. other languages)
+#### Comparative benchmarks (Aperio vs. other languages)
 
 These are **internal development tools**, not published results.
 Their purpose is to give the team visibility into the language's
@@ -107,7 +107,7 @@ A benchmark file declares its equivalent in another language as
 a sibling:
 
 ```
-// bench_message_passing_test.lt
+// bench_message_passing_test.ap
 //
 // @external_equivalents:
 //   - lang: go
@@ -136,7 +136,7 @@ Useful comparative-perf categories for internal use:
 
 Comparative results are not gatekept; any branch can produce
 them and stash them in `bench-results/` (gitignored). A regression
-in lotus-vs-X ratio is a developer signal, not a CI gate.
+in aperio-vs-X ratio is a developer signal, not a CI gate.
 
 #### Performance regressions in CI
 
@@ -150,38 +150,38 @@ improves; widening a band is an explicit, reviewed action.
 ```
 project/
 ├── src/
-│   └── *.lt            // production source
+│   └── *.ap            // production source
 └── tests/
     ├── unit/
-    │   └── *_test.lt   // unit tests, by module
+    │   └── *_test.ap   // unit tests, by module
     ├── integration/
-    │   └── *_test.lt   // multi-locus integration tests
+    │   └── *_test.ap   // multi-locus integration tests
     ├── bench/
-    │   └── *_bench.lt  // benchmarks
+    │   └── *_bench.ap  // benchmarks
     └── equivalents/    // external-language equivalents for
         ├── go/         // comparative benchmarks
         ├── rust/
         └── erlang/
 ```
 
-Or, alternatively, Go-style: `*_test.lt` lives next to the
+Or, alternatively, Go-style: `*_test.ap` lives next to the
 source it tests. Both layouts are supported; the runner finds
-tests by suffix (`_test.lt`) regardless of location.
+tests by suffix (`_test.ap`) regardless of location.
 
 ## Toolchain commands
 
 | Command | Purpose |
 |---|---|
-| `lotus build` | Compile source → executable / library |
-| `lotus check` | Static checks: parse, typecheck, framework discipline |
-| `lotus test` | Run all `*_test.lt` files in the project |
-| `lotus test -run pattern` | Run matching tests only |
-| `lotus bench` | Run all `*_bench.lt` files |
-| `lotus bench -compare` | Build and run external equivalents alongside |
-| `lotus verify` | Layer-2 discipline checks specifically (no execution) |
-| `lotus fmt` | Canonical formatter (Go-style: zero config) |
+| `aperio build` | Compile source → executable / library |
+| `aperio check` | Static checks: parse, typecheck, framework discipline |
+| `aperio test` | Run all `*_test.ap` files in the project |
+| `aperio test -run pattern` | Run matching tests only |
+| `aperio bench` | Run all `*_bench.ap` files |
+| `aperio bench -compare` | Build and run external equivalents alongside |
+| `aperio verify` | Layer-2 discipline checks specifically (no execution) |
+| `aperio fmt` | Canonical formatter (Go-style: zero config) |
 
-`lotus test` runs Layer 1 + Layer 2. `lotus bench` runs Layer 3.
+`aperio test` runs Layer 1 + Layer 2. `aperio bench` runs Layer 3.
 
 ## Test assertion library
 
@@ -241,11 +241,11 @@ Not in the v0.1 stdlib.
 
 The toolchain emits machine-readable output:
 
-- `lotus test --json` produces JSON test results (per-test pass/fail,
+- `aperio test --json` produces JSON test results (per-test pass/fail,
   per-test timing, error messages).
-- `lotus bench --json` produces JSON benchmark output (per-bench
+- `aperio bench --json` produces JSON benchmark output (per-bench
   time, allocations, comparative table if `-compare` given).
-- `lotus check --json` produces JSON diagnostics.
+- `aperio check --json` produces JSON diagnostics.
 
 CI consumes the JSON; standard reporters (JUnit XML, GitHub
 Actions annotations, etc.) are downstream conversions.
@@ -262,6 +262,6 @@ Actions annotations, etc.) are downstream conversions.
    that's free). Does the runtime need deterministic
    scheduling for benchmark consistency? Probably yes for some
    benchmark classes; opt-in.
-3. **External-language toolchain access.** `lotus bench
+3. **External-language toolchain access.** `aperio bench
    -compare` needs `go`, `rustc`, `erlc`, etc. on PATH.
    Documenting this clearly is dev-experience work.

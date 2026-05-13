@@ -143,9 +143,10 @@ on consistent vocabulary. Slot 1..N parent-override is deferred
 to v1.x — the first workload that demands a parent-owned Pool
 shared across accepted children will unlock the syntax.
 
-**Naming note.** The Recognition projection class's
-pre-allocated bitmap pool (`RecognitionPool`, documented later
-in this file) is the *slot 0 storage strategy for recognition-
+**Naming note.** The Recognition projection class's recpool
+(see § "Recognition sub-modes (v1.x-3)" above —
+`lotus_recpool_fixed_*` / `lotus_recpool_slab_*` per the chosen
+sub-mode) is the *slot 0 storage strategy for recognition-
 classed loci*. F.22's `pool` slot is a user-declared slot at
 1..N with chunked-+-free-list backing and no projection-class
 entanglement. The two systems may unify in v1.x once F.22
@@ -366,21 +367,33 @@ coordinatee dissolves.
 
 ### Recognition
 
-```
-struct RecognitionPool {
-    cells: [RecognitionCell; POOL_SIZE],
-    occupied_bitmap: [u64; POOL_SIZE / 64],
-}
+Sub-mode-typed at the locus declaration site
+(`recognition(cap=N, <sub_mode>)`); v1 ships two sub-modes:
 
-struct RecognitionCell {
-    summary: RecognitionSummary,
-    occupied: bool,
-}
+```c
+/* fixed_cell(bytes=K) — bitmap-tracked cells; the cell IS
+ * the child's arena. Per-child release clears the bit. */
+struct lotus_recpool_fixed {
+    size_t cap_count, cell_bytes, cell_stride, bitmap_words;
+    uint64_t *bitmap;
+    char *cells;   /* cap_count * cell_stride bytes;
+                    * each cell holds an inline arena
+                    * header + chunk header + K-byte payload */
+};
+
+/* shared_slab(bytes=K) — one shared arena; every acquire
+ * returns the same pointer; per-child release is no-op. */
+struct lotus_recpool_slab {
+    size_t cap_count, slab_bytes;
+    lotus_arena_t *slab_arena;   /* fixed_size=1 */
+};
 ```
 
-Pre-allocated pool of fixed-size cells. Allocation is a bitmap
-search; deallocation is a bitmap clear. No dynamic memory in
-steady state.
+Allocation is a bitmap search (fixed_cell) or a regular arena
+bump (shared_slab); no dynamic memory in steady state for
+either. See `crates/aperio-codegen/runtime/lotus_arena.c` for
+the canonical implementation and § "Recognition sub-modes
+(v1.x-3)" above for the per-sub-mode contract.
 
 ## What the compiler emits
 

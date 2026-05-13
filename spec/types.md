@@ -1,6 +1,6 @@
 # Type system
 
-This document specifies lotus's type system: what types exist,
+This document specifies Aperio's type system: what types exist,
 how they relate, what the compiler verifies. Where the grammar
 (`grammar.ebnf`) tells you what's syntactically valid, this
 document tells you what's *meaningfully* valid.
@@ -96,9 +96,9 @@ typecheck and codegen.
 | LLVM repr | `ptr` — a typed pointer to T's struct layout |
 | Element type | The boxed inner type carries T from the slot's `of T` declaration; `Cell<Int>` and `Cell<Float>` typecheck distinctly. |
 | Validity surface | Round-trip only: a value can flow through `let`-bindings, get re-supplied to `release` / `free`, and live inside the locus body. |
-| Forbidden v1 ops | println, arithmetic, comparison, fn-return-boundary crossing. Each rejects with a focused build-time diagnostic. |
-| v1.x follow-up | Direct load / store through a Cell handle (`*cell` for primitive cells, `cell.field` for struct cells). Lands when Map / Vec stdlib drive the surface. |
-| Slot-of-origin tracking | Not in v1 — a `Cell<T>` carries T but not the slot it came from, so releasing into a different slot of the same T is undefined behavior. v1.x type refinement closes this. |
+| Forbidden ops | println, arithmetic, comparison, fn-return-boundary crossing. Each rejects with a focused build-time diagnostic. |
+| Field access (v1.x-2) | Struct cells support `cell.field` reads and `cell.field = v` writes; lowers to struct GEP + load/store. Primitive cells (`Cell<Int>` etc.) reject field access with a focused diagnostic. |
+| Slot-of-origin tracking (v1.x-5) | `Cell<T>` carries both T AND the originating `(locus, slot)` pair. Releasing a cell into a different slot than it came from is a hard error at codegen and the interpreter, with a diagnostic naming the originating slot. |
 
 ## Perspective types
 
@@ -488,11 +488,11 @@ in the current scope.
 
 Per `notes/open-questions.md` and design-rationale §16:
 
-- **Trait system.** No `trait` keyword in v0 (reserved). Generic
-  constraints limited to projection class + `Numeric`. The
-  structural `interface` form (F.20) ships as the v0 interface
-  mechanism; full traits with `impl I for L` declarations and
-  generic bounds remain deferred.
+- **Trait system.** No `trait` keyword in v0 (reserved). The
+  structural `interface` form (F.20) ships as the v1 interface
+  mechanism — both Phase A (typecheck) and Phase B (codegen
+  vtable dispatch) landed 2026-05-11. Full traits with `impl I
+  for L` declarations and generic bounds remain deferred.
 - **Refinement types** (e.g., `int where x > 0`). Deferred.
 - **Effect / capability system.** Substrate-derivation tracking
   is currently runtime-enforced via closure tests; future

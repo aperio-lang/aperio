@@ -257,8 +257,12 @@ matching C primitive:
 Calling a pool method on a heap slot (or vice versa) is a
 build-time diagnostic that names the right method for the
 slot kind. The `Cell<T>` cell type is documented in
-`types.md`; at v1 it is opaque round-trip only (no read /
-write through the cell — pending Map / Vec stdlib in v1.x).
+`types.md`; struct cells support `cell.field` read/write (v1.x-2)
+and `Cell<T>` carries slot-of-origin so cross-slot release is
+a hard error (v1.x-5). Primitive cells (`Cell<Int>` etc.) still
+reject field access with a focused diagnostic — direct
+load/store through a primitive Cell handle (e.g. `*cell`) is
+the natural next surface but no current workload demands it.
 
 Slot access outside a method-call receiver position (e.g.,
 `let x = self.entries;` to hold a slot handle as a value) is
@@ -272,17 +276,23 @@ class slot-handle values.
 
 When a locus is accepted by a parent whose projection class is
 **Chunked** or **Recognition**, the child's slot 0 (arena) is
-allocated as a sub-region of the parent's arena via
-`lotus_arena_create_subregion`. The child is freed wholesale
-when the parent's arena dissolves. **Rich**-class parents do
-not sub-region-allocate; accepted children get their own
-top-level arenas. See `memory.md` Per-projection-class
-allocation table.
+allocated either as a sub-region of the parent's arena (Chunked,
+via `lotus_arena_create_subregion`) or out of the parent's
+recpool (Recognition with the matching sub-mode, via
+`lotus_recpool_fixed_acquire` / `lotus_recpool_slab_acquire`).
+The child is freed wholesale when the parent dissolves.
+**Rich**-class parents do not sub-region-allocate; accepted
+children get their own top-level arenas. See `memory.md`
+Per-projection-class allocation table.
 
-This is existing v0 behavior; F.22 names it as "projection
-class governs parent-override of slot 0" so future slot-1..N
-parent-override (deferred to v1.x as `as_parent_for`) sits
-on consistent vocabulary.
+F.22 names this as "projection class governs parent-override
+of slot 0." **Slot 1..N parent-override** (`pool entries of Int
+as_parent_for ChildL;`) shipped via v1.x-4 (surface) + v1.x-4b
+(runtime mechanic, commit `d50ab79`): the borrow-mask
+`__slot_borrowed_mask` field carries one bit per slot, set when
+the slot was borrowed from a parent's matching slot at accept
+time; the dissolve pass skips destroy on borrowed slots so the
+parent retains ownership of the underlying allocator.
 
 ## Lifecycle method invocation
 

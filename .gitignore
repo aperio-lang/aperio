@@ -41,6 +41,9 @@ apps/cli-demo/cli-demo
 # Aperio example build artifacts (compiled binaries sit next
 # to main.ap after `aperio build`).
 examples/*/main
+# Multi-file examples take the directory name as the output —
+# match per example directory the way apps/ does.
+examples/14-projection-classes/14-projection-classes
 
 # Ferryman recognition output. Lands in <repo>/.ferryman/ wherever
 # ferryman is pointed; the apps/operational-graph/fixture path

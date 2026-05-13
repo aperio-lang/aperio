@@ -1057,11 +1057,15 @@ class loci. The cost reflects the projection class:
 - Chunked (proj_chunked): `self.children` is a chunked array
   with sub-region pointers; iteration is O(N) with one indirect
   load per child.
-- Recognition (proj_recognition): `self.children` is a fixed
-  pre-allocated pool with summary statistics — iteration may
-  be discouraged by the compiler in favor of summary access
-  (e.g., `self.children.count` vs `count = ...; for c in
-  self.children { count = count + 1; }`).
+- Recognition (proj_recognition): the `: projection
+  recognition(cap=N, <sub_mode>)` annotation commits to a
+  recpool sub-mode at the declaration site (`fixed_cell`,
+  `shared_slab`, `spillover`, or `summary_only`; v1 ships the
+  first two — see `spec/memory.md` § "Recognition sub-modes
+  (v1.x-3)"). `self.children` iterates the pool's occupied
+  cells; iteration may be discouraged by the compiler in
+  favor of summary access (`self.children.count` vs the
+  manual count-loop) once a workload exercises the surface.
 
 **v0 limitation: single-accept-type only.** A locus with
 `accept(c: ChildType)` for a single ChildType has well-typed
@@ -1605,13 +1609,19 @@ parent-override of slot 0." No new behavior at v0 — F.22
 *names* the existing capability so future slot-1..N overrides
 sit on a consistent vocabulary.
 
-**Slot 1..N parent-override (deferred to v1.x).** A future
-extension lets a parent declare `capacity { pool entries of
-Int as_parent_for ChildL; }` so that any `ChildL` accepted by
-this parent gets its `entries` slot pointer replaced with the
-parent's at accept time. Generalizes the chunked-class
-sub-region hand-off to all slot kinds. Spec text waits for the
-first workload that demands it.
+**Slot 1..N parent-override (v1.x-4 + v1.x-4b, SHIPPED).** A
+parent declares `capacity { pool entries of Int as_parent_for
+ChildL; }` and any `ChildL` accepted by this parent gets its
+matching slot pointer replaced with the parent's at accept
+time. Generalizes the chunked-class sub-region hand-off to
+all slot kinds. Runtime mechanic: every locus struct carries
+a synthetic `__slot_borrowed_mask: i64` with one bit per slot;
+the bit is set when the slot was borrowed, and the dissolve
+pass skips destroy on borrowed slots so the parent retains
+ownership of the underlying allocator. Codegen-side defensive
+kind+elem_ty validation rejects mismatched borrows at the
+swap site; `@form(vec)` slots cannot be borrowed (rejected
+with a focused diag).
 
 **Restrictions (v0).**
 
@@ -1637,15 +1647,17 @@ first workload that demands it.
    `acquire` / `alloc` return `*T`-shaped pointers.
 
 **Naming note.** F.22's `pool` slot is distinct from
-`spec/memory.md`'s `RecognitionPool` (the bitmap-backed
-fixed-cap pool that the Recognition projection class uses
-internally for slot 0). Both are "pools of cells" in the
-substrate sense, but the Recognition pool is part of
-projection-class semantics (slot 0 storage strategy for
-recognition-classed loci), whereas F.22's pool slot is a
-user-declared slot at 1..N with chunked-+-free-list backing
-and no projection-class entanglement. The two systems may
-unify in v1.x once F.22 slots 1..N stabilize.
+the recognition projection class's recpool (see
+`spec/memory.md` § "Recognition sub-modes (v1.x-3)" —
+`lotus_recpool_fixed_*` for `fixed_cell` sub-mode,
+`lotus_recpool_slab_*` for `shared_slab`). Both are "pools
+of cells" in the substrate sense, but the Recognition
+recpool is part of projection-class semantics (slot 0
+storage strategy for recognition-classed loci), whereas
+F.22's pool slot is a user-declared slot at 1..N with
+chunked-+-free-list backing and no projection-class
+entanglement. The two systems may unify in v1.x once F.22
+slots 1..N stabilize.
 
 **Why.** The 1D collapse forced every long-lived data
 structure into wholesale-free semantics. Growable types — Map,
@@ -1802,9 +1814,13 @@ the friction-log entry asked for.
 
 The grammar in v0 does **not** specify:
 
-- **Trait / interface system.** No `trait` keyword in v0
-  (reserved). Generics are bound only by projection class for
-  now. A full trait system is a future extension.
+- **Trait system.** No `trait` keyword in v0 (reserved). The
+  Go-style structural `interface` form (F.20) shipped 2026-05-11
+  with Phase A typecheck + Phase B codegen vtable dispatch;
+  loci structurally satisfy interfaces with no `impl I for L`
+  declaration. Rust-style traits with explicit impl blocks,
+  trait bounds on generics, and coherence remain a future
+  extension. Generics today are bound only by projection class.
 - **Effect / capability system.** Substrate-derivation anchor
   tracking is currently a runtime concern enforced by closure
   tests. A future version may move it into the type system as
