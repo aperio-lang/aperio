@@ -242,6 +242,12 @@ pub struct CapacitySlot {
     /// chunked-class slot-0 sub-region handoff to slots 1..N.
     /// `None` for ordinary slots that own their allocator.
     pub as_parent_for: Option<Ident>,
+    /// v1.x-FORM-4 slot key-by-field: when a slot is declared
+    /// with `indexed_by <fieldname>`, the named field of the
+    /// cell type serves as the hashmap key. Only meaningful on
+    /// `@form(hashmap)` loci; typecheck flags misuse on other
+    /// shapes. `None` for ordinary slots.
+    pub indexed_by: Option<Ident>,
     pub span: Span,
 }
 

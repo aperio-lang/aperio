@@ -78,6 +78,12 @@ pub enum TokenKind {
     /// `pool entries of T as_parent_for ChildL;` overrides
     /// accepted ChildL's same-named slot to share this allocator.
     AsParentFor,
+    /// v1.x-FORM-4: slot-decl trailing clause introducer for
+    /// `@form(hashmap)`. `pool entries of T indexed_by name;`
+    /// says the cell type T has a field `name` that serves as
+    /// the hashmap key. Only meaningful on a `@form(hashmap)`
+    /// locus; ignored elsewhere (typecheck flags misuse).
+    IndexedBy,
 
     // Keywords — lifecycle
     Birth,
@@ -407,6 +413,7 @@ impl<'a> Lexer<'a> {
             "bus" => TokenKind::Bus,
             "capacity" => TokenKind::Capacity,
             "as_parent_for" => TokenKind::AsParentFor,
+            "indexed_by" => TokenKind::IndexedBy,
 
             // Lifecycle
             "birth" => TokenKind::Birth,

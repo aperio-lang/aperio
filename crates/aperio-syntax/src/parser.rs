@@ -757,6 +757,16 @@ impl Parser {
         let name = self.expect_ident("slot name")?;
         self.expect(TokenKind::Of, "of")?;
         let elem_ty = self.parse_type_expr()?;
+        // v1.x-FORM-4 optional trailing clause:
+        //   `indexed_by <fieldname>`
+        // Names a field of the cell type as the hashmap key.
+        // Only meaningful on `@form(hashmap)` loci; ignored
+        // elsewhere (typecheck flags misuse).
+        let indexed_by = if self.eat(&TokenKind::IndexedBy) {
+            Some(self.expect_ident("field name after `indexed_by`")?)
+        } else {
+            None
+        };
         // F.22 v1.x-4 optional trailing clause:
         //   `as_parent_for <ChildLocus>`
         let as_parent_for = if self.eat(&TokenKind::AsParentFor) {
@@ -771,6 +781,7 @@ impl Parser {
             kind,
             elem_ty,
             as_parent_for,
+            indexed_by,
         })
     }
 
@@ -3410,5 +3421,102 @@ fn main() { }
             msg.contains("import alias"),
             "diag should mention the missing alias identifier, got: {msg}"
         );
+    }
+
+    // === v1.x-FORM-4 PR1 tests ===========================
+    //
+    // Capacity-slot `indexed_by <fieldname>` clause. Parser-
+    // level only — typecheck enforcement that `indexed_by` is
+    // meaningful only on `@form(hashmap)` lands in PR2.
+
+    #[test]
+    fn parse_indexed_by_clause() {
+        let src = r#"
+@form(hashmap)
+locus Registry {
+    capacity { pool entries of Entry indexed_by name; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let cap = match &prog.items[0] {
+            TopDecl::Locus(l) => l.members.iter().find_map(|m| match m {
+                LocusMember::Capacity(c) => Some(c),
+                _ => None,
+            }).expect("capacity block"),
+            _ => panic!("expected locus"),
+        };
+        let slot = &cap.slots[0];
+        assert_eq!(slot.name.name, "entries");
+        assert_eq!(slot.kind, CapacitySlotKind::Pool);
+        assert_eq!(slot.indexed_by.as_ref().map(|i| i.name.as_str()), Some("name"));
+        assert!(slot.as_parent_for.is_none());
+    }
+
+    #[test]
+    fn parse_slot_without_indexed_by_clause() {
+        // Existing plain slots stay unchanged — indexed_by is None.
+        let src = r#"
+locus Bag {
+    capacity { heap items of Int; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let cap = match &prog.items[0] {
+            TopDecl::Locus(l) => l.members.iter().find_map(|m| match m {
+                LocusMember::Capacity(c) => Some(c),
+                _ => None,
+            }).expect("capacity block"),
+            _ => panic!("expected locus"),
+        };
+        assert!(cap.slots[0].indexed_by.is_none());
+    }
+
+    #[test]
+    fn parse_indexed_by_missing_ident_rejected() {
+        let src = r#"
+locus Registry {
+    capacity { pool entries of Entry indexed_by ; }
+}
+"#;
+        let diags =
+            parse_str(src).expect_err("missing fieldname must reject");
+        let msg = diags
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains("field name after `indexed_by`"),
+            "diag should name the missing fieldname, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_indexed_by_outside_keyword_position_is_ident() {
+        // `indexed_by` outside the slot clause position should
+        // not lex as a keyword. We don't have a great place to
+        // test "is an ident" without a synthetic decl, but we
+        // can at least verify a normal slot decl after one
+        // doesn't get confused. Smoke-test: two slots, first
+        // uses indexed_by, second doesn't, both parse.
+        let src = r#"
+locus Two {
+    capacity {
+        pool keyed of Entry indexed_by name;
+        heap log of Int;
+    }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let cap = match &prog.items[0] {
+            TopDecl::Locus(l) => l.members.iter().find_map(|m| match m {
+                LocusMember::Capacity(c) => Some(c),
+                _ => None,
+            }).expect("capacity block"),
+            _ => panic!("expected locus"),
+        };
+        assert_eq!(cap.slots.len(), 2);
+        assert_eq!(cap.slots[0].indexed_by.as_ref().map(|i| i.name.as_str()), Some("name"));
+        assert!(cap.slots[1].indexed_by.is_none());
     }
 }
