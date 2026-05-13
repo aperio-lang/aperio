@@ -159,8 +159,8 @@ position.
 Annotation:
 
 ```
-locus FitterL          : schedule cooperative { ... }   // default
-locus DataIngestL      : schedule pinned      { ... }
+locus Fitter          : schedule cooperative { ... }   // default
+locus DataIngest      : schedule pinned      { ... }
 ```
 
 | Class | Yield discipline | Resource |

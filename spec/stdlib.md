@@ -148,7 +148,7 @@ surface.
 |---|---|---|
 | F.22 interpreter parity | v1.x-1 | `pool X of T;` / `heap Y of T;` slots work under `aperio run` with the same `self.X.acquire/release/alloc/free` shape as codegen. |
 | Cell content I/O (struct cells) | v1.x-2 | `cell.field = v` writes; `cell.field` reads. Primitive cells (`Cell<Int>` etc.) reject field access with focused diagnostic — primitive-cell content access is a later v1.x follow-up. |
-| `as_parent_for ChildL` slot clause | v1.x-4 (surface) | Parser + typecheck accept `pool X of T as_parent_for ChildL;`. Runtime mechanic (borrow-mask + skip-destroy-on-borrowed) is v1.x-4b. |
+| `as_parent_for Child` slot clause | v1.x-4 (surface) | Parser + typecheck accept `pool X of T as_parent_for Child;`. Runtime mechanic (borrow-mask + skip-destroy-on-borrowed) is v1.x-4b. |
 | Slot-of-origin tracking on `Cell<T>` | v1.x-5 | Releasing a cell into the wrong slot is a hard error at codegen + runtime. |
 | Type records hold `fn(...)` fields | v1.x-8 | `type Cmd { name: String; run: fn(); }` parses + dispatches. `c.run()` GEPs the field, loads the fn pointer, indirect-calls. |
 | F-string interpolation | v1.x-10 | `f"hello {name}"` lowers to `Lit + to_string(expr) + Lit + ...`. Plain `"..."` strings keep `{` and `}` as ordinary characters (back-compat). |

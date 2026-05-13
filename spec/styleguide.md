@@ -73,14 +73,14 @@ shipping.
 
 ### 1. App locus — outer encapsulation
 
-Every app's `main.ap` defines an `<Name>L` locus that owns the
+Every app's `main.ap` defines a top-level locus that owns the
 whole run. `fn main()` reads argv, instantiates the locus, exits.
 The locus's `run()` body delegates to a free helper because
 lifecycle bodies reject `return` at v0 — short-circuit logic
 factors out.
 
 ```aperio
-locus OnboardL {
+locus Onboard {
     params {
         dir: String = "apps/operational-graph/fixture";
         flavor: String = "go";
@@ -99,19 +99,20 @@ fn main() {
     if std::env::args_count() > 2 {
         flavor = std::env::arg(2);
     }
-    OnboardL { dir: dir, flavor: flavor };
+    Onboard { dir: dir, flavor: flavor };
 }
 ```
 
 Conventions:
 
-- Locus name is `<FileStem>L` with `L` suffix.
+- Locus name is the file stem in PascalCase (e.g., `onboard.ap` →
+  `Onboard`).
 - `params` block holds argv-derived configuration with reasonable
   defaults (so the app self-demos with no flags).
 - `run()` is the only lifecycle method needed for most apps.
 - `main()` does the argv parsing, then a single statement-position
   locus literal kicks the run.
-- Statement-position literals fire-and-forget: `OnboardL { ... };`
+- Statement-position literals fire-and-forget: `Onboard { ... };`
   starts the run and the locus dissolves at fn-return.
 
 ### 2. Namespace lotus — empty params, methods only
@@ -246,7 +247,7 @@ let req = std::http::Request {
 
 Conventions:
 
-- PascalCase, no `L` suffix (the suffix is reserved for loci).
+- PascalCase.
 - Fields named with snake_case.
 - Returnable from fns by value. No lifecycle implications.
 - Types may hold `fn(...)` fields (v1.x-8); dispatch via
@@ -281,18 +282,19 @@ vocabulary stay as free fns.
 
 | Construct | Convention | Example |
 |---|---|---|
-| Locus (any kind) | `<Name>L` suffix | `OnboardL`, `RecognitionCoord` |
-| Type (shape record) | PascalCase, no suffix | `Request`, `Response`, `Point` |
+| Locus (any kind) | PascalCase | `Onboard`, `RecognitionCoord`, `Listener` |
+| Type (shape record) | PascalCase | `Request`, `Response`, `Point` |
 | Locus method / type field | snake_case | `name_to_motion`, `listen_fd` |
 | Lifecycle method declaration | drop the `fn` keyword | `run() { ... }`, `birth() { ... }` |
 | Free fn | bare snake_case | `drive`, `handle_one_connection`, `say` |
 | Bus subject | dot-separated, lowercase | `log.app.db`, `agent.intent.camera` |
 | Constants | UPPER_SNAKE_CASE | `STDLIB_AP_SOURCE` |
 
-The `<Name>L` suffix on loci is the load-bearing convention that
-makes loci-vs-types instantly recognizable at the call site. A
-new locus declaration without the suffix is a style violation
-even if it parses cleanly.
+Loci and types share PascalCase; the distinction at the call site
+comes from context (a locus literal `Onboard { ... }` runs the
+lifecycle; a type literal `Point { x: 1, y: 2 }` constructs a
+record value). The `locus` vs `type` keyword at the declaration
+site is the canonical disambiguator.
 
 ## Composition patterns
 
@@ -305,7 +307,7 @@ even if it parses cleanly.
 - **Let-bound locus literals** defer dissolve to scope-exit per
   the m82 dissolve-timing rule. Use when the locus's lifecycle
   should match a fn body's duration.
-- **Statement-position literals** (`SomeL { ... };` with no
+- **Statement-position literals** (`Some { ... };` with no
   `let`) fire and dissolve at end of expression. Use for one-shot
   runs with no aftermath.
 - **Cross-locus state via bus subjects**, not via field reads on

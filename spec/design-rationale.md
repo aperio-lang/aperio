@@ -116,7 +116,7 @@ symbol-input friction. Tooling is simpler.
 ## 2. Locus declaration
 
 ```
-locus FitterL : tier 4, projection chunked {
+locus Fitter : tier 4, projection chunked {
     params { ... }
     contract { ... }
     bus { ... }
@@ -197,7 +197,7 @@ pattern, Aperio collapses the params-vs-state distinction. The
 declared params are simultaneously:
 
 1. *Birth-time defaults*: overridable at instantiation
-   (`AggregatorL { running_sum: 100 }`).
+   (`Aggregator { running_sum: 100 }`).
 2. *Runtime mutable state*: accessible and reassignable via
    `self.foo` throughout the locus's lifetime, from any
    lifecycle method, mode block, closure, or member function.
@@ -650,12 +650,12 @@ function compiles to three.
 A locus is instantiated using struct-literal syntax:
 
 ```
-let h = HelloL { greeting: "hi" };
-HelloL { };  // unbound; locus dissolves at statement end
+let h = Hello { greeting: "hi" };
+Hello { };  // unbound; locus dissolves at statement end
 ```
 
 The compiler distinguishes locus instantiation from struct
-construction by what `HelloL` is declared as. The semantic
+construction by what `Hello` is declared as. The semantic
 difference is significant:
 
 - A struct literal allocates the value and assigns its fields.
@@ -672,20 +672,20 @@ When the handle is bound (`let h = ...`), the locus lives until
 `h` goes out of scope (at which point default `drain` and
 `dissolve` are invoked).
 
-When the handle is **unbound** (`HelloL { };` as a statement-
+When the handle is **unbound** (`Hello { };` as a statement-
 expression), the rule depends on whether the locus has any
 **ongoing-work surface** beyond birth:
 
 - **Ephemeral.** Only `birth` + `params` (or just `params`).
   The locus dissolves at the enclosing statement boundary.
-  Hello-world's `HelloL { };` is the canonical case.
+  Hello-world's `Hello { };` is the canonical case.
 - **Long-lived.** Has `run`, *or* has bus subscriptions, *or*
   has mode declarations callable from outside, *or* otherwise
   exposes a surface that can be invoked post-birth. The locus
   becomes an *anonymous child of the enclosing scope*; its
   work proceeds until the enclosing scope dissolves it
   (typically via SIGINT-triggered drain cascade). Examples:
-  01's `TickerL { n: 3 };` (run), 05's `EchoL { };` (bus
+  01's `Ticker { n: 3 };` (run), 05's `Echo { };` (bus
   subscriptions).
 
 The rule generalizes: a locus is long-lived iff it can do
@@ -737,7 +737,7 @@ when:
 - The function body's last statement completes, AND
 - All children of the function's implicit locus have dissolved.
 
-For `fn main() { TickerL { ... }; }`, the implicit `main` locus
+For `fn main() { Ticker { ... }; }`, the implicit `main` locus
 has one anonymous child (the ticker). `main` cannot return until
 the ticker's `run()` has completed (or been drained). This makes
 "main returns when its work is done" the natural semantics
@@ -750,14 +750,14 @@ instantiated inside a lifecycle method attach to the enclosing
 locus, not to a fresh implicit scope.
 
 ```
-locus CoordinatorL {
-    accept(g: GreeterL) {
+locus Coordinator {
+    accept(g: Greeter) {
         println(g.greeting);  // reads child's exposed state
     }
     run() {
-        // GreeterL { ... } here: child of CoordinatorL,
+        // Greeter { ... } here: child of Coordinator,
         // NOT of run()'s scope. accept() will be invoked.
-        GreeterL { greeting: "hi" };
+        Greeter { greeting: "hi" };
     }
 }
 ```
@@ -1370,7 +1370,7 @@ interface Sink {
     fn newline();
 }
 
-locus StdoutSinkL {
+locus StdoutSink {
     params { }
     fn write(s: String) { print(s); }
     fn line(s: String) { println(s); }
@@ -1382,8 +1382,8 @@ fn render(sink: Sink) {
 }
 
 fn main() {
-    let s = StdoutSinkL { };
-    render(s);   // implicit: StdoutSinkL satisfies Sink
+    let s = StdoutSink { };
+    render(s);   // implicit: StdoutSink satisfies Sink
 }
 ```
 
@@ -1401,7 +1401,7 @@ admit no default methods at v0; the body is signature-only.
 locus with `dest: String` branching on every method) because
 there was no interface mechanism; `std::log::StdoutSink` had to
 couple through the bus for the same reason. Structural interfaces
-let `StdoutSinkL` / `StringSinkL` / `FileSinkL` coexist as
+let `StdoutSink` / `StringSink` / `FileSink` coexist as
 separate loci with one shared surface, eliminating the inner
 dispatch entirely. The Go-shape (structural, no `impl`
 declaration) is the simplest mechanism that solves the friction
@@ -1417,7 +1417,7 @@ a concrete arg.
 
 **Considered and rejected.**
 
-- *Rust-style `impl Sink for StdoutSinkL { ... }`.* Reject for
+- *Rust-style `impl Sink for StdoutSink { ... }`.* Reject for
   v0; adds a separate declaration that has to be kept in sync
   with both sides, and introduces orphan-rule / coherence
   questions. The Go shape (structural, implicit) is simpler.
@@ -1542,7 +1542,7 @@ baseline — wholesale-free at dissolve). Loci that need richer
 discipline declare additional slots in a `capacity` block:
 
 ```
-locus FooL {
+locus Foo {
     capacity {
         pool entries of Int;        // slot 1: cell-recycling of Int-sized
         heap registry of Command;   // slot 2: growable, individual free
@@ -1611,7 +1611,7 @@ sit on a consistent vocabulary.
 
 **Slot 1..N parent-override (v1.x-4 + v1.x-4b, SHIPPED).** A
 parent declares `capacity { pool entries of Int as_parent_for
-ChildL; }` and any `ChildL` accepted by this parent gets its
+Child; }` and any `Child` accepted by this parent gets its
 matching slot pointer replaced with the parent's at accept
 time. Generalizes the chunked-class sub-region hand-off to
 all slot kinds. Runtime mechanic: every locus struct carries
@@ -1629,9 +1629,9 @@ with a focused diag).
    `LocusRef`. Loci have lifecycle; cell recycling
    (Pool.release) would orphan the locus, and individual heap
    free would race with the locus's own dissolve. Loci go
-   under `self.children` via `accept(c: ChildL)` per the
+   under `self.children` via `accept(c: Child)` per the
    existing membership model; slots are for *types*. The
-   typechecker rejects `pool X of SomeL` and `heap Y of SomeL`
+   typechecker rejects `pool X of Some` and `heap Y of Some`
    with a diagnostic pointing at this rule.
 
 2. **Slot pointers don't cross the bus.** A slot lives in the

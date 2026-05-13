@@ -27,7 +27,7 @@ like the existing `@projection` annotation:
 
 ```aperio
 @form(vec)
-locus ItemListL<T> {
+locus ItemList<T> {
     capacity { heap items of T; }
 }
 ```
@@ -70,7 +70,7 @@ error[FORM-SHAPE]: @form(vec) requires exactly one `heap` slot;
     |
   3 | @form(vec)
     | ^^^^^^^^^^
-  4 | locus RegistryL { capacity { pool entries of CmdEntry; } }
+  4 | locus Registry { capacity { pool entries of CmdEntry; } }
     |                              ----------------------------
     |                              expected `heap items of T`
 ```
@@ -82,7 +82,7 @@ not declare them; call sites resolve as if they were declared.
 
 ```aperio
 @form(vec)
-locus ItemListL<T> {
+locus ItemList<T> {
     capacity { heap items of T; }
     // push, get, pop, len, is_empty come from @form(vec).
 }
@@ -114,7 +114,7 @@ Form configuration splits between *slot clauses* and
 ```aperio
 // Storage discipline — slot clause.
 @form(hashmap)
-locus CmdRegistryL {
+locus CmdRegistry {
     capacity { pool entries of CmdEntry indexed_by name; }
     //                                   ^^^^^^^^^^^^^^^
     //                                   slot clause
@@ -122,7 +122,7 @@ locus CmdRegistryL {
 
 // Policy / tuning — annotation argument.
 @form(lru_cache, max = 100, ttl = 60s)
-locus SessionCacheL {
+locus SessionCache {
     capacity { pool sessions of SessionEntry indexed_by id; }
 }
 ```
@@ -221,7 +221,7 @@ becomes the vec's element type `T`.
 
 ```aperio
 @form(vec)
-locus ItemListL<T> {
+locus ItemList<T> {
     capacity { heap items of T; }
 }
 ```
@@ -244,7 +244,7 @@ The cell type `T` may be:
   `Duration`, `String`, `Bytes`).
 - A user-defined `type` (struct or enum).
 - A generic parameter (`heap items of T` inside a generic locus
-  `ItemListL<T>`); monomorphization (m63) produces a concrete
+  `ItemList<T>`); monomorphization (m63) produces a concrete
   `@form(vec)` instance per binding.
 
 The cell type MAY NOT be a locus reference — vecs hold values,
@@ -433,7 +433,7 @@ before further forms are added to the library.
 // WRONG — @form(vec) synthesizes push; user declaration
 // collides with the synthesized name.
 @form(vec)
-locus ItemListL<T> {
+locus ItemList<T> {
     capacity { heap items of T; }
     fn push(x: T) -> () { /* ... */ }  // rejected
 }
@@ -497,7 +497,7 @@ Spec to be written when FORM-4 starts. Surface preview:
 
 ```aperio
 @form(hashmap)
-locus CmdRegistryL {
+locus CmdRegistry {
     capacity { pool entries of CmdEntry indexed_by name; }
 }
 ```
@@ -522,7 +522,7 @@ Spec to be written when FORM-4 starts. Surface preview:
 
 ```aperio
 @form(ring_buffer, cap = 64)
-locus RecentCmdsL {
+locus RecentCmds {
     capacity { pool history of CmdEntry; }
 }
 ```

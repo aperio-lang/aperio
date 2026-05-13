@@ -164,7 +164,7 @@ free fn whose return is the per-iteration boundary (see
 
 ### Method-returning-locus heap allocation (m90)
 
-When a method declares `-> SomeL` and instantiates a `SomeL`
+When a method declares `-> Some` and instantiates a `Some`
 in its body, the instance is allocated via the lazy global
 payload arena (program-lifetime), **not** the caller's stack
 or the callee's arena. Both the eager dissolve and the
@@ -183,7 +183,7 @@ lifetime semantics).
 A return-slot ABI (caller passes a struct out-pointer +
 adopts the locus into its own deferred-dissolves frame) would
 tighten this without leaking — deferred to v1.x. Covers
-both `return SomeL { ... };` and `let s = SomeL { }; ...;
+both `return Some { ... };` and `let s = Some { }; ...;
 return s;` because `current_user_fn_ret` is set during either
 literal's lowering.
 
@@ -228,7 +228,7 @@ to slots within a locus.
 1. **Slot element type must be a value-shape, not a LocusRef.**
    Loci have lifecycle; cell recycling (Pool.release) or
    individual free (Heap.free) would orphan the locus. Use
-   `accept(c: ChildL)` for locus membership; slots are for
+   `accept(c: Child)` for locus membership; slots are for
    value-shaped types. Enforced at typecheck (with a
    span-targeted diagnostic) and again at codegen as defense
    in depth.
@@ -287,7 +287,7 @@ Per-projection-class allocation table.
 
 F.22 names this as "projection class governs parent-override
 of slot 0." **Slot 1..N parent-override** (`pool entries of Int
-as_parent_for ChildL;`) shipped via v1.x-4 (surface) + v1.x-4b
+as_parent_for Child;`) shipped via v1.x-4 (surface) + v1.x-4b
 (runtime mechanic, commit `d50ab79`): the borrow-mask
 `__slot_borrowed_mask` field carries one bit per slot, set when
 the slot was borrowed from a parent's matching slot at accept
@@ -630,7 +630,7 @@ sites. The mapping is canonical, not advisory:
     ```aperio
     fn parse_message(b: Bytes) -> Message fallible(ParseError) { ... }
 
-    locus ReaderL {
+    locus Reader {
         fn handle_input(b: Bytes) -> () {
             let m = parse_message(b) or default_message();
             // ...

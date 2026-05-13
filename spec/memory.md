@@ -108,7 +108,7 @@ Slot 0 is the locus's own Arena (everything above this section).
 Slots 1..N are user-declared in a `capacity { ... }` block:
 
 ```
-locus FooL {
+locus Foo {
     capacity {
         pool entries of Int;        // slot 1: cell-recycling of Int-sized
         heap registry of Command;   // slot 2: growable, individual free
@@ -130,7 +130,7 @@ runs in reverse declaration order before slot 0. Cell alignment
 is 8 bytes (the v0 substrate's universal scalar alignment); cell
 size comes from T's LLVM struct layout. Restriction: a cell
 type cannot be a `LocusRef` — locus membership goes through
-`accept(c: ChildL)`, not slots. See `spec/semantics.md`
+`accept(c: Child)`, not slots. See `spec/semantics.md`
 "Capacity slot lifecycle and dispatch (F.22)" for the user-
 facing method-shaped surface and full restriction list.
 
@@ -138,7 +138,7 @@ facing method-shaped surface and full restriction list.
 (table above): Chunked / Recognition parents sub-region-allocate
 their accepted children's slot 0; Rich parents do not. F.22
 names this existing v0 behavior so future **slot 1..N parent-
-override** (`pool entries of Int as_parent_for ChildL;`) sits
+override** (`pool entries of Int as_parent_for Child;`) sits
 on consistent vocabulary. Slot 1..N parent-override is deferred
 to v1.x — the first workload that demands a parent-owned Pool
 shared across accepted children will unlock the syntax.
@@ -158,7 +158,7 @@ distinct mechanisms that happen to share the word "pool."
 ### Bound handles
 
 ```
-let h = LocusL { ... };
+let h = Locus { ... };
 // h is bound. Locus lives until `h` goes out of scope.
 // Then: drain() runs (cascades), dissolve() runs, region freed.
 ```
@@ -460,8 +460,8 @@ order:
 5. Call `T.dissolve(child_ptr)` if declared.
 
 `accept` runs *before* the child's own `birth`, per F.7. This
-is how `02-parent-child`'s `Coord.accept(g: GreeterL)` fires for
-each `GreeterL { ... }` instantiated in the coordinator's `run()`
+is how `02-parent-child`'s `Coord.accept(g: Greeter)` fires for
+each `Greeter { ... }` instantiated in the coordinator's `run()`
 body. Inside `accept`, `self.X` GEPs through the parent's struct
 and `g.X` GEPs through the child's struct — different `getelementptr`
 chains, same lowering machinery.

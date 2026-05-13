@@ -86,7 +86,7 @@ high-water.
 
 ```
 fn bench_hello() {
-    HelloL { };
+    Hello { };
 }
 ```
 
