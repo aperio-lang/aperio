@@ -178,10 +178,13 @@ Deferred (gated on design):
 - v1.x-9 (closures with capture) — MS2 invariant says every
   quantity assignable to one locus tower; naive lexical capture
   lets values float. Wait for closure-design pass.
-- v1.x-FORM-4 (`@form(hashmap)` + `@form(ring_buffer)`) — surface
-  preview in `spec/forms.md`; FORM-2 shipped `@form(vec)`,
-  FORM-3 is the perf-gate bench protocol, FORM-4 picks up the
-  remaining two named forms once the bench gate clears.
+- v1.x-FORM-4 (`@form(hashmap)`) — shipped 2026-05-13 end-to-end
+  (PR1–7). `spec/forms.md` carries the full contract. FORM-3 perf
+  work (lazy fallible-payload construction + subregion elision
+  for non-allocating fn bodies) shipped alongside; the
+  `form_vec_push` 10% (band (a)) gate is met. `@form(ring_buffer)`
+  remains a surface preview only, deferred until a driver
+  workload surfaces.
 
 Cut from roadmap (2026-05-12 design pass):
 

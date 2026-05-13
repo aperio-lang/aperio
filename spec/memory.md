@@ -663,29 +663,55 @@ m20 deliberately keeps free fns + main on the program-wide arena
 class — chunked-class per-coordinatee sub-regions land in m22,
 the recognition-class fixed pool in m23.
 
-**m49 closes the free-fn gap.** Every non-main free fn now takes
+**m49 closes the free-fn gap.** Every non-main free fn takes
 an implicit `__caller_arena: ptr` first param at the LLVM ABI.
-At body entry the callee opens a subregion of `__caller_arena`
-via `lotus_arena_create_subregion(__caller_arena)`; the body's
-allocations route through that subregion (a new tier between
-`current_self`'s arena and `arena.global` in the codegen-side
-allocation routing). At return, the body branches to a unified
-`fn.exit` epilogue that deep-copies the return value into
-`__caller_arena` (identity for value types; `lotus_str_clone`
-for String; recursive walk for Tuple), destroys the subregion
-wholesale, and emits `build_return`. `main` keeps the
-program-wide `arena.global` it always had — it's the single fn
-without a caller. Heap-typed returns of Array, TypeRef-struct,
-or has-payload-Enum are rejected at v0.1 — none currently
-appear as free-fn returns; ship as a follow-up when a workload
-demands. This delivers the spec's "every free function has its
-own implicit locus" memory boundary at the codegen substrate.
+At body entry the **allocating** callee opens a subregion of
+`__caller_arena` via `lotus_arena_create_subregion(__caller_arena)`;
+the body's allocations route through that subregion (a new
+tier between `current_self`'s arena and `arena.global` in the
+codegen-side allocation routing). At return, the body branches
+to a unified `fn.exit` epilogue that deep-copies the return
+value into `__caller_arena` (identity for value types;
+`lotus_str_clone` for String; recursive walk for Tuple),
+destroys the subregion wholesale, and emits `build_return`.
+`main` keeps the program-wide `arena.global` it always had —
+it's the single fn without a caller. Heap-typed returns of
+Array, TypeRef-struct, or has-payload-Enum are rejected at
+v0.1 — none currently appear as free-fn returns; ship as a
+follow-up when a workload demands.
+
+**Subregion elision for non-allocating bodies (FORM-3,
+2026-05-13).** Codegen classifies each user fn at declare time
+via a conservative syntactic walk
+(`fn_body_definitely_non_allocating`). A body is non-
+allocating iff every expression in it lowers to a known-non-
+arena-touching shape: literals (incl. String — global static),
+identifier reads, KwSelf, field/index reads (excluding
+range-index slices), numeric/bool/bitwise Binary (Add excluded
+since it could be String concat without type info threaded
+in), Unary, If with non-allocating arms. For fns that pass the
+classifier, the subregion `create` + `destroy` are skipped
+entirely (`fn_arena_alloca` aliases `caller_arena_alloca`),
+and the return-value deep-copy is skipped — the return value
+is either a primitive or a pointer to a region stable across
+the fn frame (String-literal global, caller-passed pointer,
+field read of one of those). Closes the bench's per-call cost
+for leaf fns (`fn_call` went 188 ms → 37.1 ms = 5×, ratio vs
+Go 0.04× → 0.21×; `form_vec_push` reached 1.00× = Go parity).
+The `__caller_arena` LLVM param is still passed even to
+non-allocating fns (kept uniform per-fn ABI); the optimization
+is purely on the body side. Fallible fns always pay the full
+subregion lifecycle because `fail E { ... }` allocates the
+payload struct.
+
+This delivers the spec's "every free function has its own
+implicit locus" memory boundary at the codegen substrate.
 Bound handles in free fn bodies still attach to the enclosing
-deferred-dissolve frame (lifecycle parity with main and lifecycle
-methods); the implicit-locus *handle-rooting* semantic — fn
-return waits for in-fn-bound children to dissolve as if the fn
-were itself a locus — remains a future-work item, not exercised
-by any current example.
+deferred-dissolve frame (lifecycle parity with main and
+lifecycle methods); the implicit-locus *handle-rooting*
+semantic — fn return waits for in-fn-bound children to
+dissolve as if the fn were itself a locus — remains a
+future-work item, not exercised by any current example.
 
 ### Per-projection-class arena strategies (m22 + m23)
 
