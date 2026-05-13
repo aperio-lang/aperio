@@ -271,3 +271,21 @@ Fix: in `lower_locus_instantiation`, compute `parent_accepts_us = current_self.l
 **Why it matters:** The "registry of N up to a cap" shape recurs (HTTP route tables, event subject lists, plugin maps, dependency-injection containers, ...). Each instance pays the worst-case footprint. Proper fix is growable storage — either a `List<T>` generic over arbitrary types (gates on generics, far-future) or a String-backed appendable buffer with offset indexing (could come together with `bytes::concat` once that lands; see ws-echo `bytes-construction-from-ints`). Until one of those ships, every registry-shape primitive carries this same overhead.
 **Substrate landed (2026-05-11, F.22):** Per spec/design-rationale.md §F.22, every locus now declares its storage discipline as a tuple of named slots (`pool X of T;` / `heap Y of T;`). Pool gives bounded-population cell recycling; Heap gives growable-but-locus-bounded individual alloc/free. Both compile down to per-locus allocator pointers on the locus struct, init at instantiation, wholesale teardown at dissolve. The C runtime adds `lotus_pool_*` and `lotus_heap_*` symbol families. cli-demo's registry, F.22's Map/Vec stdlib (still pending), event subject lists, etc. can now express their storage commitment without paying the worst-case fixed-cap footprint. Direct user-facing surface for cell contents (load/store through a cell handle) is the v1.x follow-up — v1 ships the substrate + round-trip-only dispatch (`let c = self.X.acquire(); self.X.release(c);`). The friction entry stays as the design-rationale anchor for why the substrate exists; the in-app workaround stays in place until the stdlib types built on top of F.22 ship.
 
+**Form surface landed (2026-05-13, v1.x-FORM-2 + FORM-4):** Both
+form-annotation lowerings on the F.22 substrate now ship.
+`@form(vec)` (FORM-2) covers the unindexed growable-buffer
+shape (apps that want a `Vec<T>`-style append-and-iterate
+surface). `@form(hashmap)` (FORM-4) covers the keyed-registry
+shape — the canonical case in the "registry of N up to a cap"
+family (HTTP route tables, plugin maps, command registries,
+event-handler dispatch). Both synthesize standard method sets
+(`push`/`get`/`pop`/`len`/`is_empty` for vec;
+`set`/`get`/`has`/`remove`/`len`/`is_empty` for hashmap) and
+route through the C runtime's `lotus_vec_*` / `lotus_hashmap_*`
+primitives. The "registry pays the worst-case footprint"
+property of fixed-cap arrays is gone: with `@form(hashmap)`
+the underlying open-addressing table grows on demand, with
+load-factor 0.7 + power-of-two doubling. The friction entry
+stays as the design-rationale anchor for why the form
+machinery exists.
+

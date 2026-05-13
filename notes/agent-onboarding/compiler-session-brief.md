@@ -37,16 +37,28 @@ Recent significant ships (commit order; see
   `__slot_borrowed_mask` + borrow swap + skip-destroy at
   dissolve.
 
+Recent significant ships (continued):
+
+- **v1.x-FORM-4 `@form(hashmap)`** (PR1–7, 2026-05-13):
+  capacity-slot `indexed_by <field>` clause; typecheck shape
+  verification; method synthesis (`set` / `get` / `has` /
+  `remove` / `len` / `is_empty`) over `(value: S, key: K)`
+  derived from the indexed-by field; `KeyError { kind: String }`
+  injected; `lotus_hashmap_*` C runtime (open-addressing,
+  backward-shift deletion, FNV-1a / Knuth-mix); codegen lowering
+  + interpreter parity. Successor to the cut `Map<K,V>`
+  parametric item. Workspace test count: 656.
+
 Design-gated remaining items:
 
 - **v1.x-9**: closures with capture — MS2 invariant constraint
   (every quantity assigned to one locus tower; naive lexical
   capture would let values float). Needs a closure-design pass
   before implementation. Hold for a driver workload.
-- **v1.x-FORM-4**: `@form(hashmap)` + `@form(ring_buffer)`.
-  Successor to the cut `Map<K,V>` / `Vec<T>` parametric items.
-  Surface preview in `spec/forms.md`; implementation when a
-  driver workload surfaces.
+- **`@form(ring_buffer)`**: surface preview in `spec/forms.md`.
+  Implementation when a driver workload surfaces (the
+  fixed-capacity pop-front / push-back shape needs a concrete
+  consumer to demonstrate the right contract).
 
 Cut from roadmap (2026-05-12): v1.x-6 (Result + `?`), v1.x-12
 (parametric Map), v1.x-13 (parametric Vec), v1.x-14 (Rope).
@@ -57,8 +69,8 @@ collection successor surface. See `notes/v1.x-checkpoint.md`
 
 Canonical refs:
 
-- `spec/forms.md` — `@form(vec)` contract; preview surface for
-  `@form(hashmap)` / `@form(ring_buffer)`.
+- `spec/forms.md` — `@form(vec)` + `@form(hashmap)` contracts;
+  preview surface for `@form(ring_buffer)`.
 - `spec/semantics.md` § "Fallible call semantics" — value-error
   channel; two-channel rule.
 - `spec/memory.md` § "Recognition sub-modes" — projection-class

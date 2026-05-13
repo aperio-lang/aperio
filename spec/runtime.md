@@ -590,6 +590,115 @@ backed by `Rc<RefCell<Vec<Value>>>` and the
 Synthesized methods route directly to this dispatcher before
 normal locus-method lookup.
 
+## Form-hashmap runtime (v1.x-FORM-4)
+
+The `@form(hashmap)` form lowers to an intrusive open-addressing
+hash table implemented in C. See `spec/forms.md` for the form
+contract and synthesized method set; this section documents the
+runtime shape.
+
+### C struct layout
+
+Each `@form(hashmap)` locus's pool slot lowers to an inline
+struct:
+
+```c
+typedef struct {
+    size_t cap;          // power-of-two slot count
+    size_t len;          // live entry count
+    size_t key_size;     // sizeof(K), set at init
+    size_t value_size;   // sizeof(S), set at init
+    int    key_type_tag; // 0 = Int, 1 = String
+    char  *slots;        // cap * (1 + key_size + value_size) bytes
+} lotus_hashmap_t;
+```
+
+Each slot is `1 + key_size + value_size` bytes:
+
+```
+[occupied: u8] [key: key_size bytes] [value: value_size bytes]
+```
+
+`occupied = 0` means empty. Backward-shift deletion (no
+tombstones) — probes terminate at the first empty slot.
+
+The C ABI is type-erased: codegen passes `key_size` /
+`value_size` at init time, and per-call sites pass raw `void *`
+key/value pointers. Codegen GEPs the indexed-by field on the
+caller's side to derive the key pointer before each `set`.
+
+### Primitive functions
+
+Defined in `crates/aperio-codegen/runtime/lotus_arena.c`
+(v1.x-FORM-4 PR4):
+
+| Function | Behavior |
+|----------|----------|
+| `void lotus_hashmap_init(void *m, size_t key_size, size_t value_size, int key_type_tag)` | Allocate `cap=8` slots, zero them; freeze key/value sizes and key-type tag |
+| `void lotus_hashmap_set(void *m, const void *key, const void *value)` | Insert or replace; grow at load factor 0.7 |
+| `int  lotus_hashmap_get(void *m, const void *key, void *out_value)` | Bounds-checked read; returns 1=OK, 0=missing_key |
+| `int  lotus_hashmap_has(void *m, const void *key)` | 1=present, 0=missing |
+| `int  lotus_hashmap_remove(void *m, const void *key)` | 1=removed, 0=missing |
+| `int64_t lotus_hashmap_len(void *m)` | Live entry count |
+| `int  lotus_hashmap_is_empty(void *m)` | 1=empty, 0=non-empty |
+| `void lotus_hashmap_destroy(void *m)` | `free(slots)`; called at locus dissolve |
+
+### Key types and hashing
+
+| `key_type_tag` | Type | Hash function | Equality |
+|---|---|---|---|
+| `0` (LOTUS_HASHMAP_KEY_INT) | `int64_t` | Knuth multiplicative (`k * 0x9E3779B97F4A7C15`) | `==` on i64 |
+| `1` (LOTUS_HASHMAP_KEY_STRING) | `const char *` (NUL-terminated) | FNV-1a over the bytes | `strcmp == 0`, with pointer-identity fast path |
+
+Other key types (Bytes, custom structs, enum tags) are not
+supported at v1; codegen rejects `@form(hashmap)` with a
+focused diagnostic when the indexed-by field's resolved type
+doesn't map to one of these two tags.
+
+### Growth policy
+
+- Initial: `cap=8`, slots calloc'd at locus birth via
+  `lotus_hashmap_init`.
+- Growth: when `(len + 1) > 0.7 * cap`, double cap and rehash
+  every live entry through the normal `set` path (the probe
+  sequence changes with the new mask, so we don't copy raw
+  bytes between tables).
+- Shrink: not implemented in v1.
+- Cap is always a power of two so hash-to-index folds to
+  `& mask`.
+
+### Deletion policy
+
+Backward-shift deletion (no tombstones). After clearing the
+target slot, the runtime walks forward through the cluster and
+shifts any entry whose natural position is "before" the freed
+slot in the probe sequence. The cluster boundary is the first
+empty slot encountered. This keeps probe chains tight and lets
+`find_slot` terminate correctly without a separate tombstone
+marker.
+
+### Failure shapes
+
+- `lotus_hashmap_get` / `lotus_hashmap_remove` return 0 on
+  contract break (missing key). Codegen wraps this into the
+  `Ty::Fallible { success: S, payload: KeyError }` surface via
+  the same machinery `@form(vec)` uses for `IndexError`,
+  synthesizing the `KeyError { kind: "missing_key" }` payload
+  at the call site (shipped v1.x-FORM-4 PR5).
+- `lotus_hashmap_set` OOM during the slot calloc / realloc
+  routes through the substrate-trap → closure-violation
+  channel per the two-channel rule.
+
+### Interpreter parity
+
+The interpreter (`crates/aperio-runtime/src/eval.rs`)
+implements the same surface via the `SlotState::Hashmap`
+variant and the `try_eval_form_hashmap_call` dispatcher
+(v1.x-FORM-4 PR6). Synthesized methods route directly to this
+dispatcher before normal locus-method lookup. The interpreter's
+backing structure does not need to match the C runtime's
+data-structure choices — only the observable semantics.
+
 ## Runtime size budget
 
 The runtime should be small enough that a hello-world program

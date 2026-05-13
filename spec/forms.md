@@ -491,34 +491,355 @@ contract above is independent of them.
 
 ---
 
-# `@form(hashmap)` — pending FORM-4
+# `@form(hashmap)`
 
-Spec to be written when FORM-4 starts. Surface preview:
+A keyed associative store: each entry is a struct value `S` that
+carries its own key as one of its fields. The Aperio analogue of
+`Map<K, V>` / `std::unordered_map` / Go `map[K]V` — but
+*intrusive*: the value type S carries the key inside it rather
+than the map storing separate (K, V) pairs. Shipped as the second
+form in v1, following `@form(vec)`.
+
+## Required capacity shape
+
+The locus MUST declare exactly one `pool` slot, with an
+`indexed_by <field>` clause naming a field of the cell type to
+serve as the key:
 
 ```aperio
+type CmdEntry {
+    name: String;
+    handler: Int;
+}
 @form(hashmap)
 locus CmdRegistry {
     capacity { pool entries of CmdEntry indexed_by name; }
 }
 ```
 
-Synthesized methods:
+Rules verified at typecheck:
+
+- Exactly one slot. Zero slots, more than one slot, or a `heap`
+  slot is rejected.
+- The slot MUST be `pool`. (Hashmap recycles entry cells as
+  inserts / removes flow — the `pool` discipline. `heap` is the
+  growable-contiguous shape covered by `@form(vec)`.)
+- The slot MUST declare `indexed_by <field>`. The named field
+  must exist on the cell type.
+- The cell type MUST be a user-declared `type` struct.
+  Primitives, enums, type aliases, locus references, and
+  qualified paths are rejected — the substrate needs the cell's
+  field layout to GEP the key out at insert time, which only
+  resolves cleanly for struct cells.
+- The slot name is user-chosen and is not part of the contract.
+  The compiler finds the form's pool slot by *position*, not by
+  name. Idiomatic spellings: `entries`, `bindings`, `routes`.
+- `as_parent_for` on the slot is rejected — `@form(hashmap)`
+  owns its slot's allocator, so the borrow mechanic from
+  v1.x-4b doesn't compose.
+- `@form(hashmap, ...)` with annotation arguments is rejected:
+  there are no tuning knobs at v1.
+
+The key type `K` is derived from the resolved type of the
+indexed-by field. At v1, K must be `Int` or `String`. Other
+field types parse and synthesize methods but reject at codegen
+with a focused diagnostic (the runtime ABI's `key_type_tag`
+only enumerates these two).
+
+## Synthesized methods
 
 ```
 fn get(key: K) -> S fallible(KeyError)
-fn set(value: S) -> ()
-fn has(key: K) -> Bool
+fn set(value: S) -> ()                       # infallible
+fn has(key: K) -> Bool                       # infallible
 fn remove(key: K) -> () fallible(KeyError)
-fn len() -> Int
+fn len() -> Int                              # infallible
+fn is_empty() -> Bool                        # infallible
 ```
 
-Where `K` is the type of the field named in `indexed_by` and
-`S` is the slot's cell type. Lowering: open-addressing
-hashtable keyed on the indexed field's value.
+The fallible methods return the synthesized `KeyError` payload:
 
-# `@form(ring_buffer)` — pending FORM-4
+```aperio
+type KeyError {
+    kind: String;   # "missing_key" — only kind at v1
+}
+```
 
-Spec to be written when FORM-4 starts. Surface preview:
+`KeyError` is injected into the bundle scope by the form
+machinery alongside `IndexError`. The same type is shared across
+all `@form(hashmap)` instantiations.
+
+The key is not carried on the error because K varies per
+hashmap. Users who want key context construct it through the
+substitute motion (`or fallback(err)`), where `err: KeyError`
+is in scope and any of the call's local bindings — including
+the key arg — are available.
+
+### `set`
+
+```
+fn set(value: S) -> ()
+```
+
+Inserts or replaces. `set(v)` GEPs the indexed-by field from
+`v` to derive the key, then writes the whole struct at the
+hashed slot. If a previous entry shared the key, it is
+overwritten (`set` is unconditional — no error on duplicate).
+
+`set` is **infallible**. OOM during the doubling realloc is a
+substrate-level concern routed through the closure-violation
+channel, not a `fallible(...)` return. Same shape as
+`@form(vec)`'s `push`.
+
+### `get`
+
+```
+fn get(key: K) -> S fallible(KeyError)
+```
+
+Returns the entry whose indexed-by field equals `key`. If no
+such entry exists, fails with `KeyError { kind: "missing_key" }`.
+
+```aperio
+let entry = registry.get(name) or raise;
+let entry = registry.get(name) or default;
+let entry = registry.get(name) or fallback(err);
+```
+
+### `has`
+
+```
+fn has(key: K) -> Bool
+```
+
+`true` iff an entry with this key is present. Equivalent to
+"`get(key)` would succeed" but cheaper — no value copy.
+
+### `remove`
+
+```
+fn remove(key: K) -> () fallible(KeyError)
+```
+
+Removes the entry whose indexed-by field equals `key`. If no
+such entry exists, fails with `KeyError { kind: "missing_key" }`.
+Idiomatic call shape:
+
+```aperio
+registry.remove(name) or raise;        # bubble on missing
+registry.remove(name) or ignore(err);  # swallow via Unit-returning handler
+```
+
+Aperio doesn't surface `()` as a literal expression at v1, so
+swallowing the error requires a Unit-returning handler call (or
+guarding with `has` first):
+
+```aperio
+fn ignore(_e: KeyError) { }
+// later:
+registry.remove(name) or ignore(err);
+```
+
+`remove` does not shrink the underlying buffer; capacity does
+not decrease. Buffer release happens at locus dissolution.
+
+### `len` and `is_empty`
+
+```
+fn len() -> Int
+fn is_empty() -> Bool
+```
+
+`len()` returns the entry count; `is_empty()` is sugar for
+`len() == 0`. Both infallible, O(1).
+
+## Lowering strategy
+
+`@form(hashmap)` lowers the pool slot to an inline six-field C
+struct holding open-addressing hashtable state:
+
+```c
+typedef struct {
+    size_t cap;          // power-of-two slot count
+    size_t len;          // live entry count
+    size_t key_size;     // sizeof(K), set at init
+    size_t value_size;   // sizeof(S), set at init
+    int    key_type_tag; // 0 = Int, 1 = String
+    char  *slots;        // cap * (1 + key_size + value_size) bytes
+} lotus_hashmap_t;
+```
+
+Each slot is `1 + key_size + value_size` bytes laid out as
+`[occupied: u8][key: K][value: S]`. `occupied = 0` means empty;
+the runtime uses **backward-shift deletion** (no tombstones) so
+probes terminate as soon as an empty slot is seen.
+
+- **Initial cap:** 8 slots, allocated at locus birth via
+  `lotus_hashmap_init`. Power of two so hash → index folds to
+  a single `& mask`.
+- **Growth policy:** double `cap` when `(len + 1) > 0.7 * cap`.
+  Rehash every live entry through the normal `set` path (the
+  probe sequence changes with the new mask).
+- **Shrink policy:** none. Capacity is monotonic in v1.
+- **Hash functions:** 64-bit Knuth multiplicative for Int keys
+  (`k * 0x9E3779B97F4A7C15`), FNV-1a over the bytes for String
+  keys.
+- **Probing:** linear with `& mask`. Backward-shift deletion
+  walks the cluster forward, shifting any entry whose natural
+  position is "before" the freed slot. Cluster boundary is the
+  first empty slot.
+
+### Key extraction at the codegen surface
+
+At each `set(value: S)` call site, codegen GEPs the indexed-by
+field offset on the value alloca to produce a pointer to the
+key, then passes `(slot_ptr, key_ptr, value_ptr)` to
+`lotus_hashmap_set`. The runtime memcpys `key_size` bytes from
+`key_ptr` into the slot's key region and `value_size` bytes
+from `value_ptr` into the value region.
+
+At `get`, `has`, `remove` sites, codegen lowers the key arg
+into an alloca matching `key_size` and passes its address.
+
+## Arena ownership
+
+`@form(hashmap)` is **not** a separate arena-allocated structure.
+The `lotus_hashmap_t` struct lives inline in the locus's struct
+layout, the same way the literal F.22 pool-slot declaration
+would. The `slots` buffer is malloc'd from the *system
+allocator*, not from the locus's arena — matching the existing
+F.22 slot contract.
+
+Dissolution: when the locus arena is destroyed, the hashmap's
+`slots` buffer is freed via `lotus_hashmap_destroy` in the F.22
+dissolve cascade.
+
+For elements of pointer-shaped types (`String`, `Bytes`) in the
+cell struct, the hashmap stores the pointer by value; the
+pointed-to bytes live in whatever arena they were allocated
+from. Hashmap dissolution frees the slots buffer but does not
+free the pointed-to bytes — those follow their owning arena's
+lifetime per the standard F.22 contract.
+
+## Complexity
+
+| Operation | Expected | Worst case |
+|---|---|---|
+| `set` (no resize) | O(1) | O(N) on probe cluster |
+| `set` (with resize) | O(N) amortized over inserts | O(N) per resize |
+| `get` / `has` | O(1) expected | O(N) on probe cluster |
+| `remove` | O(1) expected | O(N) on shift |
+| `len` / `is_empty` | O(1) | O(1) |
+
+Load factor stays ≤ 0.7 by construction. Hash quality for Int
+keys (Knuth multiplicative) handles dense sequences such as
+consecutive IDs without all colliding on slot 0.
+
+## Interaction with the locus tower
+
+A `@form(hashmap)` locus is a locus in every other respect — it
+can have `params`, lifecycle bodies (`birth` / `run` / `drain` /
+`dissolve`), `closure` invariants, `on_failure` routing, bus
+membership, and projection by `perspective` declarations. The
+form annotation *replaces* the literal F.22 pool-slot lowering
+and synthesizes the six methods; it does not replace any other
+locus mechanic.
+
+## Bench protocol (future FORM-N gate)
+
+Once `@form(vec)`'s 10% bench gate (FORM-3) is satisfied,
+`@form(hashmap)` gets its own bench under a parallel FORM-N
+milestone:
+
+1. **Microbench.** 1M `set` followed by 1M `get` (each with
+   uniformly-random keys drawn from a population larger than
+   the load-factor expansion), compared against an equivalent
+   hand-written C program using `malloc` + linear probing
+   tables of the same shape. The `@form(hashmap)` lowering
+   must come within 10% of the C baseline on wall-clock and
+   peak RSS.
+2. **App bench.** A representative app rewritten to use
+   `@form(hashmap)` where it currently does explicit registry
+   walks; before / after comparison.
+
+Both benches will live under `bench/forms/hashmap/`. Not gated
+on FORM-4 shipping; ships as a separate milestone after the
+core surface stabilizes.
+
+## Anti-patterns
+
+### Treating `set` as keyed insert
+
+```aperio
+// WRONG — set takes the whole value, not (key, value).
+registry.set("foo", entry);   // type error: too many args
+```
+
+```aperio
+// RIGHT — value carries its key as a field; substrate extracts.
+registry.set(CmdEntry { name: "foo", handler: 1 });
+```
+
+The intrusive shape means the type system catches this for you
+(`set` is synthesized with the single-arg signature `set(value:
+S) -> ()`), but the conceptual reflex from `HashMap<K, V>`
+shaped languages is worth flagging.
+
+### Ignoring the fallible return
+
+```aperio
+// WRONG — get and remove return fallible(KeyError).
+let v = registry.get(name);          // compile error: error not addressed
+registry.remove(name);               // compile error: error not addressed
+```
+
+```aperio
+// RIGHT — address the error via one of the three motions.
+let v = registry.get(name) or raise;
+registry.remove(name) or ();
+```
+
+### Mutating the indexed-by field after `set`
+
+The intrusive shape means the key is the field. If user code
+keeps a reference to the value and mutates the indexed-by
+field, the hashmap's invariant breaks (the cell sits in the
+slot keyed by its *old* key, but `get` now looks up by its
+*new* key). The v1 surface doesn't expose stored cells by
+reference, so this isn't reachable from user code today.
+Future iteration APIs that surface entry references will need
+to gate against indexed-by-field mutation.
+
+## Open questions deferred to a future milestone
+
+These are spec-level questions that don't block FORM-4 because
+the core surface above is independent of them.
+
+1. **Iteration surface.** `for entry in registry { ... }` is
+   natural but the loop construct's lowering depends on what
+   the existing `for` over capacity slots does — and a hashmap
+   iteration that visits each occupied slot once needs cluster-
+   aware traversal. Deferred.
+2. **Bulk operations.** `clear()`, `extend(other)`,
+   `take(key) -> S fallible(KeyError)` (get + remove fused).
+   Useful but not foundational. Add after a workload demands.
+3. **Additional key types.** `Bytes`, custom structs with a
+   hashable derivation, enum tags. Each adds a `key_type_tag`
+   to the runtime ABI. Workload-driven.
+4. **Capacity hints.** `@form(hashmap, cap = 64)` is rejected
+   in v1; no tuning knobs. Add when a workload demonstrates
+   the 0 → 8 → 16 → ... grow cascade is costing measurable
+   time.
+5. **Set type.** A `@form(set)` would be a hashmap-without-
+   value variant (the cell IS the key). Not part of FORM-4;
+   revisit if a workload needs it.
+
+# `@form(ring_buffer)` — pending future milestone
+
+FORM-4 shipped `@form(hashmap)` only; `@form(ring_buffer)` waits
+for a concrete driver workload that the fixed-size pop-front /
+push-back surface is the right shape for. Spec to be written
+when that milestone starts. Surface preview:
 
 ```aperio
 @form(ring_buffer, cap = 64)

@@ -887,11 +887,17 @@ struct FnSig<'ctx> {
 /// `Expr::Or`. Carries the i1 path SSA plus the two sret slot
 /// pointers and the types they point to, so the Or arm can
 /// branch, load the success value, or propagate the error.
+///
+/// `success_ty = None` means the call's success path produces
+/// Unit (no value) — `lower_or_expr` then skips the load and
+/// the phi, returning a Unit-shaped sentinel. v1.x-FORM-4
+/// introduces this case via `@form(hashmap)`'s `remove() -> ()
+/// fallible(KeyError)` synth method.
 struct FallibleCallResult<'ctx> {
     i1_path: IntValue<'ctx>,
-    out_val_slot: PointerValue<'ctx>,
+    out_val_slot: Option<PointerValue<'ctx>>,
     out_err_slot: PointerValue<'ctx>,
-    success_ty: CodegenTy,
+    success_ty: Option<CodegenTy>,
     payload_ty: CodegenTy,
 }
 
@@ -1222,16 +1228,32 @@ struct CapacitySlotLayout {
     /// pointer). `Some(SlotForm::Vec)` means the slot is the
     /// inline storage for a `@form(vec)` locus.
     form: Option<SlotForm>,
+    /// v1.x-FORM-4: for `@form(hashmap)` slots, the indexed-by
+    /// field's name on the cell struct. Codegen looks this up
+    /// in the cell type's `user_types` entry to derive
+    /// `key_size` + `key_type_tag` at init time and the GEP
+    /// offset for key extraction at set call sites. `None` for
+    /// all other slot kinds.
+    indexed_by: Option<String>,
 }
 
 /// v1.x-FORM-2: which form lowering is in play for a capacity slot.
-/// Today only `Vec` exists; `HashMap` / `RingBuffer` land in FORM-4.
+/// `Vec` shipped in FORM-2; `Hashmap` shipped in FORM-4.
+/// `RingBuffer` is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotForm {
     /// `@form(vec)` — heap slot becomes an inline
     /// `{ i64 cap, i64 len, ptr buf }` struct managed by
     /// the `lotus_vec_*` C runtime.
     Vec,
+    /// `@form(hashmap)` — pool slot becomes an inline
+    /// `{ i64 cap, i64 len, i64 key_size, i64 value_size,
+    ///   i32 key_type_tag, ptr slots }` struct managed by
+    /// the `lotus_hashmap_*` C runtime. Layout matches the
+    /// C-side `lotus_hashmap_t` exactly (LLVM inserts the
+    /// 4-byte pad between `i32` and `ptr` for natural
+    /// alignment).
+    Hashmap,
 }
 
 /// Maximum number of children any locus struct's built-in
@@ -1528,6 +1550,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let vec_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_vec_destroy", vec_destroy_ty, None);
+
+        // v1.x-FORM-4: @form(hashmap) C runtime primitives. The
+        // hashmap lives inline as { i64 cap, i64 len, i64 key_size,
+        // i64 value_size, i32 key_type_tag, ptr slots } in the
+        // locus struct; lotus_hashmap_* operate on a pointer to
+        // that field. key_size / value_size / key_type_tag are
+        // baked in at init time (per-call sites pass raw key/value
+        // pointers without per-call size args, unlike vec).
+        //
+        // declare void    @lotus_hashmap_init(ptr m, i64 key_size, i64 value_size, i32 key_type_tag)
+        // declare void    @lotus_hashmap_set(ptr m, ptr key, ptr value)
+        // declare i32     @lotus_hashmap_get(ptr m, ptr key, ptr out_value)
+        // declare i32     @lotus_hashmap_has(ptr m, ptr key)
+        // declare i32     @lotus_hashmap_remove(ptr m, ptr key)
+        // declare i64     @lotus_hashmap_len(ptr m)
+        // declare i32     @lotus_hashmap_is_empty(ptr m)
+        // declare void    @lotus_hashmap_destroy(ptr m)
+        //
+        // get / has / remove / is_empty return i32 (1 = OK / true,
+        // 0 = missing / false) at the C boundary. The fallible
+        // methods (get, remove) invert this at codegen time to
+        // match Aperio's i1 (true = err) ABI.
+        let hashmap_init_ty = void_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into(), i32_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_hashmap_init", hashmap_init_ty, None);
+        let hashmap_set_ty =
+            void_t.fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_set", hashmap_set_ty, None);
+        let hashmap_get_ty =
+            i32_t.fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_get", hashmap_get_ty, None);
+        let hashmap_has_ty =
+            i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_has", hashmap_has_ty, None);
+        let hashmap_remove_ty =
+            i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_remove", hashmap_remove_ty, None);
+        let hashmap_len_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_len", hashmap_len_ty, None);
+        let hashmap_is_empty_ty = i32_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_is_empty", hashmap_is_empty_ty, None);
+        let hashmap_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_hashmap_destroy", hashmap_destroy_ty, None);
 
         // m36: string runtime helpers. Each takes a `ptr` for the
         // destination arena (where the result lives) plus the
@@ -3792,6 +3867,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // of `inject_form_stdlib_types` in
         // aperio-types/src/resolve.rs.
         self.declare_builtin_index_error_type();
+        // v1.x-FORM-4: synthesized @form(hashmap) `get` /
+        // `remove` surface a typed `KeyError` payload. Mirror
+        // of the typecheck-side injection alongside IndexError.
+        self.declare_builtin_key_error_type();
 
         // F.20: register interface declarations by name. The
         // codegen layer uses this in two places: signature lowering
@@ -4664,6 +4743,36 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         struct_ty.set_body(&llvm_field_tys, false);
         self.user_types.insert(
             "IndexError".to_string(),
+            TypeInfo {
+                struct_ty,
+                fields,
+                field_order,
+            },
+        );
+    }
+
+    /// v1.x-FORM-4: register the built-in `KeyError` record so
+    /// synthesized @form(hashmap) `get` / `remove` codegen can
+    /// allocate it. Mirror of `inject_form_stdlib_types` for
+    /// KeyError in aperio-types/src/resolve.rs. v1 fields:
+    /// `kind: String` only — the key isn't carried because K
+    /// varies per hashmap.
+    fn declare_builtin_key_error_type(&mut self) {
+        if self.user_types.contains_key("KeyError") {
+            return;
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let mut fields: BTreeMap<String, (u32, CodegenTy)> = BTreeMap::new();
+        fields.insert("kind".into(), (0, CodegenTy::String));
+        let field_order = vec!["kind".to_string()];
+        let llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
+            vec![ptr_t.into()];
+        let struct_ty = self
+            .context
+            .opaque_struct_type("type.KeyError");
+        struct_ty.set_body(&llvm_field_tys, false);
+        self.user_types.insert(
+            "KeyError".to_string(),
             TypeInfo {
                 struct_ty,
                 fields,
@@ -6474,6 +6583,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .as_ref()
             .map(|f| f.name.name.as_str() == "vec")
             .unwrap_or(false);
+        let is_form_hashmap = l
+            .form
+            .as_ref()
+            .map(|f| f.name.name.as_str() == "hashmap")
+            .unwrap_or(false);
         let mut capacity_slots: Vec<CapacitySlotLayout> = Vec::new();
         let mut seen_slot_names: BTreeSet<String> = BTreeSet::new();
         for member in &l.members {
@@ -6524,6 +6638,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     );
                     llvm_field_tys.push(vec_struct_ty.into());
                     Some(SlotForm::Vec)
+                } else if is_form_hashmap
+                    && matches!(slot.kind, CapacitySlotKind::Pool)
+                {
+                    // v1.x-FORM-4: @form(hashmap): emit the inline
+                    // lotus_hashmap_t-shaped struct instead of an
+                    // allocator-pointer field. Layout matches the
+                    // C-side struct exactly — LLVM naturally inserts
+                    // the 4-byte pad between i32 key_type_tag and
+                    // ptr slots for alignment. Typecheck (FORM-4 PR2)
+                    // already verified exactly one pool slot with
+                    // indexed_by exists when @form(hashmap) is in
+                    // play.
+                    let i32_t = self.context.i32_type();
+                    let hashmap_struct_ty = self.context.struct_type(
+                        &[
+                            i64_t.into(),  // cap
+                            i64_t.into(),  // len
+                            i64_t.into(),  // key_size
+                            i64_t.into(),  // value_size
+                            i32_t.into(),  // key_type_tag
+                            ptr_t.into(),  // slots (4-byte pad inserted before)
+                        ],
+                        false,
+                    );
+                    llvm_field_tys.push(hashmap_struct_ty.into());
+                    Some(SlotForm::Hashmap)
                 } else {
                     llvm_field_tys.push(ptr_t.into());
                     None
@@ -6539,6 +6679,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .map(|i| i.name.clone()),
                     struct_field_idx: slot_field_idx,
                     form,
+                    indexed_by: slot
+                        .indexed_by
+                        .as_ref()
+                        .map(|i| i.name.clone()),
                 });
             }
         }
@@ -9345,7 +9489,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         inner: &Expr,
         disposition: &OrDisposition,
         scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+    ) -> Result<(Option<BasicValueEnum<'ctx>>, Option<CodegenTy>), CodegenError> {
         let call = self.lower_fallible_call(inner, scope)?;
         let func = self
             .current_fn
@@ -9360,15 +9504,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_conditional_branch(call.i1_path, err_bb, ok_bb)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
-        // OK branch: load the success value out of the sret slot.
-        // The br to join_bb is added after we know whether the err
-        // branch joins us (Substitute) or terminates (Raise).
+        // OK branch: load the success value out of the sret slot
+        // when there is one. v1.x-FORM-4: `() fallible(E)` calls
+        // (e.g. hashmap.remove) carry `success_ty = None` and no
+        // out_val_slot — the ok branch just falls through to the
+        // join.
         self.builder.position_at_end(ok_bb);
-        let llvm_succ_ty = self.llvm_basic_type(&call.success_ty);
-        let ok_v = self
-            .builder
-            .build_load(llvm_succ_ty, call.out_val_slot, "or.ok.val")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ok_v_opt: Option<BasicValueEnum<'ctx>> =
+            match (&call.success_ty, call.out_val_slot) {
+                (Some(succ_ty), Some(slot)) => {
+                    let llvm_succ_ty = self.llvm_basic_type(succ_ty);
+                    let v = self
+                        .builder
+                        .build_load(llvm_succ_ty, slot, "or.ok.val")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    Some(v)
+                }
+                _ => None,
+            };
         let ok_end_bb = self
             .builder
             .get_insert_block()
@@ -9376,7 +9529,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         // ERR branch.
         self.builder.position_at_end(err_bb);
-        let err_join: Option<(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+        let err_join: Option<(Option<BasicValueEnum<'ctx>>, inkwell::basic_block::BasicBlock<'ctx>)> =
             match disposition {
                 OrDisposition::Raise(_) => {
                     self.lower_or_raise(&call)?;
@@ -9395,8 +9548,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         "err".to_string(),
                         (call.out_err_slot, call.payload_ty.clone()),
                     );
-                    let (sub_v, sub_ty) =
-                        self.lower_expr(rhs, &sub_scope)?;
+                    let (sub_v, sub_ty) = if call.success_ty.is_none() {
+                        // v1.x-FORM-4: Unit-success fallible (e.g.
+                        // hashmap.remove). The substitute RHS is
+                        // Unit-typed — lower it as a statement so
+                        // Unit-returning fn calls (`ignore(err)`,
+                        // `noop()`) work without the expression-
+                        // position "fn returns no value" reject.
+                        let s = Stmt::Expr((**rhs).clone());
+                        let mut sub_mut_scope = Scope {
+                            locals: sub_scope.locals.clone(),
+                        };
+                        self.lower_stmt(&s, &mut sub_mut_scope)?;
+                        (None, None)
+                    } else {
+                        self.lower_expr_opt(rhs, &sub_scope)?
+                    };
                     if sub_ty != call.success_ty {
                         return Err(CodegenError::Unsupported(format!(
                             "`or` substitute type mismatch: expected {:?}, \
@@ -9425,9 +9592,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         match err_join {
             None => {
                 // Raise: err branch terminated. Only ok flows to
-                // the join. Result is the ok-branch SSA directly.
+                // the join. Result is the ok-branch SSA directly
+                // (or None for Unit-success).
                 self.builder.position_at_end(join_bb);
-                Ok((ok_v, call.success_ty))
+                Ok((ok_v_opt, call.success_ty))
             }
             Some((sub_v, sub_end_bb)) => {
                 self.builder.position_at_end(sub_end_bb);
@@ -9435,17 +9603,45 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_unconditional_branch(join_bb)
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 self.builder.position_at_end(join_bb);
-                let phi = self
-                    .builder
-                    .build_phi(llvm_succ_ty, "or.result")
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                phi.add_incoming(&[
-                    (&ok_v, ok_end_bb),
-                    (&sub_v, sub_end_bb),
-                ]);
-                Ok((phi.as_basic_value(), call.success_ty))
+                match (ok_v_opt, sub_v, &call.success_ty) {
+                    (Some(ok_v), Some(sv), Some(succ_ty)) => {
+                        let llvm_succ_ty = self.llvm_basic_type(succ_ty);
+                        let phi = self
+                            .builder
+                            .build_phi(llvm_succ_ty, "or.result")
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        phi.add_incoming(&[
+                            (&ok_v, ok_end_bb),
+                            (&sv, sub_end_bb),
+                        ]);
+                        Ok((Some(phi.as_basic_value()), call.success_ty))
+                    }
+                    _ => Ok((None, call.success_ty)),
+                }
             }
         }
+    }
+
+    /// v1.x-FORM-4: wrapper around `lower_expr` for sub-expressions
+    /// whose result may be Unit. `lower_expr` returns
+    /// `(BasicValueEnum, CodegenTy)` — for `or`-disposition
+    /// substitute RHSs that may evaluate to Unit (matching a
+    /// `() fallible(E)` call), we need the option-wrapped variant.
+    /// Falls through to `lower_expr` for the value-producing case
+    /// and special-cases `Expr::Tuple([])` (the Unit literal `()`)
+    /// for the no-value case.
+    fn lower_expr_opt(
+        &mut self,
+        e: &Expr,
+        scope: &Scope<'ctx>,
+    ) -> Result<(Option<BasicValueEnum<'ctx>>, Option<CodegenTy>), CodegenError> {
+        if let Expr::Tuple(parts, _) = e {
+            if parts.is_empty() {
+                return Ok((None, None));
+            }
+        }
+        let (v, ty) = self.lower_expr(e, scope)?;
+        Ok((Some(v), Some(ty)))
     }
 
     /// v1.x-FORM-2 PR6: lower the inner expression of an `or`,
@@ -9593,9 +9789,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         Ok(FallibleCallResult {
             i1_path,
-            out_val_slot,
+            out_val_slot: Some(out_val_slot),
             out_err_slot,
-            success_ty,
+            success_ty: Some(success_ty),
             payload_ty,
         })
     }
@@ -9753,10 +9949,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         {
             return Ok(result);
         }
+        if let Some(result) = self
+            .try_lower_form_hashmap_fallible_method(
+                &info,
+                self_ptr,
+                &locus_name,
+                method_name,
+                args,
+                scope,
+            )?
+        {
+            return Ok(result);
+        }
         Err(CodegenError::Unsupported(format!(
             "fallible method `{}.{}` — not a synthesized @form(vec) \
-             get/pop; user-declared fallible methods on loci are not \
-             yet wired",
+             get/pop or @form(hashmap) get/remove; user-declared \
+             fallible methods on loci are not yet wired",
             locus_name, method_name
         )))
     }
@@ -9943,9 +10151,227 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         Ok(Some(FallibleCallResult {
             i1_path: is_err,
-            out_val_slot,
+            out_val_slot: Some(out_val_slot),
             out_err_slot,
-            success_ty: elem_ty,
+            success_ty: Some(elem_ty),
+            payload_ty,
+        }))
+    }
+
+    /// v1.x-FORM-4: inline-lower a synthesized `@form(hashmap)`
+    /// fallible method (`get`, `remove`) as-if it were a
+    /// fallible-ABI call. Parallel to
+    /// `try_lower_form_vec_fallible_method` but with:
+    ///   - the C ABI bakes key/value sizes at init time, so per-
+    ///     call sites pass raw key/value pointers without size
+    ///     args;
+    ///   - the key is materialized into an alloca matching the
+    ///     indexed-by field's type;
+    ///   - `remove()` returns `() fallible(KeyError)` (Unit
+    ///     success), so the FallibleCallResult carries
+    ///     `success_ty = None` and no out_val_slot.
+    fn try_lower_form_hashmap_fallible_method(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        locus_self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+        method_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<Option<FallibleCallResult<'ctx>>, CodegenError> {
+        let Some(slot) = info
+            .capacity_slots
+            .iter()
+            .find(|s| s.form == Some(SlotForm::Hashmap))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if !matches!(method_name, "get" | "remove") {
+            return Ok(None);
+        }
+
+        // Look up the cell type + indexed-by field's CodegenTy
+        // (codegen-side mirror of the typecheck synthesis at
+        // resolve.rs:form_hashmap_value_and_key_ty).
+        let cell_name = match &slot.elem_ty {
+            CodegenTy::TypeRef(n) => n.clone(),
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "@form(hashmap) `{}`.{}: slot `{}` cell type must be a \
+                     user-declared struct; got {:?}",
+                    locus_name, method_name, slot.name, other
+                )));
+            }
+        };
+        let cell_info = self
+            .user_types
+            .get(&cell_name)
+            .cloned()
+            .ok_or_else(|| CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: cell type `{}` not registered",
+                locus_name, method_name, cell_name
+            )))?;
+        let field_name = slot
+            .indexed_by
+            .as_ref()
+            .ok_or_else(|| CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: slot `{}` missing indexed_by",
+                locus_name, method_name, slot.name
+            )))?
+            .clone();
+        let (_field_idx, key_codegen_ty) = cell_info
+            .fields
+            .get(&field_name)
+            .cloned()
+            .ok_or_else(|| CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: indexed-by field `{}` not on \
+                 cell `{}`",
+                locus_name, method_name, field_name, cell_name
+            )))?;
+        if !matches!(key_codegen_ty, CodegenTy::Int | CodegenTy::String) {
+            return Err(CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: key type {:?} unsupported; v1 \
+                 supports Int and String keys only",
+                locus_name, method_name, key_codegen_ty
+            )));
+        }
+        let value_codegen_ty = CodegenTy::TypeRef(cell_name.clone());
+        let payload_ty = CodegenTy::TypeRef("KeyError".to_string());
+
+        let hashmap_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                locus_self_ptr,
+                slot.struct_field_idx,
+                &format!(
+                    "{}.__hashmap_{}.fallible.ptr",
+                    locus_name, slot.name
+                ),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: expects 1 arg, got {}",
+                locus_name,
+                method_name,
+                args.len()
+            )));
+        }
+        let (key_val, key_ty) = self.lower_expr(&args[0], scope)?;
+        if key_ty != key_codegen_ty {
+            return Err(CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: key arg type mismatch: expected \
+                 {:?}, got {:?}",
+                locus_name, method_name, key_codegen_ty, key_ty
+            )));
+        }
+        let key_alloca = self
+            .alloca_for(&key_codegen_ty, &format!("hm.{}.key.slot", method_name))?;
+        self.builder
+            .build_store(key_alloca, key_val)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let out_err_slot = self.alloca_for(
+            &payload_ty,
+            &format!("hm.{}.out_err.slot", method_name),
+        )?;
+        let i32_t = self.context.i32_type();
+        let zero_i32 = i32_t.const_int(0, false);
+
+        let (c_ret, out_val_slot_opt, success_ty_opt) = match method_name {
+            "get" => {
+                // `out_val_slot` holds the surface-level success
+                // value, which for a TypeRef cell is a *pointer
+                // to* the struct (matching how `lower_or_expr`
+                // loads it via `llvm_basic_type(TypeRef) = ptr`).
+                // Arena-allocate a fresh buffer for the runtime
+                // to memcpy `value_size` bytes into, then store
+                // its pointer in the surface slot.
+                let cell_struct_size = cell_info
+                    .struct_ty
+                    .size_of()
+                    .expect("cell struct has known size");
+                let value_buf_ptr = self.arena_alloc(
+                    cell_struct_size,
+                    "hm.get.value_buf",
+                )?;
+                let out_val_slot = self.alloca_for(
+                    &value_codegen_ty,
+                    "hm.get.out_val.slot",
+                )?;
+                self.builder
+                    .build_store(out_val_slot, value_buf_ptr)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let get_fn = self
+                    .module
+                    .get_function("lotus_hashmap_get")
+                    .expect("lotus_hashmap_get declared");
+                let c_ret = self
+                    .builder
+                    .build_call(
+                        get_fn,
+                        &[
+                            hashmap_field_ptr.into(),
+                            key_alloca.into(),
+                            value_buf_ptr.into(),
+                        ],
+                        &format!("{}.get.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_hashmap_get returns i32")
+                    .into_int_value();
+                (c_ret, Some(out_val_slot), Some(value_codegen_ty.clone()))
+            }
+            "remove" => {
+                let remove_fn = self
+                    .module
+                    .get_function("lotus_hashmap_remove")
+                    .expect("lotus_hashmap_remove declared");
+                let c_ret = self
+                    .builder
+                    .build_call(
+                        remove_fn,
+                        &[hashmap_field_ptr.into(), key_alloca.into()],
+                        &format!("{}.remove.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_hashmap_remove returns i32")
+                    .into_int_value();
+                (c_ret, None, None)
+            }
+            _ => unreachable!("matched above"),
+        };
+
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                c_ret,
+                zero_i32,
+                &format!("{}.{}.is_err", locus_name, method_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // Unconditionally construct the KeyError. The OK path's
+        // KeyError is dead but harmless — keeps the emitter local
+        // and the IR compact.
+        let ke_ptr = self.emit_key_error_alloc("missing_key")?;
+        self.builder
+            .build_store(out_err_slot, ke_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        Ok(Some(FallibleCallResult {
+            i1_path: is_err,
+            out_val_slot: out_val_slot_opt,
+            out_err_slot,
+            success_ty: success_ty_opt,
             payload_ty,
         }))
     }
@@ -10025,6 +10451,47 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         self.builder
             .build_store(len_field_ptr, len_ssa)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        Ok(alloc_ptr)
+    }
+
+    /// v1.x-FORM-4: allocate a `KeyError` struct in the current
+    /// arena and populate its single field `kind: String`. Matches
+    /// the shape `inject_form_stdlib_types` synthesizes and the
+    /// interpreter's `key_error_value` helper.
+    fn emit_key_error_alloc(
+        &mut self,
+        kind: &str,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let info = self
+            .user_types
+            .get("KeyError")
+            .cloned()
+            .expect("KeyError injected by aperio-types resolver");
+        let size = info
+            .struct_ty
+            .size_of()
+            .expect("KeyError has known size");
+        let alloc_ptr = self.arena_alloc(size, "KeyError.alloc")?;
+
+        let kind_str_ptr = self.global_string(kind);
+        let (kind_idx, _) = info
+            .fields
+            .get("kind")
+            .cloned()
+            .expect("KeyError.kind field");
+        let kind_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                kind_idx,
+                "KeyError.kind.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(kind_field_ptr, kind_str_ptr)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         Ok(alloc_ptr)
@@ -10750,6 +11217,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             Stmt::Match(m) => self.lower_match_stmt(m, scope),
             Stmt::Fail { value, .. } => self.lower_fail(value, scope),
+            Stmt::Expr(Expr::Or { inner, disposition, .. }) => {
+                // v1.x-FORM-4: `r.remove(k) or raise;` /
+                // `r.remove(k) or ();` as a bare statement.
+                // Discards the success value (always Unit for the
+                // statement-position fallible-method shape this
+                // covers; non-Unit success values can also flow
+                // here harmlessly and get discarded).
+                let _ = self.lower_or_expr(inner, disposition, scope)?;
+                Ok(BlockEnd::Open)
+            }
             Stmt::Expr(_) => Err(CodegenError::Unsupported(
                 "expression statement other than locus literal or builtin call"
                     .to_string(),
@@ -13791,7 +14268,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok((v, ty))
             }
             Expr::Or { inner, disposition, .. } => {
-                self.lower_or_expr(inner, disposition, scope)
+                let (v_opt, ty_opt) =
+                    self.lower_or_expr(inner, disposition, scope)?;
+                match (v_opt, ty_opt) {
+                    (Some(v), Some(ty)) => Ok((v, ty)),
+                    _ => Err(CodegenError::Unsupported(
+                        "`or` expression in value position has Unit \
+                         success type — bare-statement use is fine, but \
+                         can't bind to `let` without a value (use \
+                         `let _: () = expr or ...;` if you want to ignore)"
+                            .into(),
+                    )),
+                }
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "expression form {:?}",
@@ -19030,6 +19518,98 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
+                Some(SlotForm::Hashmap) => {
+                    // v1.x-FORM-4: form-hashmap slot. The field IS
+                    // the inline lotus_hashmap_t struct;
+                    // lotus_hashmap_init allocates the initial 8
+                    // slots and stashes key_size / value_size /
+                    // key_type_tag at fixed offsets. The cell type
+                    // is a user-declared struct; the indexed-by
+                    // field on that struct supplies the key type.
+                    let cell_name = match &slot.elem_ty {
+                        CodegenTy::TypeRef(n) => n.clone(),
+                        _ => {
+                            return Err(CodegenError::Unsupported(format!(
+                                "@form(hashmap) `{}`: slot `{}` cell type \
+                                 must be a user-declared struct; got {:?} \
+                                 (typecheck should have rejected this — \
+                                 contact compiler maintainer)",
+                                locus_name, slot.name, slot.elem_ty
+                            )));
+                        }
+                    };
+                    let cell_info = self
+                        .user_types
+                        .get(&cell_name)
+                        .cloned()
+                        .ok_or_else(|| CodegenError::Unsupported(format!(
+                            "@form(hashmap) `{}`: cell type `{}` not \
+                             registered in user_types",
+                            locus_name, cell_name
+                        )))?;
+                    let field_name = slot
+                        .indexed_by
+                        .as_ref()
+                        .ok_or_else(|| CodegenError::Unsupported(format!(
+                            "@form(hashmap) `{}`: slot `{}` missing \
+                             indexed_by clause (typecheck should have \
+                             rejected this — contact compiler maintainer)",
+                            locus_name, slot.name
+                        )))?;
+                    let (_field_idx, key_codegen_ty) = cell_info
+                        .fields
+                        .get(field_name)
+                        .cloned()
+                        .ok_or_else(|| CodegenError::Unsupported(format!(
+                            "@form(hashmap) `{}`: indexed-by field `{}` \
+                             not on cell type `{}` (typecheck should have \
+                             rejected this — contact compiler maintainer)",
+                            locus_name, field_name, cell_name
+                        )))?;
+                    let key_type_tag: u64 = match key_codegen_ty {
+                        CodegenTy::Int => 0,
+                        CodegenTy::String => 1,
+                        other => {
+                            return Err(CodegenError::Unsupported(format!(
+                                "@form(hashmap) `{}`: indexed-by field \
+                                 `{}` has type {:?}; v1 supports Int and \
+                                 String key types only (other key types \
+                                 are deferred — see spec/forms.md \
+                                 @form(hashmap) key types section)",
+                                locus_name, field_name, other
+                            )));
+                        }
+                    };
+                    let key_llvm_ty =
+                        self.llvm_basic_type(&key_codegen_ty);
+                    let key_size = key_llvm_ty
+                        .size_of()
+                        .expect("key type has known size");
+                    let value_size = cell_info
+                        .struct_ty
+                        .size_of()
+                        .expect("cell struct has known size");
+                    let key_type_tag_const = self
+                        .context
+                        .i32_type()
+                        .const_int(key_type_tag, false);
+                    let init_fn = self
+                        .module
+                        .get_function("lotus_hashmap_init")
+                        .expect("lotus_hashmap_init extern declared");
+                    self.builder
+                        .build_call(
+                            init_fn,
+                            &[
+                                slot_field_ptr.into(),
+                                key_size.into(),
+                                value_size.into(),
+                                key_type_tag_const.into(),
+                            ],
+                            &format!("{}.{}.init", locus_name, slot.name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
                 None => {
                     // Default F.22 lowering: allocate via
                     // lotus_pool_create / lotus_heap_create and
@@ -20284,6 +20864,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         )? {
             return Ok(form_result);
         }
+        // v1.x-FORM-4: intercept synthesized @form(hashmap) methods
+        // on `self`. Parallel to the vec dispatch above.
+        if let Some(form_result) = self.try_lower_form_hashmap_method(
+            &info,
+            cs.self_ptr,
+            &cs.locus_name,
+            method_name,
+            args,
+            scope,
+        )? {
+            return Ok(form_result);
+        }
         let func = info
             .user_methods
             .get(method_name)
@@ -20635,6 +21227,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // before the user_methods lookup. They aren't real LLVM fns;
         // they lower inline to lotus_vec_* on the inline vec slot.
         if let Some(form_result) = self.try_lower_form_vec_method(
+            &info,
+            recv_val.into_pointer_value(),
+            &locus_name,
+            method_name,
+            args,
+            scope,
+        )? {
+            return Ok(form_result);
+        }
+        // v1.x-FORM-4: intercept synthesized @form(hashmap) methods
+        // before the user_methods lookup. Parallel to the vec
+        // dispatch above.
+        if let Some(form_result) = self.try_lower_form_hashmap_method(
             &info,
             recv_val.into_pointer_value(),
             &locus_name,
@@ -21147,6 +21752,296 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             "get" | "pop" => Err(CodegenError::Unsupported(format!(
                 "@form(vec) `{}`.{}: fallible method must be addressed via \
                  `or raise` / `or <expr>` / `or handler(err)`",
+                locus_name, method_name
+            ))),
+            _ => unreachable!("is_synth guard"),
+        }
+    }
+
+    /// v1.x-FORM-4: dispatcher for the infallible synth methods on
+    /// `@form(hashmap)` loci — `set`, `has`, `len`, `is_empty`.
+    /// `get` and `remove` are fallible and handled by
+    /// `try_lower_form_hashmap_fallible_method`.
+    ///
+    /// Returns `Ok(None)` if the receiver isn't a hashmap-form
+    /// locus or the method name isn't a synth. Otherwise
+    /// `Ok(Some(...))` with the inner result: `Some` for
+    /// value-producing methods, `None` for Unit-returning ones.
+    /// Errors only for genuine codegen problems (arg-arity / type
+    /// mismatch).
+    fn try_lower_form_hashmap_method(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        locus_self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+        method_name: &str,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<
+        Option<Option<(BasicValueEnum<'ctx>, CodegenTy)>>,
+        CodegenError,
+    > {
+        let Some(slot) = info
+            .capacity_slots
+            .iter()
+            .find(|s| s.form == Some(SlotForm::Hashmap))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let is_synth = matches!(
+            method_name,
+            "set" | "has" | "len" | "is_empty" | "get" | "remove"
+        );
+        if !is_synth {
+            return Ok(None);
+        }
+
+        let i32_t = self.context.i32_type();
+        let hashmap_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                locus_self_ptr,
+                slot.struct_field_idx,
+                &format!("{}.__hashmap_{}.ptr", locus_name, slot.name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        match method_name {
+            "set" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.set: expects 1 arg, got {}",
+                        locus_name,
+                        args.len()
+                    )));
+                }
+                // Cell type + indexed-by field — needed to GEP the
+                // key out of the value at this call site.
+                let cell_name = match &slot.elem_ty {
+                    CodegenTy::TypeRef(n) => n.clone(),
+                    other => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "@form(hashmap) `{}`.set: slot cell type must \
+                             be a user-declared struct; got {:?}",
+                            locus_name, other
+                        )));
+                    }
+                };
+                let cell_info = self
+                    .user_types
+                    .get(&cell_name)
+                    .cloned()
+                    .ok_or_else(|| CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.set: cell type `{}` \
+                         unregistered",
+                        locus_name, cell_name
+                    )))?;
+                let field_name = slot
+                    .indexed_by
+                    .as_ref()
+                    .ok_or_else(|| CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.set: slot missing indexed_by",
+                        locus_name
+                    )))?
+                    .clone();
+                let (key_field_idx, _key_ty) = cell_info
+                    .fields
+                    .get(&field_name)
+                    .cloned()
+                    .ok_or_else(|| CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.set: indexed-by field `{}` \
+                         not on cell `{}`",
+                        locus_name, field_name, cell_name
+                    )))?;
+
+                let (arg_val, arg_ty) =
+                    self.lower_expr(&args[0], scope)?;
+                let expected_value_ty = CodegenTy::TypeRef(cell_name.clone());
+                if arg_ty != expected_value_ty {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.set arg type mismatch: \
+                         expected {:?}, got {:?}",
+                        locus_name, expected_value_ty, arg_ty
+                    )));
+                }
+
+                // The value lowered to a TypeRef arrives as a
+                // pointer to the struct (user_type instantiations
+                // return `*StructTy`). Pass it directly as
+                // value_ptr; GEP the indexed-by field through it
+                // to derive the key_ptr.
+                let value_ptr = arg_val.into_pointer_value();
+                let key_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cell_info.struct_ty,
+                        value_ptr,
+                        key_field_idx,
+                        &format!("{}.set.key.ptr", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                let set_fn = self
+                    .module
+                    .get_function("lotus_hashmap_set")
+                    .expect("lotus_hashmap_set extern declared");
+                self.builder
+                    .build_call(
+                        set_fn,
+                        &[
+                            hashmap_field_ptr.into(),
+                            key_field_ptr.into(),
+                            value_ptr.into(),
+                        ],
+                        &format!("{}.set.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok(Some(None))
+            }
+            "has" => {
+                if args.len() != 1 {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.has: expects 1 arg, got {}",
+                        locus_name,
+                        args.len()
+                    )));
+                }
+                // Look up the key type so we can validate the arg +
+                // alloca the right shape.
+                let cell_name = match &slot.elem_ty {
+                    CodegenTy::TypeRef(n) => n.clone(),
+                    _ => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "@form(hashmap) `{}`.has: slot cell type must \
+                             be a user-declared struct",
+                            locus_name
+                        )));
+                    }
+                };
+                let cell_info = self
+                    .user_types
+                    .get(&cell_name)
+                    .cloned()
+                    .expect("cell type registered");
+                let field_name = slot
+                    .indexed_by
+                    .as_ref()
+                    .expect("indexed_by set on hashmap slot")
+                    .clone();
+                let (_, key_codegen_ty) = cell_info
+                    .fields
+                    .get(&field_name)
+                    .cloned()
+                    .expect("indexed_by field on cell");
+
+                let (key_val, key_ty) = self.lower_expr(&args[0], scope)?;
+                if key_ty != key_codegen_ty {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.has: key arg type mismatch: \
+                         expected {:?}, got {:?}",
+                        locus_name, key_codegen_ty, key_ty
+                    )));
+                }
+                let key_alloca = self
+                    .alloca_for(&key_codegen_ty, "hm.has.key.slot")?;
+                self.builder
+                    .build_store(key_alloca, key_val)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let has_fn = self
+                    .module
+                    .get_function("lotus_hashmap_has")
+                    .expect("lotus_hashmap_has extern declared");
+                let result_i32 = self
+                    .builder
+                    .build_call(
+                        has_fn,
+                        &[hashmap_field_ptr.into(), key_alloca.into()],
+                        &format!("{}.has.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_hashmap_has returns i32")
+                    .into_int_value();
+                let zero = i32_t.const_int(0, false);
+                let result_i1 = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        result_i32,
+                        zero,
+                        &format!("{}.has.bool", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok(Some(Some((result_i1.into(), CodegenTy::Bool))))
+            }
+            "len" => {
+                if !args.is_empty() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.len: takes no args, got {}",
+                        locus_name,
+                        args.len()
+                    )));
+                }
+                let len_fn = self
+                    .module
+                    .get_function("lotus_hashmap_len")
+                    .expect("lotus_hashmap_len extern declared");
+                let result = self
+                    .builder
+                    .build_call(
+                        len_fn,
+                        &[hashmap_field_ptr.into()],
+                        &format!("{}.len.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_hashmap_len returns i64");
+                Ok(Some(Some((result, CodegenTy::Int))))
+            }
+            "is_empty" => {
+                if !args.is_empty() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(hashmap) `{}`.is_empty: takes no args, \
+                         got {}",
+                        locus_name,
+                        args.len()
+                    )));
+                }
+                let is_empty_fn = self
+                    .module
+                    .get_function("lotus_hashmap_is_empty")
+                    .expect("lotus_hashmap_is_empty extern declared");
+                let result_i32 = self
+                    .builder
+                    .build_call(
+                        is_empty_fn,
+                        &[hashmap_field_ptr.into()],
+                        &format!("{}.is_empty.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_hashmap_is_empty returns i32")
+                    .into_int_value();
+                let zero = i32_t.const_int(0, false);
+                let result_i1 = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        result_i32,
+                        zero,
+                        &format!("{}.is_empty.bool", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok(Some(Some((result_i1.into(), CodegenTy::Bool))))
+            }
+            "get" | "remove" => Err(CodegenError::Unsupported(format!(
+                "@form(hashmap) `{}`.{}: fallible method must be addressed \
+                 via `or raise` / `or <expr>` / `or handler(err)`",
                 locus_name, method_name
             ))),
             _ => unreachable!("is_synth guard"),
@@ -23796,6 +24691,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .module
                         .get_function("lotus_vec_destroy")
                         .expect("lotus_vec_destroy extern declared");
+                    self.builder
+                        .build_call(
+                            destroy_fn,
+                            &[slot_field_ptr.into()],
+                            &format!("{}.{}.destroy", locus_name, slot.name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                Some(SlotForm::Hashmap) => {
+                    // v1.x-FORM-4: free the hashmap's slot-array
+                    // buffer. The lotus_hashmap_t struct itself is
+                    // inline in the locus and dies with the arena.
+                    let destroy_fn = self
+                        .module
+                        .get_function("lotus_hashmap_destroy")
+                        .expect("lotus_hashmap_destroy extern declared");
                     self.builder
                         .build_call(
                             destroy_fn,

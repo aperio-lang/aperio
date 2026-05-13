@@ -120,6 +120,18 @@ pub enum SlotState {
     Vec {
         items: Rc<RefCell<Vec<Value>>>,
     },
+    /// v1.x-FORM-4 PR6: `@form(hashmap)` storage. The locus's
+    /// single pool slot is replaced with a keyed entry table.
+    /// Backing is a Vec<(key, value)> with linear scan — the
+    /// interpreter isn't perf-critical and the linear scan
+    /// trivially matches the C runtime's observable semantics
+    /// without needing a Value-Ord impl. `indexed_by_field`
+    /// is cached at instantiation so each set call doesn't
+    /// re-walk the decl to find the key field.
+    Hashmap {
+        indexed_by_field: String,
+        entries: Rc<RefCell<Vec<(Value, Value)>>>,
+    },
 }
 
 #[derive(Debug, Clone)]

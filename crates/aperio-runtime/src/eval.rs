@@ -1147,6 +1147,13 @@ impl Interpreter {
                 {
                     return Ok(result);
                 }
+                // v1.x-FORM-4 PR6: parallel dispatch for
+                // `<hashmap-locus>.<form-method>(args)`.
+                if let Some(result) =
+                    self.try_eval_form_hashmap_call(callee, args)?
+                {
+                    return Ok(result);
+                }
                 let callee_v = self.eval_expr(callee)?;
                 let mut arg_vs = Vec::with_capacity(args.len());
                 for a in args {
@@ -1611,6 +1618,168 @@ impl Interpreter {
         }
     }
 
+    /// v1.x-FORM-4 PR6: parallel to `try_eval_form_vec_call` for
+    /// `@form(hashmap)` synthesized methods. Returns `Ok(None)`
+    /// when the receiver isn't a hashmap-form locus or the method
+    /// isn't one of the synth names — caller falls through. The
+    /// fallible methods (`get`, `remove`) return
+    /// `Value::FallibleErr(Box::new(key_error_value("missing_key")))`
+    /// when the key is absent; the immediate caller's `or`
+    /// disposition unwraps.
+    fn try_eval_form_hashmap_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Value>, Signal> {
+        let (receiver_expr, method_name) = match callee {
+            Expr::Field { receiver, name, .. } => (receiver, name.name.clone()),
+            _ => return Ok(None),
+        };
+        if !matches!(
+            method_name.as_str(),
+            "set" | "get" | "has" | "remove" | "len" | "is_empty"
+        ) {
+            return Ok(None);
+        }
+        let recv_v = self.eval_expr(receiver_expr)?;
+        let handle = match recv_v {
+            Value::Locus(h) => h,
+            _ => return Ok(None),
+        };
+        let is_form_hashmap = handle
+            .decl
+            .form
+            .as_ref()
+            .map(|f| f.name.name == "hashmap")
+            .unwrap_or(false);
+        if !is_form_hashmap {
+            return Ok(None);
+        }
+        let (entries_rc, indexed_by_field) = {
+            let slots = handle.slots.borrow();
+            slots
+                .iter()
+                .find_map(|(_, st)| match st {
+                    SlotState::Hashmap {
+                        entries,
+                        indexed_by_field,
+                    } => Some((entries.clone(), indexed_by_field.clone())),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Signal::Error(format!(
+                        "@form(hashmap) locus `{}` has no hashmap-state \
+                         slot (form-shape verification should have caught \
+                         this)",
+                        handle.name
+                    ))
+                })?
+        };
+
+        let mut arg_vs = Vec::with_capacity(args.len());
+        for a in args {
+            arg_vs.push(self.eval_expr(a)?);
+        }
+
+        match method_name.as_str() {
+            "set" => {
+                if arg_vs.len() != 1 {
+                    return Err(Signal::Error(format!(
+                        "@form(hashmap).set expects 1 arg, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                let value = arg_vs.into_iter().next().unwrap();
+                let key = extract_indexed_field(&value, &indexed_by_field)
+                    .ok_or_else(|| {
+                        Signal::Error(format!(
+                            "@form(hashmap).set: value missing indexed-by \
+                             field `{}` (typecheck should have caught this)",
+                            indexed_by_field
+                        ))
+                    })?;
+                let mut entries = entries_rc.borrow_mut();
+                if let Some(slot) =
+                    entries.iter_mut().find(|(k, _)| values_equal(k, &key))
+                {
+                    slot.1 = value;
+                } else {
+                    entries.push((key, value));
+                }
+                Ok(Some(Value::Unit))
+            }
+            "get" => {
+                if arg_vs.len() != 1 {
+                    return Err(Signal::Error(format!(
+                        "@form(hashmap).get expects 1 arg, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                let key = arg_vs.into_iter().next().unwrap();
+                let entries = entries_rc.borrow();
+                match entries.iter().find(|(k, _)| values_equal(k, &key)) {
+                    Some((_, v)) => Ok(Some(v.clone())),
+                    None => Ok(Some(Value::FallibleErr(Box::new(
+                        key_error_value("missing_key"),
+                    )))),
+                }
+            }
+            "has" => {
+                if arg_vs.len() != 1 {
+                    return Err(Signal::Error(format!(
+                        "@form(hashmap).has expects 1 arg, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                let key = arg_vs.into_iter().next().unwrap();
+                let entries = entries_rc.borrow();
+                let found = entries
+                    .iter()
+                    .any(|(k, _)| values_equal(k, &key));
+                Ok(Some(Value::Bool(found)))
+            }
+            "remove" => {
+                if arg_vs.len() != 1 {
+                    return Err(Signal::Error(format!(
+                        "@form(hashmap).remove expects 1 arg, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                let key = arg_vs.into_iter().next().unwrap();
+                let mut entries = entries_rc.borrow_mut();
+                if let Some(pos) =
+                    entries.iter().position(|(k, _)| values_equal(k, &key))
+                {
+                    entries.remove(pos);
+                    Ok(Some(Value::Unit))
+                } else {
+                    Ok(Some(Value::FallibleErr(Box::new(
+                        key_error_value("missing_key"),
+                    ))))
+                }
+            }
+            "len" => {
+                if !arg_vs.is_empty() {
+                    return Err(Signal::Error(format!(
+                        "@form(hashmap).len expects 0 args, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                Ok(Some(Value::Int(entries_rc.borrow().len() as i64)))
+            }
+            "is_empty" => {
+                if !arg_vs.is_empty() {
+                    return Err(Signal::Error(format!(
+                        "@form(hashmap).is_empty expects 0 args, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                Ok(Some(Value::Bool(entries_rc.borrow().is_empty())))
+            }
+            _ => unreachable!("filtered at the top of the fn"),
+        }
+    }
+
     fn try_eval_capacity_slot_call(
         &mut self,
         callee: &Expr,
@@ -1651,6 +1820,10 @@ impl Interpreter {
                 // dispatch path (push/get/pop/len/is_empty)
                 // routed elsewhere.
                 Some(SlotState::Vec { .. }) => return Ok(None),
+                // v1.x-FORM-4 PR6: hashmap slots likewise route
+                // through their own form-method path
+                // (set/get/has/remove/len/is_empty).
+                Some(SlotState::Hashmap { .. }) => return Ok(None),
                 None => return Ok(None),
             }
         };
@@ -1986,11 +2159,33 @@ impl Interpreter {
                         .as_ref()
                         .map(|f| f.name.name == "vec")
                         .unwrap_or(false);
+                    // v1.x-FORM-4 PR6: when the locus is
+                    // `@form(hashmap)`, the single pool slot
+                    // becomes a keyed entry table. Synthesized
+                    // methods (set/get/has/remove/len/is_empty)
+                    // dispatch via `try_eval_form_hashmap_call`.
+                    let is_form_hashmap = decl
+                        .form
+                        .as_ref()
+                        .map(|f| f.name.name == "hashmap")
+                        .unwrap_or(false);
                     let st = if is_form_vec
                         && matches!(slot.kind, CapacitySlotKind::Heap)
                     {
                         SlotState::Vec {
                             items: Rc::new(RefCell::new(Vec::new())),
+                        }
+                    } else if is_form_hashmap
+                        && matches!(slot.kind, CapacitySlotKind::Pool)
+                    {
+                        let indexed_by_field = slot
+                            .indexed_by
+                            .as_ref()
+                            .map(|i| i.name.clone())
+                            .unwrap_or_default();
+                        SlotState::Hashmap {
+                            indexed_by_field,
+                            entries: Rc::new(RefCell::new(Vec::new())),
                         }
                     } else {
                         match slot.kind {
@@ -3546,3 +3741,32 @@ fn index_error_value(kind: &str, index: i64, len: i64) -> Value {
         fields: Rc::new(RefCell::new(fields)),
     }
 }
+
+/// v1.x-FORM-4 PR6: construct a `KeyError` value matching the
+/// stdlib type synthesized alongside `IndexError`. v1's KeyError
+/// is minimal — just a `kind: String` tag. Used by
+/// `@form(hashmap).get` / `.remove` to surface a typed payload
+/// on missing-key access.
+fn key_error_value(kind: &str) -> Value {
+    let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+    fields.insert("kind".to_string(), Value::String(kind.to_string()));
+    Value::Struct {
+        name: "KeyError".to_string(),
+        fields: Rc::new(RefCell::new(fields)),
+    }
+}
+
+/// v1.x-FORM-4 PR6: extract the indexed-by field from a struct
+/// value at `set` call time. Returns `None` when the value isn't
+/// a struct or doesn't carry the named field — both of which
+/// indicate a typecheck escape (PR2 verifies the field exists on
+/// the cell type at locus declaration time).
+fn extract_indexed_field(value: &Value, field_name: &str) -> Option<Value> {
+    match value {
+        Value::Struct { fields, .. } => {
+            fields.borrow().get(field_name).cloned()
+        }
+        _ => None,
+    }
+}
+
