@@ -290,11 +290,33 @@ pub fn build_executable_with_imports(
             CodegenError::LlvmInit("could not create target machine".to_string())
         })?;
 
+    // Dump pre-optimization IR if requested. The IR shape tests
+    // (serializer_shape, etc.) check for codegen-synthesized fn
+    // definitions, which the O2 pipeline below may inline / DCE
+    // / rename — so the dump that's surfaced to tests is the
+    // pre-opt view.
     let obj_path: PathBuf = output_path.with_extension("o");
     if std::env::var("LOTUS_DUMP_IR").is_ok() {
         let ir_path = output_path.with_extension("ll");
         let _ = cx.module.print_to_file(&ir_path);
     }
+
+    // Run LLVM's standard module-level optimization pipeline at
+    // -O2 equivalent. Without this the codegen emits naive IR:
+    // every let-binding stays as alloca + load/store on every
+    // use, and loop-invariant struct-field reads (e.g.
+    // `while i < self.batch_size`) reload from memory each
+    // iteration. The backend's late pipeline can't fully recover
+    // what mid-pipeline mem2reg + LICM + SROA would have given,
+    // because the allocas' addresses are implicitly observable
+    // through pointer-typed parameters. `default<O2>` runs the
+    // canonical pass set (mem2reg, SROA, LICM, InstCombine,
+    // SimplifyCFG, GVN, etc.) — same as Clang -O2.
+    let pb_opts = inkwell::passes::PassBuilderOptions::create();
+    cx.module
+        .run_passes("default<O2>", &machine, pb_opts)
+        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
     machine
         .write_to_file(&cx.module, FileType::Object, &obj_path)
         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
