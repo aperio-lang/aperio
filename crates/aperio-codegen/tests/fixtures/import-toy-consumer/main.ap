@@ -1,0 +1,17 @@
+// import-toy-consumer/main.ap — exercises cross-seed import.
+//
+// `import "lib-toy" as toy;` resolves to the sibling directory
+// `../lib-toy/` (workspace-root fallback if entry-relative
+// search misses). The consumer references `toy::Greeter` (a
+// locus declared in greet.ap) and `toy::Formatted` (a type
+// declared in format.ap) — both via the `toy::` namespace
+// alias.
+
+import "../lib-toy" as toy;
+
+fn main() {
+    let g = toy::Greeter { prefix: "hi" };
+    let f = g.format("world");
+    println(f.head);
+    println(f.body);
+}

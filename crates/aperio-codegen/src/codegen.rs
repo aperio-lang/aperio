@@ -173,10 +173,29 @@ impl std::fmt::Display for CodegenError {
 impl std::error::Error for CodegenError {}
 
 /// Compile `program` to an executable at `output_path`. Uses
-/// `clang` to link the object file produced by LLVM.
+/// `clang` to link the object file produced by LLVM. Equivalent
+/// to `build_executable_with_imports(program, output_path, &[])`;
+/// callers with no cross-seed imports should use this entry point.
 pub fn build_executable(
     program: &Program,
     output_path: &Path,
+) -> Result<(), CodegenError> {
+    build_executable_with_imports(program, output_path, &[])
+}
+
+/// v1.x-IMPORT: variant of `build_executable` that accepts a
+/// per-build path-rename table for cross-seed imports. The caller
+/// (the CLI) resolves any `import "lib/X" as foo;` declarations,
+/// mangles each imported sub-program, merges the mangled decls
+/// into `program`, and passes the per-build table here. Each
+/// entry maps a segment vector (`["foo", "Bar"]`) to the mangled
+/// symbol name (`"__lib_foo_<stem>_Bar"`). The codegen consults
+/// this table after the static stdlib + moa tables when resolving
+/// qualified-name paths.
+pub fn build_executable_with_imports(
+    program: &Program,
+    output_path: &Path,
+    import_renames: &[(Vec<String>, String)],
 ) -> Result<(), CodegenError> {
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| CodegenError::LlvmInit(e.to_string()))?;
@@ -230,6 +249,10 @@ pub fn build_executable(
         user_types: BTreeMap::new(),
         user_enums: BTreeMap::new(),
         user_interfaces: BTreeSet::new(),
+        import_renames: import_renames
+            .iter()
+            .map(|(segs, mangled)| (segs.clone(), mangled.clone()))
+            .collect(),
         bus_state: None,
         deferred_dissolves: Vec::new(),
         in_main: false,
@@ -584,6 +607,15 @@ struct Cx<'ctx, 'p> {
     /// (the typechecker already enforces structural impl, so
     /// codegen just needs the layout, not a re-verified table).
     user_interfaces: BTreeSet<String>,
+    /// v1.x-IMPORT: per-build path-rename table for cross-seed
+    /// imports. Same shape as `STDLIB_PATH_RENAMES` /
+    /// `MOA_PATH_RENAMES` but populated per build from the user's
+    /// `import "lib/X" as foo;` declarations. Maps a qualified
+    /// segment vector (e.g. `["foo", "Bar"]`) to the mangler-
+    /// generated symbol name (e.g. `"__lib_foo_Y_Bar"`). Consulted
+    /// by `Cx::mangled_for_path` after the static stdlib + moa
+    /// tables.
+    import_renames: BTreeMap<Vec<String>, String>,
     /// Bus state generated when any locus declares a subscribe.
     /// `Some` iff the program contains at least one `bus subscribe`
     /// declaration. Bus storage itself lives in the C runtime
@@ -1249,6 +1281,23 @@ struct SelfCx<'ctx> {
 }
 
 impl<'ctx, 'p> Cx<'ctx, 'p> {
+    /// v1.x-IMPORT: resolve a qualified-name path to its mangled
+    /// symbol name. Consults the static `STDLIB_PATH_RENAMES` and
+    /// `MOA_PATH_RENAMES` tables (via `stdlib_mangled_for_path`)
+    /// first, then the per-build `import_renames` table populated
+    /// from the user's `import "..." as alias;` declarations.
+    /// Returns the mangled name as an owned String — the static
+    /// tables produce `&'static str` and the per-build table
+    /// produces an owned String, so the method's return is
+    /// uniformly owned.
+    fn mangled_for_path(&self, segs: &[&str]) -> Option<String> {
+        if let Some(name) = stdlib_mangled_for_path(segs) {
+            return Some(name.to_string());
+        }
+        let key: Vec<String> = segs.iter().map(|s| s.to_string()).collect();
+        self.import_renames.get(&key).cloned()
+    }
+
     fn declare_builtins(&self) {
         // declare i32 @printf(ptr, ...)
         let i32_t = self.context.i32_type();
@@ -4426,12 +4475,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect();
-                let mangled = stdlib_mangled_for_path(&segs).ok_or_else(|| {
+                let mangled_owned = self.mangled_for_path(&segs).ok_or_else(|| {
                     CodegenError::Unsupported(format!(
                         "qualified type `{}` not in stdlib path-renames table",
                         segs.join("::")
                     ))
                 })?;
+                let mangled: &str = &mangled_owned;
                 if self.user_loci.contains_key(mangled) {
                     Ok(CodegenTy::LocusRef(mangled.to_string()))
                 } else if self.user_types.contains_key(mangled) {
@@ -10021,8 +10071,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .map(|s| s.name.as_str())
                     .collect();
                 let resolved_name: String = if path.segments.len() > 1 {
-                    match stdlib_mangled_for_path(&segs) {
-                        Some(mangled) => mangled.to_string(),
+                    match self.mangled_for_path(&segs) {
+                        Some(mangled) => mangled,
                         None => {
                             return Err(CodegenError::Unsupported(format!(
                                 "qualified-name struct literal `{}`",
@@ -13443,12 +13493,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect();
-                let mangled = stdlib_mangled_for_path(&segs).ok_or_else(|| {
+                let mangled_owned = self.mangled_for_path(&segs).ok_or_else(|| {
                     CodegenError::Unsupported(format!(
                         "qualified-name struct literal `{}` in expression position",
                         segs.join("::")
                     ))
                 })?;
+                let mangled: &str = &mangled_owned;
                 if self.user_loci.contains_key(mangled) {
                     let ptr = self.lower_locus_instantiation(mangled, inits, scope)?;
                     Ok((ptr.into(), CodegenTy::LocusRef(mangled.to_string())))
@@ -18324,8 +18375,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // m84: path-qualified stdlib `type` records resolve via
             // the same table; we mustn't accidentally classify them
             // as locus literals (they have no dissolve to defer).
-            if let Some(mangled) = stdlib_mangled_for_path(&segs) {
-                return self.user_loci.contains_key(mangled);
+            if let Some(mangled) = self.mangled_for_path(&segs) {
+                return self.user_loci.contains_key(&mangled);
             }
         }
         false

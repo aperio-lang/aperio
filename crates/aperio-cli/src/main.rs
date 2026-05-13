@@ -129,89 +129,308 @@ fn collect_ap_files(target: &Path) -> Result<Vec<PathBuf>, String> {
     Err(format!("not a file or directory: {}", target.display()))
 }
 
-/// Parse a single entry file and recursively follow its
-/// `import "..."` directives, merging all encountered top-level
-/// declarations + imports into one logical Program. Paths
-/// resolve RELATIVE to the importing file's directory, with the
-/// `.ap` extension implicit (so `import "foo/bar"` from
-/// `proj/main.ap` opens `proj/foo/bar.ap`).
-///
-/// Cycles are tolerated by short-circuiting on already-visited
-/// canonical paths (the second sight contributes nothing new).
-/// The merged Program's `imports` list is left empty since
-/// resolution has already happened — no downstream pass needs
-/// to re-walk it.
-fn parse_with_imports(
-    entry: &Path,
-) -> Result<(Program, BTreeMap<PathBuf, String>), Vec<(PathBuf, aperio_syntax::Diag, String)>>
-{
-    let mut merged_items = Vec::new();
-    let mut sources: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut visited: std::collections::BTreeSet<PathBuf> =
-        std::collections::BTreeSet::new();
-    let mut errors: Vec<(PathBuf, aperio_syntax::Diag, String)> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![entry.to_path_buf()];
-    let mut entry_span_program: Option<Program> = None;
+/// Per-build path-rename table for cross-seed imports
+/// (v1.x-IMPORT). Each entry maps a qualified-name segment vector
+/// (e.g. `["foo", "Bar"]`) to the mangler-generated symbol name
+/// (`__lib_foo_<stem>_Bar`). Passed to
+/// `build_executable_with_imports` so codegen can resolve
+/// `alias::Name` references in user code.
+type ImportRenames = Vec<(Vec<String>, String)>;
 
-    while let Some(path) = stack.pop() {
-        let canon = match path.canonicalize() {
-            Ok(c) => c,
-            Err(_) => path.clone(),
+/// Walk upward from `start` looking for a `Cargo.toml`; the first
+/// directory containing one is treated as the workspace root.
+/// Used for the workspace-root fallback in import resolution.
+/// Returns `None` if no Cargo.toml is found before hitting the
+/// filesystem root (standalone-shipped binaries hit this — they
+/// can still use entry-relative imports, just not the
+/// workspace-fallback path).
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        if cur.join("Cargo.toml").is_file() {
+            return Some(cur);
+        }
+        cur = match cur.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return None,
         };
-        if !visited.insert(canon.clone()) {
+    }
+}
+
+/// What an `import "path" as alias;` resolved to on disk.
+enum ImportTarget {
+    /// `<importer_dir>/<path>.ap` (single-file lib).
+    SingleFile(PathBuf),
+    /// `<importer_dir>/<path>/` or `<workspace_root>/<path>/`
+    /// (directory bundle — one seed of multiple `.ap` files).
+    Directory(PathBuf),
+}
+
+/// Try the three resolution strategies in order: entry-relative
+/// single file, entry-relative directory, workspace-root directory.
+/// Returns `None` if none of them hit.
+fn resolve_import(
+    importer_dir: &Path,
+    workspace_root: Option<&Path>,
+    import_path: &str,
+) -> Option<ImportTarget> {
+    let single = importer_dir.join(format!("{}.ap", import_path));
+    if single.is_file() {
+        return Some(ImportTarget::SingleFile(single));
+    }
+    let dir_local = importer_dir.join(import_path);
+    if dir_local.is_dir() {
+        return Some(ImportTarget::Directory(dir_local));
+    }
+    if let Some(root) = workspace_root {
+        let dir_root = root.join(import_path);
+        if dir_root.is_dir() {
+            return Some(ImportTarget::Directory(dir_root));
+        }
+    }
+    None
+}
+
+/// Collect every `.ap` file at an import target. SingleFile
+/// resolves to one path; Directory enumerates the dir, sorting
+/// alphabetically for deterministic merge order (mirrors the
+/// per-dir seed convention from F.19).
+fn collect_target_files(t: &ImportTarget) -> Result<Vec<PathBuf>, String> {
+    match t {
+        ImportTarget::SingleFile(p) => Ok(vec![p.clone()]),
+        ImportTarget::Directory(d) => {
+            let mut out = Vec::new();
+            for entry in fs::read_dir(d).map_err(|e| e.to_string())? {
+                let e = entry.map_err(|e| e.to_string())?;
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("ap") {
+                    out.push(p);
+                }
+            }
+            out.sort();
+            if out.is_empty() {
+                return Err(format!(
+                    "imported directory {} contains no .ap files",
+                    d.display()
+                ));
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Resolve a flat list of import directives originating from one
+/// importer directory: for each import, locate the target on disk
+/// (entry-relative file or dir, workspace-root fallback dir),
+/// parse every `.ap` file, mangle each sub-program with the
+/// import alias + the file's stem, and merge the mangled items
+/// into `merged_items`. Populates `renames` with
+/// `(["<alias>", "<TopName>"], mangled_name)` entries so the
+/// codegen can resolve `alias::Name` references downstream.
+///
+/// Imports inside the imported libs themselves are NOT followed
+/// (strict barrier / no re-exports — see v1.x-IMPORT handoff).
+fn resolve_imports(
+    imports: &[aperio_syntax::ast::Import],
+    importer_dir: &Path,
+    workspace_root: Option<&Path>,
+    visited: &mut std::collections::BTreeSet<PathBuf>,
+    sources: &mut BTreeMap<PathBuf, String>,
+    errors: &mut Vec<(PathBuf, aperio_syntax::Diag, String)>,
+    merged_items: &mut Vec<aperio_syntax::ast::TopDecl>,
+    renames: &mut ImportRenames,
+) -> Result<(), ()> {
+    for imp in imports {
+        // `import "std" as ...;` would be malformed at the spec
+        // level — std is the bundled namespace, not a vendored
+        // lib. Defensive skip; the parser doesn't reject it yet.
+        if imp.path.starts_with("std/") || imp.path == "std" {
             continue;
         }
-        let source = match fs::read_to_string(&path) {
-            Ok(s) => s,
+        let alias = match &imp.alias {
+            Some(a) => a.clone(),
+            None => continue, // v1.x-IMPORT PR1 enforces; defensive.
+        };
+        let target = match resolve_import(importer_dir, workspace_root, &imp.path) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "could not resolve import \"{}\": tried {}/{}.ap, {}/{}/, \
+                     and workspace-root/{}/",
+                    imp.path,
+                    importer_dir.display(),
+                    imp.path,
+                    importer_dir.display(),
+                    imp.path,
+                    imp.path,
+                );
+                return Err(());
+            }
+        };
+        let files = match collect_target_files(&target) {
+            Ok(f) => f,
             Err(e) => {
-                eprintln!("could not read {}: {}", path.display(), e);
-                return Err(errors);
+                eprintln!("import \"{}\": {}", imp.path, e);
+                return Err(());
             }
         };
-        let program = match aperio_syntax::parse_source(&source) {
-            Ok(p) => p,
-            Err(diags) => {
-                for d in diags {
-                    errors.push((path.clone(), d, source.clone()));
-                }
-                sources.insert(canon, source);
-                continue;
-            }
-        };
-        // Follow imports relative to THIS file's directory.
-        // Imports beginning with `std/` are stdlib namespace
-        // markers — the toolchain handles `time::sleep`,
-        // `time::monotonic`, etc. as built-ins, so there's no
-        // on-disk source to load. Silently skip those.
-        let dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-        for imp in &program.imports {
-            if imp.path.starts_with("std/") || imp.path == "std" {
-                continue;
-            }
-            let mut p = dir.clone();
-            p.push(format!("{}.ap", imp.path));
-            stack.push(p);
+        // Parse every file in the import target into a parallel
+        // (file_path, stem, source, Program) list, recording the
+        // canon path in `visited` so we don't double-parse.
+        struct ParsedLibFile {
+            path: PathBuf,
+            canon: PathBuf,
+            stem: String,
+            source: String,
+            program: aperio_syntax::ast::Program,
         }
-        sources.insert(canon, source);
-        if entry_span_program.is_none() {
-            // Use the entry program's span / shape as the
-            // skeleton; just collect items from imports into it.
-            entry_span_program = Some(Program {
-                items: Vec::new(),
-                imports: Vec::new(),
-                span: program.span,
+        let mut parsed_files: Vec<ParsedLibFile> = Vec::new();
+        for file in files {
+            let canon = file.canonicalize().unwrap_or_else(|_| file.clone());
+            if !visited.insert(canon.clone()) {
+                continue;
+            }
+            let source = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "could not read imported file {} (from import \"{}\"): {}",
+                        file.display(),
+                        imp.path,
+                        e
+                    );
+                    return Err(());
+                }
+            };
+            let program = match aperio_syntax::parse_source(&source) {
+                Ok(p) => p,
+                Err(diags) => {
+                    for d in diags {
+                        errors.push((file.clone(), d, source.clone()));
+                    }
+                    sources.insert(canon, source);
+                    continue;
+                }
+            };
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unnamed")
+                .to_string();
+            parsed_files.push(ParsedLibFile {
+                path: file,
+                canon,
+                stem,
+                source,
+                program,
             });
         }
-        merged_items.extend(program.items);
+        if parsed_files.is_empty() {
+            continue;
+        }
+        // Build the unified rename map across every file in this
+        // import target. Cross-file references inside the lib
+        // (e.g. greet.ap uses a type declared in format.ap)
+        // resolve through this shared map.
+        let stem_prog_refs: Vec<(String, &aperio_syntax::ast::Program)> = parsed_files
+            .iter()
+            .map(|f| (f.stem.clone(), &f.program))
+            .collect();
+        let seed_renames =
+            aperio_codegen::mangle::build_seed_renames(&stem_prog_refs, &alias);
+        // Mangle each file's program with the shared map.
+        for pf in parsed_files.iter_mut() {
+            aperio_codegen::mangle::mangle_with_renames(&mut pf.program, &seed_renames);
+        }
+        // Populate the per-build path-rename table.
+        for (name, mangled) in &seed_renames {
+            renames.push((vec![alias.clone(), name.clone()], mangled.clone()));
+        }
+        // Move mangled items into the merged program; stash sources.
+        for pf in parsed_files {
+            merged_items.extend(pf.program.items);
+            sources.insert(pf.canon, pf.source);
+            let _ = pf.path; // path was only needed for diagnostics above
+        }
+    }
+    Ok(())
+}
+
+/// Parse a single-file entry, follow its `import "..." as alias;`
+/// directives, and produce the merged Program + per-build path-
+/// rename table. Imports inside imported libs are NOT followed
+/// (strict barrier). Cycles are tolerated by canonical-path
+/// short-circuit.
+fn parse_with_imports(
+    entry: &Path,
+) -> Result<
+    (Program, ImportRenames, BTreeMap<PathBuf, String>),
+    Vec<(PathBuf, aperio_syntax::Diag, String)>,
+> {
+    let mut sources: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut errors: Vec<(PathBuf, aperio_syntax::Diag, String)> = Vec::new();
+    let mut visited: std::collections::BTreeSet<PathBuf> =
+        std::collections::BTreeSet::new();
+
+    let workspace_root = find_workspace_root(entry);
+    let entry_dir = entry
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    let entry_canon = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf());
+    let entry_source = match fs::read_to_string(entry) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not read {}: {}", entry.display(), e);
+            return Err(errors);
+        }
+    };
+    let entry_program = match aperio_syntax::parse_source(&entry_source) {
+        Ok(p) => p,
+        Err(diags) => {
+            for d in diags {
+                errors.push((entry.to_path_buf(), d, entry_source.clone()));
+            }
+            return Err(errors);
+        }
+    };
+    visited.insert(entry_canon.clone());
+    sources.insert(entry_canon, entry_source);
+
+    let mut merged_items = entry_program.items;
+    let mut renames: ImportRenames = Vec::new();
+
+    if resolve_imports(
+        &entry_program.imports,
+        &entry_dir,
+        workspace_root.as_deref(),
+        &mut visited,
+        &mut sources,
+        &mut errors,
+        &mut merged_items,
+        &mut renames,
+    )
+    .is_err()
+    {
+        return Err(errors);
     }
 
     if !errors.is_empty() {
         return Err(errors);
     }
-    let mut prog = entry_span_program.expect("at least one parse succeeded");
-    prog.items = merged_items;
-    Ok((prog, sources))
+    let merged = Program {
+        imports: Vec::new(),
+        items: merged_items,
+        span: entry_program.span,
+    };
+    Ok((merged, renames, sources))
 }
+
 
 fn parse_files(
     files: &[PathBuf],
@@ -286,7 +505,13 @@ fn run_program(target: &Path) -> ExitCode {
     // them as today (multi-file projects without import wiring
     // — useful for ad-hoc test setups).
     if target.is_file() {
-        let (program, sources) = match parse_with_imports(target) {
+        // `aperio run` ignores the import_renames table — the
+        // interpreter doesn't currently resolve qualified-name
+        // paths (it already fails on `std::http::Request { ... }`
+        // per the known limitation). Cross-seed imports through
+        // `aperio run` will likewise fail on `alias::Name` paths;
+        // use `aperio build` for programs with imports.
+        let (program, _renames, sources) = match parse_with_imports(target) {
             Ok(x) => x,
             Err(errors) => {
                 for (path, d, src) in &errors {
@@ -373,8 +598,8 @@ fn run_build(target: &Path) -> ExitCode {
     // binary). The directory shape is the user-facing answer to
     // the single-file-app-monolith friction; the file shape stays
     // for backwards compatibility and for one-off scripts.
-    let (program, sources, output) = if target.is_file() {
-        let (program, sources) = match parse_with_imports(target) {
+    let (program, renames, sources, output) = if target.is_file() {
+        let (program, renames, sources) = match parse_with_imports(target) {
             Ok(x) => x,
             Err(errors) => {
                 for (path, d, src) in &errors {
@@ -386,7 +611,7 @@ fn run_build(target: &Path) -> ExitCode {
         };
         // hello-world.ap → hello-world
         let output = target.with_extension("");
-        (program, sources, output)
+        (program, renames, sources, output)
     } else if target.is_dir() {
         let files = match collect_ap_files(target) {
             Ok(f) => f,
@@ -399,12 +624,70 @@ fn run_build(target: &Path) -> ExitCode {
             Ok(x) => x,
             Err(code) => return code,
         };
+        // Collect the union of all imports across the bundle's
+        // files. Multiple files in one seed may share an import
+        // alias (e.g. both reference `lib/foo`); the visited-set
+        // inside resolve_imports dedupes by canonical file path,
+        // so the same import resolved twice is a no-op.
+        let mut union_imports: Vec<aperio_syntax::ast::Import> = Vec::new();
+        for prog in programs.values() {
+            for imp in &prog.imports {
+                union_imports.push(imp.clone());
+            }
+        }
         let merged = match merge_programs(programs.values()) {
             Some(m) => m,
             None => {
                 eprintln!("no .ap files in {}", target.display());
                 return ExitCode::from(1);
             }
+        };
+        // Resolve the union of imports against the directory's
+        // own dir as the importer dir + the workspace fallback.
+        let workspace_root = find_workspace_root(target);
+        let mut merged_items = merged.items;
+        let mut renames: ImportRenames = Vec::new();
+        let mut path_sources: BTreeMap<PathBuf, String> =
+            sources.into_iter().collect();
+        let mut visited: std::collections::BTreeSet<PathBuf> =
+            std::collections::BTreeSet::new();
+        for f in &files {
+            if let Ok(c) = f.canonicalize() {
+                visited.insert(c);
+            } else {
+                visited.insert(f.clone());
+            }
+        }
+        let mut import_errors: Vec<(PathBuf, aperio_syntax::Diag, String)> = Vec::new();
+        if resolve_imports(
+            &union_imports,
+            target,
+            workspace_root.as_deref(),
+            &mut visited,
+            &mut path_sources,
+            &mut import_errors,
+            &mut merged_items,
+            &mut renames,
+        )
+        .is_err()
+        {
+            for (path, d, src) in &import_errors {
+                eprintln!("{}:", path.display());
+                eprintln!("  {}", d.render(src));
+            }
+            return ExitCode::from(1);
+        }
+        if !import_errors.is_empty() {
+            for (path, d, src) in &import_errors {
+                eprintln!("{}:", path.display());
+                eprintln!("  {}", d.render(src));
+            }
+            return ExitCode::from(1);
+        }
+        let with_imports = Program {
+            imports: Vec::new(),
+            items: merged_items,
+            span: merged.span,
         };
         // apps/ferryman/ → ferryman; output lands next to target.
         let bin_name = target
@@ -413,11 +696,7 @@ fn run_build(target: &Path) -> ExitCode {
             .unwrap_or_else(|| "main".to_string());
         let mut output = target.to_path_buf();
         output.push(&bin_name);
-        let path_sources: BTreeMap<PathBuf, String> = sources
-            .into_iter()
-            .map(|(k, v)| (k, v))
-            .collect();
-        (merged, path_sources, output)
+        (with_imports, renames, path_sources, output)
     } else {
         eprintln!("not a file or directory: {}", target.display());
         return ExitCode::from(1);
@@ -440,7 +719,7 @@ fn run_build(target: &Path) -> ExitCode {
         }
         return ExitCode::from(1);
     }
-    match aperio_codegen::build_executable(&program, &output) {
+    match aperio_codegen::build_executable_with_imports(&program, &output, &renames) {
         Ok(()) => {
             eprintln!("built: {}", output.display());
             ExitCode::SUCCESS

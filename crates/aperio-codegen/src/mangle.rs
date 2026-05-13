@@ -35,6 +35,15 @@ use aperio_syntax::ast::*;
 /// intra-seed references carry the `__lib_<alias>_<file_stem>_*`
 /// prefix. `file_stem` is the basename of the source file the
 /// program was parsed from, without the `.ap` extension.
+///
+/// This entry is correct only for single-file libraries (or
+/// multi-file libraries whose files don't reference each other).
+/// For multi-file libraries with intra-seed cross-file references,
+/// use `build_seed_renames` + `mangle_with_renames` so every file
+/// shares a unified name table — otherwise a reference from
+/// `a.ap` to a decl in `b.ap` won't resolve, since the mangler
+/// only sees `a.ap`'s own top-level decls when building its
+/// rename map.
 pub fn mangle_program(prog: &mut Program, alias: &str, file_stem: &str) {
     let mut renames: HashMap<String, String> = HashMap::new();
     for item in &prog.items {
@@ -42,11 +51,44 @@ pub fn mangle_program(prog: &mut Program, alias: &str, file_stem: &str) {
             renames.insert(n.to_string(), mangled(alias, file_stem, n));
         }
     }
+    mangle_with_renames(prog, &renames);
+}
+
+/// Build the unified `name -> mangled_name` map for a multi-file
+/// library: every program in the bundle contributes its top-level
+/// names. Pair with `mangle_with_renames` to mangle each file
+/// against the shared map so cross-file references resolve.
+///
+/// `programs` is a slice of `(file_stem, &Program)` pairs — the
+/// stem becomes part of the mangled prefix for that file's own
+/// decls, while use-sites of any name in the seed resolve through
+/// the shared map regardless of which file the use-site lives in.
+pub fn build_seed_renames(
+    programs: &[(String, &Program)],
+    alias: &str,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for (stem, prog) in programs {
+        for item in &prog.items {
+            if let Some(n) = top_decl_name(item) {
+                out.insert(n.to_string(), mangled(alias, stem, n));
+            }
+        }
+    }
+    out
+}
+
+/// Mangle `prog` using a pre-built `renames` map. Used by the CLI
+/// when mangling multi-file libraries: the caller builds one
+/// unified map via `build_seed_renames` then applies it to each
+/// file, so a use-site in `a.ap` referencing a decl in `b.ap`
+/// rewrites to the correct mangled name.
+pub fn mangle_with_renames(prog: &mut Program, renames: &HashMap<String, String>) {
     if renames.is_empty() {
         return;
     }
     let mut walker = Mangler {
-        renames: &renames,
+        renames,
         scopes: Vec::new(),
     };
     for item in &mut prog.items {

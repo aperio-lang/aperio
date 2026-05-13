@@ -32,4 +32,4 @@
 pub mod codegen;
 pub mod mangle;
 
-pub use codegen::{build_executable, CodegenError};
+pub use codegen::{build_executable, build_executable_with_imports, CodegenError};
