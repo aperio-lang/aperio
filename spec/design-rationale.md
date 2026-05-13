@@ -547,16 +547,34 @@ inference problems that have historically made region-based MM
 hard (Tofte-Talpin region inference is hard; here, the hierarchy
 is explicit in the source).
 
-Allocation strategy varies by projection class:
+The projection class is a **perspective-resolution
+commitment** — a declaration of what observation granularity
+the locus serves to perspectives one tower up. Storage
+strategy is downstream of that commitment, not the commitment
+itself:
 
-- `rich`: per-locus arena, low churn, freed on dissolution.
-- `chunked`: per-locus arena with per-coordinatee sub-regions,
-  freed on each coordinatee dissolution.
-- `recognition`: pre-allocated fixed pool, no dynamic allocation
-  in steady state.
+- **`rich`** — fine-grained. Perspectives address individual
+  children by name; each child carries its own state worth
+  observing in detail. Storage consequence: per-locus arena
+  per child, low churn, freed on dissolution.
+- **`chunked`** — mid-grained. Perspectives operate over
+  chunks or ranges; the parent commits to "I'll serve
+  observations at chunk resolution." Storage consequence:
+  per-locus arena with per-coordinatee sub-regions, freed on
+  each coordinatee dissolution. The sub-region shape is what
+  makes chunk-level observation cheap.
+- **`recognition`** — aggregate. Perspectives operate over
+  the population, not individuals — "represent as a curve,"
+  "represent as a histogram," "represent as a count." At
+  this resolution, individual child types stop mattering;
+  the perspective consumes the population's structural shape.
+  Storage consequence: pre-allocated fixed pool (or shared
+  slab); cell stride derived from the accept-method type
+  union; no dynamic allocation in steady state.
 
-The compiler picks the allocator based on the locus's projection
-class.
+The compiler picks the allocator based on the locus's
+declared resolution. The resolution choice is what's
+load-bearing; the allocator is its implementation.
 
 **Considered and rejected.**
 
@@ -842,6 +860,19 @@ determinism, scheduler design prefers runtime throughput.
 to Go's `any`. The constraint `<T: ProjectionClass>` requires
 T to be `Rich`, `Chunked`, or `Recognition`. No full trait
 system in v0; the constraint is built into the compiler.
+
+The three classes are a **perspective-resolution gradient**,
+not three flavors of allocation strategy. Rich serves
+fine-grained observation (named-child resolution); chunked
+serves mid-grained observation (chunk-level resolution);
+recognition serves aggregate observation (population-level
+resolution — "curve," "histogram," "count"). The allocator
+choice in each case is *downstream* of the resolution
+commitment: rich's per-child arenas make per-child
+observation cheap; chunked's parent-arena sub-regions make
+chunk observation cheap; recognition's recpool makes
+population observation cheap. See section 11 (region-based
+memory) for the storage consequences.
 
 This resolves the open question of "how does a generic bound
 work without traits" without adding type-system surface. If

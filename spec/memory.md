@@ -48,9 +48,18 @@ region references).
 
 ## Per-projection-class allocation
 
-A locus's projection class (rich / chunked / recognition)
-determines its allocator strategy. Same syntactic source, three
-generated implementations:
+A locus's projection class (rich / chunked / recognition) is
+a **perspective-resolution commitment** — a declaration of
+what observation granularity the locus serves to perspectives
+one tower up. Rich serves named-child observation (fine
+resolution); chunked serves chunk-level observation (mid
+resolution); recognition serves population-level observation
+(aggregate resolution — "represent as a curve," "as a
+histogram," "as a count"). The allocator strategy below is a
+*consequence* of the resolution commitment, not the
+commitment itself — same syntactic source, three generated
+implementations chosen to make observation at the declared
+resolution cheap:
 
 | Projection class | Allocator | Coordinatee model |
 |---|---|---|
