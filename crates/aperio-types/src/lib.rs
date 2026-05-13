@@ -971,12 +971,120 @@ mod tests {
         );
     }
 
+    // === v1.x-FORM-4 PR2 tests ===========================
+    //
+    // @form(hashmap) shape contract: exactly one `pool` slot
+    // with `indexed_by <fieldname>` on a struct cell type whose
+    // field exists.
+
     #[test]
-    fn err_form_hashmap_not_yet_implemented() {
+    fn ok_form_hashmap_with_correct_shape() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { Registry { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean check on @form(hashmap) with pool + indexed_by, \
+             got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_with_heap_slot() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { heap entries of Entry indexed_by name; }
+            }
+            fn main() { Registry { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("@form(hashmap) requires a `pool` slot")),
+            "expected heap-rejected diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_missing_indexed_by() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry; }
+            }
+            fn main() { Registry { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("must declare `indexed_by")),
+            "expected missing-indexed_by diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_field_does_not_exist() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Entry indexed_by nope; }
+            }
+            fn main() { Registry { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("has no field `nope`")),
+            "expected field-not-found diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_cell_is_primitive() {
         let src = r#"
             @form(hashmap)
+            locus Registry {
+                capacity { pool entries of Int indexed_by name; }
+            }
+            fn main() { Registry { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("must be a user-declared struct")),
+            "expected primitive-cell-rejected diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_with_multiple_slots() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap)
             locus L {
-                capacity { pool entries of Int; }
+                capacity {
+                    pool entries of Entry indexed_by name;
+                    heap log of Int;
+                }
             }
             fn main() { L { }; }
         "#;
@@ -984,8 +1092,50 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("not yet implemented")),
-            "expected hashmap-deferred diag, got: {:?}",
+                .any(|d| d.message.contains("exactly one capacity slot")),
+            "expected multiple-slots diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_with_args() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, cap = 64)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("@form(hashmap) takes no arguments")),
+            "expected hashmap-no-args diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_ring_buffer_still_deferred() {
+        // ring_buffer is the one form name that still rejects
+        // with "not yet implemented" — guards the FORM-4 split
+        // (hashmap shipped, ring_buffer pending).
+        let src = r#"
+            @form(ring_buffer)
+            locus L {
+                capacity { pool history of Int; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("ring_buffer") && d.message.contains("not yet implemented")),
+            "expected ring_buffer-deferred diag, got: {:?}",
             diags
         );
     }

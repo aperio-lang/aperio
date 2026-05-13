@@ -347,19 +347,19 @@ impl<'a> Checker<'a> {
 
     /// v1.x-FORM-1: verify a `@form(<name>)` annotation's
     /// shape contract against the locus's actual capacity
-    /// declaration. v1 ships `@form(vec)` shape checks;
-    /// other form names are rejected as "not yet implemented."
+    /// declaration. v1 ships `@form(vec)` (v1.x-FORM-2) and
+    /// `@form(hashmap)` (v1.x-FORM-4) shape checks;
+    /// `@form(ring_buffer)` is recognized but pending.
     fn check_form_shape(&mut self, decl: &'a LocusDecl, form: &'a FormAnnotation) {
         match form.name.name.as_str() {
             "vec" => self.check_form_vec_shape(decl, form),
-            "hashmap" | "ring_buffer" => {
+            "hashmap" => self.check_form_hashmap_shape(decl, form),
+            "ring_buffer" => {
                 self.diags.push(Diag::ty(
                     form.span,
-                    format!(
-                        "@form({}) recognized but not yet implemented \
-                         (FORM-4 work; v1 ships @form(vec) only)",
-                        form.name.name
-                    ),
+                    "@form(ring_buffer) recognized but not yet implemented \
+                     (FORM-4 pending; v1 ships @form(vec) and @form(hashmap))"
+                        .to_string(),
                 ));
             }
             other => {
@@ -373,6 +373,189 @@ impl<'a> Checker<'a> {
                 ));
             }
         }
+    }
+
+    /// v1.x-FORM-4: `@form(hashmap)` requires exactly one
+    /// capacity slot, of kind `pool`, with an `indexed_by
+    /// <fieldname>` clause. The slot's cell type must be a
+    /// user-declared struct; the indexed-by field must exist
+    /// on that struct. The field's type becomes the hashmap
+    /// key type K; the cell type becomes the value type S.
+    fn check_form_hashmap_shape(&mut self, decl: &'a LocusDecl, form: &'a FormAnnotation) {
+        if !form.args.is_empty() {
+            self.diags.push(Diag::ty(
+                form.span,
+                format!(
+                    "@form(hashmap) takes no arguments; got {} (hashmap has no \
+                     tuning knobs in v1 — drop the arg list)",
+                    form.args.len()
+                ),
+            ));
+        }
+        let capacity = decl.members.iter().find_map(|m| match m {
+            LocusMember::Capacity(cb) => Some(cb),
+            _ => None,
+        });
+        let cb = match capacity {
+            Some(cb) => cb,
+            None => {
+                self.diags.push(Diag::ty(
+                    form.span,
+                    "@form(hashmap) requires exactly one `pool` capacity slot \
+                     with `indexed_by <fieldname>`; found no `capacity { ... }` \
+                     block on this locus"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        if cb.slots.is_empty() {
+            self.diags.push(Diag::ty(
+                cb.span,
+                "@form(hashmap) requires exactly one `pool` capacity slot \
+                 with `indexed_by <fieldname>`; found an empty capacity block"
+                    .to_string(),
+            ));
+            return;
+        }
+        if cb.slots.len() > 1 {
+            self.diags.push(Diag::ty(
+                cb.span,
+                format!(
+                    "@form(hashmap) requires exactly one capacity slot; \
+                     found {} slots. Hashmap is a single keyed store.",
+                    cb.slots.len()
+                ),
+            ));
+            return;
+        }
+        let slot = &cb.slots[0];
+        // Slot kind must be Pool (cells recycle as entries come
+        // and go); Heap doesn't model the "bounded recyclable
+        // population" the hashmap needs.
+        match slot.kind {
+            CapacitySlotKind::Pool => {}
+            CapacitySlotKind::Heap => {
+                self.diags.push(Diag::ty(
+                    slot.span,
+                    format!(
+                        "@form(hashmap) requires a `pool` slot; got `heap {} \
+                         of ...`. Hashmap recycles cells as entries are \
+                         inserted and removed — that's the `pool` discipline. \
+                         `heap` is the unordered growable shape (use @form(vec)).",
+                        slot.name.name
+                    ),
+                ));
+            }
+        }
+        // Slot must declare `indexed_by <fieldname>`.
+        let field_ident = match &slot.indexed_by {
+            Some(i) => i,
+            None => {
+                self.diags.push(Diag::ty(
+                    slot.span,
+                    format!(
+                        "@form(hashmap) slot `{}` must declare `indexed_by \
+                         <fieldname>` naming the field of the cell type that \
+                         serves as the hashmap key",
+                        slot.name.name
+                    ),
+                ));
+                return;
+            }
+        };
+        // The cell type must be a user-declared struct so we can
+        // verify the indexed-by field exists. Primitives, enums,
+        // and locus refs are rejected.
+        let cell_name = match &slot.elem_ty {
+            TypeExpr::Named { path, .. } if path.segments.len() == 1 => {
+                path.segments[0].name.clone()
+            }
+            _ => {
+                self.diags.push(Diag::ty(
+                    slot.elem_ty.span(),
+                    "@form(hashmap) cell type must be a user-declared struct \
+                     (so the `indexed_by` field can resolve to a typed key); \
+                     got a primitive, qualified path, or composite type"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let field_ty = match self.top.lookup(&cell_name) {
+            Some(TopSymbol::Type(info)) => match &info.kind {
+                TypeKind::Struct(fields) => {
+                    match fields.iter().find(|f| f.name == field_ident.name) {
+                        Some(f) => f.ty.clone(),
+                        None => {
+                            self.diags.push(Diag::ty(
+                                field_ident.span,
+                                format!(
+                                    "@form(hashmap) cell type `{}` has no field \
+                                     `{}` — the `indexed_by` field must exist on \
+                                     the cell struct",
+                                    cell_name, field_ident.name
+                                ),
+                            ));
+                            return;
+                        }
+                    }
+                }
+                TypeKind::Enum(_) => {
+                    self.diags.push(Diag::ty(
+                        slot.elem_ty.span(),
+                        format!(
+                            "@form(hashmap) cell type `{}` is an enum; cell \
+                             must be a struct so `indexed_by` can resolve to a \
+                             typed key field",
+                            cell_name
+                        ),
+                    ));
+                    return;
+                }
+                TypeKind::Alias(_) => {
+                    self.diags.push(Diag::ty(
+                        slot.elem_ty.span(),
+                        format!(
+                            "@form(hashmap) cell type `{}` is a type alias; \
+                             cell must be a struct so `indexed_by` can resolve",
+                            cell_name
+                        ),
+                    ));
+                    return;
+                }
+            },
+            Some(TopSymbol::Locus(_)) => {
+                self.diags.push(Diag::ty(
+                    slot.elem_ty.span(),
+                    format!(
+                        "@form(hashmap) cell type `{}` is a locus; cells must \
+                         be value-shape types (struct), not loci with lifecycle",
+                        cell_name
+                    ),
+                ));
+                return;
+            }
+            _ => {
+                // Cell type unresolved — separate error already
+                // raised by the type resolver. Skip further checks
+                // so we don't double-report.
+                return;
+            }
+        };
+        // as_parent_for and form-lowered slots don't compose:
+        // the form owns the slot's allocator.
+        if slot.as_parent_for.is_some() {
+            self.diags.push(Diag::ty(
+                slot.span,
+                "@form(hashmap) slot cannot also be an `as_parent_for` \
+                 override; form-lowered slots own their own allocator"
+                    .to_string(),
+            ));
+        }
+        // PR3 reads the key type `field_ty` to synthesize methods;
+        // for now we just verified it resolves.
+        let _ = field_ty;
     }
 
     /// v1.x-FORM-1: `@form(vec)` requires exactly one capacity
