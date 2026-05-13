@@ -572,13 +572,14 @@ passes `sizeof(T)` at each call site.
 ### Failure shapes
 
 - `lotus_vec_get` / `lotus_vec_pop` return 0 on contract
-  break (out-of-bounds / empty). Codegen (PR5/6 pending)
-  wraps this into the `Ty::Fallible { success: T, payload:
-  IndexError }` surface via a small adapter that synthesizes
-  the `IndexError` struct from the bool + the call args.
-- `lotus_vec_push` OOM is currently a best-effort no-op; the
-  proper substrate trap → closure violation routing lands
-  with PR5/6.
+  break (out-of-bounds / empty). Codegen wraps this into the
+  `Ty::Fallible { success: T, payload: IndexError }` surface
+  via a small adapter that synthesizes the `IndexError`
+  struct from the bool + the call args (shipped v1.x-FORM-2
+  PR5/6).
+- `lotus_vec_push` OOM routes through the substrate-trap →
+  closure-violation channel per the two-channel rule (shipped
+  v1.x-FORM-2 PR6).
 
 ### Interpreter parity
 
