@@ -223,9 +223,11 @@ impl<'a> Mangler<'a> {
             LocusMember::Mode(md) => self.walk_fn_like(&mut md.params, md.ret.as_mut(), &mut md.body),
             LocusMember::Failure(f) => self.walk_fn_like(&mut f.params, None, &mut f.body),
             LocusMember::Closure(c) => {
-                self.walk_expr(&mut c.assertion.left);
-                self.walk_expr(&mut c.assertion.right);
-                self.walk_expr(&mut c.assertion.tolerance);
+                if let Some(a) = &mut c.assertion {
+                    self.walk_expr(&mut a.left);
+                    self.walk_expr(&mut a.right);
+                    self.walk_expr(&mut a.tolerance);
+                }
                 for cl in &mut c.clauses {
                     if let ClosureClause::Epoch(EpochSpec::Duration(e)) = cl {
                         self.walk_expr(e);
@@ -428,6 +430,11 @@ impl<'a> Mangler<'a> {
                     match m {
                         RecoveryModifier::For(e) | RecoveryModifier::Until(e) => self.walk_expr(e),
                     }
+                }
+            }
+            Stmt::Violate { payload, .. } => {
+                if let Some(p) = payload {
+                    self.walk_expr(p);
                 }
             }
             Stmt::Send { subject, value, .. } => {

@@ -282,8 +282,13 @@ failure_decl      = "on_failure" , "(" , param_list , ")" , block ;
    the band. Epoch annotations control how the test handles
    coordinatee churn and recovery events. *)
 
+(* v1.x-VIOLATE (F.27): the assertion is optional when an
+   `epoch inline` clause is present. An inline closure is a
+   named structural-failure tag fired via `violate`; it has no
+   band to audit, so the assertion is dead syntax. For all
+   other epochs the assertion is required. *)
 closure_decl      = "closure" , IDENTIFIER , "{" ,
-                    closure_assertion , ";" ,
+                    [ closure_assertion , ";" ] ,
                     { closure_clause } ,
                     "}" ;
 
@@ -296,14 +301,24 @@ closure_decl      = "closure" , IDENTIFIER , "{" ,
 closure_assertion = expression , ( "~~" | "approx" ) , expression ,
                     "within" , expression ;
 
+(* `captures` (v1.x-VIOLATE) is a *contextual* keyword: the
+   lexer emits it as IDENTIFIER; the parser recognizes it as a
+   clause keyword only inside `closure { ... }`. *)
 closure_clause    = "epoch" , epoch_spec , ";"
                   | "persists_through" , "(" , identifier_list , ")" , ";"
                   | "resets_on" , "(" , identifier_list , ")" , ";"
+                  | "captures" , ":" , identifier_list , ";"
                   ;
 
+(* `inline` (v1.x-VIOLATE) is a *contextual* keyword:
+   recognized only as an `epoch_spec` variant; ordinary
+   identifier elsewhere. *)
 epoch_spec        = "tick"
                   | "duration" , "(" , expression , ")"
+                  | "birth"
+                  | "dissolve"
                   | "explicit"
+                  | "inline"
                   ;
 
 
@@ -453,6 +468,7 @@ statement         = let_stmt
                   | continue_stmt
                   | yield_stmt
                   | recovery_stmt
+                  | violate_stmt
                   | fail_stmt
                   | block
                   | expr_stmt
@@ -531,6 +547,18 @@ recovery_op       = "restart"
 recovery_modifier = "for" , expression
                   | "until" , expression
                   ;
+
+(* v1.x-VIOLATE (F.27): escalate a caught value error into a
+   structural failure by firing a named, epoch-inline closure
+   declared on the enclosing locus. Statement-level; divergent
+   (typecheck treats as Never). Optional `with EXPR` adds a
+   user-shaped payload to the synthesized ClosureViolation.
+
+   `violate` is a *contextual* keyword — recognized only as the
+   leading token of a statement inside a locus method body.
+   Outside that position it's an ordinary identifier. *)
+violate_stmt      = "violate" , IDENTIFIER ,
+                    [ "with" , expression ] , ";" ;
 
 expr_stmt         = expression , ";" ;
 

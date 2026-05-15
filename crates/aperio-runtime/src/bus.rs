@@ -441,6 +441,7 @@ mod tests {
                 dissolved: Rc::new(std::cell::Cell::new(false)),
                 restart_count: Rc::new(std::cell::Cell::new(0)),
                 quarantined: Rc::new(std::cell::Cell::new(false)),
+                draining: Rc::new(std::cell::Cell::new(false)),
                 duration_last_fire: Rc::new(RefCell::new(Vec::new())),
                 parent: Rc::new(RefCell::new(None)),
                 restart_in_place_pending: Rc::new(std::cell::Cell::new(false)),

@@ -1150,6 +1150,9 @@ fn stmt_reads_self_children(s: &Stmt) -> bool {
         Stmt::Fail { value, .. } => expr_reads_self_children(value),
         Stmt::Block(b) => block_reads_self_children(b),
         Stmt::Recovery { args, .. } => args.iter().any(expr_reads_self_children),
+        Stmt::Violate { payload, .. } => {
+            payload.as_ref().is_some_and(expr_reads_self_children)
+        }
         Stmt::Send { subject, value, .. } => {
             expr_reads_self_children(subject) || expr_reads_self_children(value)
         }
@@ -1421,6 +1424,13 @@ struct LocusInfo<'ctx> {
     /// `__restart_count` — the kind flag only changes whether
     /// the re-run preserves state.
     restart_in_place_pending_field_idx: u32,
+    /// v1.x-VIOLATE (F.27): index of the synthetic
+    /// `__drain_requested: i64` flag. Zero at instantiation; set
+    /// to 1 when `violate NAME;` fires inside a method body on
+    /// this locus. Read as `self.draining` (the typechecker
+    /// resolves the synthetic Bool field; this codegen LocusInfo
+    /// entry carries the layout index for the load).
+    drain_requested_field_idx: u32,
     /// v1.x-4b: index of the synthetic `__slot_borrowed_mask:
     /// i64` field. Always present (uniform locus-struct layout).
     /// Bit N (LSB = slot 0 in declaration order) is set iff this
@@ -7107,6 +7117,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let restart_in_place_pending_field_idx = idx;
         llvm_field_tys.push(i64_t_struct.into());
         idx += 1;
+        // v1.x-VIOLATE (F.27): synthetic __drain_requested flag.
+        // Zero-initialized at instantiation; set by `violate
+        // NAME;` lowering when the time comes; read by
+        // `self.draining` from user code. Always present so the
+        // synthetic field surface stays uniform across loci with
+        // or without inline closures.
+        let drain_requested_field_idx = idx;
+        llvm_field_tys.push(i64_t_struct.into());
+        idx += 1;
         // v1.x-4b: synthetic __slot_borrowed_mask — bit N is set
         // iff the Nth capacity slot was borrowed from a parent
         // via `as_parent_for`. Zero-init at instantiation; OR-in
@@ -7196,9 +7215,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 continue;
             };
             let mut accs: Vec<(AccumulatorKind, Option<Expr>)> = Vec::new();
-            collect_sum_calls(&c.assertion.left, &mut accs);
-            collect_sum_calls(&c.assertion.right, &mut accs);
-            collect_sum_calls(&c.assertion.tolerance, &mut accs);
+            // v1.x-VIOLATE (F.27): assertion-less inline closures
+            // have no accumulator-bearing exprs.
+            if let Some(a) = &c.assertion {
+                collect_sum_calls(&a.left, &mut accs);
+                collect_sum_calls(&a.right, &mut accs);
+                collect_sum_calls(&a.tolerance, &mut accs);
+            }
             let mut slots: Vec<AccumulatorSlot> = Vec::new();
             for (kind, inner_opt) in accs {
                 match kind {
@@ -7495,6 +7518,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 restart_count_field_idx,
                 quarantined_field_idx,
                 restart_in_place_pending_field_idx,
+                drain_requested_field_idx,
                 slot_borrowed_mask_field_idx,
                 recpool_field_idx,
                 recpool_release_pool_field_idx,
@@ -7849,16 +7873,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 epoch = spec.clone();
                             }
                             ClosureClause::PersistsThrough(_)
-                            | ClosureClause::ResetsOn(_) => {
-                                // Recovery-event hooks; relevant
-                                // when accumulators land. No effect
-                                // on the v0 single-shot path.
+                            | ClosureClause::ResetsOn(_)
+                            | ClosureClause::Captures(_) => {
+                                // Recovery-event hooks +
+                                // v1.x-VIOLATE captures clause;
+                                // no effect on the v0 assertion-
+                                // bearing single-shot path.
                             }
                         }
                     }
+                    // v1.x-VIOLATE (F.27): assertion-less inline
+                    // closures don't go through this auto-epoch
+                    // lowering pipeline (they fire via `violate`,
+                    // not at epoch boundaries). Codegen for them
+                    // is part of phase 4 of v1.x-VIOLATE; the
+                    // parse + AST plumbing lands in phase 2.
+                    let Some(assertion) = c.assertion.clone() else {
+                        continue;
+                    };
                     closures.push((
                         c.name.name.clone(),
-                        c.assertion.clone(),
+                        assertion,
                         epoch,
                     ));
                 }
@@ -12304,6 +12339,316 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 self.lower_send(subject, value, scope)?;
                 Ok(BlockEnd::Open)
             }
+            // v1.x-VIOLATE (F.27): inline structural failure.
+            // 1. Set __drain_requested = 1 on self (so a later
+            //    `self.draining` read returns true).
+            // 2. Read parent_self + parent_on_failure from the
+            //    synthetic fields. If non-null, build a
+            //    ClosureViolation (locus + closure names only at
+            //    this milestone — captures + with-payload travel
+            //    in the interpreter path; codegen captures
+            //    lowering is a separate follow-up that needs the
+            //    ClosureViolation type to grow per-closure
+            //    fields).
+            // 3. Route via indirect call to parent's on_failure.
+            //    If parent_on_failure is null, dprintf + exit
+            //    (panic). Mirrors the auto-epoch routing in
+            //    `lower_closure_check` route_bb.
+            // 4. Emit a divergent return from the current fn.
+            //    The return value is undef (LLVM poison) for non-
+            //    void fns — the canonical pattern guards
+            //    downstream uses with `if !self.draining { ... }`,
+            //    so the undef never gets read. Mirrors the
+            //    Signal::Violate handling in the interpreter.
+            Stmt::Violate { name, payload: _, span: _ } => {
+                let cs = self.current_self.as_ref().cloned().ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "`violate {}`: no enclosing locus self in codegen",
+                        name.name,
+                    ))
+                })?;
+                let info = self
+                    .user_loci
+                    .get(&cs.locus_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "`violate {}`: no LocusInfo for `{}`",
+                            name.name, cs.locus_name,
+                        ))
+                    })?;
+
+                let i64_t = self.context.i64_type();
+                let i32_t = self.context.i32_type();
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                let void_t = self.context.void_type();
+
+                // 1. Set __drain_requested = 1.
+                let one = i64_t.const_int(1, false);
+                let dr_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cs.struct_ty,
+                        cs.self_ptr,
+                        info.drain_requested_field_idx,
+                        "violate.dr.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(dr_ptr, one)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                // 2. Read parent_self + parent_on_failure.
+                let ps_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cs.struct_ty,
+                        cs.self_ptr,
+                        info.parent_self_field_idx,
+                        "violate.parent_self.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let parent_self = self
+                    .builder
+                    .build_load(ptr_t, ps_ptr, "violate.parent_self")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_pointer_value();
+                let poh_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        cs.struct_ty,
+                        cs.self_ptr,
+                        info.parent_on_failure_field_idx,
+                        "violate.parent_on_failure.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let parent_on_failure = self
+                    .builder
+                    .build_load(ptr_t, poh_ptr, "violate.parent_on_failure")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_pointer_value();
+
+                // 3. Allocate + fill ClosureViolation.
+                let viol_info = self
+                    .user_types
+                    .get("ClosureViolation")
+                    .cloned()
+                    .expect("ClosureViolation declared at startup");
+                let size = viol_info
+                    .struct_ty
+                    .size_of()
+                    .expect("violation struct has known size");
+                let viol_ptr = self.arena_alloc(size, "violate.viol.alloc")?;
+                let locus_str = self.global_string(&cs.locus_name);
+                let closure_str = self.global_string(&name.name);
+                let f0 = self
+                    .builder
+                    .build_struct_gep(
+                        viol_info.struct_ty,
+                        viol_ptr,
+                        0,
+                        "violate.viol.locus.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(f0, locus_str)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let f1 = self
+                    .builder
+                    .build_struct_gep(
+                        viol_info.struct_ty,
+                        viol_ptr,
+                        1,
+                        "violate.viol.closure.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(f1, closure_str)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let f2 = self
+                    .builder
+                    .build_struct_gep(
+                        viol_info.struct_ty,
+                        viol_ptr,
+                        2,
+                        "violate.viol.diff.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(f2, i64_t.const_zero())
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                // 4. Branch on parent_on_failure null.
+                let func = self.current_fn.expect("current_fn set");
+                let route_bb =
+                    self.context.append_basic_block(func, "violate.route");
+                let bare_bb =
+                    self.context.append_basic_block(func, "violate.bare");
+                let ret_bb =
+                    self.context.append_basic_block(func, "violate.return");
+                let null_check = self
+                    .builder
+                    .build_is_not_null(parent_on_failure, "violate.has.handler")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_conditional_branch(null_check, route_bb, bare_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                // 5a. route_bb: indirect-call parent.on_failure(
+                //         parent_self, self_ptr, viol_ptr).
+                self.builder.position_at_end(route_bb);
+                let handler_callee_ty = void_t.fn_type(
+                    &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
+                    false,
+                );
+                self.builder
+                    .build_indirect_call(
+                        handler_callee_ty,
+                        parent_on_failure,
+                        &[
+                            parent_self.into(),
+                            cs.self_ptr.into(),
+                            viol_ptr.into(),
+                        ],
+                        "violate.on_failure.call",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_unconditional_branch(ret_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                // 5b. bare_bb: dprintf + exit (no parent handler).
+                self.builder.position_at_end(bare_bb);
+                let fflush_fn = self
+                    .module
+                    .get_function("fflush")
+                    .expect("fflush declared");
+                self.builder
+                    .build_call(
+                        fflush_fn,
+                        &[ptr_t.const_null().into()],
+                        "violate.fflush",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let fmt = self.global_string(
+                    "runtime error: ClosureViolation: locus `%s` closure `%s` (inline, no parent handler)\n",
+                );
+                let dprintf_fn = self
+                    .module
+                    .get_function("dprintf")
+                    .expect("dprintf declared");
+                self.builder
+                    .build_call(
+                        dprintf_fn,
+                        &[
+                            i32_t.const_int(2, false).into(),
+                            fmt.into(),
+                            locus_str.into(),
+                            closure_str.into(),
+                        ],
+                        "violate.dprintf",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let exit_fn = self
+                    .module
+                    .get_function("exit")
+                    .expect("exit declared");
+                self.builder
+                    .build_call(
+                        exit_fn,
+                        &[i32_t.const_int(1, false).into()],
+                        "violate.exit",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+                // 6. ret_bb: emit divergent return.
+                self.builder.position_at_end(ret_bb);
+                let ret_ty = self
+                    .current_user_fn_ret
+                    .clone()
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(
+                            "`violate` outside a user fn".to_string(),
+                        )
+                    })?;
+                let in_free_fn = self.current_user_fn_exit_bb.is_some();
+                match ret_ty {
+                    None => {
+                        if in_free_fn {
+                            let exit_bb =
+                                self.current_user_fn_exit_bb.unwrap();
+                            self.builder
+                                .build_unconditional_branch(exit_bb)
+                                .map_err(|e| {
+                                    CodegenError::LlvmEmit(e.to_string())
+                                })?;
+                        } else {
+                            self.builder
+                                .build_return(None)
+                                .map_err(|e| {
+                                    CodegenError::LlvmEmit(e.to_string())
+                                })?;
+                        }
+                    }
+                    Some(declared) => {
+                        // Undef poison value of the declared
+                        // return type. The canonical pattern
+                        // guards consumption with self.draining
+                        // so the poison is never read.
+                        let llvm_ty = self.llvm_basic_type(&declared);
+                        let undef: inkwell::values::BasicValueEnum<'ctx> =
+                            match llvm_ty {
+                                inkwell::types::BasicTypeEnum::IntType(t) => {
+                                    t.get_undef().into()
+                                }
+                                inkwell::types::BasicTypeEnum::FloatType(t) => {
+                                    t.get_undef().into()
+                                }
+                                inkwell::types::BasicTypeEnum::PointerType(t) => {
+                                    t.get_undef().into()
+                                }
+                                inkwell::types::BasicTypeEnum::ArrayType(t) => {
+                                    t.get_undef().into()
+                                }
+                                inkwell::types::BasicTypeEnum::StructType(t) => {
+                                    t.get_undef().into()
+                                }
+                                inkwell::types::BasicTypeEnum::VectorType(t) => {
+                                    t.get_undef().into()
+                                }
+                            };
+                        if in_free_fn {
+                            let ret_alloca = self
+                                .current_user_fn_ret_alloca
+                                .expect(
+                                    "ret_alloca set in free fn with ret ty",
+                                );
+                            self.builder
+                                .build_store(ret_alloca, undef)
+                                .map_err(|e| {
+                                    CodegenError::LlvmEmit(e.to_string())
+                                })?;
+                            let exit_bb =
+                                self.current_user_fn_exit_bb.unwrap();
+                            self.builder
+                                .build_unconditional_branch(exit_bb)
+                                .map_err(|e| {
+                                    CodegenError::LlvmEmit(e.to_string())
+                                })?;
+                        } else {
+                            self.builder
+                                .build_return(Some(&undef))
+                                .map_err(|e| {
+                                    CodegenError::LlvmEmit(e.to_string())
+                                })?;
+                        }
+                    }
+                }
+                Ok(BlockEnd::Terminated)
+            }
             Stmt::Match(m) => self.lower_match_stmt(m, scope),
             Stmt::Fail { value, .. } => self.lower_fail(value, scope),
             Stmt::Expr(Expr::Or { inner, disposition, .. }) => {
@@ -14727,6 +15072,50 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .build_float_div(b_f, denom, "k_max")
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     return Ok((k_max.into(), CodegenTy::Float));
+                }
+                // v1.x-VIOLATE (F.27): `self.draining` reads the
+                // synthetic `__drain_requested: i64` field and
+                // returns it as a Bool. Set by `violate NAME;` —
+                // user code reads it (canonically as
+                // `if !self.draining { ... }`) to gate
+                // downstream effects after a structural failure.
+                if name.name == "draining" {
+                    let info = self
+                        .user_loci
+                        .get(&cs.locus_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            CodegenError::Unsupported(format!(
+                                "self.draining: no LocusInfo for `{}`",
+                                cs.locus_name
+                            ))
+                        })?;
+                    let dr_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            cs.struct_ty,
+                            cs.self_ptr,
+                            info.drain_requested_field_idx,
+                            "self.draining.ptr",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let i64_t = self.context.i64_type();
+                    let raw = self
+                        .builder
+                        .build_load(i64_t, dr_ptr, "self.draining.raw")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let zero = i64_t.const_int(0, false);
+                    let as_bool = self
+                        .builder
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            raw,
+                            zero,
+                            "self.draining",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    return Ok((as_bool.into(), CodegenTy::Bool));
                 }
                 let (idx, ty) = cs.fields.get(&name.name).cloned().ok_or_else(
                     || {
@@ -20959,6 +21348,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         self.builder
             .build_store(rip_ptr, zero)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // v1.x-VIOLATE (F.27): zero-init the synthetic
+        // __drain_requested flag. `violate NAME;` sets it to 1;
+        // `self.draining` reads it back as a Bool.
+        let dr_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.drain_requested_field_idx,
+                &format!("{}.__drain_requested.ptr", locus_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(dr_ptr, zero)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         // v1.x-4b: zero-init the synthetic __slot_borrowed_mask.
         // Bits get OR'd in below during slot init when a parent

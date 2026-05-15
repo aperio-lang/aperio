@@ -536,7 +536,11 @@ pub struct FailureDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClosureDecl {
     pub name: Ident,
-    pub assertion: ClosureAssertion,
+    /// v1.x-VIOLATE (F.27): assertion is optional. `epoch
+    /// inline` closures have no audit band and omit the
+    /// assertion entirely. For all other epochs the assertion
+    /// is required (enforced at typecheck, not at parse).
+    pub assertion: Option<ClosureAssertion>,
     pub clauses: Vec<ClosureClause>,
     pub span: Span,
 }
@@ -554,6 +558,11 @@ pub enum ClosureClause {
     Epoch(EpochSpec),
     PersistsThrough(Vec<Ident>),
     ResetsOn(Vec<Ident>),
+    /// v1.x-VIOLATE (F.27): names locus fields whose values are
+    /// snapshotted into the synthesized `ClosureViolation`
+    /// payload at fire time. Only meaningful when paired with
+    /// `epoch inline`.
+    Captures(Vec<Ident>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -563,6 +572,9 @@ pub enum EpochSpec {
     Birth,
     Dissolve,
     Explicit,
+    /// v1.x-VIOLATE (F.27): pull-only epoch. The closure never
+    /// fires automatically; only `violate NAME;` fires it.
+    Inline,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -800,6 +812,19 @@ pub enum Stmt {
         op: RecoveryOp,
         args: Vec<Expr>,
         modifier: Option<RecoveryModifier>,
+        span: Span,
+    },
+    /// v1.x-VIOLATE (F.27): `violate NAME;` or
+    /// `violate NAME with <expr>;`. Statement-level, divergent
+    /// (typechecked as Never). `name` resolves to a closure
+    /// declared on the enclosing locus; the typechecker enforces
+    /// that the target closure is `epoch inline`. The optional
+    /// payload becomes a `payload` field on the synthesized
+    /// ClosureViolation; named field snapshots come from the
+    /// closure's `captures:` clause.
+    Violate {
+        name: Ident,
+        payload: Option<Expr>,
         span: Span,
     },
     /// Bus send: `subject <- value;`. The `subject` expression must

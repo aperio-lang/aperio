@@ -107,15 +107,23 @@ statement is a send.
 
 ### Recovery primitives are statements, not operators
 
-`restart`, `quarantine`, `bubble`, etc. are statement-level
-keywords; they do not participate in the precedence table. They
-appear in the form:
+`restart`, `quarantine`, `bubble`, `violate`, etc. are
+statement-level keywords; they do not participate in the
+precedence table. They appear in the form:
 
 ```
 restart(child);
 quarantine(child) for 30s;
 bubble(err);
+violate fatal_io;             // F.27, v1.x-VIOLATE
+violate fatal_io with detail; // optional payload
 ```
+
+`violate` is divergent (same type-level shape as `fail` /
+`bubble`); the typechecker treats it as `Never`. Its closure-
+name argument is a bare identifier (not a parenthesized
+argument list), and the optional `with <expr>` trailer carries
+a user-shaped payload onto the synthesized `ClosureViolation`.
 
 ### Lifecycle and locus member declarations are not expressions
 

@@ -12,9 +12,15 @@ use aperio_syntax::{Diag, parse_source};
 use aperio_types::{check_bundle, Bundle};
 
 fn examples_dir() -> PathBuf {
+    // Examples moved to crates/aperio-codegen/tests/fixtures/examples/
+    // during the public-release cleanup. From this crate's
+    // manifest dir (crates/aperio-types/), pop to crates/, then
+    // descend through aperio-codegen/tests/fixtures/examples.
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
-    p.pop();
+    p.push("aperio-codegen");
+    p.push("tests");
+    p.push("fixtures");
     p.push("examples");
     p
 }

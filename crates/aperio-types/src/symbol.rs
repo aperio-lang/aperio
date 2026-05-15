@@ -114,6 +114,23 @@ pub struct LocusInfo {
     /// "no field `X`". Slot kinds + element types live on
     /// the codegen-side LocusInfo where dispatch happens.
     pub capacity_slot_names: Vec<String>,
+    /// v1.x-VIOLATE (F.27): closure declarations on this locus.
+    /// Used by typecheck to resolve `violate NAME;` against the
+    /// enclosing locus and enforce the `epoch inline` gate.
+    pub closures: Vec<ClosureSymInfo>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClosureSymInfo {
+    pub name: String,
+    /// True iff the closure has an `epoch inline` clause. Inline
+    /// closures fire only via `violate`; auto-epoch closures fire
+    /// at epoch boundaries and do not accept `violate`.
+    pub is_inline: bool,
+    /// Field names from the `captures:` clause (if any). Each
+    /// must reference an existing locus param/state field.
+    pub captures: Vec<String>,
     pub span: Span,
 }
 

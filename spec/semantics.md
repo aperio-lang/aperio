@@ -599,6 +599,115 @@ Epoch boundaries:
 - `epoch birth`: fires once, after birth completes.
 - `epoch explicit`: fires only when user code calls
   `epoch_advance(NAME)`.
+- `epoch inline` (F.27, v1.x-VIOLATE): never fires
+  automatically; fires only when user code executes
+  `violate NAME;`. The closure body has no assertion (no LEFT /
+  RIGHT / TOL to evaluate). See "Inline closure violation"
+  below.
+
+## Inline closure violation
+
+(F.27, v1.x-VIOLATE.) Inline closures provide a pull-only
+structural-failure channel for locus method bodies that catch a
+value error and want to escalate it. The declaration carries no
+assertion; the optional `captures:` clause names locus fields
+whose values are snapshotted into the ClosureViolation payload
+at fire time.
+
+```aperio
+closure fatal_io { captures: last_error; epoch inline; }
+```
+
+`violate NAME;` (optionally `violate NAME with EXPR;`) fires the
+closure synchronously at the call site:
+
+1. Runtime synthesizes a `ClosureViolation` value carrying:
+   - `locus`, `closure` — string names of the failing locus and
+     the inline closure (always present, both runtimes).
+   - Under `aperio run` only: one field per name in the
+     closure's `captures:` clause, holding the snapshot of
+     `self.<field>` taken at the fire point. Under `aperio
+     build` the LLVM `ClosureViolation` struct has a fixed
+     shape and these convenience fields are not materialized.
+     The portable access pattern is to read frozen child state
+     through the child handle in `on_failure(c, err)` — see
+     "Reading the audit state" below.
+   - If `with EXPR` was given (interpreter), a `payload` field
+     with EXPR's value. Codegen evaluates EXPR for side effects
+     (and to detect typecheck errors on the payload type) but
+     does not materialize a `payload` field on the compiled
+     `ClosureViolation`.
+   - The assertion-shape fields (`left`, `right`, `tolerance`,
+     `diff`) are NOT populated for inline violations.
+2. The locus's exploded flag is set (same as the auto-epoch
+   path; downstream observers can't tell from the flag whether
+   the fire was auto-epoch or inline).
+3. The synthetic `__drain_requested` field on the locus is
+   set. Readable from user code as `self.draining`.
+4. The parent's `on_failure(child, ClosureViolation { ... })`
+   handler runs — same routing as for auto-epoch closure
+   violations.
+
+### Reading the audit state
+
+The portable access pattern in `on_failure(c, err)` is to read
+the child's frozen locus state through the child handle:
+
+```aperio
+on_failure(c: Child, err: ClosureViolation) {
+    log::error(err.closure, " ", c.last_error, " fd=", c.conn_fd);
+}
+```
+
+`violate` is divergent — the method body's remaining statements
+do not execute, so the child's locus state is frozen at the
+violate moment. `c.last_error` reads exactly the value the
+violate site observed. This works identically in both runtimes.
+
+Under the interpreter, `err.<capture_name>` is also available
+as a convenience (the interpreter materializes captures fields
+on the `ClosureViolation` struct). Compiled code does not
+materialize these fields. Source that reads `err.last_error`
+will typecheck (`ClosureViolation` admits unknown fields
+permissively at field-access time) but will fail to link / run
+under `aperio build` — prefer `c.last_error` for portability.
+
+The `violate` statement is divergent: the typechecker treats it
+as `Never`, the same as `fail` in fallible fn bodies and
+`bubble` in `on_failure`. No statement after `violate` in the
+same block is reachable; the typechecker does not require a
+trailing `return` on a `violate` branch.
+
+### `self.draining`
+
+While the locus is draining, the synthetic `self.draining`
+field reads `true` from any locus method body. The canonical
+use is to suppress downstream sends after escalation:
+
+```aperio
+let r = expr or self.handle_io(err);
+if !self.draining { Result <- r; }
+```
+
+`self.draining` is the only synthetic field exposed by name to
+user code; `__drain_requested` is internal-only.
+
+### Rejection contexts
+
+`violate` is rejected at typecheck in:
+
+- **Free fn bodies.** No `self` to resolve the closure name
+  against. A free fn helper called from a locus method body
+  cannot violate transitively: `violate` is lexically scoped to
+  the locus method body it appears in.
+- **`on_failure` body.** Use `bubble(err)` — `on_failure` is the
+  parent-side handler for child failures; re-firing a self-
+  closure from there mixes the two channels.
+
+Allowed everywhere else that has `self`: named locus method
+bodies, bus-handler methods (`subscribe X as foo` → `fn foo`),
+`run()`, lifecycle methods (`birth()`, `dissolve()`, `drain()`),
+mode-method bodies. The same body shape gets the same primitive.
 
 ## Perspective hot-load
 
@@ -700,6 +809,13 @@ A closure violation at any epoch:
 5. Parent's policy decides: absorb, recover, bubble.
 6. If bubbled, propagates to grandparent; recursively until
    absorbed or reaching root (process exit).
+
+`epoch inline` closures (F.27) take the same cascade path with
+one addition: at step 2 they also set `__drain_requested`, so
+the locus enters drain at the next cooperative yield rather
+than continuing on its current epoch. The drain initiation is
+the only divergence from the auto-epoch cascade; routing to
+parent's `on_failure` at step 4 is identical.
 
 ## Scheduler dispatch
 

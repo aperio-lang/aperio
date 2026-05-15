@@ -29,6 +29,17 @@ pub enum Signal {
     /// surfaces the wrapped value as the program's failure
     /// (process exits non-zero).
     Bubble(Value),
+    /// v1.x-VIOLATE (F.27): a `violate NAME;` statement fired
+    /// and was successfully routed to the parent's on_failure
+    /// (parent absorbed). Signals divergence of the enclosing
+    /// block so subsequent statements don't run, but does not
+    /// abort the program — the locus's `draining` flag is set
+    /// and the caller frame catches at the next dispatch
+    /// boundary (handler exit, lifecycle transition, run-loop
+    /// iteration). Caught + cleared by exec_block on the way
+    /// out so it propagates only as far as the locus method
+    /// body it was raised in.
+    Violate,
     Error(String),
 }
 
@@ -302,6 +313,16 @@ impl Interpreter {
         match result {
             Ok(()) => Ok(Value::Unit),
             Err(Signal::Return(v)) => Ok(v),
+            // v1.x-VIOLATE (F.27): a `violate NAME;` inside the
+            // method body diverged the body. The closure has
+            // already been routed to the parent's on_failure via
+            // deliver_violation; from the call site's perspective
+            // the call returned with the locus in `draining`
+            // state. Surface as Unit so caller code keeps
+            // composing (the canonical pattern then uses
+            // `if !self.draining { ... }` to suppress
+            // downstream effects).
+            Err(Signal::Violate) => Ok(Value::Unit),
             Err(other) => Err(other),
         }
     }
@@ -617,6 +638,101 @@ impl Interpreter {
             Stmt::Expr(e) => {
                 let _ = self.eval_expr(e)?;
                 Ok(())
+            }
+            // v1.x-VIOLATE (F.27): inline structural failure.
+            // Snapshot the captures fields from self, synthesize a
+            // ClosureViolation value, set the locus's draining
+            // flag, and route to the parent's on_failure via the
+            // existing closure-violation pathway.
+            Stmt::Violate { name, payload, span: _ } => {
+                let handle = self.self_stack.last().cloned().ok_or_else(|| {
+                    Signal::Error(format!(
+                        "`violate {}`: no enclosing locus on self_stack",
+                        name.name
+                    ))
+                })?;
+                let closure_decl = handle
+                    .decl
+                    .members
+                    .iter()
+                    .find_map(|m| match m {
+                        aperio_syntax::ast::LocusMember::Closure(c)
+                            if c.name.name == name.name =>
+                        {
+                            Some(c.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        Signal::Error(format!(
+                            "`violate {}`: locus `{}` has no closure named `{}`",
+                            name.name, handle.name, name.name,
+                        ))
+                    })?;
+                let is_inline = closure_decl.clauses.iter().any(|c| matches!(
+                    c,
+                    aperio_syntax::ast::ClosureClause::Epoch(
+                        aperio_syntax::ast::EpochSpec::Inline
+                    )
+                ));
+                if !is_inline {
+                    return Err(Signal::Error(format!(
+                        "`violate {}`: closure `{}` is not `epoch inline`",
+                        name.name, name.name,
+                    )));
+                }
+                let captures: Vec<String> = closure_decl
+                    .clauses
+                    .iter()
+                    .flat_map(|c| match c {
+                        aperio_syntax::ast::ClosureClause::Captures(names) => {
+                            names.iter().map(|n| n.name.clone()).collect::<Vec<_>>()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .collect();
+
+                let payload_val = match payload {
+                    Some(p) => Some(self.eval_expr(p)?),
+                    None => None,
+                };
+
+                let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+                fields.insert("locus".into(), Value::String(handle.name.clone()));
+                fields.insert("closure".into(), Value::String(name.name.clone()));
+                let state = handle.state.borrow();
+                for cap in &captures {
+                    let v = state
+                        .get(cap)
+                        .cloned()
+                        .unwrap_or(Value::Nil);
+                    fields.insert(cap.clone(), v);
+                }
+                drop(state);
+                if let Some(v) = payload_val {
+                    fields.insert("payload".into(), v);
+                }
+                let violation = Value::Struct {
+                    name: "ClosureViolation".to_string(),
+                    fields: Rc::new(RefCell::new(fields)),
+                };
+
+                handle.draining.set(true);
+                let parent = handle.parent.borrow().clone();
+                self.deliver_violation(handle.clone(), parent.as_ref(), violation)?;
+                // Synthesize a divergent control-flow signal so
+                // subsequent statements in the surrounding block
+                // don't run. The error is structural-shaped per
+                // F.9; reusing Signal::Error matches the existing
+                // closure-violation cascade for uncaught cases
+                // (parent absorbs → Ok(()) → caller treats
+                // statement as having diverged via the natural
+                // unwinding). Since deliver_violation returns
+                // Ok(()) when the parent absorbed, we need an
+                // explicit divergence marker — use a fresh Signal
+                // tagged as ViolateDiverge so dissolve cleanup
+                // distinguishes it from a hard error path.
+                Err(Signal::Violate)
             }
         }
     }
@@ -1418,6 +1534,11 @@ impl Interpreter {
                         .map(|c| Value::Locus(c.clone()))
                         .collect();
                     return Ok(Value::Array(Rc::new(RefCell::new(arr))));
+                }
+                // v1.x-VIOLATE (F.27): synthetic Bool flag set by
+                // `violate NAME;` and read as `self.draining`.
+                if name == "draining" {
+                    return Ok(Value::Bool(handle.draining.get()));
                 }
                 if name == "k_max" {
                     // F.1: k_max = B / [(1-phi)c + phi*sigma].
@@ -2385,6 +2506,7 @@ impl Interpreter {
             dissolved: Rc::new(std::cell::Cell::new(false)),
             restart_count: Rc::new(std::cell::Cell::new(0)),
             quarantined: Rc::new(std::cell::Cell::new(false)),
+            draining: Rc::new(std::cell::Cell::new(false)),
             duration_last_fire: Rc::new(RefCell::new(vec![now_ns; duration_count])),
             parent: Rc::new(RefCell::new(parent_at_birth)),
             restart_in_place_pending: Rc::new(std::cell::Cell::new(false)),
@@ -2593,7 +2715,10 @@ impl Interpreter {
         self.parent_stack.pop();
         self.self_stack.pop();
         match result {
-            Ok(()) | Err(Signal::Return(_)) => Ok(()),
+            // v1.x-VIOLATE (F.27): violate-divergence is a clean
+            // method-body exit; the closure has already been
+            // routed to parent's on_failure.
+            Ok(()) | Err(Signal::Return(_)) | Err(Signal::Violate) => Ok(()),
             Err(other) => Err(other),
         }
     }
@@ -2630,7 +2755,10 @@ impl Interpreter {
         self.parent_stack.pop();
         self.self_stack.pop();
         match result {
-            Ok(()) | Err(Signal::Return(_)) => Ok(()),
+            // v1.x-VIOLATE (F.27): violate-divergence is a clean
+            // method-body exit; the closure has already been
+            // routed to parent's on_failure.
+            Ok(()) | Err(Signal::Return(_)) | Err(Signal::Violate) => Ok(()),
             Err(other) => Err(other),
         }
     }
@@ -2987,6 +3115,16 @@ impl Interpreter {
         handle: LocusHandle,
         closure: &ClosureDecl,
     ) -> Result<ClosureOutcome, Signal> {
+        // v1.x-VIOLATE (F.27): assertion-less inline closures
+        // don't auto-evaluate. Callers (fire_tick_closures,
+        // dissolve, etc.) filter them out by epoch, so reaching
+        // here without an assertion is a contract bug.
+        let Some(assertion) = closure.assertion.as_ref() else {
+            return Err(Signal::Error(format!(
+                "evaluate_closure called on assertion-less closure `{}`",
+                closure.name.name,
+            )));
+        };
         self.self_stack.push(handle.clone());
         self.env.push();
 
@@ -2996,7 +3134,7 @@ impl Interpreter {
         // `mean(x)` in left/right/tolerance, in occurrence order.
         // The assertion's substitutions then read the post-update
         // values.
-        let accs = collect_accumulators_in_assertion(&closure.assertion);
+        let accs = collect_accumulators_in_assertion(assertion);
         if !accs.is_empty() {
             self.update_closure_accumulators(
                 &handle,
@@ -3011,9 +3149,9 @@ impl Interpreter {
         }
 
         let result: Result<(Value, Value, Value), Signal> = (|| {
-            let lt = self.eval_expr(&closure.assertion.left)?;
-            let rt = self.eval_expr(&closure.assertion.right)?;
-            let tol = self.eval_expr(&closure.assertion.tolerance)?;
+            let lt = self.eval_expr(&assertion.left)?;
+            let rt = self.eval_expr(&assertion.right)?;
+            let tol = self.eval_expr(&assertion.tolerance)?;
             Ok((lt, rt, tol))
         })();
 

@@ -662,6 +662,34 @@ fn register_locus(
         }
     }
 
+    // v1.x-VIOLATE (F.27): collect closure declarations so the
+    // typechecker can resolve `violate NAME;` against the
+    // enclosing locus and enforce the `epoch inline` gate.
+    let mut closures: Vec<ClosureSymInfo> = Vec::new();
+    for member in &decl.members {
+        if let LocusMember::Closure(cd) = member {
+            let is_inline = cd.clauses.iter().any(|c| {
+                matches!(c, ClosureClause::Epoch(EpochSpec::Inline))
+            });
+            let captures = cd
+                .clauses
+                .iter()
+                .flat_map(|c| match c {
+                    ClosureClause::Captures(names) => {
+                        names.iter().map(|n| n.name.clone()).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect();
+            closures.push(ClosureSymInfo {
+                name: cd.name.name.clone(),
+                is_inline,
+                captures,
+                span: cd.span,
+            });
+        }
+    }
+
     // v1.x-FORM-1 PR3b: synthesize standard methods for
     // form-annotated loci. Method synthesis is form-specific:
     // @form(vec) emits push/get/pop/len/is_empty over the cell
@@ -701,6 +729,7 @@ fn register_locus(
         contract_consume,
         methods,
         capacity_slot_names,
+        closures,
         span: decl.span,
     };
 

@@ -1922,6 +1922,193 @@ rule — same discipline applied at a different layer.
 § "Implementation entry points" for the file paths and primary
 functions.
 
+### F.27 Inline closure violation (v1.x-VIOLATE, 2026-05-15)
+
+A locus method body can escalate a value error into a structural
+failure by declaring an assertion-less `epoch inline` closure and
+firing it with the new `violate` statement:
+
+```aperio
+locus DbConnection {
+    params {
+        host:       String = "127.0.0.1";
+        port:       Int    = 5432;
+        conn_fd:    Int    = -1;
+        last_error: String = "";
+    }
+    bus { subscribe ExecuteQuery as on_query; publish QueryResult; }
+
+    closure fatal_io { captures: last_error; epoch inline; }
+
+    birth()    { self.conn_fd = std::io::tcp::connect(self.host, self.port); }
+    dissolve() { if self.conn_fd >= 0 { std::io::tcp::close_fd(self.conn_fd); } }
+
+    fn handle_io(e: DbError) -> Row {
+        self.last_error = e.detail;
+        if e.kind == "send_failed" || e.kind == "recv_empty" {
+            violate fatal_io;
+        }
+        return Row { data: "" };
+    }
+
+    fn on_query(q: Query) {
+        let r = send_query(self.conn_fd, q) or self.handle_io(err);
+        if !self.draining { QueryResult <- r; }
+    }
+}
+```
+
+The pattern `let r = expr or self.handle_io(err);` — paired with
+`handle_io` returning the success type on recoverable cases and
+calling `violate` on fatal ones — is the *error-check function*:
+one named method on the locus owns both the audit-log update
+(`self.last_error = ...`) and the recovery / escalation choice.
+Channels stay separated (per the two-channel rule, F.22-era);
+the conversion from value error to structural failure happens at
+exactly one named site.
+
+The parent's `on_failure(c: DbConnection, err: ClosureViolation)`
+body reads the audit-log state through the child handle —
+`c.last_error`, `c.conn_fd`, etc. — not through the
+`ClosureViolation` payload. Because `violate` is divergent, the
+child's locus state is *frozen* at the violate moment (the
+remainder of the method body doesn't execute), so the child
+handle's field reads return exactly the state at the
+escalation point. The `captures:` clause is a declarative audit
+hint pointing the reader at the structurally relevant state;
+the portable access path is via the child handle.
+
+**Commits to.**
+
+1. **A new closure shape.** `closure` declarations may omit the
+   assertion when an `epoch inline` clause is present. The body
+   then consists only of optional clauses (`captures:`,
+   `persists_through(...)`, `resets_on(...)`, `epoch inline`).
+   Assertion-bearing closures cannot pair with `epoch inline`.
+
+2. **`captures:` clause.** A `captures: f1, f2, ... ;` clause
+   names locus state fields that are *structurally relevant* at
+   the violate point — a declarative audit-log hint. Field names
+   must reference declared locus params. The parent's
+   `on_failure(c, err)` body reads each captured field through
+   the child handle (`c.f1`, `c.f2`) — because `violate` is
+   divergent, the child's state is frozen at the violate
+   moment, so the handle reads return the snapshot the captures
+   clause names. Under `aperio run` the interpreter additionally
+   materializes each captured field on the `ClosureViolation`
+   value as a convenience (`err.f1` works); under `aperio build`
+   only the child-handle path is wired (the `ClosureViolation`
+   carries `err.locus` + `err.closure` only). The portable
+   access pattern, recommended in both runtimes, is the child-
+   handle path.
+
+3. **`epoch inline`.** A new variant alongside `tick`,
+   `duration(d)`, `dissolve`, `birth`, and `explicit`. Inline
+   closures do *not* fire automatically at any epoch boundary;
+   they fire only via `violate <name>;`.
+
+4. **`violate` statement.** Statement-level, recovery-primitive-
+   shaped. Form: `violate IDENT;` or `violate IDENT with EXPR;`.
+   Divergent (typechecker treats as `Never`, same as `fail` in
+   fallible fns and `bubble` in `on_failure`). Resolves the
+   identifier to a closure declared on the enclosing locus; the
+   target closure must be `epoch inline`.
+
+5. **Inline fires initiate drain.** Auto-epoch closures keep
+   F.9's behavior: flip the exploded flag, locus keeps running,
+   parent's `on_failure` fires at natural dissolve. Inline
+   closures do that *and* request drain — at the next
+   cooperative yield point the runtime transitions the locus to
+   the draining state, cascading through children depth-first as
+   usual. The exploded flag is set identically; the only
+   difference from auto-epoch is that the locus stops accepting
+   new work instead of completing its current epoch.
+
+6. **`self.draining` reads as a synthetic Bool.** Locus method
+   bodies may read `self.draining` to check whether the locus
+   has entered the winding-down state. This lets the canonical
+   pattern above suppress a downstream send after escalation:
+
+   ```aperio
+   if !self.draining { QueryResult <- r; }
+   ```
+
+**Rejection contexts.** `violate` is rejected:
+
+- In free fn bodies (no `self` to anchor the closure name).
+- In `on_failure` body (use `bubble(err)`; `on_failure` is the
+  parent-side handler for child failures, and re-firing a self-
+  closure from there would mix channels).
+
+Allowed everywhere else that has `self`: named locus method
+bodies, bus-handler methods (`subscribe X as foo` → `fn foo`),
+`run()`, lifecycle methods (`birth()`, `dissolve()`, `drain()`),
+mode-method bodies. The same body shape gets the same primitive.
+
+**Why.** The two-channel rule (locus methods cannot declare
+`fallible(E)`) shipped to keep recovery paths legible: parents
+handle structural failures (`on_failure`), free fns and
+`@form`-synthesized methods handle value errors (`fallible`).
+But the bridge between them — converting a caught value error
+into a structural failure inside a locus method — had no clean
+primitive. The workaround was a `should_exit: Bool` flag plus a
+`while !should_exit { yield; }` loop in `run()` plus a separate
+`last_error` field for diagnostics: three pieces of state doing
+what should be one named call.
+
+`violate` collapses the three-piece workaround to one line by
+naming the closure being violated. The closure name is the
+audit-log handle (`ClosureViolation.closure`) the parent
+receives, and `captures:` makes the diagnostic payload
+declarative instead of folded into a free-form `Error` payload.
+
+**Considered and rejected.**
+
+- *A `:fatal` modifier on auto-epoch closures.* Reject; would
+  conflate the audit-fire path with the inline-fire path.
+  Auto-epoch closures fire at epoch boundaries; the `:fatal`
+  variant would never fire automatically (since `violate` is
+  the only producer). A separate `epoch inline` is clearer
+  about which closures are pull-only.
+- *Statement-level `terminate;` without a closure name.* Reject;
+  the closure name is the structural-failure label the parent
+  matches on (`match err { ClosureViolation { closure: "fatal_io",
+  ... } -> ... }`). Anonymous terminate would lose the audit
+  shape that F.9 established.
+- *Allow `violate` from a fallible free fn.* Reject for v1; the
+  value channel already has `fail`. Mixing channels in free fns
+  has no demonstrated workload. (A free fn called from a locus
+  method body still can't violate transitively — `violate` is
+  declaration-site-only, lexically inside a locus method.)
+- *Make assertions still mandatory and just ignored for inline.*
+  Reject; an assertion that never fires is dead syntax. Better
+  to make the assertion optional and gate it on the absence of
+  `epoch inline`.
+- *Pass the captures snapshot via `with <expr>` instead of a
+  declarative clause.* Reject for the canonical case; the
+  capture set is structural (a list of field names declared at
+  closure-decl time), not value-dependent. `with <expr>` remains
+  available as an additional payload for cases that need it; if
+  both are present, the parent sees both as fields on the
+  `ClosureViolation` payload.
+
+**Implementation entry points.**
+
+- `crates/aperio-syntax/` — lexer (`violate` / `inline` /
+  `captures` as contextual keywords), AST (`Stmt::Violate`,
+  `ClosureClause::Captures`, `EpochSpec::Inline`,
+  `ClosureDecl.assertion: Option<ClosureAssertion>`), parser
+  arms.
+- `crates/aperio-types/` — typecheck divergence,
+  closure-name resolution, rejection-context enforcement, `with
+  <expr>` payload typing.
+- `crates/aperio-codegen/` — synthetic `__drain_requested: i64`
+  field, `self.draining` codegen, ClosureViolation synthesis at
+  the `violate` site with captures snapshot, drain initiation at
+  the next cooperative yield.
+- `crates/aperio-runtime/` — interpreter parity for the new
+  statement and assertion-less closures.
+
 ## 16. What's deferred
 
 The grammar in v0 does **not** specify:

@@ -278,6 +278,97 @@ namespace-lotus form often reads better. The pattern catalog's
 that earned promotion. Helpers that don't form a coherent
 vocabulary stay as free fns.
 
+### 7. Error-check fn — value error → structural failure
+
+A locus method that catches a `fallible` call's error and needs
+to decide between recovery (keep running with a substituted
+value) and escalation (drain this locus and escalate to the
+parent) pairs an `or self.method(err)` clause with an
+`epoch inline` closure:
+
+```aperio
+locus DbConnection {
+    params {
+        host:       String = "127.0.0.1";
+        port:       Int    = 5432;
+        conn_fd:    Int    = -1;
+        last_error: String = "";
+    }
+    bus { subscribe ExecuteQuery as on_query; publish QueryResult; }
+
+    closure fatal_io { captures: last_error; epoch inline; }
+
+    fn handle_io(e: DbError) -> Row {
+        self.last_error = e.detail;
+        if e.kind == "send_failed" || e.kind == "recv_empty" {
+            violate fatal_io;
+        }
+        return Row { data: "" };
+    }
+
+    fn on_query(q: Query) {
+        let r = send_query(self.conn_fd, q) or self.handle_io(err);
+        if !self.draining { QueryResult <- r; }
+    }
+}
+
+locus DbPool {
+    accept(c: DbConnection) { }
+    on_failure(c: DbConnection, err: ClosureViolation) {
+        log::error("db.fatal", err.closure, " ", c.last_error);
+    }
+}
+```
+
+**Shape elements.**
+
+- `send_query` is a `fallible(DbError)` free fn (or stdlib
+  call); the bus handler addresses the error with
+  `or self.handle_io(err)`.
+- `handle_io` is the *error-check fn*: takes the error type,
+  returns the success type at the call site. The typechecker
+  enforces the return-type shape via the `or` clause's existing
+  rules.
+- The locus declares an assertion-less `closure NAME { captures:
+  ... ; epoch inline; }` whose only role is to be a named
+  structural-failure tag. `captures:` names the locus fields
+  that are structurally relevant at the violate point — a
+  declarative audit-log hint.
+- `violate NAME;` (or `violate NAME with EXPR;`) inside the
+  error-check fn diverges. The runtime synthesizes a
+  `ClosureViolation`, sets the `draining` flag, and routes to
+  the parent's `on_failure` handler.
+- The bus handler's downstream send is guarded by
+  `if !self.draining { ... }` so a post-violation iteration
+  doesn't publish a bogus result.
+- The parent's `on_failure(c, err)` accesses the audit state
+  via the child handle: `c.last_error`, `c.conn_fd`, etc. Since
+  `violate` is divergent, the child's locus state is frozen at
+  the violate moment — every captured field is readable through
+  the handle. This is the portable access pattern; it works
+  identically under `aperio run` (interpreted) and `aperio build`
+  (native).
+
+**Why this shape.** Three forces meet:
+
+- **The two-channel rule** (locus methods cannot declare
+  `fallible(E)`, F.22-era) keeps recovery legible: parents
+  handle structural failures via `on_failure`, free fns +
+  `@form`-synthesized methods handle value errors via
+  `fallible`.
+- **Channel conversion needs one named site.** The error-check
+  fn is that site: one method per error-context, owning both
+  the audit-log update (`self.last_error = ...`) and the
+  escalation choice.
+- **`violate` is the bridge.** A caught value error becomes a
+  named structural failure with declarative capture of locus
+  state — same audit shape the parent's `on_failure` already
+  expects.
+
+See `spec/design-rationale.md` F.27 for the design and rejected
+alternatives; `spec/semantics.md` § "Inline closure violation"
+for runtime contract.
+
 ## Naming conventions
 
 | Construct | Convention | Example |

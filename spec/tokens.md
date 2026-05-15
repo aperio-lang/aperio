@@ -113,12 +113,31 @@ post-dot. Shipped 2026-05-11; resolves
 `notes/aperio-friction.md` 2026-05-10
 `closure-keyword-shadows-helper-ident`.
 
+`captures` and `inline` (v1.x-VIOLATE, F.27) are
+**contextual keywords**. `captures` is recognized only as a
+clause keyword inside `closure { ... }` body, in the
+`captures: f1, f2 ... ;` production. `inline` is recognized
+only as an `epoch_spec` variant (immediately after `epoch` in
+a closure clause). Both lex as ordinary Idents elsewhere — so
+`let captures = ...` and `fn inline(...)` stay admissible
+outside closure bodies. Same F.10-style narrowing.
+
 ### Recovery primitives
 
 ```
 restart         restart_in_place    quarantine      reorganize
 bubble
 ```
+
+`violate` (v1.x-VIOLATE, F.27) is a **contextual keyword**:
+recognized only as the leading token of a statement inside a
+locus method body (the `violate_stmt` production in
+`grammar.ebnf` § 14). Outside that position it lexes as an
+ordinary Ident, so `let violate = ...` and `fn violate(...)`
+stay admissible. The optional trailing `with` in
+`violate NAME with EXPR;` is the previously-reserved keyword
+`with` (no longer reserved-for-future-use); recognized only as
+the separator before the payload expression in this production.
 
 ### Contract keywords
 
@@ -180,8 +199,11 @@ compiler warning.
 
 ```
 trait           impl            async           await
-macro           where           with
+macro           where
 ```
+
+(`with` is no longer in this list — v1.x-VIOLATE recognizes it
+as a contextual keyword inside the `violate_stmt` production.)
 
 `yield` is a real statement keyword (m26b) — explicit
 cooperative yield point; lowers to a bus-queue drain in

@@ -161,6 +161,7 @@ pub fn check_bundle(bundle: &Bundle<'_>, top: &TopScope) -> Vec<Diag> {
             current_locus: None,
             in_lifecycle: false,
             in_closure: false,
+            in_on_failure: false,
             fallible_ctx: None,
         };
         for item in &program.items {
@@ -266,6 +267,10 @@ struct Checker<'a> {
     current_locus: Option<&'a LocusInfo>,
     in_lifecycle: bool,
     in_closure: bool,
+    /// v1.x-VIOLATE (F.27): true while typechecking an
+    /// `on_failure` body. Gates the rejection of `violate`
+    /// inside `on_failure` (use `bubble(err)` instead).
+    in_on_failure: bool,
     /// v1.x-FORM-1: when inside a `fallible(E)` fn body, holds
     /// `(success_ret, payload_E)`. Used to validate `return`
     /// against the success type, `fail <expr>;` against the
@@ -947,6 +952,7 @@ impl<'a> Checker<'a> {
             }
             LocusMember::Failure(fd) => {
                 self.in_lifecycle = true;
+                self.in_on_failure = true;
                 self.locals.push();
                 for p in &fd.params {
                     let ty = resolve_type_expr(&p.ty, self.known);
@@ -954,44 +960,117 @@ impl<'a> Checker<'a> {
                 }
                 self.check_block(&fd.body);
                 self.locals.pop();
+                self.in_on_failure = false;
                 self.in_lifecycle = false;
             }
             LocusMember::Closure(cd) => {
                 self.in_closure = true;
                 self.in_lifecycle = true;
-                let lt = self.check_expr(&cd.assertion.left);
-                let rt = self.check_expr(&cd.assertion.right);
-                if !lt.assignable_from(&rt) && !rt.assignable_from(&lt) {
+                // v1.x-VIOLATE (F.27): structural rules on the
+                // closure declaration itself.
+                let is_inline = cd.clauses.iter().any(|c| {
+                    matches!(c, ClosureClause::Epoch(EpochSpec::Inline))
+                });
+                let captures: Vec<&Ident> = cd
+                    .clauses
+                    .iter()
+                    .flat_map(|c| match c {
+                        ClosureClause::Captures(names) => names.iter().collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                // 1. Assertion-presence must match epoch shape.
+                //    - `epoch inline`: assertion MUST be absent
+                //      (inline fires only via `violate`; an
+                //      assertion that never fires is dead).
+                //    - Any other epoch: assertion MUST be present.
+                if is_inline && cd.assertion.is_some() {
                     self.diags.push(Diag::ty(
-                        cd.assertion.span,
+                        cd.span,
                         format!(
-                            "closure `{}`: assertion sides have incompatible types \
-                             `{}` and `{}`",
+                            "closure `{}`: `epoch inline` closures must \
+                             omit the assertion (inline closures fire \
+                             only via `violate`; the assertion has no \
+                             evaluation site)",
                             cd.name.name,
-                            lt.display(),
-                            rt.display()
                         ),
                     ));
                 }
-                // Cycle-existence: at least one side of the
-                // assertion must observe runtime-varying state
-                // (self, locals, method calls). Two pure-literal
-                // sides means the assertion has nothing to
-                // audit — either always passes or always fails.
-                if is_pure_literal(&cd.assertion.left)
-                    && is_pure_literal(&cd.assertion.right)
-                {
+                if !is_inline && cd.assertion.is_none() {
                     self.diags.push(Diag::ty(
-                        cd.assertion.span,
+                        cd.span,
                         format!(
-                            "closure `{}`: both assertion sides are pure literals; \
-                             a closure must observe at least one runtime-varying \
-                             value (e.g. `self.x`) to audit anything",
-                            cd.name.name
+                            "closure `{}`: missing assertion. Assertion-\
+                             less closures require an `epoch inline` \
+                             clause (per F.27); otherwise declare the \
+                             `LEFT ~~ RIGHT within TOL;` band",
+                            cd.name.name,
                         ),
                     ));
                 }
-                let _ = self.check_expr(&cd.assertion.tolerance);
+                // 2. `captures:` is only meaningful on inline
+                //    closures.
+                if !captures.is_empty() && !is_inline {
+                    self.diags.push(Diag::ty(
+                        cd.span,
+                        format!(
+                            "closure `{}`: `captures:` is meaningful only \
+                             on `epoch inline` closures (the snapshot \
+                             happens at `violate` fire time, which \
+                             auto-epoch closures don't reach)",
+                            cd.name.name,
+                        ),
+                    ));
+                }
+                // 3. Each captured field name must exist on the
+                //    locus param/state surface.
+                if let Some(locus) = self.current_locus {
+                    for f in &captures {
+                        if !locus.params.iter().any(|p| p.name == f.name) {
+                            self.diags.push(Diag::ty(
+                                f.span,
+                                format!(
+                                    "closure `{}`: `captures:` references \
+                                     field `{}`, which is not declared on \
+                                     locus `{}`",
+                                    cd.name.name, f.name, locus.name,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // Original assertion checks for assertion-bearing
+                // closures.
+                if let Some(assertion) = &cd.assertion {
+                    let lt = self.check_expr(&assertion.left);
+                    let rt = self.check_expr(&assertion.right);
+                    if !lt.assignable_from(&rt) && !rt.assignable_from(&lt) {
+                        self.diags.push(Diag::ty(
+                            assertion.span,
+                            format!(
+                                "closure `{}`: assertion sides have incompatible types \
+                                 `{}` and `{}`",
+                                cd.name.name,
+                                lt.display(),
+                                rt.display()
+                            ),
+                        ));
+                    }
+                    if is_pure_literal(&assertion.left)
+                        && is_pure_literal(&assertion.right)
+                    {
+                        self.diags.push(Diag::ty(
+                            assertion.span,
+                            format!(
+                                "closure `{}`: both assertion sides are pure literals; \
+                                 a closure must observe at least one runtime-varying \
+                                 value (e.g. `self.x`) to audit anything",
+                                cd.name.name
+                            ),
+                        ));
+                    }
+                    let _ = self.check_expr(&assertion.tolerance);
+                }
                 self.in_lifecycle = false;
                 self.in_closure = false;
             }
@@ -1403,6 +1482,82 @@ impl<'a> Checker<'a> {
                     let _ = self.check_expr(e);
                 }
             }
+            // v1.x-VIOLATE (F.27): rejection-context enforcement
+            // + closure-name resolution against the enclosing
+            // locus + epoch-inline gate. The parser already
+            // accepts `violate NAME [with EXPR];` only at
+            // statement positions where it disambiguates from a
+            // function call; here we enforce the structural
+            // rules from F.27.
+            Stmt::Violate { name, payload, span } => {
+                if let Some(p) = payload {
+                    let _ = self.check_expr(p);
+                }
+                match self.current_locus {
+                    None => {
+                        self.diags.push(Diag::ty(
+                            *span,
+                            format!(
+                                "`violate {}`: free fns can't use `violate` \
+                                 (no `self` to anchor the closure name). \
+                                 Use `fail <payload>;` if this fn is \
+                                 declared `fallible(E)`, or move the call \
+                                 into a locus method body",
+                                name.name,
+                            ),
+                        ));
+                    }
+                    Some(locus) if self.in_on_failure => {
+                        self.diags.push(Diag::ty(
+                            *span,
+                            format!(
+                                "`violate {}`: not allowed inside an \
+                                 `on_failure` body (use `bubble(err)` to \
+                                 propagate the child's failure instead — \
+                                 `on_failure` is the parent-side handler, \
+                                 not a place to fire `{}`'s own closures)",
+                                name.name, locus.name,
+                            ),
+                        ));
+                    }
+                    Some(locus) => {
+                        match locus.closures.iter().find(|c| c.name == name.name) {
+                            None => {
+                                self.diags.push(Diag::ty(
+                                    name.span,
+                                    format!(
+                                        "`violate {}`: locus `{}` has no \
+                                         closure named `{}`",
+                                        name.name, locus.name, name.name,
+                                    ),
+                                ));
+                            }
+                            Some(c) if !c.is_inline => {
+                                self.diags.push(Diag::ty(
+                                    name.span,
+                                    format!(
+                                        "`violate {}`: closure `{}` on locus \
+                                         `{}` is not declared `epoch inline`. \
+                                         Only assertion-less, inline-epoch \
+                                         closures can be fired via `violate`; \
+                                         add `epoch inline;` to its clause \
+                                         list (or use `bubble(err)` from an \
+                                         `on_failure` body instead)",
+                                        name.name, name.name, locus.name,
+                                    ),
+                                ));
+                            }
+                            Some(_) => {
+                                // Closure exists and is epoch-inline.
+                                // Payload-type validation against the
+                                // closure's captures + `with` shape
+                                // lands in phase 4 alongside
+                                // ClosureViolation synthesis.
+                            }
+                        }
+                    }
+                }
+            }
             Stmt::Expr(e) => {
                 let _ = self.check_expr_addressed(e);
             }
@@ -1750,6 +1905,15 @@ impl<'a> Checker<'a> {
                         // whether B/c/sigma are Int (the divisor is
                         // a phi-weighted blend).
                         return Some(Ty::Prim(PrimType::Float));
+                    }
+                    // v1.x-VIOLATE (F.27): synthetic Bool flag
+                    // readable from any locus method body. True
+                    // while the locus is winding down after
+                    // `violate`; canonical use is to gate
+                    // downstream sends after escalation. Backed
+                    // by `__drain_requested` at codegen.
+                    if name == "draining" {
+                        return Some(Ty::Prim(PrimType::Bool));
                     }
                     if let Some(p) = info.params.iter().find(|p| p.name == name) {
                         return Some(p.ty.clone());

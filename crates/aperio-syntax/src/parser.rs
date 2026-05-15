@@ -1430,9 +1430,17 @@ impl Parser {
         let kw = self.expect(TokenKind::Closure, "closure")?;
         let name = self.expect_ident("closure name")?;
         self.expect(TokenKind::LBrace, "{")?;
-        // First clause: assertion (LEFT ~~ RIGHT within TOL ;)
-        let assertion = self.parse_closure_assertion()?;
-        // Optional clauses
+        // v1.x-VIOLATE (F.27): the assertion is optional. If the
+        // body opens with a clause leader (epoch /
+        // persists_through / resets_on / captures), there is no
+        // assertion. Otherwise the first item is an assertion.
+        // Typecheck (not parse) enforces "assertion required
+        // unless epoch inline".
+        let assertion = if self.at_closure_clause_leader() {
+            None
+        } else {
+            Some(self.parse_closure_assertion()?)
+        };
         let mut clauses = Vec::new();
         while !self.at(&TokenKind::RBrace) && !matches!(self.peek(), TokenKind::Eof) {
             clauses.push(self.parse_closure_clause()?);
@@ -1444,6 +1452,24 @@ impl Parser {
             clauses,
             span: kw.span.merge(close.span),
         })
+    }
+
+    /// True when peek begins a closure-clause production
+    /// (`epoch`, `persists_through`, `resets_on`, or the
+    /// contextual `captures`) OR is the body's closing brace
+    /// (empty body — assertion-less). Used by parse_closure_decl
+    /// to decide whether the first body item is an assertion or
+    /// not. Typecheck (not parse) enforces "assertion required
+    /// unless epoch inline".
+    fn at_closure_clause_leader(&self) -> bool {
+        match self.peek() {
+            TokenKind::Epoch
+            | TokenKind::PersistsThrough
+            | TokenKind::ResetsOn
+            | TokenKind::RBrace => true,
+            TokenKind::Ident(s) if s == "captures" => true,
+            _ => false,
+        }
     }
 
     fn parse_closure_assertion(&mut self) -> Result<ClosureAssertion, Diag> {
@@ -1489,7 +1515,7 @@ impl Parser {
     }
 
     fn parse_closure_clause(&mut self) -> Result<ClosureClause, Diag> {
-        match self.peek() {
+        match self.peek().clone() {
             TokenKind::Epoch => {
                 self.bump();
                 let spec = self.parse_epoch_spec()?;
@@ -1508,6 +1534,20 @@ impl Parser {
                 self.expect(TokenKind::Semi, ";")?;
                 Ok(ClosureClause::ResetsOn(names))
             }
+            // v1.x-VIOLATE (F.27): `captures: f1, f2, ... ;`
+            // Contextual — only recognized inside a closure body
+            // by peek matching on the Ident name.
+            TokenKind::Ident(s) if s == "captures" => {
+                self.bump(); // consume `captures` ident
+                self.expect(TokenKind::Colon, ":")?;
+                let mut names = Vec::new();
+                names.push(self.expect_ident("captured field name")?);
+                while self.eat(&TokenKind::Comma) {
+                    names.push(self.expect_ident("captured field name")?);
+                }
+                self.expect(TokenKind::Semi, ";")?;
+                Ok(ClosureClause::Captures(names))
+            }
             other => Err(Diag::parse(
                 self.peek_token().span,
                 format!("expected closure clause, got {:?}", other),
@@ -1524,6 +1564,12 @@ impl Parser {
             TokenKind::Ident(s) if s == "explicit" => {
                 self.bump();
                 Ok(EpochSpec::Explicit)
+            }
+            // v1.x-VIOLATE (F.27): `epoch inline` — pull-only,
+            // fires only via `violate NAME;`. Contextual ident.
+            TokenKind::Ident(s) if s == "inline" => {
+                self.bump();
+                Ok(EpochSpec::Inline)
             }
             TokenKind::Birth => {
                 self.bump();
@@ -2017,6 +2063,20 @@ impl Parser {
             stmts.push(self.parse_fail_stmt()?);
             return Ok(None);
         }
+        // v1.x-VIOLATE (F.27): `violate NAME [with EXPR];`. The
+        // keyword is contextual at the statement-leading
+        // position. We accept it at parse-time anywhere a
+        // statement is legal; typecheck enforces the rejection
+        // contexts (free fn, on_failure body). This means
+        // `let violate = 0;` and `violate();` (call expr) still
+        // work — the violate-stmt only triggers when the *next*
+        // token after `violate` is a bare ident-then-`;`/`with`,
+        // distinguishing it from a function call. See
+        // peek_is_violate_stmt for the disambiguation rule.
+        if self.peek_is_violate_stmt() {
+            stmts.push(self.parse_violate_stmt()?);
+            return Ok(None);
+        }
         match self.peek() {
             TokenKind::Let
             | TokenKind::If
@@ -2057,6 +2117,48 @@ impl Parser {
         let semi = self.expect(TokenKind::Semi, ";")?;
         Ok(Stmt::Fail {
             value,
+            span: kw.span.merge(semi.span),
+        })
+    }
+
+    /// True when peek is the contextual `violate` keyword at
+    /// statement-leading position AND the lookahead disambiguates
+    /// it from a function call. The violate-stmt grammar is
+    /// `violate IDENT (`with` EXPR)? ;` — so after `violate` we
+    /// require an Ident followed by either `;` (no payload) or
+    /// `with` (payload). Otherwise we fall through to expression
+    /// parsing so `violate();`, `violate.foo`, `let x = violate;`
+    /// etc. still work.
+    fn peek_is_violate_stmt(&self) -> bool {
+        if !matches!(self.peek(), TokenKind::Ident(s) if s == "violate") {
+            return false;
+        }
+        if !matches!(self.peek_at(1), TokenKind::Ident(_)) {
+            return false;
+        }
+        match self.peek_at(2) {
+            TokenKind::Semi => true,
+            TokenKind::Ident(s) if s == "with" => true,
+            _ => false,
+        }
+    }
+
+    /// v1.x-VIOLATE (F.27): `violate NAME [with EXPR];`.
+    /// Statement-level, divergent. The closure-name lookup and
+    /// rejection-context enforcement happen at typecheck.
+    fn parse_violate_stmt(&mut self) -> Result<Stmt, Diag> {
+        let kw = self.bump(); // consume `violate` Ident
+        let name = self.expect_ident("closure name after `violate`")?;
+        let payload = if matches!(self.peek(), TokenKind::Ident(s) if s == "with") {
+            self.bump(); // consume `with`
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let semi = self.expect(TokenKind::Semi, ";")?;
+        Ok(Stmt::Violate {
+            name,
+            payload,
             span: kw.span.merge(semi.span),
         })
     }
@@ -3834,5 +3936,139 @@ locus Two {
         assert_eq!(cap.slots.len(), 2);
         assert_eq!(cap.slots[0].indexed_by.as_ref().map(|i| i.name.as_str()), Some("name"));
         assert!(cap.slots[1].indexed_by.is_none());
+    }
+
+    // v1.x-VIOLATE (F.27) phase 2 — parser tests.
+
+    #[test]
+    fn parse_inline_closure_no_assertion() {
+        let src = r#"
+locus L {
+    params { last_error: String = ""; }
+    closure fatal_io { captures: last_error; epoch inline; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let cl = match &prog.items[0] {
+            TopDecl::Locus(l) => l.members.iter().find_map(|m| match m {
+                LocusMember::Closure(c) => Some(c),
+                _ => None,
+            }).expect("closure decl"),
+            _ => panic!("expected locus"),
+        };
+        assert_eq!(cl.name.name, "fatal_io");
+        assert!(cl.assertion.is_none());
+        assert_eq!(cl.clauses.len(), 2);
+        let mut saw_captures = false;
+        let mut saw_inline = false;
+        for cls in &cl.clauses {
+            match cls {
+                ClosureClause::Captures(names) => {
+                    assert_eq!(names.len(), 1);
+                    assert_eq!(names[0].name, "last_error");
+                    saw_captures = true;
+                }
+                ClosureClause::Epoch(EpochSpec::Inline) => {
+                    saw_inline = true;
+                }
+                _ => panic!("unexpected clause: {:?}", cls),
+            }
+        }
+        assert!(saw_captures && saw_inline);
+    }
+
+    #[test]
+    fn parse_assertion_bearing_closure_still_works() {
+        let src = r#"
+locus L {
+    params { x: Int = 0; }
+    closure invariant { self.x ~~ self.x within 0; epoch tick; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        match &prog.items[0] {
+            TopDecl::Locus(l) => {
+                let cl = l.members.iter().find_map(|m| match m {
+                    LocusMember::Closure(c) => Some(c),
+                    _ => None,
+                }).expect("closure decl");
+                assert!(cl.assertion.is_some());
+            }
+            _ => panic!("expected locus"),
+        }
+    }
+
+    #[test]
+    fn parse_violate_stmt_bare() {
+        let src = r#"
+locus L {
+    params { x: Int = 0; }
+    closure fatal { epoch inline; }
+    fn step() { violate fatal; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let f = match &prog.items[0] {
+            TopDecl::Locus(l) => l.members.iter().find_map(|m| match m {
+                LocusMember::Fn(f) => Some(f),
+                _ => None,
+            }).expect("fn"),
+            _ => panic!("expected locus"),
+        };
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Violate { ref name, payload: None, .. } if name.name == "fatal"
+        ));
+    }
+
+    #[test]
+    fn parse_violate_stmt_with_payload() {
+        let src = r#"
+locus L {
+    closure fatal { epoch inline; }
+    fn step() { violate fatal with 42; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let f = match &prog.items[0] {
+            TopDecl::Locus(l) => l.members.iter().find_map(|m| match m {
+                LocusMember::Fn(f) => Some(f),
+                _ => None,
+            }).expect("fn"),
+            _ => panic!("expected locus"),
+        };
+        match &f.body.stmts[0] {
+            Stmt::Violate { name, payload: Some(_), .. } => {
+                assert_eq!(name.name, "fatal");
+            }
+            other => panic!("expected violate stmt with payload, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_violate_as_ident_when_no_stmt_shape() {
+        // `violate` outside the violate-stmt grammar lexes /
+        // parses as an ordinary identifier. `let violate = 1;`
+        // must remain admissible, as must `violate()` (call).
+        let src = r#"
+fn main() {
+    let violate = 1;
+    let _ = violate;
+}
+"#;
+        parse_str(src).expect("parse failed");
+    }
+
+    #[test]
+    fn parse_with_as_ident_outside_violate_stmt() {
+        // `with` is no longer reserved; ordinary identifier
+        // elsewhere.
+        let src = r#"
+fn main() {
+    let with = 1;
+    let _ = with;
+}
+"#;
+        parse_str(src).expect("parse failed");
     }
 }

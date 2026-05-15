@@ -188,7 +188,9 @@ pub enum TokenKind {
     Yield,
     Macro,
     Where,
-    With,
+    // v1.x-VIOLATE (F.27): `with` is no longer reserved at the
+    // lexer level. The lexer emits it as an Ident; the parser
+    // recognizes it contextually inside `violate_stmt`.
 
     // Operators / punctuation
     Plus,       // +
@@ -506,7 +508,23 @@ impl<'a> Lexer<'a> {
             "yield" => TokenKind::Yield,
             "macro" => TokenKind::Macro,
             "where" => TokenKind::Where,
-            "with" => TokenKind::With,
+            // `with` is NOT in this list — v1.x-VIOLATE (F.27)
+            // makes it a contextual keyword inside the
+            // `violate_stmt` production. It lexes as Ident so
+            // `let with = ...` / `fn with(...)` stay admissible.
+
+            // `violate` is a contextual keyword recognized only
+            // as the leading token of a statement inside a locus
+            // method body. Lexed as Ident; same F.10-style
+            // narrowing as `fail`.
+            //
+            // `inline` is a contextual keyword recognized only as
+            // an `epoch_spec` variant inside a closure body.
+            // Lexed as Ident.
+            //
+            // `captures` is a contextual keyword recognized only
+            // as a closure-clause leader (`captures: f1, f2 ...;`)
+            // inside a closure body. Lexed as Ident.
 
             other => TokenKind::Ident(other.to_string()),
         };

@@ -173,6 +173,14 @@ pub struct LocusHandle {
     /// still fire (cleanup is unconditional). Bus-dispatch
     /// gating waits on m41b.
     pub quarantined: Rc<std::cell::Cell<bool>>,
+    /// v1.x-VIOLATE (F.27): sticky flag set when a `violate
+    /// NAME;` fires inside a method on this locus. Exposed to
+    /// user code as `self.draining`; the canonical pattern is
+    /// `if !self.draining { Subject <- value; }` so a post-
+    /// violation iteration doesn't publish a bogus result.
+    /// Once set, the locus is winding down toward its
+    /// `on_failure`-routed dissolution.
+    pub draining: Rc<std::cell::Cell<bool>>,
     /// m45: signals the next restart re-run should reset
     /// user fields to declared defaults before invoking
     /// birth(). Set by `restart_in_place(c)`; cleared by
