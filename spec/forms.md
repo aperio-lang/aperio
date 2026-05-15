@@ -439,7 +439,7 @@ replace any other locus mechanic.
 
 `@form(vec)` is the canonical benchmark target. The three perf
 bands above map to three benches that ship under
-`bench/micro/`:
+`micro/` in the sibling `aperio-lang/bench` repo:
 
 1. **Tight-loop primitive (band (a), 10% gate).**
    `form_vec_push` — 1M `push` on a `@form(vec)` of `Int`,
@@ -469,18 +469,20 @@ bands above map to three benches that ship under
    form-lowered version targeted to be no worse than the F.22
    baseline. Not yet wired.
 
-The microbench harness is at `bench/run.sh`; the bench sources
-are sibling `.ap` / `.go` / `.js` / `.py` files under
-`bench/micro/` and `bench/app/`.
+The microbench harness lives in the sibling `aperio-lang/bench`
+repo; its `run.sh` resolves the `aperio` binary via
+`$APERIO_BIN` → `aperio` on PATH → `../aperio/target/release/aperio`.
+Bench sources are sibling `.ap` / `.go` / `.js` / `.py` files
+under `micro/` and `app/`.
 
 If a bench fails its applicable band, the lowering is
 redesigned before further forms are added to the library.
 `@form(hashmap)` shipped via v1.x-FORM-4 without a parallel
 bench under this protocol (the band (a) win on
 `form_vec_push` was held to license the form-machinery
-extension); a `bench/micro/form_hashmap_*` family is the
-natural follow-up if perf becomes load-bearing for hashmap
-consumers.
+extension); a `micro/form_hashmap_*` family in `aperio-lang/bench`
+is the natural follow-up if perf becomes load-bearing for
+hashmap consumers.
 
 ## Anti-patterns
 
@@ -805,7 +807,8 @@ locus mechanic.
 ## Bench protocol (future FORM-N gate)
 
 `@form(hashmap)` gets a bench family parallel to `@form(vec)`'s
-three bands once `bench/micro/form_hashmap_*` is wired up:
+three bands once `aperio-lang/bench`'s `micro/form_hashmap_*`
+is wired up:
 
 1. **Tight-loop primitive (band (a)).** A `form_hashmap_set`
    microbench — 200k `set` calls on a hashmap of struct cells,
@@ -1125,6 +1128,7 @@ buffer should pick a generous cap up front, or use
    demonstrates demand.
 3. **Iteration in pop order without removing.** A "drain" or
    "iter_pop" that visits elements oldest-first as a one-shot.
-4. **Bench protocol.** A `bench/micro/form_ring_buffer_*`
-   family parallel to vec's and hashmap's. Ships as a separate
-   milestone after a consumer workload surfaces.
+4. **Bench protocol.** A `micro/form_ring_buffer_*` family
+   in `aperio-lang/bench`, parallel to vec's and hashmap's.
+   Ships as a separate milestone after a consumer workload
+   surfaces.

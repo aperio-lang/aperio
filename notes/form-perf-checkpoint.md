@@ -1,16 +1,17 @@
 # @form perf checkpoint
 
 Tracks the FORM-3 perf gate (10% of hand-written C) as the
-substrate iterates. The `bench/` harness is the source of truth
-for current numbers; this file is the narrative the harness
-output doesn't carry — what changed, what the diagnosis was,
-what's still open.
+substrate iterates. The bench harness in the sibling
+[`aperio-lang/bench`](https://github.com/aperio-lang/bench)
+repo is the source of truth for current numbers; this file is
+the narrative the harness output doesn't carry — what changed,
+what the diagnosis was, what's still open.
 
 ## 2026-05-13 — first bench, post-FORM-4
 
 The bench harness landed (parallel-process activity in
-`bench/`) and surfaced concrete ratio data against Go / Node /
-Python siblings. Headline numbers from the 5-sample median
+`aperio-lang/bench`) and surfaced concrete ratio data against
+Go / Node / Python siblings. Headline numbers from the 5-sample median
 run, Aperio vs Go:
 
 | Bench               | Aperio   | Go ratio | Status |
