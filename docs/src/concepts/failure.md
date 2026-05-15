@@ -205,9 +205,6 @@ loci, so the value channel fits.
 
 ## Bridging the channels: structural failure from value-error context
 
-> *Shipping in v1.x; specified at `spec/design-rationale.md` § F.27.
-> Compiler implementation in progress.*
-
 The two-channel rule keeps locus methods off the value channel —
 but real systems regularly need to *cross from one to the other*.
 A locus method catches a value error in an `or` clause, decides

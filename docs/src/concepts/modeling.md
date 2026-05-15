@@ -229,8 +229,6 @@ the namespace-lotus form (pattern 2) often reads better.
 
 ### 7. Error-check function — bridging the channels
 
-> *Shipping in v1.x; specified at `spec/design-rationale.md` § F.27.*
-
 A locus member fn whose signature is `fn(ErrType) -> SuccessType`,
 used as the fallback in an `or self.handler(err)` clause at a
 fallible call site. Internally, it examines the error and
@@ -312,33 +310,6 @@ catch yourself reaching for one, reconsider.
 - **Fluent-builder chains that mutate self.** If you're
   writing `obj.with(x).with(y).build()`, the thing wanted to
   be a locus with proper `params` and lifecycle.
-
-## The friction-log discipline
-
-When the language doesn't cleanly express what you want, the
-productive move is *not* to paper over with hacks or invent a
-primitive. It's to write the friction down.
-
-In your app directory, keep a `FRICTION.md` with one entry
-per friction. Each entry:
-
-- **Smallest reproducible example.** The minimum code that
-  exhibits the friction.
-- **What you tried.** Each variant attempted and why it
-  didn't work.
-- **What you wanted.** The shape you reached for — what would
-  have felt natural.
-
-The pattern catalog (the six above) and the language itself
-both grow from real friction. The std seed has absorbed a lot
-of historical friction; the form library, the topic system,
-schedule classes, structural interfaces all started as
-entries in someone's `FRICTION.md`.
-
-Friction is data, not noise. Logging it is how you contribute
-to the language's growth — even if you never file a single
-issue, the patterns that recur across friction logs are what
-drive the design direction.
 
 ## A worked example: choosing the model
 
@@ -442,6 +413,3 @@ example from the introduction grows into a complete system —
 matchmaker locus, per-match game session loci, terminal
 client loci, all composed through the bus. The "Build a real
 app" tutorial walks through that build (forthcoming).
-
-If you hit friction while writing code, log it. The language
-needs your friction more than your perfection.

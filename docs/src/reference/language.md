@@ -68,11 +68,10 @@ with the spec, the spec wins.
 ## Style and conventions
 
 - [`spec/styleguide.md`](https://github.com/aperio-lang/aperio/blob/main/spec/styleguide.md) —
-  idiomatic Aperio. The full version of the six patterns
+  idiomatic Aperio. The full version of the patterns
   introduced in
   [Modeling — how to think in Aperio](../concepts/modeling.md);
-  full naming conventions; expanded anti-patterns; the
-  friction-log contract.
+  full naming conventions; expanded anti-patterns.
 
 ## Testing
 

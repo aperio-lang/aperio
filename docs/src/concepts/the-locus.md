@@ -135,9 +135,8 @@ declares a closure whose only firing mode is explicit
 clause names locus state to snapshot into the violation payload.
 This shape is the bridge between the value channel and the
 structural channel — covered in detail in
-[The two failure channels](./failure.md). *(`epoch inline`,
-`violate`, and the `captures:` clause are shipping in v1.x; the
-spec change is `F.27` in `spec/design-rationale.md`.)*
+[The two failure channels](./failure.md). (Spec reference:
+`F.27` in `spec/design-rationale.md`.)
 
 ## `locus` vs `type`
 

@@ -170,17 +170,8 @@ Filter these reflexes before they cost you time.
   `mydir/mydir`. Inside one seed, top-level scope is shared and
   resolution is order-free.
 - Don't edit `crates/`. That's compiler territory. If a
-  primitive you need is missing, surface friction rather than
-  reaching into the compiler.
-
-## Friction log discipline
-
-When the language can't express what you want cleanly, write it
-down — don't paper over with hacks or invent a primitive. In
-your app directory, keep a `FRICTION.md` with one entry per
-friction: smallest reproducible example, what you tried, what
-you wanted. The pattern catalog grows from real friction, not
-speculation.
+  primitive you need is missing, work within the existing
+  surface; don't reach into the compiler.
 
 ## Naming
 
@@ -221,18 +212,17 @@ surprises:
 4. Write the smallest program that gets one thing working.
    `aperio run <file-or-dir>` for fast feedback; `aperio build`
    for the native binary.
-5. Iterate. If you hit a wall, log friction.
+5. Iterate.
 
-## Forthcoming (v1.x in progress — do not emit yet)
+## Inline structural failure
 
-The compiler is implementing a small set of additions for
-"inline structural failure." These are NOT in the language
-today; do not generate code that uses them until the spec
-change at `spec/design-rationale.md` § F.27 ships:
+For "catch a value error in a locus method and shut this locus
+down," use the four-piece pattern. Spec reference:
+`spec/design-rationale.md` § F.27.
 
 - **`closure NAME { captures: f1, f2; epoch inline; }`** —
   assertion-less closure shape that fires only via explicit
-  `violate`. Snapshot the listed fields into the violation
+  `violate`. Snapshots the listed fields into the violation
   payload.
 - **`violate NAME;` / `violate NAME with expr;`** —
   statement-level, divergent (`Never` type, same shape as
@@ -250,12 +240,11 @@ change at `spec/design-rationale.md` § F.27 ships:
   completes. Useful for "don't publish further after we
   decided to wind down."
 
-When these ship, the canonical pattern for "catch error and
-shut this locus down" becomes a closure declaration + a
-member fn + one `violate` statement, replacing the current
-workaround (a `should_exit: Bool` flag plus a
-`while !should_exit { yield; }` loop in `run()`). Until then,
-use the workaround.
+The canonical pattern for "catch error and shut this locus
+down" is a closure declaration + a member fn + one `violate`
+statement. Don't reach for a `should_exit: Bool` flag plus a
+`while !should_exit { yield; }` loop — the primitives above
+are the supported form.
 
 ## Pointers
 
