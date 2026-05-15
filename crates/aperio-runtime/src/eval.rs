@@ -40,6 +40,11 @@ pub enum Signal {
     /// out so it propagates only as far as the locus method
     /// body it was raised in.
     Violate,
+    /// `std::process::exit(code)` — unwind to `run_main`, which
+    /// maps the carried i32 to the program's exit code. Bypasses
+    /// the normal dissolve cascade (matches libc exit semantics:
+    /// the process terminates immediately).
+    Exit(i32),
     Error(String),
 }
 
@@ -229,6 +234,13 @@ impl Interpreter {
                 None
             }
             Err(Signal::Return(_)) => None,
+            // std::process::exit(n): immediate-exit semantics. The
+            // dissolve cascade below is skipped so the process
+            // terminates with `n` regardless of in-flight loci —
+            // mirrors libc exit(3). Return early.
+            Err(Signal::Exit(n)) => {
+                return Ok(n);
+            }
             Err(s) => Some(s),
         };
 
@@ -1225,6 +1237,39 @@ impl Interpreter {
                         {
                             return self.read_next_accumulator_slot(&i.name);
                         }
+                    }
+                }
+                // std::process::exit(n) — intercept before the
+                // generic stdlib-path dispatch so we can raise
+                // the dedicated Signal::Exit rather than going
+                // through a Builtin (whose return signature has
+                // no divergence channel). `n` evaluates as an
+                // Int; truncation to i32 mirrors the codegen
+                // ABI.
+                if let Expr::Path(qn) = callee.as_ref() {
+                    let segs: Vec<&str> = qn
+                        .segments
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .collect();
+                    if segs.as_slice() == ["std", "process", "exit"] {
+                        if args.len() != 1 {
+                            return Err(Signal::Error(format!(
+                                "std::process::exit takes 1 arg (code), got {}",
+                                args.len()
+                            )));
+                        }
+                        let v = self.eval_expr(&args[0])?;
+                        let code = match v {
+                            Value::Int(n) => n as i32,
+                            other => {
+                                return Err(Signal::Error(format!(
+                                    "std::process::exit: code must be Int, got {}",
+                                    other.type_name()
+                                )))
+                            }
+                        };
+                        return Err(Signal::Exit(code));
                     }
                 }
                 // m44: intercept `check_closures()` before
