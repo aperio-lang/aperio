@@ -144,6 +144,41 @@ For codegen-only changes, the integration tests under
 `crates/aperio-codegen/tests/` are the broadest exercise
 surface.
 
+## Performance
+
+The bench harness lives in the sibling
+[`aperio-lang/bench`](https://github.com/aperio-lang/bench)
+repo. Clone it next to `aperio/` so the harness finds the
+compiled binary, or install `aperio` on PATH:
+
+```
+~/code/aperio-lang/
+├── aperio/   (this repo)
+└── bench/    (clone of aperio-lang/bench)
+```
+
+The harness resolves the binary as: `$APERIO_BIN` →
+`aperio` on PATH → `../aperio/target/release/aperio`.
+
+Perf-sensitive changes — anything touching codegen lowering,
+the C runtime, or the bus dispatch path — should run the
+relevant benches before and after, and either match or beat
+the baseline.
+
+```
+cd ../bench
+./run.sh --bench=<name>             # one bench
+./run.sh                            # full suite; exits 1 on Aperio regression
+./run.sh --update-baselines         # after a verified gain
+```
+
+Baselines live in `aperio-lang/bench/baselines.json` and update
+deliberately (commit the new medians in the bench repo with a
+commit message explaining what changed and where the gain came
+from). Comparative numbers vs Go / Node / Python are emitted
+in the report but never gate exit code — only Aperio
+regressions do.
+
 ## The recursive principle, applied to compiler internals
 
 Aperio's "everything is a locus" axiom applies inside the
