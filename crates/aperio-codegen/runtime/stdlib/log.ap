@@ -96,9 +96,11 @@ locus __StdLogLogger {
 // regardless of namespace depth. Emits one line per event in
 // the form `[LEVEL path] msg`.
 //
-// v0 emits all levels to stdout. WARN/ERROR routing to stderr
-// is a follow-up — needs a `eprintln`-style primitive that
-// doesn't yet exist.
+// Routing: WARN and ERROR go to stderr via `eprintln` so the
+// signal lane separates from normal program output in shell
+// pipelines and supervisor / CI log capture. INFO, DEBUG, and
+// TRACE go to stdout via `println`. Both runtimes implement
+// `eprintln`.
 locus __StdLogStdoutSink {
     bus {
         subscribe "log.**" as on_event of type __StdLogEvent;
@@ -110,6 +112,10 @@ locus __StdLogStdoutSink {
         if e.level == 3 { name = "ERROR"; }
         if e.level == 4 { name = "DEBUG"; }
         if e.level == 5 { name = "TRACE"; }
-        println("[", name, " ", e.path, "] ", e.msg);
+        if e.level == 2 || e.level == 3 {
+            eprintln("[", name, " ", e.path, "] ", e.msg);
+        } else {
+            println("[", name, " ", e.path, "] ", e.msg);
+        }
     }
 }

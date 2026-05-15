@@ -24,6 +24,8 @@ fn build_aperio(name: &str, source: &str) -> std::path::PathBuf {
 
 #[test]
 fn logger_basic_levels_print_to_stdout() {
+    // Routing: WARN/ERROR go to stderr; INFO/DEBUG/TRACE go to
+    // stdout. Verify the per-stream split.
     let src = r#"
         fn main() {
             std::log::StdoutSink { };
@@ -40,11 +42,14 @@ fn logger_basic_levels_print_to_stdout() {
     let _ = std::fs::remove_file(&bin);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[INFO app] starting"), "got: {:?}", stdout);
-    assert!(stdout.contains("[WARN app] watch out"), "got: {:?}", stdout);
-    assert!(stdout.contains("[ERROR app] kaboom"), "got: {:?}", stdout);
-    assert!(stdout.contains("[DEBUG app] noise"), "got: {:?}", stdout);
-    assert!(stdout.contains("[TRACE app] ultra-noise"), "got: {:?}", stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // stdout: INFO / DEBUG / TRACE.
+    assert!(stdout.contains("[INFO app] starting"), "stdout: {:?}", stdout);
+    assert!(stdout.contains("[DEBUG app] noise"), "stdout: {:?}", stdout);
+    assert!(stdout.contains("[TRACE app] ultra-noise"), "stdout: {:?}", stdout);
+    // stderr: WARN / ERROR.
+    assert!(stderr.contains("[WARN app] watch out"), "stderr: {:?}", stderr);
+    assert!(stderr.contains("[ERROR app] kaboom"), "stderr: {:?}", stderr);
 }
 
 #[test]
@@ -66,10 +71,12 @@ fn logger_cascades_via_parent_path() {
     let _ = std::fs::remove_file(&bin);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[INFO app] starting"), "got: {:?}", stdout);
-    assert!(stdout.contains("[INFO app.db] connected"), "got: {:?}", stdout);
-    assert!(stdout.contains("[WARN app.api] slow"), "got: {:?}", stdout);
-    assert!(stdout.contains("[ERROR app.db] query failed"), "got: {:?}", stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // INFO lands on stdout; WARN / ERROR on stderr.
+    assert!(stdout.contains("[INFO app] starting"), "stdout: {:?}", stdout);
+    assert!(stdout.contains("[INFO app.db] connected"), "stdout: {:?}", stdout);
+    assert!(stderr.contains("[WARN app.api] slow"), "stderr: {:?}", stderr);
+    assert!(stderr.contains("[ERROR app.db] query failed"), "stderr: {:?}", stderr);
 }
 
 #[test]

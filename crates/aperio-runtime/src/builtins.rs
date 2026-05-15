@@ -33,6 +33,20 @@ pub fn install_builtins(env: &crate::env::Env) {
         }),
     );
     env.define(
+        "eprint",
+        Value::Builtin(BuiltinRef {
+            name: "eprint",
+            func: Rc::new(builtin_eprint),
+        }),
+    );
+    env.define(
+        "eprintln",
+        Value::Builtin(BuiltinRef {
+            name: "eprintln",
+            func: Rc::new(builtin_eprintln),
+        }),
+    );
+    env.define(
         "len",
         Value::Builtin(BuiltinRef {
             name: "len",
@@ -307,6 +321,21 @@ fn builtin_print(args: &[Value]) -> Result<Value, String> {
 fn builtin_println(args: &[Value]) -> Result<Value, String> {
     let body: String = args.iter().map(|v| v.display()).collect();
     println!("{}", body);
+    Ok(Value::Unit)
+}
+
+fn builtin_eprint(args: &[Value]) -> Result<Value, String> {
+    use std::io::Write;
+    let body: String = args.iter().map(|v| v.display()).collect();
+    let mut err = std::io::stderr().lock();
+    err.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    err.flush().map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn builtin_eprintln(args: &[Value]) -> Result<Value, String> {
+    let body: String = args.iter().map(|v| v.display()).collect();
+    eprintln!("{}", body);
     Ok(Value::Unit)
 }
 
