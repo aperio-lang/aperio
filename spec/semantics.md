@@ -395,6 +395,154 @@ from a parent) is permitted iff `bulk` is contract-exposed
 on the child; goes through the contract's typed surface (per
 F.14).
 
+## Topic declarations
+
+A `topic Foo { payload: T; }` declaration names a typed pub/sub
+channel at top level. Subscribers, publishers, and send sites
+reference the topic by name; the payload type travels with the
+declaration instead of being repeated at every `subscribe ...
+of type T` site.
+
+```aperio
+type Tick { n: Int; }
+topic Ticks { payload: Tick; }
+
+locus Counter {
+    params { count: Int = 0; }
+    bus { subscribe Ticks as on_tick; }    // no `of type T`
+    fn on_tick(t: Tick) { self.count = self.count + 1; }
+}
+
+locus Pub {
+    bus { publish Ticks; }                  // no `of type T`
+    run() {
+        Ticks <- Tick { n: 1 };             // identifier subject, not "Ticks"
+    }
+}
+```
+
+Type-check rules:
+
+1. Every subscriber's handler signature must match `Topic.payload`
+   exactly — a static error cites both sites if they diverge.
+2. The send-expression's type at a topic-ref `<-` site must match
+   `Topic.payload`.
+3. The `of type T` clause is forbidden on topic-ref subscribe /
+   publish; the topic carries the payload type.
+4. A topic identifier outside subscribe / publish / send-subject
+   position (e.g. `let x = Foo;`) is a type error — topics are not
+   values, they only address bus channels.
+
+`topic` is a contextual keyword: lexes as `IDENTIFIER` except in
+top-level declaration position, so existing names (struct fields
+called `topic`, local variables named `topic`) continue to work.
+
+Lowering: codegen and runtime work against the legacy
+string-subject form. A desugaring pass between typecheck and
+codegen rewrites `BusSubject::Topic(Foo)` → `BusSubject::Literal {
+subject: "Foo" }` and fills in the elided payload type, so the
+downstream pipeline (cooperative queue, mailbox post, transport
+fanout) is unchanged from the string-subject path. The wire-format
+subject for a topic named `Foo` is the bare string `"Foo"`.
+
+Coexistence: the legacy form (`subscribe "S" as h of type T;`) is
+still accepted, so existing examples continue to work unchanged.
+The two forms can be mixed within one program; they only collide
+if a topic name and a literal subject share the same wire-format
+string, which the type checker catches via the standard
+duplicate-symbol diagnostic.
+
+### Phase 2: hierarchy, subjects, bindings, intra-locus optimization
+
+Phase 2 extends topic declarations with three orthogonal pieces:
+
+**1. Hierarchical topics + wire subject.** A topic may declare a
+parent and an own-subject segment. The materialized "wire subject"
+is the dot-joined chain of segments root-to-leaf:
+
+```aperio
+topic Events { payload: Event; subject: "events"; }
+topic Login : Events { payload: Login; subject: "login"; }
+// Login's wire subject is "events.login".
+```
+
+Defaults: own-subject defaults to the topic's name (verbatim), so
+top-level `topic Ticks { payload: Tick; }` keeps Phase-1's
+behavior of wire subject `"Ticks"`. Parent must reference a
+declared topic; cycles + missing parents are typecheck errors. Two
+distinct topics that produce the same wire subject are also
+errors — path-shaped routing would be ambiguous.
+
+The desugar pass rewrites `BusSubject::Topic(Login)` to
+`BusSubject::Literal { subject: "events.login" }` so codegen and
+the bus runtime see only the wire form.
+
+**2. `main` locus + `bindings { }` block.** A locus prefixed with
+`main` is the binary's entry-point holder and is the only place a
+`bindings { }` member is legal. Bindings choose a transport per
+topic; the same library compiles to in-process or external in
+different binaries by varying the main locus.
+
+```aperio
+main locus App {
+    bindings {
+        Beat: in_memory;                              // default; can be omitted
+        Login: unix("/tmp/login.sock") : listen;      // AF_UNIX server side
+        Events: unix("/tmp/events.sock") : connect;   // AF_UNIX client side
+    }
+}
+```
+
+Transport surface (Phase 2):
+
+- `in_memory` — same-binary cooperative queue; emits no
+  `lotus_bus_register_remote` call (this is the runtime default).
+- `unix("/path") : listen|connect` — AF_UNIX framed-byte transport;
+  `listen` spawns a reader thread that fans recv'd payloads into
+  the local handler set, `connect` opens a write-side transport
+  that publish-site dispatch sends to.
+- `tcp("host", port) : listen|connect` — parsed but unimplemented
+  in Phase 2 (codegen errors out at link time).
+- `nats("nats://...", subject = "...", ...)` — parsed but
+  unimplemented in Phase 2.
+
+Bundle-wide rules:
+
+1. At most one `main` locus per bundle. Zero is fine — the
+   classic bare `fn main()` shape is still legal.
+2. Each `bindings` entry's topic must name a declared `topic`.
+3. A topic may appear at most once across all bindings.
+4. Bindings only legal in a `main`-modified locus. The parser
+   rejects them in any other locus position.
+
+Codegen emits one `lotus_bus_register_remote(subject, url, role)`
+call per non-`in_memory` binding entry into `fn main`'s prelude,
+right after the bus queue is published. Subjects use the
+desugared wire form (so a binding for hierarchical `Login`
+registers as `"events.login"`).
+
+**3. Closed-world intra-locus optimization.** When a topic is
+used only intra-locus and has no binding, the desugar pass
+rewrites the publisher's `Stmt::Send` into a direct
+`self.handler(payload)` method call. Conditions:
+
+- No `bindings { Topic: ... }` entry exists for this topic.
+- Exactly one locus type publishes the topic.
+- Exactly one locus type subscribes the topic.
+- Publisher locus type == subscriber locus type.
+
+When all four hold, every Send necessarily happens inside an
+instance of the same locus that hosts the handler, so the
+publish→queue→drain→dispatch path is observable as a synchronous
+self-call. The optimization sidesteps the bus entirely; the
+`subscribe` / `publish` entries stay declared (still type-check)
+but the bus runtime never sees traffic on the optimized subject.
+This is a pure-perf rewrite — observable behavior is identical
+modulo timing (synchronous instead of cooperative-deferred).
+
+A bound topic is never optimized: the binding may publish to
+remote subscribers that aren't visible at compile time.
+
 ## Bus subscription dispatch
 
 A `bus { subscribe SUBJECT as HANDLER of type T; }` declaration

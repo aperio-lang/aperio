@@ -31,6 +31,7 @@ pub enum TopSymbol {
     Const(ConstInfo),
     Fn(FnSig),
     Interface(InterfaceInfo),
+    Topic(TopicInfo),
 }
 
 impl TopSymbol {
@@ -42,8 +43,30 @@ impl TopSymbol {
             TopSymbol::Const(c) => c.span,
             TopSymbol::Fn(f) => f.span,
             TopSymbol::Interface(i) => i.span,
+            TopSymbol::Topic(t) => t.span,
         }
     }
+}
+
+/// Resolved `topic Foo { payload: T; }` declaration. The payload
+/// type is the single source of truth for every subscribe /
+/// publish / send site referencing this topic by name.
+///
+/// `parent` (Phase 2) is the optional declared parent topic — it
+/// roots a hierarchy used to derive a wire subject for transports
+/// that benefit from path-shaped routing (NATS, MQTT). The
+/// `wire_subject` field is the materialized dot-path: own
+/// `subject` if no parent, else `parent.wire_subject + "." +
+/// subject`. Defaults to the topic's lowercased name when no
+/// `subject:` is declared.
+#[derive(Debug, Clone)]
+pub struct TopicInfo {
+    pub name: String,
+    pub payload: Ty,
+    pub parent: Option<String>,
+    pub subject: String,
+    pub wire_subject: String,
+    pub span: Span,
 }
 
 /// Resolved interface — a named set of method signatures. Order

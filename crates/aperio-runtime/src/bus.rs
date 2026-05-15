@@ -422,6 +422,7 @@ mod tests {
                 end: aperio_syntax::Pos(0),
             },
             },
+            is_main: false,
             generics: Vec::new(),
             annotations: Vec::new(),
             form: None,

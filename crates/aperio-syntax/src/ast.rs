@@ -30,6 +30,7 @@ pub enum TopDecl {
     Fn(FnDecl),
     Module(ModuleDecl),
     Interface(InterfaceDecl),
+    Topic(TopicDecl),
 }
 
 impl TopDecl {
@@ -42,8 +43,42 @@ impl TopDecl {
             TopDecl::Fn(f) => f.span,
             TopDecl::Module(m) => m.span,
             TopDecl::Interface(i) => i.span,
+            TopDecl::Topic(t) => t.span,
         }
     }
+}
+
+/// `topic Foo [: Parent] { payload: T; subject: "..."; }` — names
+/// a typed bus channel.
+///
+/// Phase 1 carried only `payload`. Phase 2 adds:
+///   - **`subject:`** — explicit wire-format string. When omitted,
+///     defaults to the topic's local name (composed with parent's
+///     subject when nested).
+///   - **`: Parent`** — declarative parent topic, builds the
+///     hierarchical tree the closed-world topology analysis
+///     consumes (per The Design / vertical-only-flow). Wire
+///     subject derives from the parent chain.
+///
+/// Phase 3 will add `transport:` classification once stdlib's
+/// `interface Transport` is in place; for now external-vs-intra
+/// is derived purely from `main.bindings`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopicDecl {
+    pub name: Ident,
+    /// Optional declarative parent — `topic Login : Events { ... }`.
+    /// `None` means this topic is at the root of its tree. Resolution
+    /// looks the parent up by name; cycles are rejected.
+    pub parent: Option<Ident>,
+    /// Required: the payload type carried by this topic. Every
+    /// subscriber's handler must take a single param of this type;
+    /// every publisher's `Foo <- expr` must produce this type.
+    pub payload: TypeExpr,
+    /// Optional explicit wire subject. When `None`, defaults to
+    /// the topic's local name (joined with parent's subject path
+    /// at desugar time).
+    pub subject: Option<String>,
+    pub span: Span,
 }
 
 /// Structural interface — a named set of method signatures. Any
@@ -75,6 +110,13 @@ pub struct InterfaceMethodSig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocusDecl {
     pub name: Ident,
+    /// Phase 2: when set, this locus is the binary's entry point —
+    /// `main locus App { ... }`. Carries `bindings { }`
+    /// configuration for cross-process topics. Exactly one
+    /// `main locus` per binary (validated downstream); a
+    /// non-main locus carrying a `bindings { }` block is a
+    /// parse error.
+    pub is_main: bool,
     /// m63: optional generic param list on the locus
     /// declaration. `locus Cache<K, V> { ... }` parses to a
     /// non-empty Vec; non-generic loci leave this empty.
@@ -218,6 +260,70 @@ pub enum LocusMember {
     /// `capacity { ... }` block. Slot 0 (the locus's own Arena)
     /// stays implicit — capacity declarations cover slots 1..N.
     Capacity(CapacityBlock),
+    /// Phase 2: `bindings { Topic: <transport>; }` block. Valid
+    /// only inside `main locus`. Each entry binds one declared
+    /// topic to a concrete transport, marking that topic as
+    /// external for the closed-world topology classification.
+    Bindings(BindingsBlock),
+}
+
+/// Phase 2: per-topic transport binding inside `main locus`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingsBlock {
+    pub entries: Vec<BindingEntry>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingEntry {
+    /// Topic name being bound — must reference a declared topic.
+    pub topic: Ident,
+    /// Transport constructor — `in_memory`, `unix(...)`, etc.
+    pub transport: TransportSpec,
+    pub span: Span,
+}
+
+/// Phase 2: closed set of compiler-recognized transport
+/// constructors. Phase 3 will replace this with a polymorphic
+/// dispatch through stdlib's `interface Transport` once user-
+/// defined adapters are supported.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransportSpec {
+    /// `in_memory` — single-process, no transport. Equivalent to
+    /// not binding at all; appears explicitly so test mains can
+    /// assert "this topic must NOT cross processes."
+    InMemory { span: Span },
+    /// `unix("/path/to/sock") : connect|listen` — AF_UNIX domain
+    /// socket. Wired to today's `lotus_transport_*` substrate.
+    Unix {
+        path: String,
+        role: TransportRole,
+        span: Span,
+    },
+    /// `tcp("host", port) : connect|listen` — TCP socket. Parsed
+    /// in Phase 2; backend not yet implemented (build error).
+    Tcp {
+        host: String,
+        port: i64,
+        role: TransportRole,
+        span: Span,
+    },
+    /// `nats("nats://...", subject = "...", queue_group = "...")`
+    /// — broker. Parsed in Phase 2; backend not yet implemented
+    /// (build error).
+    Nats {
+        url: String,
+        kwargs: Vec<(Ident, Expr)>,
+        span: Span,
+    },
+}
+
+/// Role suffix for point-to-point transports (unix, tcp).
+/// Brokers (nats) don't take a role.
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub enum TransportRole {
+    Connect,
+    Listen,
 }
 
 /// F.22 `capacity { ... }` block: a flat list of slot
@@ -321,17 +427,66 @@ pub struct BusBlock {
     pub span: Span,
 }
 
+/// A bus subscribe / publish / send site addresses its channel
+/// either through a literal subject string (legacy form,
+/// `subscribe "log.error" as h of type LogEvent;`) or through a
+/// named `topic Foo { ... }` reference. Both flow through the
+/// same downstream typecheck + codegen — the topic form gets its
+/// payload from the topic decl rather than the call-site `of
+/// type T` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BusSubject {
+    /// Legacy bare-string subject. Carries the literal subject
+    /// text plus the source span of the string token.
+    Literal { subject: String, span: Span },
+    /// `topic Foo` reference. The Ident span is the topic name's
+    /// source location for diagnostics.
+    Topic(Ident),
+}
+
+impl BusSubject {
+    pub fn span(&self) -> Span {
+        match self {
+            BusSubject::Literal { span, .. } => *span,
+            BusSubject::Topic(i) => i.span,
+        }
+    }
+
+    /// The wire-format subject string this site addresses. For
+    /// literal subjects, the string itself. For topic refs, the
+    /// topic name. Used by codegen + runtime, which run after
+    /// the topic-desugaring pass and see only `Literal` variants
+    /// in practice — but this method works on the unnormalized
+    /// AST too, so callers can read subjects without branching.
+    pub fn canonical(&self) -> &str {
+        match self {
+            BusSubject::Literal { subject, .. } => subject.as_str(),
+            BusSubject::Topic(i) => i.name.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for BusSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.canonical())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BusMember {
     Subscribe {
-        subject: String,
+        subject: BusSubject,
         handler: Ident,
+        /// `of type T` clause. Required for literal-subject form;
+        /// MUST be `None` for topic-ref form (the topic carries
+        /// the payload type). Typecheck enforces this constraint.
         ty: Option<TypeExpr>,
         span: Span,
     },
     Publish {
-        subject: String,
-        ty: TypeExpr,
+        subject: BusSubject,
+        /// `of type T` clause. Same constraint as `Subscribe.ty`.
+        ty: Option<TypeExpr>,
         alias: Option<Ident>,
         span: Span,
     },

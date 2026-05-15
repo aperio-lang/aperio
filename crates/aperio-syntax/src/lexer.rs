@@ -406,6 +406,11 @@ impl<'a> Lexer<'a> {
             "import" => TokenKind::Import,
             "export" => TokenKind::Export,
             "module" => TokenKind::Module,
+            // `topic` is contextually keyworded — recognized only
+            // in top-level declaration position (see
+            // `parse_top_decl`). Lexing it always as Ident frees
+            // the identifier for use as a struct-field name etc.
+            // Same pattern as `approx`/`within`/`pool`/`heap`.
 
             // Locus members
             "params" => TokenKind::Params,

@@ -359,6 +359,17 @@ and modes; specific transports come from stdlib (`std::bus::*`).
   transport implementation conforming to it can be plugged in.
   No specific transport ships with the runtime itself.
 
+**v1.x source surface.** Subjects are now declared as typed
+top-level `topic Foo { payload: T; subject: "..."; }` decls
+(with optional `: Parent` for hierarchical wire subjects);
+deployment-time bindings live in the `main` locus's
+`bindings { Topic: <transport>; }` block (`in_memory`,
+`unix(...)` wired in v1.x; `tcp(...)` and `nats(...)` parse but
+unimplemented). See `spec/semantics.md` "Topic declarations →
+Phase 2" for the full surface, including the closed-world
+intra-locus optimization that elides bus dispatch when a topic
+is used only inside one locus and has no binding.
+
 ### Closure-test infrastructure
 
 - **Default epoch is `dissolve`.** Closures with no `epoch`

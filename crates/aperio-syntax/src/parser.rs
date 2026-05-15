@@ -315,11 +315,122 @@ impl Parser {
             TokenKind::Fn => self.parse_fn_decl().map(TopDecl::Fn),
             TokenKind::Module => self.parse_module_decl().map(TopDecl::Module),
             TokenKind::Interface => self.parse_interface_decl().map(TopDecl::Interface),
+            // `topic` is a contextual keyword recognized only here
+            // at top-level decl position. Lexes as `Ident("topic")`
+            // everywhere else (struct field names, vars, etc.).
+            TokenKind::Ident(s) if s == "topic" => {
+                self.parse_topic_decl().map(TopDecl::Topic)
+            }
+            // `main locus Foo { ... }` — Phase 2 entry-point
+            // marker. Same contextual-keyword pattern. The
+            // following token must be `locus`.
+            TokenKind::Ident(s) if s == "main" => {
+                self.parse_locus_decl().map(TopDecl::Locus)
+            }
             other => Err(Diag::parse(
                 self.peek_token().span,
                 format!("expected top-level declaration, got {:?}", other),
             )),
         }
+    }
+
+    /// `topic Foo { payload: T; }` — Phase 1 carries only the
+    /// payload type. Later phases extend with `transport:`,
+    /// `bindings`, etc. Parser keeps the body shape open-ended:
+    /// any `key: <expr-or-type>;` line is recognized; unknown
+    /// keys are rejected by typecheck. Per-field validation
+    /// (payload required, payload exactly once, etc.) lives
+    /// downstream so the parser stays simple.
+    fn parse_topic_decl(&mut self) -> Result<TopicDecl, Diag> {
+        // `topic` is a contextual keyword — consumed here as
+        // `Ident("topic")`, not `TokenKind::Topic`. See the
+        // dispatch in `parse_top_decl`.
+        let kw_tok = self.peek_token().clone();
+        let kw = match &kw_tok.kind {
+            TokenKind::Ident(s) if s == "topic" => {
+                self.bump();
+                kw_tok
+            }
+            _ => {
+                return Err(Diag::parse(
+                    kw_tok.span,
+                    "expected `topic`",
+                ));
+            }
+        };
+        let name = self.expect_ident("topic name")?;
+        // Optional declarative parent: `topic Login : Events { ... }`.
+        let parent = if self.eat(&TokenKind::Colon) {
+            Some(self.expect_ident("parent topic name")?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut payload: Option<TypeExpr> = None;
+        let mut subject: Option<String> = None;
+        while !matches!(self.peek(), TokenKind::RBrace) {
+            let field_name = self.expect_ident("topic field name")?;
+            self.expect(TokenKind::Colon, ":")?;
+            match field_name.name.as_str() {
+                "payload" => {
+                    let ty = self.parse_type_expr()?;
+                    if payload.is_some() {
+                        return Err(Diag::parse(
+                            field_name.span,
+                            "duplicate `payload:` in topic declaration",
+                        ));
+                    }
+                    payload = Some(ty);
+                }
+                "subject" => {
+                    let tok = self.peek_token().clone();
+                    let s = match tok.kind {
+                        TokenKind::StringLit(s) => {
+                            self.bump();
+                            s
+                        }
+                        _ => {
+                            return Err(Diag::parse(
+                                tok.span,
+                                "topic `subject:` must be a string literal",
+                            ));
+                        }
+                    };
+                    if subject.is_some() {
+                        return Err(Diag::parse(
+                            field_name.span,
+                            "duplicate `subject:` in topic declaration",
+                        ));
+                    }
+                    subject = Some(s);
+                }
+                other => {
+                    return Err(Diag::parse(
+                        field_name.span,
+                        format!(
+                            "unknown topic field `{}` (recognized: \
+                             `payload:`, `subject:`)",
+                            other
+                        ),
+                    ));
+                }
+            }
+            self.expect(TokenKind::Semi, ";")?;
+        }
+        let close = self.expect(TokenKind::RBrace, "}")?;
+        let payload = payload.ok_or_else(|| {
+            Diag::parse(
+                name.span,
+                "topic declaration missing required `payload: T;` field",
+            )
+        })?;
+        Ok(TopicDecl {
+            name,
+            parent,
+            payload,
+            subject,
+            span: kw.span.merge(close.span),
+        })
     }
 
     /// v1.x-FORM-1: `@form(<name>, <args>...)`.
@@ -405,6 +516,17 @@ impl Parser {
     // === locus ===========================================
 
     fn parse_locus_decl(&mut self) -> Result<LocusDecl, Diag> {
+        // Phase 2: optional `main` modifier — `main locus App { ... }`.
+        // `main` is a contextual keyword (lexes as Ident); accepting
+        // it here at locus-decl prefix position frees the identifier
+        // for use as a struct field / local elsewhere.
+        let is_main = matches!(
+            self.peek(),
+            TokenKind::Ident(s) if s == "main"
+        );
+        if is_main {
+            self.bump();
+        }
         let kw = self.expect(TokenKind::Locus, "locus")?;
         let name = self.expect_ident("locus name")?;
         // m63: optional `<K, V, ...>` generic param list right
@@ -426,8 +548,26 @@ impl Parser {
             members.push(self.parse_locus_member()?);
         }
         let close = self.expect(TokenKind::RBrace, "}")?;
+        // Reject `bindings { }` blocks in non-main loci at parse
+        // time so the diagnostic cites the bindings span directly.
+        if !is_main {
+            for m in &members {
+                if let LocusMember::Bindings(bb) = m {
+                    return Err(Diag::parse(
+                        bb.span,
+                        format!(
+                            "`bindings` block is only valid inside `main \
+                             locus`; locus `{}` is not declared with the \
+                             `main` modifier",
+                            name.name
+                        ),
+                    ));
+                }
+            }
+        }
         Ok(LocusDecl {
             name,
+            is_main,
             generics,
             annotations,
             form: None,
@@ -711,9 +851,176 @@ impl Parser {
             TokenKind::Fn => self.parse_fn_decl().map(LocusMember::Fn),
             TokenKind::Const => self.parse_const_decl().map(LocusMember::Const),
             TokenKind::Type => self.parse_type_decl().map(LocusMember::Type),
+            // Phase 2 contextual keyword — `bindings { ... }`.
+            // Lexes as Ident; recognized as a member-introducer
+            // here. The "must be inside `main locus`" check fires
+            // in `parse_locus_decl` after the body is parsed.
+            TokenKind::Ident(s) if s == "bindings" => {
+                self.parse_bindings_block().map(LocusMember::Bindings)
+            }
             other => Err(Diag::parse(
                 self.peek_token().span,
                 format!("expected locus member, got {:?}", other),
+            )),
+        }
+    }
+
+    /// `bindings { Topic: <transport>; ... }` — Phase 2.
+    fn parse_bindings_block(&mut self) -> Result<BindingsBlock, Diag> {
+        let kw_tok = self.peek_token().clone();
+        self.bump(); // consume `bindings` ident
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut entries = Vec::new();
+        while !matches!(self.peek(), TokenKind::RBrace) {
+            let topic = self.expect_ident("topic name")?;
+            self.expect(TokenKind::Colon, ":")?;
+            let transport = self.parse_transport_spec()?;
+            let semi = self.expect(TokenKind::Semi, ";")?;
+            entries.push(BindingEntry {
+                topic: topic.clone(),
+                transport,
+                span: topic.span.merge(semi.span),
+            });
+        }
+        let close = self.expect(TokenKind::RBrace, "}")?;
+        Ok(BindingsBlock {
+            entries,
+            span: kw_tok.span.merge(close.span),
+        })
+    }
+
+    /// Transport constructor — closed set in Phase 2:
+    /// `in_memory`
+    /// `unix("/path") : connect|listen`
+    /// `tcp("host", port) : connect|listen`
+    /// `nats("nats://...", subject = "...", queue_group = "...")`
+    fn parse_transport_spec(&mut self) -> Result<TransportSpec, Diag> {
+        let head_tok = self.peek_token().clone();
+        let head_name = match &head_tok.kind {
+            TokenKind::Ident(s) => s.clone(),
+            other => {
+                return Err(Diag::parse(
+                    head_tok.span,
+                    format!(
+                        "expected transport constructor name (`in_memory`, \
+                         `unix`, `tcp`, `nats`), got {:?}",
+                        other
+                    ),
+                ));
+            }
+        };
+        self.bump();
+        match head_name.as_str() {
+            "in_memory" => Ok(TransportSpec::InMemory { span: head_tok.span }),
+            "unix" => {
+                self.expect(TokenKind::LParen, "(")?;
+                let path = self.expect_string_literal("unix path")?;
+                let close = self.expect(TokenKind::RParen, ")")?;
+                let role = self.parse_transport_role("unix")?;
+                Ok(TransportSpec::Unix {
+                    path,
+                    role,
+                    span: head_tok.span.merge(close.span),
+                })
+            }
+            "tcp" => {
+                self.expect(TokenKind::LParen, "(")?;
+                let host = self.expect_string_literal("tcp host")?;
+                self.expect(TokenKind::Comma, ",")?;
+                let port = self.expect_int_literal("tcp port")?;
+                let close = self.expect(TokenKind::RParen, ")")?;
+                let role = self.parse_transport_role("tcp")?;
+                Ok(TransportSpec::Tcp {
+                    host,
+                    port,
+                    role,
+                    span: head_tok.span.merge(close.span),
+                })
+            }
+            "nats" => {
+                self.expect(TokenKind::LParen, "(")?;
+                let url = self.expect_string_literal("nats url")?;
+                let mut kwargs = Vec::new();
+                while self.eat(&TokenKind::Comma) {
+                    let key = self.expect_ident("nats kwarg name")?;
+                    self.expect(TokenKind::Eq, "=")?;
+                    let value = self.parse_expr()?;
+                    kwargs.push((key, value));
+                }
+                let close = self.expect(TokenKind::RParen, ")")?;
+                Ok(TransportSpec::Nats {
+                    url,
+                    kwargs,
+                    span: head_tok.span.merge(close.span),
+                })
+            }
+            other => Err(Diag::parse(
+                head_tok.span,
+                format!(
+                    "unknown transport constructor `{}` (recognized: \
+                     `in_memory`, `unix`, `tcp`, `nats`)",
+                    other
+                ),
+            )),
+        }
+    }
+
+    fn parse_transport_role(&mut self, transport: &str) -> Result<TransportRole, Diag> {
+        if !self.eat(&TokenKind::Colon) {
+            return Err(Diag::parse(
+                self.peek_token().span,
+                format!(
+                    "transport `{}` requires `: connect` or `: listen` role suffix",
+                    transport
+                ),
+            ));
+        }
+        let tok = self.peek_token().clone();
+        let role_name = match &tok.kind {
+            TokenKind::Ident(s) => s.clone(),
+            // `connect` shares no token; both lex as Ident.
+            other => {
+                return Err(Diag::parse(
+                    tok.span,
+                    format!("expected `connect` or `listen`, got {:?}", other),
+                ));
+            }
+        };
+        self.bump();
+        match role_name.as_str() {
+            "connect" => Ok(TransportRole::Connect),
+            "listen" => Ok(TransportRole::Listen),
+            other => Err(Diag::parse(
+                tok.span,
+                format!("expected `connect` or `listen`, got `{}`", other),
+            )),
+        }
+    }
+
+    fn expect_string_literal(&mut self, ctx: &str) -> Result<String, Diag> {
+        let tok = self.peek_token().clone();
+        match tok.kind {
+            TokenKind::StringLit(s) => {
+                self.bump();
+                Ok(s)
+            }
+            _ => Err(Diag::parse(
+                tok.span,
+                format!("expected string literal for {}", ctx),
+            )),
+        }
+    }
+
+    fn expect_int_literal(&mut self, ctx: &str) -> Result<i64, Diag> {
+        let tok = self.peek_token().clone();
+        match tok.kind {
+            TokenKind::IntLit(n) => {
+                self.bump();
+                Ok(n)
+            }
+            _ => Err(Diag::parse(
+                tok.span,
+                format!("expected integer literal for {}", ctx),
             )),
         }
     }
@@ -923,18 +1230,7 @@ impl Parser {
         match self.peek() {
             TokenKind::Subscribe => {
                 let kw = self.bump();
-                let subject = match self.peek().clone() {
-                    TokenKind::StringLit(s) => {
-                        self.bump();
-                        s
-                    }
-                    other => {
-                        return Err(Diag::parse(
-                            self.peek_token().span,
-                            format!("expected subject string, got {:?}", other),
-                        ));
-                    }
-                };
+                let subject = self.parse_bus_subject("subscribe")?;
                 // `as IDENT`
                 self.expect_kw_as()?;
                 let handler = self.expect_ident("handler name")?;
@@ -954,21 +1250,13 @@ impl Parser {
             }
             TokenKind::Publish => {
                 let kw = self.bump();
-                let subject = match self.peek().clone() {
-                    TokenKind::StringLit(s) => {
-                        self.bump();
-                        s
-                    }
-                    other => {
-                        return Err(Diag::parse(
-                            self.peek_token().span,
-                            format!("expected subject string, got {:?}", other),
-                        ));
-                    }
+                let subject = self.parse_bus_subject("publish")?;
+                let ty = if self.eat(&TokenKind::Of) {
+                    self.expect(TokenKind::Type, "type")?;
+                    Some(self.parse_type_expr()?)
+                } else {
+                    None
                 };
-                self.expect(TokenKind::Of, "of")?;
-                self.expect(TokenKind::Type, "type")?;
-                let ty = self.parse_type_expr()?;
                 let alias = if self.peek_is_kw_as() {
                     self.bump();
                     Some(self.expect_ident("alias")?)
@@ -986,6 +1274,34 @@ impl Parser {
             other => Err(Diag::parse(
                 self.peek_token().span,
                 format!("expected subscribe or publish, got {:?}", other),
+            )),
+        }
+    }
+
+    /// Parse a bus subscribe/publish subject — either a string
+    /// literal (legacy form) or a topic-name identifier (new form
+    /// per `topic Foo { ... }` decls). Typecheck enforces the
+    /// "of type T" constraint per form.
+    fn parse_bus_subject(&mut self, ctx: &str) -> Result<BusSubject, Diag> {
+        let tok = self.peek_token().clone();
+        match tok.kind {
+            TokenKind::StringLit(s) => {
+                self.bump();
+                Ok(BusSubject::Literal {
+                    subject: s,
+                    span: tok.span,
+                })
+            }
+            TokenKind::Ident(_) => {
+                let ident = self.expect_ident("topic name")?;
+                Ok(BusSubject::Topic(ident))
+            }
+            other => Err(Diag::parse(
+                tok.span,
+                format!(
+                    "expected subject string or topic name after `{}`, got {:?}",
+                    ctx, other
+                ),
             )),
         }
     }

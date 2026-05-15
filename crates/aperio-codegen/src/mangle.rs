@@ -108,6 +108,7 @@ fn top_decl_name(d: &TopDecl) -> Option<&str> {
         TopDecl::Const(c) => Some(&c.name.name),
         TopDecl::Fn(f) => Some(&f.name.name),
         TopDecl::Interface(i) => Some(&i.name.name),
+        TopDecl::Topic(t) => Some(&t.name.name),
         TopDecl::Module(_) => None,
     }
 }
@@ -159,6 +160,10 @@ impl<'a> Mangler<'a> {
             }
             TopDecl::Fn(f) => self.walk_fn_decl(f),
             TopDecl::Interface(i) => self.walk_interface(i),
+            TopDecl::Topic(t) => {
+                self.walk_type_expr(&mut t.payload);
+                self.rewrite_ident(&mut t.name.name);
+            }
             TopDecl::Module(_) => {}
         }
         self.pop_scope();
@@ -206,7 +211,11 @@ impl<'a> Mangler<'a> {
                                 self.walk_type_expr(t);
                             }
                         }
-                        BusMember::Publish { ty, .. } => self.walk_type_expr(ty),
+                        BusMember::Publish { ty, .. } => {
+                            if let Some(t) = ty {
+                                self.walk_type_expr(t);
+                            }
+                        }
                     }
                 }
             }
@@ -235,6 +244,19 @@ impl<'a> Mangler<'a> {
                     if let Some(ap) = &mut slot.as_parent_for {
                         // Top-level locus name reference.
                         self.rewrite_ident(&mut ap.name);
+                    }
+                }
+            }
+            LocusMember::Bindings(bb) => {
+                // Topic idents resolve against top-level topic decls;
+                // current substitution scope (locus generic params)
+                // never collides. Walk transport kwargs for safety.
+                for entry in &mut bb.entries {
+                    self.rewrite_ident(&mut entry.topic.name);
+                    if let TransportSpec::Nats { kwargs, .. } = &mut entry.transport {
+                        for (_, e) in kwargs {
+                            self.walk_expr(e);
+                        }
                     }
                 }
             }

@@ -39,14 +39,26 @@ impl From<String> for Signal {
 }
 
 pub fn run_program(program: &Program) -> Result<i32, String> {
+    let mut program_owned = program.clone();
+    aperio_syntax::desugar::desugar_intra_locus_topics(&mut program_owned);
+    aperio_syntax::desugar::desugar_topics(&mut program_owned);
     let mut interp = Interpreter::new();
-    interp.load_program(program);
+    interp.load_program(&program_owned);
     interp.run_main()
 }
 
 pub fn run_bundle(programs: &[&Program]) -> Result<i32, String> {
     let mut interp = Interpreter::new();
-    for p in programs {
+    let owned: Vec<Program> = programs
+        .iter()
+        .map(|p| {
+            let mut clone = (*p).clone();
+            aperio_syntax::desugar::desugar_intra_locus_topics(&mut clone);
+            aperio_syntax::desugar::desugar_topics(&mut clone);
+            clone
+        })
+        .collect();
+    for p in &owned {
         interp.load_program(p);
     }
     interp.run_main()
@@ -172,6 +184,15 @@ impl Interpreter {
                 // signatures only, no bodies. The interpreter
                 // handles interface dispatch lazily at call time
                 // by looking the method up on the receiver locus.
+            }
+            TopDecl::Topic(_) => {
+                // Topic declarations carry only the payload type,
+                // which the typechecker consumed already. The
+                // desugaring pass (run before the interpreter
+                // loads the program) rewrites every topic
+                // reference into its literal-subject equivalent,
+                // so the interpreter sees no topic-specific
+                // semantics at this stage.
             }
         }
     }
@@ -2387,7 +2408,7 @@ impl Interpreter {
                 for bm in &bb.members {
                     if let BusMember::Subscribe { subject, handler, .. } = bm {
                         self.bus.subscribe(
-                            subject.clone(),
+                            subject.canonical().to_string(),
                             handle.clone(),
                             handler.name.clone(),
                             subscribe_parent.clone(),

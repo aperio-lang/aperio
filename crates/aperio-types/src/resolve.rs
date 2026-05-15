@@ -62,9 +62,28 @@ pub fn build_top_scope(bundle: &Bundle<'_>) -> (TopScope, Vec<Diag>) {
             .or_insert(zero);
     }
 
+    // Pre-pass: build a name → ResolvedTopic table for every
+    // declared topic, including parent chain + wire subject.
+    // Loci that reference topics in their bus blocks resolve
+    // through this table during the main register pass below, so
+    // iteration order between locus and topic decls doesn't
+    // matter. Diagnostics for unknown parents / cycles / dup
+    // subjects also originate here.
+    let mut topics_resolved: BTreeMap<String, ResolvedTopic> = BTreeMap::new();
+    for program in bundle.programs.values() {
+        collect_topic_decls(&program.items, &known_names, &mut topics_resolved, &mut diags);
+    }
+    finalize_topic_chain(&mut topics_resolved, &mut diags);
+
     // Second pass: resolve and emit full TopSymbol entries.
     for program in bundle.programs.values() {
-        register_top_decls(&program.items, &known_names, &mut scope, &mut diags);
+        register_top_decls(
+            &program.items,
+            &known_names,
+            &topics_resolved,
+            &mut scope,
+            &mut diags,
+        );
     }
 
     // v1.x-FORM-1 PR3b: inject the form-specific stdlib type
@@ -104,6 +123,7 @@ fn collect_type_names(
             TopDecl::Type(t) => insert_name(known, &t.name, diags),
             TopDecl::Perspective(p) => insert_name(known, &p.name, diags),
             TopDecl::Interface(i) => insert_name(known, &i.name, diags),
+            TopDecl::Topic(t) => insert_name(known, &t.name, diags),
             TopDecl::Module(m) => collect_type_names(&m.items, known, diags),
             _ => {}
         }
@@ -128,25 +148,288 @@ fn insert_name(
     known.insert(ident.name.clone(), ident.span);
 }
 
+/// Pre-resolved topic data. Built before the main register pass
+/// so locus `bus { subscribe T as h; }` and `bindings { T: ... }`
+/// can resolve regardless of source order. `wire_subject` is
+/// finalized post-collect by `finalize_topic_chain` (which walks
+/// the parent chain and concatenates segments).
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedTopic {
+    pub name: String,
+    pub payload: Ty,
+    pub parent: Option<String>,
+    /// Own subject segment — explicit `subject: "..."` else a
+    /// lowercased default of the topic name.
+    pub subject: String,
+    /// Materialized dot-path; `String::new()` until
+    /// `finalize_topic_chain` runs (or if the topic is part of an
+    /// unresolved cycle).
+    pub wire_subject: String,
+    pub span: Span,
+}
+
+/// Walk every `topic Foo : Parent { payload: T; subject: "..."; }`
+/// decl in `items` and record the resolved payload + parent +
+/// subject. Diagnostics emitted for missing-payload / dup-subject
+/// among siblings are deferred to the typecheck pass; here we
+/// only record what's syntactically present.
+fn collect_topic_decls(
+    items: &[TopDecl],
+    known: &BTreeMap<String, Span>,
+    topics: &mut BTreeMap<String, ResolvedTopic>,
+    _diags: &mut Vec<Diag>,
+) {
+    for item in items {
+        match item {
+            TopDecl::Topic(t) => {
+                let payload = resolve_type_expr(&t.payload, known);
+                let subject = t
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| default_subject_segment(&t.name.name));
+                topics.insert(
+                    t.name.name.clone(),
+                    ResolvedTopic {
+                        name: t.name.name.clone(),
+                        payload,
+                        parent: t.parent.as_ref().map(|p| p.name.clone()),
+                        subject,
+                        wire_subject: String::new(),
+                        span: t.span,
+                    },
+                );
+            }
+            TopDecl::Module(m) => {
+                collect_topic_decls(&m.items, known, topics, _diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Default wire subject segment when the user didn't write
+/// `subject: "..."`. Verbatim topic name — preserves Phase 1
+/// behavior where `topic Ticks` desugars to literal subject
+/// "Ticks". Style guides can choose to be explicit
+/// (`subject: "ticks"`).
+fn default_subject_segment(name: &str) -> String {
+    name.to_string()
+}
+
+/// Walk parent chains, detect cycles + missing parents, and
+/// materialize each topic's `wire_subject` (dot-joined ancestor
+/// subjects). Topics that hit a missing-parent or cycle keep
+/// `wire_subject = ""` and trigger diagnostics; downstream code
+/// treats an empty wire subject as "skip codegen-side wiring".
+fn finalize_topic_chain(
+    topics: &mut BTreeMap<String, ResolvedTopic>,
+    diags: &mut Vec<Diag>,
+) {
+    // Snapshot keys so we can mutably index `topics` while looping.
+    let names: Vec<String> = topics.keys().cloned().collect();
+    let mut wire: BTreeMap<String, String> = BTreeMap::new();
+    for name in &names {
+        if wire.contains_key(name) {
+            continue;
+        }
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur = name.clone();
+        let mut bad = false;
+        loop {
+            if chain.contains(&cur) {
+                let span = topics.get(&cur).map(|t| t.span).unwrap_or(Span::new(0, 0));
+                diags.push(Diag::ty(
+                    span,
+                    format!("topic `{}` parent chain forms a cycle", cur),
+                ));
+                bad = true;
+                break;
+            }
+            chain.push(cur.clone());
+            let parent = match topics.get(&cur).and_then(|t| t.parent.clone()) {
+                Some(p) => p,
+                None => break,
+            };
+            if !topics.contains_key(&parent) {
+                let span = topics.get(&cur).map(|t| t.span).unwrap_or(Span::new(0, 0));
+                diags.push(Diag::ty(
+                    span,
+                    format!(
+                        "topic `{}` declares unknown parent topic `{}`",
+                        cur, parent
+                    ),
+                ));
+                bad = true;
+                break;
+            }
+            cur = parent;
+        }
+        if bad {
+            for n in chain {
+                wire.entry(n).or_insert_with(String::new);
+            }
+            continue;
+        }
+        // chain is leaf-to-root; reverse to root-to-leaf and join
+        // each topic's own `subject` segment.
+        chain.reverse();
+        let segments: Vec<String> = chain
+            .iter()
+            .map(|n| topics[n].subject.clone())
+            .collect();
+        // Now record wire_subject for every prefix so siblings
+        // sharing ancestors don't recompute.
+        let mut acc: Vec<String> = Vec::new();
+        for (i, seg) in segments.iter().enumerate() {
+            acc.push(seg.clone());
+            wire.entry(chain[i].clone())
+                .or_insert_with(|| acc.join("."));
+        }
+    }
+    for (n, w) in wire {
+        if let Some(t) = topics.get_mut(&n) {
+            t.wire_subject = w;
+        }
+    }
+
+    // Duplicate-wire-subject check: two distinct topic names with
+    // the same materialized subject would route ambiguously on a
+    // path-shaped transport. Skip empty wire subjects (those are
+    // already errored out above).
+    let mut by_wire: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (n, t) in topics.iter() {
+        if t.wire_subject.is_empty() {
+            continue;
+        }
+        by_wire
+            .entry(t.wire_subject.clone())
+            .or_default()
+            .push(n.clone());
+    }
+    for (w, owners) in by_wire {
+        if owners.len() > 1 {
+            for n in &owners {
+                let span = topics[n].span;
+                diags.push(Diag::ty(
+                    span,
+                    format!(
+                        "topic `{}` shares wire subject `{}` with: {}",
+                        n,
+                        w,
+                        owners.iter().filter(|x| *x != n).cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 fn register_top_decls(
     items: &[TopDecl],
     known: &BTreeMap<String, Span>,
+    topics: &BTreeMap<String, ResolvedTopic>,
     scope: &mut TopScope,
     diags: &mut Vec<Diag>,
 ) {
     for item in items {
         match item {
-            TopDecl::Locus(l) => register_locus(l, known, scope, diags),
+            TopDecl::Locus(l) => register_locus(l, known, topics, scope, diags),
             TopDecl::Type(t) => register_type(t, known, scope, diags),
             TopDecl::Perspective(p) => register_perspective(p, known, scope, diags),
             TopDecl::Const(c) => register_const(c, known, scope, diags),
             TopDecl::Fn(f) => register_fn(f, known, scope, diags),
             TopDecl::Module(m) => {
-                register_top_decls(&m.items, known, scope, diags);
+                register_top_decls(&m.items, known, topics, scope, diags);
             }
             TopDecl::Interface(i) => register_interface(i, known, scope, diags),
+            TopDecl::Topic(t) => register_topic(t, topics, scope, diags),
         }
     }
+}
+
+/// Resolve a `BusSubject` to the (canonical_subject_string,
+/// payload_ty) pair downstream code consumes. Literal subjects
+/// take payload from the explicit `of type T` clause; topic
+/// references look payload up in the topic-payload table built
+/// during the pre-pass. Diagnostics fire for:
+///   - topic-ref with no matching `topic` decl
+///   - topic-ref with a stray `of type T` clause (forbidden;
+///     the topic carries payload type)
+///   - literal subject with no `of type T` clause (still required;
+///     legacy form)
+fn resolve_bus_subject(
+    subject: &BusSubject,
+    ty: Option<&TypeExpr>,
+    known: &BTreeMap<String, Span>,
+    topics: &BTreeMap<String, ResolvedTopic>,
+    diags: &mut Vec<Diag>,
+    ctx: &'static str,
+) -> (String, Ty) {
+    match subject {
+        BusSubject::Literal { subject: s, .. } => {
+            let payload = match ty {
+                Some(te) => resolve_type_expr(te, known),
+                None => Ty::Unknown,
+            };
+            (s.clone(), payload)
+        }
+        BusSubject::Topic(ident) => {
+            if let Some(te) = ty {
+                diags.push(Diag::ty(
+                    te.span(),
+                    format!(
+                        "{} `{}` is a topic reference; `of type T` is forbidden \
+                         (the topic carries the payload type)",
+                        ctx, ident.name
+                    ),
+                ));
+            }
+            match topics.get(&ident.name) {
+                Some(t) => (ident.name.clone(), t.payload.clone()),
+                None => {
+                    diags.push(Diag::ty(
+                        ident.span,
+                        format!(
+                            "{} references unknown topic `{}` (no `topic {}` \
+                             declaration in scope)",
+                            ctx, ident.name, ident.name
+                        ),
+                    ));
+                    (ident.name.clone(), Ty::Unknown)
+                }
+            }
+        }
+    }
+}
+
+fn register_topic(
+    decl: &TopicDecl,
+    topics: &BTreeMap<String, ResolvedTopic>,
+    scope: &mut TopScope,
+    diags: &mut Vec<Diag>,
+) {
+    // Pre-pass collected payload + parent + subject + wire_subject;
+    // just lift it into a TopSymbol. Parent/cycle/dup-subject diags
+    // already fired during finalize_topic_chain.
+    let r = match topics.get(&decl.name.name) {
+        Some(r) => r.clone(),
+        None => return,
+    };
+    let info = crate::symbol::TopicInfo {
+        name: r.name,
+        payload: r.payload,
+        parent: r.parent,
+        subject: r.subject,
+        wire_subject: r.wire_subject,
+        span: decl.span,
+    };
+    register_symbol(
+        scope,
+        &decl.name.name,
+        TopSymbol::Topic(info),
+        decl.span,
+        diags,
+    );
 }
 
 fn register_interface(
@@ -189,6 +472,7 @@ fn register_interface(
 fn register_locus(
     decl: &LocusDecl,
     known: &BTreeMap<String, Span>,
+    topics: &BTreeMap<String, ResolvedTopic>,
     scope: &mut TopScope,
     diags: &mut Vec<Diag>,
 ) {
@@ -266,21 +550,22 @@ fn register_locus(
                 for bm in &bb.members {
                     match bm {
                         BusMember::Subscribe { subject, handler, ty, span } => {
-                            let payload = match ty {
-                                Some(te) => resolve_type_expr(te, known),
-                                None => Ty::Unknown,
-                            };
+                            let (subject_str, payload) = resolve_bus_subject(
+                                subject, ty.as_ref(), known, topics, diags, "subscribe",
+                            );
                             bus_subscribes.push(BusSubscribeInfo {
-                                subject: subject.clone(),
+                                subject: subject_str,
                                 handler: handler.name.clone(),
                                 payload,
                                 span: *span,
                             });
                         }
                         BusMember::Publish { subject, ty, span, .. } => {
-                            let payload = resolve_type_expr(ty, known);
+                            let (subject_str, payload) = resolve_bus_subject(
+                                subject, ty.as_ref(), known, topics, diags, "publish",
+                            );
                             bus_publishes.push(BusPublishInfo {
-                                subject: subject.clone(),
+                                subject: subject_str,
                                 payload,
                                 span: *span,
                             });

@@ -167,7 +167,82 @@ pub fn check_bundle(bundle: &Bundle<'_>, top: &TopScope) -> Vec<Diag> {
             cx.check_top_decl(item);
         }
     }
+    // Bundle-level rules around topic bindings:
+    //   - at most one `main` locus per bundle
+    //   - bindings entries reference declared topics
+    //   - duplicate bindings for the same topic are forbidden
+    check_main_and_bindings(bundle, top, &mut diags);
     diags
+}
+
+/// Bundle-wide validation for the v1.x topic-bindings feature.
+/// Runs after per-locus checks because it cuts across loci. The
+/// rules:
+///   - At most one `main` locus per bundle. (Zero is fine — the
+///     classic `fn main()` shape is still legal.)
+///   - Each `bindings { Topic: <transport>; }` entry must name a
+///     declared `topic`.
+///   - A topic may appear at most once across all bindings.
+fn check_main_and_bindings(
+    bundle: &Bundle<'_>,
+    top: &TopScope,
+    diags: &mut Vec<Diag>,
+) {
+    let mut mains: Vec<(String, Span)> = Vec::new();
+    let mut bound: BTreeMap<String, Span> = BTreeMap::new();
+    for program in bundle.programs.values() {
+        for item in &program.items {
+            if let TopDecl::Locus(l) = item {
+                if l.is_main {
+                    mains.push((l.name.name.clone(), l.span));
+                }
+                for member in &l.members {
+                    if let LocusMember::Bindings(bb) = member {
+                        for entry in &bb.entries {
+                            // Topic existence
+                            match top.lookup(&entry.topic.name) {
+                                Some(TopSymbol::Topic(_)) => {}
+                                _ => {
+                                    diags.push(Diag::ty(
+                                        entry.topic.span,
+                                        format!(
+                                            "binding references unknown topic `{}`",
+                                            entry.topic.name
+                                        ),
+                                    ));
+                                }
+                            }
+                            // Duplicate topic across all bindings
+                            if let Some(prev) = bound.get(&entry.topic.name) {
+                                diags.push(Diag::ty(
+                                    entry.topic.span,
+                                    format!(
+                                        "topic `{}` already bound (previous \
+                                         binding at {:?})",
+                                        entry.topic.name, prev
+                                    ),
+                                ));
+                            } else {
+                                bound.insert(entry.topic.name.clone(), entry.topic.span);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if mains.len() > 1 {
+        for (name, span) in &mains {
+            diags.push(Diag::ty(
+                *span,
+                format!(
+                    "more than one `main` locus declared (`{}` is one of {})",
+                    name,
+                    mains.len()
+                ),
+            ));
+        }
+    }
 }
 
 fn collect_known_names(top: &TopScope) -> BTreeMap<String, Span> {
@@ -285,6 +360,13 @@ impl<'a> Checker<'a> {
                 // collected them; the structural impl-check fires
                 // at the use site (call expression where the
                 // expected type is an interface).
+            }
+            TopDecl::Topic(_) => {
+                // Topic declarations carry only `payload: T;`. The
+                // resolver validated the payload type expression
+                // already; per-use-site checks (handler-sig match,
+                // send-payload match) happen in the bus blocks and
+                // send sites that reference the topic.
             }
         }
     }
@@ -836,6 +918,10 @@ impl<'a> Checker<'a> {
                 // checked against declared types implicitly when
                 // the param is referenced. (Milestone-2 cut: no
                 // default-vs-declared-type re-check here.)
+            }
+            LocusMember::Bindings(_) => {
+                // Bindings are checked by a separate top-level pass
+                // (validate_bindings); nothing to do here.
             }
             LocusMember::Lifecycle(lc) => {
                 self.in_lifecycle = true;
@@ -1404,8 +1490,17 @@ impl<'a> Checker<'a> {
 
     fn check_send(&mut self, subject: &Expr, value: &Expr, span: Span) {
         let payload_ty = self.check_expr(value);
+        // Subject extraction. Two static forms produce a fixed
+        // wire-format subject string: a literal `"S" <- expr` and
+        // a topic-ref `Foo <- expr` where Foo names a `topic`
+        // decl. Anything else is a computed subject and goes
+        // through the wildcard-publish path further below.
         let subject_str = match subject {
             Expr::Literal(Literal::String(s), _) => Some(s.clone()),
+            Expr::Ident(id) => match self.top.lookup(&id.name) {
+                Some(TopSymbol::Topic(_)) => Some(id.name.clone()),
+                _ => None,
+            },
             _ => None,
         };
         let locus = match self.current_locus {
@@ -1701,6 +1796,22 @@ impl<'a> Checker<'a> {
                         | TopSymbol::Type(_)
                         | TopSymbol::Perspective(_)
                         | TopSymbol::Interface(_) => Ty::Named(id.name.clone()),
+                        // Topics aren't values — they only address
+                        // a bus channel. They appear legally only on
+                        // the left of `<-` (handled in check_send,
+                        // before check_expr ever sees the subject).
+                        // Anywhere else is an error.
+                        TopSymbol::Topic(_) => {
+                            self.diags.push(Diag::ty(
+                                id.span,
+                                format!(
+                                    "topic `{}` is not a value; use `{} <- expr` \
+                                     to publish on it",
+                                    id.name, id.name
+                                ),
+                            ));
+                            Ty::Unknown
+                        }
                     }
                 } else {
                     Ty::Unknown

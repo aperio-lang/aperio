@@ -36,6 +36,7 @@ top_decl          = locus_decl
                   | function_decl
                   | module_decl
                   | interface_decl
+                  | topic_decl
                   ;
 
 module_decl       = "module" , IDENTIFIER , "{" , { top_decl } , "}" ;
@@ -48,6 +49,34 @@ interface_decl    = "interface" , IDENTIFIER , "{" ,
 interface_method_sig
                   = "fn" , IDENTIFIER , "(" , [ param_list ] , ")" ,
                     [ "->" , type_expr ] , ";" ;
+
+(* `topic Foo { payload: T; subject: "..."; }` — names a typed
+   pub/sub channel. The payload type travels with the declaration;
+   subscribe / publish / send sites reference the topic by name
+   and inherit the payload type. `topic` is a contextual keyword
+   (lexed as IDENTIFIER) — only the top-level decl position
+   recognizes it, so `topic` remains usable as a struct field or
+   local name.
+
+   Phase 2:
+     - Optional `: ParentTopic` declares a hierarchy. Wire subject
+       is the dot-joined chain of own-`subject` segments root-to-
+       leaf (defaults to the topic name when no `subject:` field
+       is given). Cycles + missing parents are typecheck errors.
+     - Optional `subject: "..."` declares the wire-name segment for
+       this topic. Two distinct topics with the same materialized
+       wire subject are an error (path-shaped routing would be
+       ambiguous).
+
+   Bindings (per-topic transport choice) live in the main locus's
+   `bindings { }` block, not in the topic body — same library can
+   be deployed in-process or external in different binaries. *)
+topic_decl        = "topic" , IDENTIFIER ,
+                    [ ":" , IDENTIFIER ] ,
+                    "{" , { topic_field } , "}" ;
+topic_field       = "payload" , ":" , type_expr , ";"
+                  | "subject" , ":" , STRING_LIT , ";"
+                  ;
 
 
 (* === 2. Locus declaration ====================================== *)
@@ -65,7 +94,12 @@ form_annotation   = "@" , "form" , "(" , IDENTIFIER ,
                     { "," , form_arg } , ")" ;
 form_arg          = IDENTIFIER , "=" , expression ;
 
-locus_decl        = [ form_annotation ] , "locus" , IDENTIFIER ,
+(* Phase 2: optional `main` modifier marks the locus as the
+   binary's entry-point holder. Only a `main` locus may host a
+   `bindings { }` member. At most one `main` locus per bundle.
+   `main` is a contextual keyword (lexed as IDENTIFIER) recognized
+   only in this prefix position. *)
+locus_decl        = [ form_annotation ] , [ "main" ] , "locus" , IDENTIFIER ,
                     [ locus_annotations ] ,
                     "{" , { locus_member } , "}" ;
 
@@ -97,7 +131,25 @@ locus_member      = params_block
                   | function_decl
                   | const_decl
                   | type_decl
+                  | bindings_block
                   ;
+
+(* Phase 2: per-topic transport binding. Only legal inside a
+   `main` locus. The same library can be deployed differently in
+   different binaries — `bindings` is the deployment seam. Empty
+   bindings means "everything is in-process via the cooperative
+   queue" (the default). `bindings` is a contextual keyword
+   recognized in locus-member position only. *)
+bindings_block    = "bindings" , "{" , { binding_entry } , "}" ;
+binding_entry     = IDENTIFIER , ":" , transport_spec , ";" ;
+transport_spec    = "in_memory"
+                  | "unix" , "(" , STRING_LIT , ")" , ":" , transport_role
+                  | "tcp" , "(" , STRING_LIT , "," , INT_LIT , ")" ,
+                    ":" , transport_role
+                  | "nats" , "(" , STRING_LIT , { "," , nats_kwarg } , ")"
+                  ;
+transport_role    = "listen" | "connect" ;
+nats_kwarg        = IDENTIFIER , "=" , expression ;
 
 
 (* === 3. Params block =========================================== *)
@@ -143,9 +195,14 @@ bus_block         = "bus" , "{" , { bus_member } , "}" ;
 bus_member        = bus_subscribe
                   | bus_publish
                   ;
-bus_subscribe     = "subscribe" , STRING_LIT , "as" , IDENTIFIER ,
+(* The subject is either a literal string (legacy form, requires
+   `of type T`) or a named topic decl (no `of type T` allowed —
+   the topic carries the payload type). *)
+bus_subject       = STRING_LIT | IDENTIFIER ;
+bus_subscribe     = "subscribe" , bus_subject , "as" , IDENTIFIER ,
                     [ "of" , "type" , type_expr ] , ";" ;
-bus_publish       = "publish" , STRING_LIT , "of" , "type" , type_expr ,
+bus_publish       = "publish" , bus_subject ,
+                    [ "of" , "type" , type_expr ] ,
                     [ "as" , IDENTIFIER ] , ";" ;
 
 

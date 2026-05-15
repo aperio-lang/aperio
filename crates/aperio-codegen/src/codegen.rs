@@ -197,6 +197,22 @@ pub fn build_executable_with_imports(
     output_path: &Path,
     import_renames: &[(Vec<String>, String)],
 ) -> Result<(), CodegenError> {
+    // Topic-reference desugaring: rewrite `BusSubject::Topic`
+    // and `Foo <- expr` (where Foo is a topic) into the
+    // equivalent literal-subject forms. The rest of codegen
+    // sees only the legacy AST shape, no topic-specific
+    // branching needed.
+    //
+    // The intra-locus optimization runs FIRST while sends still
+    // carry the cheap `Expr::Ident(Topic)` shape; it rewrites
+    // optimizable Send statements into direct `self.handler(...)`
+    // method calls. desugar_topics then handles whatever bus refs
+    // remain.
+    let mut program_owned = program.clone();
+    aperio_syntax::desugar::desugar_intra_locus_topics(&mut program_owned);
+    aperio_syntax::desugar::desugar_topics(&mut program_owned);
+    let program = &program_owned;
+
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| CodegenError::LlvmInit(e.to_string()))?;
 
@@ -1078,10 +1094,13 @@ fn expr_definitely_non_allocating(e: &Expr) -> bool {
 /// non-allocating predicate. The `Empty { }` shape passes;
 /// loci with bodies that do real work generally won't.
 ///
-/// Only applies to `AcquireStrategy::Fresh` instantiations.
-/// Subregion/RecpoolFixed/RecpoolSlab children are governed
-/// by their parent's projection-class invariants and stay on
-/// the original path.
+/// Applies to both `AcquireStrategy::Fresh` and
+/// `AcquireStrategy::Subregion` instantiations — the structural
+/// predicate (body non-allocating, no slots, no bus, no closures,
+/// no failure handler) holds independently of how `__arena` is
+/// acquired. RecpoolFixed/RecpoolSlab children stay on the
+/// original path (recpool slots have their own pre-allocated
+/// lifecycle).
 fn locus_arena_elidable(l: &LocusDecl) -> bool {
     // Structural disqualifiers — these consume arena at
     // instantiation regardless of method-body content.
@@ -1576,14 +1595,34 @@ struct LocusInfo<'ctx> {
     /// substrate: nothing in any lifecycle/mode/user-fn body
     /// allocates, no capacity slots, no bus subscriptions, no
     /// closures/failure handlers. Computed once at locus declare
-    /// time via `locus_arena_elidable`. When set AND the
-    /// instantiation goes through `AcquireStrategy::Fresh`,
-    /// `__arena` is initialized with the caller's current arena
-    /// instead of a fresh `lotus_arena_create()`, and the
-    /// dissolve cascade skips `lotus_arena_destroy` for this
-    /// locus's slot 0. Mirrors the FORM-3 fn-body elision
-    /// (precedent at `fn_body_definitely_non_allocating` users).
+    /// time via `locus_arena_elidable`. When set:
+    ///   - `AcquireStrategy::Fresh`: `__arena` borrows the
+    ///     caller's current arena instead of calling
+    ///     `lotus_arena_create()`.
+    ///   - `AcquireStrategy::Subregion`: `__arena` borrows the
+    ///     parent's arena directly instead of calling
+    ///     `lotus_arena_create_subregion(parent_arena)`. This
+    ///     is the dominant per-child cost in `coord_with_churn`
+    ///     -style chunked accept loops.
+    /// In both cases the dissolve cascade skips
+    /// `lotus_arena_destroy` for this locus's slot 0. Mirrors
+    /// the FORM-3 fn-body elision (precedent at
+    /// `fn_body_definitely_non_allocating` users).
     arena_elidable: bool,
+    /// v1.x-FRAMEWORK: lifecycle kinds whose user-supplied body is
+    /// syntactically empty (`{ }` — no stmts, no tail). Keyed by
+    /// the same `&'static str` names used in `methods`: `"birth"`,
+    /// `"accept"`, `"run"`, `"drain"`, `"dissolve"`.
+    ///
+    /// The function definition still gets emitted (Pass C runs
+    /// unconditionally so the symbol exists for direct references),
+    /// but call sites in `lower_locus_instantiation` /
+    /// `flush_dissolve_frame_kind` skip the build_call when the
+    /// kind is in this set. The trailing `lotus_bus_queue_drain`
+    /// inside the empty body would otherwise fire once per dispatch
+    /// — for accept-in-a-loop patterns (`coord_with_churn`-style)
+    /// that's the dominant per-child cost.
+    empty_lifecycle: std::collections::BTreeSet<&'static str>,
 }
 
 /// F.22 slot record carried on every LocusInfo. v1 surface:
@@ -2362,6 +2401,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         );
         let getenv_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module.add_function("getenv", getenv_ty, None);
+
+        // v1.x topic bindings: codegen emits one call per
+        // `bindings { Topic: <transport> : role; }` entry in the
+        // main locus, before lotus_bus_load_config so an env
+        // override can layer on top of the static program shape.
+        // declare void @lotus_bus_register_remote(ptr subject, ptr url, i32 role)
+        let i32_t = self.context.i32_type();
+        let bus_register_remote_ty = void_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i32_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bus_register_remote",
+            bus_register_remote_ty,
+            None,
+        );
 
         // m59: subscriber-side reader threads need access to the
         // cooperative bus queue to dispatch incoming bytes into
@@ -3211,13 +3266,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 // during the descendant's own ephemeral-dissolve /
                 // scope-exit.
                 if let Some(drain_fn) = info.methods.get("drain") {
-                    self.builder
-                        .build_call(
-                            *drain_fn,
-                            &[self_ptr.into()],
-                            &format!("{}.drain.call", locus_name),
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    if !info.empty_lifecycle.contains("drain") {
+                        self.builder
+                            .build_call(
+                                *drain_fn,
+                                &[self_ptr.into()],
+                                &format!("{}.drain.call", locus_name),
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    }
                 }
                 if let Some(closures_fn) = info.dissolve_closures_fn {
                     let (parent_self, handler_ptr) =
@@ -3238,13 +3295,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
                 if let Some(dissolve_fn) = info.methods.get("dissolve") {
-                    self.builder
-                        .build_call(
-                            *dissolve_fn,
-                            &[self_ptr.into()],
-                            &format!("{}.dissolve.call", locus_name),
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    if !info.empty_lifecycle.contains("dissolve") {
+                        self.builder
+                            .build_call(
+                                *dissolve_fn,
+                                &[self_ptr.into()],
+                                &format!("{}.dissolve.call", locus_name),
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    }
                 }
             }
             // Arena released at scope exit, after the pinned thread
@@ -4611,7 +4670,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             for member in &l.members {
                 if let LocusMember::Bus(bb) = member {
                     for bm in &bb.members {
-                        if let BusMember::Publish { ty, .. } = bm {
+                        if let BusMember::Publish { ty: Some(ty), .. } = bm {
                             if let Ok(lt) = self.type_expr_to_codegen_ty(ty) {
                                 match lt {
                                     CodegenTy::TypeRef(n) => {
@@ -4780,6 +4839,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
+        // v1.x topic bindings: emit one
+        // lotus_bus_register_remote(subject, url, role) per entry
+        // in the main locus's bindings { } block. These run BEFORE
+        // load_config so an env-var override can layer on top.
+        self.emit_bindings_prelude()?;
+
         // m58: load the deployment-config map (subject -> transport
         // URL + role) from the path in $LOTUS_BUS_CONFIG. Emitted
         // unconditionally — programs without the env var set hit
@@ -4881,6 +4946,181 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// cleanly. (Matters most for tooling — e.g. valgrind /
     /// LeakSanitizer don't see chunks as leaked when the process
     /// returns; the OS reclaims either way.)
+    /// v1.x topic bindings prelude. Walks the program for the
+    /// (at most one) `main locus`, then emits one
+    /// `lotus_bus_register_remote(subject, url, role)` call per
+    /// entry in its `bindings { }` block. The wire-subject is the
+    /// dot-joined parent chain stored in the topic decl
+    /// (computed by `aperio-types::resolve` and propagated via
+    /// `desugar_topics`); url + role come from the binding's
+    /// `TransportSpec`. Phase-2 covers `unix(...)`; `tcp` and
+    /// `nats` parse but error here so authors get a useful diag
+    /// before linking.
+    fn emit_bindings_prelude(&mut self) -> Result<(), CodegenError> {
+        // Build a name → wire_subject map for declared topics so
+        // each binding entry can resolve its topic ref. Topic-graph
+        // cycle / unknown-parent diagnostics already fired during
+        // typecheck; we just consume the resolved chain here.
+        let mut wire_subjects: BTreeMap<String, String> = BTreeMap::new();
+        Self::collect_topic_wire_subjects(&self.program.items, &mut wire_subjects);
+
+        // Locate the (single) main locus, if any. Multiple-mains
+        // would have errored in typecheck; we defensively pick the
+        // first match here.
+        let main_locus = self.program.items.iter().find_map(|item| match item {
+            TopDecl::Locus(l) if l.is_main => Some(l.clone()),
+            _ => None,
+        });
+        let Some(l) = main_locus else { return Ok(()) };
+        let bindings: Vec<BindingsBlock> = l
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                LocusMember::Bindings(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        if bindings.is_empty() {
+            return Ok(());
+        }
+
+        let i32_t = self.context.i32_type();
+        let register_fn = self
+            .module
+            .get_function("lotus_bus_register_remote")
+            .expect("lotus_bus_register_remote declared");
+
+        for block in bindings {
+            for entry in block.entries {
+                // Resolve subject. Fall back to the topic name if
+                // the wire-subject map is missing it (defensive —
+                // typecheck would have flagged the missing topic
+                // already).
+                let subject = wire_subjects
+                    .get(&entry.topic.name)
+                    .cloned()
+                    .unwrap_or_else(|| entry.topic.name.clone());
+
+                // Build URL + role from the transport spec.
+                let (url, role) = match &entry.transport {
+                    TransportSpec::InMemory { .. } => {
+                        // No remote transport — same-binary cooperative
+                        // queue is the default. Skip emission entirely.
+                        continue;
+                    }
+                    TransportSpec::Unix { path, role, .. } => {
+                        let r = match role {
+                            TransportRole::Listen => 0_i64,
+                            TransportRole::Connect => 1_i64,
+                        };
+                        (format!("unix://{}", path), r)
+                    }
+                    TransportSpec::Tcp { .. } => {
+                        return Err(CodegenError::Unsupported(
+                            "binding transport `tcp(...)` is not yet \
+                             implemented (only `unix(...)` and \
+                             `in_memory` are wired in v1.x Phase 2)"
+                                .to_string(),
+                        ));
+                    }
+                    TransportSpec::Nats { .. } => {
+                        return Err(CodegenError::Unsupported(
+                            "binding transport `nats(...)` is not yet \
+                             implemented (only `unix(...)` and \
+                             `in_memory` are wired in v1.x Phase 2)"
+                                .to_string(),
+                        ));
+                    }
+                };
+
+                let subj_ptr = self
+                    .builder
+                    .build_global_string_ptr(
+                        &subject,
+                        &format!("lotus.binding.subject.{}", entry.topic.name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .as_pointer_value();
+                let url_ptr = self
+                    .builder
+                    .build_global_string_ptr(
+                        &url,
+                        &format!("lotus.binding.url.{}", entry.topic.name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .as_pointer_value();
+                let role_val = i32_t.const_int(role as u64, false);
+                self.builder
+                    .build_call(
+                        register_fn,
+                        &[subj_ptr.into(), url_ptr.into(), role_val.into()],
+                        "lotus.binding.register",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk every `topic Foo : Parent { subject: "..."; }` decl
+    /// and produce a (name → wire_subject) table. Wire subject is
+    /// the dot-joined chain of own-subject segments root-to-leaf;
+    /// own segment defaults to the topic name when no `subject:`
+    /// is declared.
+    fn collect_topic_wire_subjects(
+        items: &[TopDecl],
+        out: &mut BTreeMap<String, String>,
+    ) {
+        // First gather raw (name → (parent, subject)) pairs.
+        struct Raw {
+            parent: Option<String>,
+            subject: String,
+        }
+        let mut raw: BTreeMap<String, Raw> = BTreeMap::new();
+        fn walk(items: &[TopDecl], raw: &mut BTreeMap<String, Raw>) {
+            for item in items {
+                match item {
+                    TopDecl::Topic(t) => {
+                        raw.insert(
+                            t.name.name.clone(),
+                            Raw {
+                                parent: t.parent.as_ref().map(|i| i.name.clone()),
+                                subject: t
+                                    .subject
+                                    .clone()
+                                    .unwrap_or_else(|| t.name.name.clone()),
+                            },
+                        );
+                    }
+                    TopDecl::Module(m) => walk(&m.items, raw),
+                    _ => {}
+                }
+            }
+        }
+        walk(items, &mut raw);
+
+        for (name, r) in raw.iter() {
+            let mut chain: Vec<String> = vec![r.subject.clone()];
+            let mut visited: Vec<String> = vec![name.clone()];
+            let mut cur = r.parent.clone();
+            while let Some(p) = cur {
+                if visited.contains(&p) {
+                    break;
+                }
+                visited.push(p.clone());
+                match raw.get(&p) {
+                    Some(pr) => {
+                        chain.push(pr.subject.clone());
+                        cur = pr.parent.clone();
+                    }
+                    None => break,
+                }
+            }
+            chain.reverse();
+            out.insert(name.clone(), chain.join("."));
+        }
+    }
+
     fn emit_arena_destroy(&mut self) -> Result<(), CodegenError> {
         let ptr_t = self.context.ptr_type(AddressSpace::default());
         let arena_global = self
@@ -5667,6 +5907,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 name: mangled_name.to_string(),
                 span: template.name.span.clone(),
             },
+            is_main: template.is_main,
             generics: Vec::new(),
             annotations: template.annotations.clone(),
             form: template.form.clone(),
@@ -5713,7 +5954,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         BusMember::Publish { subject, ty, alias, span } => {
                             BusMember::Publish {
                                 subject: subject.clone(),
-                                ty: Self::substitute_type_expr(ty, subst),
+                                ty: ty.as_ref().map(|t| {
+                                    Self::substitute_type_expr(t, subst)
+                                }),
                                 alias: alias.clone(),
                                 span: span.clone(),
                             }
@@ -6267,6 +6510,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                      * captured separately during the impl-check
                      * pass. */
                 }
+                TopDecl::Topic(t) => {
+                    /* The topic's payload type may mention a
+                     * generic name. Capture it the same way
+                     * other type-bearing positions do. */
+                    Self::collect_generic_uses(
+                        &t.payload,
+                        generic_names,
+                        seen,
+                        requests,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -6318,15 +6572,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 requests,
                             )?;
                         }
-                        BusMember::Publish { ty, .. } => {
+                        BusMember::Publish { ty: Some(t), .. } => {
                             Self::collect_generic_uses(
-                                ty,
+                                t,
                                 generic_names,
                                 seen,
                                 requests,
                             )?;
                         }
-                        BusMember::Subscribe { ty: None, .. } => {}
+                        BusMember::Subscribe { ty: None, .. }
+                        | BusMember::Publish { ty: None, .. } => {}
                     }
                 }
             }
@@ -6404,7 +6659,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             LocusMember::Contract(_)
             | LocusMember::Failure(_)
             | LocusMember::Closure(_)
-            | LocusMember::Type(_) => {}
+            | LocusMember::Type(_)
+            | LocusMember::Bindings(_) => {}
             LocusMember::Capacity(_) => {
                 // F.22 slot cell types are concrete in v1; no
                 // generic-template use sites. Future generic Pool/
@@ -7292,6 +7548,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 schedule_class,
                 capacity_slots,
                 arena_elidable: locus_arena_elidable(l),
+                empty_lifecycle: std::collections::BTreeSet::new(),
             },
         );
         Ok(())
@@ -7324,6 +7581,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let void_t = self.context.void_type();
         let mut methods: BTreeMap<&'static str, FunctionValue<'ctx>> =
             BTreeMap::new();
+        let mut empty_lifecycle: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
         let mut accept_param: Option<(String, String)> = None;
         let mut user_methods: BTreeMap<String, FunctionValue<'ctx>> =
             BTreeMap::new();
@@ -7357,6 +7616,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 LocusMember::Params(_) | LocusMember::Contract(_) => {
                     // Params handled in pass A1; contracts are a
                     // typecheck-only feature with no codegen ABI.
+                }
+                LocusMember::Bindings(_) => {
+                    // Bindings emitted by main-locus prelude pass; no
+                    // method-table contribution.
                 }
                 LocusMember::Lifecycle(lc) => {
                     if lc.ret.is_some() {
@@ -7394,6 +7657,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 None,
                             );
                             methods.insert(kind, func);
+                            if lc.body.stmts.is_empty() && lc.body.tail.is_none() {
+                                empty_lifecycle.insert(kind);
+                            }
                         }
                         LifecycleKind::Accept => {
                             if lc.params.len() != 1 {
@@ -7428,6 +7694,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             methods.insert("accept", func);
                             accept_param =
                                 Some((p.name.name.clone(), child_locus));
+                            if lc.body.stmts.is_empty() && lc.body.tail.is_none() {
+                                empty_lifecycle.insert("accept");
+                            }
                         }
                     }
                 }
@@ -7469,7 +7738,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                         ))
                                     })?;
                                 subscriptions.push((
-                                    subject.clone(),
+                                    subject.canonical().to_string(),
                                     handler.name.clone(),
                                     payload_type_name,
                                 ));
@@ -7920,6 +8189,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .get_mut(&l.name.name)
             .expect("locus struct declared in pass A1");
         info.methods = methods;
+        info.empty_lifecycle = empty_lifecycle;
         info.accept_param = accept_param;
         info.user_methods = user_methods;
         info.subscriptions = subscriptions;
@@ -20112,20 +20382,33 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         "parent.__arena",
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                let subregion_fn = self
-                    .module
-                    .get_function("lotus_arena_create_subregion")
-                    .expect("lotus_arena_create_subregion declared");
-                self.builder
-                    .build_call(
-                        subregion_fn,
-                        &[parent_arena.into()],
-                        &format!("{}.arena.sub", locus_name),
-                    )
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                    .try_as_basic_value()
-                    .left()
-                    .expect("subregion_create returns ptr")
+                if info.arena_elidable {
+                    // v1.x-FRAMEWORK: same predicate as the Fresh-strategy
+                    // elision (locus body is provably non-allocating), but
+                    // applied to chunked-class children. Point `__arena`
+                    // at the parent's arena directly so the per-child cost
+                    // drops one library call + one allocator init. The
+                    // matching `emit_locus_arena_destroy` bails on
+                    // `arena_elidable`, and the parent's arena owns the
+                    // child struct memory anyway (allocated via
+                    // `lotus_arena_alloc(parent_arena, ...)` above).
+                    parent_arena
+                } else {
+                    let subregion_fn = self
+                        .module
+                        .get_function("lotus_arena_create_subregion")
+                        .expect("lotus_arena_create_subregion declared");
+                    self.builder
+                        .build_call(
+                            subregion_fn,
+                            &[parent_arena.into()],
+                            &format!("{}.arena.sub", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("subregion_create returns ptr")
+                }
             }
             strategy @ (AcquireStrategy::RecpoolFixed | AcquireStrategy::RecpoolSlab) => {
                 let parent_self_ptr = parent_self_ptr_opt
@@ -20974,16 +21257,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .get("accept")
                         .copied()
                         .expect("accept_param implies accept method");
-                    self.builder
-                        .build_call(
-                            accept_fn,
-                            &[
-                                parent_self.self_ptr.into(),
-                                self_ptr.into(),
-                            ],
-                            &format!("{}.accept.call", parent_self.locus_name),
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    // v1.x-FRAMEWORK: skip the parent.accept(...) call
+                    // when the body is empty. The children-array
+                    // append still fires below so `for child in
+                    // self.children { ... }` keeps observing the
+                    // accepted child. Per-child cost dominator on
+                    // chunked-class accept-in-a-loop patterns —
+                    // the empty body's trailing bus drain costs
+                    // hundreds of ns per child.
+                    if !parent_info.empty_lifecycle.contains("accept") {
+                        self.builder
+                            .build_call(
+                                accept_fn,
+                                &[
+                                    parent_self.self_ptr.into(),
+                                    self_ptr.into(),
+                                ],
+                                &format!("{}.accept.call", parent_self.locus_name),
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    }
                     // Append child_self → parent.children[child_count++]
                     if let (Some(arr_idx), Some(cnt_idx)) = (
                         parent_info.children_field_idx,
@@ -21230,18 +21523,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 thread_main.get_nth_param(0).unwrap().into_pointer_value();
             for kind in &["birth", "run"] {
                 if let Some(method) = info.methods.get(*kind) {
-                    self.builder
-                        .build_call(
-                            *method,
-                            &[thread_self.into()],
-                            &format!(
-                                "{}.{}.thread_call",
-                                locus_name, kind
-                            ),
-                        )
-                        .map_err(|e| {
-                            CodegenError::LlvmEmit(e.to_string())
-                        })?;
+                    let skip = info.empty_lifecycle.contains(*kind);
+                    if !skip {
+                        self.builder
+                            .build_call(
+                                *method,
+                                &[thread_self.into()],
+                                &format!(
+                                    "{}.{}.thread_call",
+                                    locus_name, kind
+                                ),
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                    }
                     // m42: tick fires after run() on the pinned
                     // thread too. Use the wrapper here (it loads
                     // parent fields from the struct) since we're
@@ -21337,6 +21633,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             for kind in &["drain", "dissolve"] {
                 if let Some(method) = info.methods.get(*kind) {
+                    if info.empty_lifecycle.contains(*kind) {
+                        continue;
+                    }
                     self.builder
                         .build_call(
                             *method,
@@ -21437,13 +21736,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // has a matching on_failure handler, that handler runs;
         // otherwise the runtime exits with a diagnostic.
         if let Some(birth_fn) = info.methods.get("birth") {
-            self.builder
-                .build_call(
-                    *birth_fn,
-                    &[self_ptr.into()],
-                    &format!("{}.birth.call", locus_name),
-                )
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            if !info.empty_lifecycle.contains("birth") {
+                self.builder
+                    .build_call(
+                        *birth_fn,
+                        &[self_ptr.into()],
+                        &format!("{}.birth.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
         }
         if let Some(birth_closures_fn) = info.birth_closures_fn {
             let (parent_self, handler_ptr) =
@@ -21465,6 +21766,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // closure check above, the flag is now set and we skip
         // run() entirely. Drain / dissolve still fire below.
         if let Some(run_fn) = info.methods.get("run") {
+            // Whole-block elide when run() body is empty AND no
+            // tick/duration closures need to fire after run. The
+            // quarantine guard would otherwise stand around a
+            // single unconditional jump.
+            let skip_run_block = info.empty_lifecycle.contains("run")
+                && info.tick_closures_fn.is_none()
+                && info.duration_closures_fn.is_none();
+            if skip_run_block {
+                // No-op block elided.
+            } else {
             let i64_t = self.context.i64_type();
             let q_ptr = self
                 .builder
@@ -21498,13 +21809,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .build_conditional_branch(active, run_bb, after_run_bb)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             self.builder.position_at_end(run_bb);
-            self.builder
-                .build_call(
-                    *run_fn,
-                    &[self_ptr.into()],
-                    &format!("{}.run.call", locus_name),
-                )
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            if !info.empty_lifecycle.contains("run") {
+                self.builder
+                    .build_call(
+                        *run_fn,
+                        &[self_ptr.into()],
+                        &format!("{}.run.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
             // m42: tick fires after run() returns — run() is a
             // substrate cell just like a bus handler. Place the
             // call in the active branch so it doesn't fire on a
@@ -21552,6 +21865,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .build_unconditional_branch(after_run_bb)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             self.builder.position_at_end(after_run_bb);
+            }
         }
         // m82: `defer_for_let` joins `is_long_lived` as a reason to
         // route this locus through the deferred-dissolve frame
@@ -21592,13 +21906,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // drain body fires first, then dissolve-epoch closures
             // are evaluated, then the user's dissolve() body.
             if let Some(drain_fn) = info.methods.get("drain") {
-                self.builder
-                    .build_call(
-                        *drain_fn,
-                        &[self_ptr.into()],
-                        &format!("{}.drain.call", locus_name),
-                    )
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                if !info.empty_lifecycle.contains("drain") {
+                    self.builder
+                        .build_call(
+                            *drain_fn,
+                            &[self_ptr.into()],
+                            &format!("{}.drain.call", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
             }
             if let Some(closures_fn) = info.dissolve_closures_fn {
                 let (parent_self, handler_ptr) =
@@ -21619,13 +21935,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             }
             if let Some(dissolve_fn) = info.methods.get("dissolve") {
-                self.builder
-                    .build_call(
-                        *dissolve_fn,
-                        &[self_ptr.into()],
-                        &format!("{}.dissolve.call", locus_name),
-                    )
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                if !info.empty_lifecycle.contains("dissolve") {
+                    self.builder
+                        .build_call(
+                            *dissolve_fn,
+                            &[self_ptr.into()],
+                            &format!("{}.dissolve.call", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
             }
             // Wholesale-free the locus's arena. Per spec/memory.md:
             // "When the locus dissolves, the region is freed
@@ -24874,7 +25192,68 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 subj_ty
             )));
         }
-        let (payload_val, payload_ty) = self.lower_expr(value, scope)?;
+        // v1.x-FRAMEWORK: ephemeral-payload fast path. When the
+        // value is a bare struct literal, the publisher-side
+        // storage is dead after lotus_bus_dispatch returns (the
+        // queue cell holds the canonical memcpy). Stack-alloca
+        // the storage in the entry block + lower fields directly
+        // into it, bypassing lower_user_type_instantiation's
+        // arena_alloc per publish. Per-event publisher arena
+        // bloat (≈sizeof(T) bytes / publish) goes away too.
+        //
+        // Falls through to the regular lower_expr path for any
+        // value that isn't a bare struct literal (locus refs,
+        // enum payloads, expressions producing already-allocated
+        // pointers, etc.).
+        let stack_payload: Option<(PointerValue<'ctx>, String)> = match value {
+            Expr::Struct { path, inits, .. } => {
+                let mangled: Option<String> = if path.segments.len() == 1 {
+                    let name = path.segments[0].name.clone();
+                    if self.user_types.contains_key(&name) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                } else {
+                    let segs: Vec<&str> = path
+                        .segments
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    self.mangled_for_path(&segs).and_then(|m| {
+                        if self.user_types.contains_key(&m) {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(mname) = mangled {
+                    let info = self
+                        .user_types
+                        .get(&mname)
+                        .cloned()
+                        .expect("checked above");
+                    let slot = self.alloca_in_entry(
+                        info.struct_ty.into(),
+                        &format!("{}.send.payload", mname),
+                    )?;
+                    self.populate_user_type_fields(
+                        &mname, &info, inits, slot, scope,
+                    )?;
+                    Some((slot, mname))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let (payload_val, payload_ty): (BasicValueEnum<'ctx>, CodegenTy) =
+            if let Some((slot, mname)) = &stack_payload {
+                ((*slot).into(), CodegenTy::TypeRef(mname.clone()))
+            } else {
+                self.lower_expr(value, scope)?
+            };
         // m47-payloads-followup: bus payload is either a
         // user-type struct pointer OR a has-payload enum
         // pointer. Both lower to a ptr value + a sized storage
@@ -25008,6 +25387,44 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     type_name
                 ))
             })?;
+        // Allocate from the lotus arena so the struct outlives the
+        // current stack frame. Bus payloads (publisher's frame
+        // returns before subscribers finish reading), composite
+        // locus param defaults (the default-init expr runs in
+        // lower_locus_instantiation, but the resulting pointer is
+        // stored on the locus and read later) — both need
+        // long-lived storage. m19's arena holds them for the
+        // lifetime of the program; m20 will scope to the
+        // enclosing locus.
+        //
+        // `lower_send` bypasses this path for ephemeral publish
+        // payloads — it stack-allocs the storage directly and
+        // calls `populate_user_type_fields` against it (the queue
+        // cell does the canonical memcpy, so publish payloads
+        // don't need to outlive the dispatch call).
+        let size = info
+            .struct_ty
+            .size_of()
+            .expect("user struct has known size");
+        let self_ptr = self.arena_alloc(size, &format!("{}.alloc", type_name))?;
+        self.populate_user_type_fields(type_name, &info, inits, self_ptr, scope)?;
+        Ok(self_ptr)
+    }
+
+    /// Shared field-initialization pass for a user-type struct
+    /// literal. Writes each field's evaluated init expression into
+    /// the matching slot of `dest_ptr`. Used by:
+    ///   - `lower_user_type_instantiation` (arena-allocates storage),
+    ///   - `lower_send`'s ephemeral-payload fast path (stack-allocs
+    ///     storage in the entry block).
+    fn populate_user_type_fields(
+        &mut self,
+        type_name: &str,
+        info: &TypeInfo<'ctx>,
+        inits: &[StructInit],
+        dest_ptr: PointerValue<'ctx>,
+        scope: &Scope<'ctx>,
+    ) -> Result<(), CodegenError> {
         let by_name: BTreeMap<&str, &Expr> = inits
             .iter()
             .map(|i| (i.name.name.as_str(), &i.value))
@@ -25021,21 +25438,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )));
             }
         }
-
-        // Allocate from the lotus arena so the struct outlives the
-        // current stack frame. Bus payloads (publisher's frame
-        // returns before subscribers finish reading), composite
-        // locus param defaults (the default-init expr runs in
-        // lower_locus_instantiation, but the resulting pointer is
-        // stored on the locus and read later) — both need
-        // long-lived storage. m19's arena holds them for the
-        // lifetime of the program; m20 will scope to the
-        // enclosing locus.
-        let size = info
-            .struct_ty
-            .size_of()
-            .expect("user struct has known size");
-        let self_ptr = self.arena_alloc(size, &format!("{}.alloc", type_name))?;
         for fname in &info.field_order {
             let expr = by_name
                 .get(fname.as_str())
@@ -25083,7 +25485,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .builder
                 .build_struct_gep(
                     info.struct_ty,
-                    self_ptr,
+                    dest_ptr,
                     idx,
                     &format!("{}.{}.ptr", type_name, fname),
                 )
@@ -25092,7 +25494,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .build_store(field_ptr, val)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
-        Ok(self_ptr)
+        Ok(())
     }
 
     fn global_string(&mut self, s: &str) -> PointerValue<'ctx> {
