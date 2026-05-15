@@ -1,68 +1,71 @@
 // Custom highlight.js mode for Aperio code blocks.
 //
-// mdbook's `additional-js` always loads AFTER book.js, which runs
-// hljs.highlightBlock at top-level — so by the time this file runs,
-// the initial highlight pass has already happened and aperio blocks
-// were auto-detected (producing nothing useful, since 'aperio' wasn't
-// registered yet). After registering the language below, we redo
-// those blocks specifically: reset their content to plain text, strip
-// any hljs-* classes the first pass added, and call highlightElement
-// again — now the language IS registered so it produces real output.
+// mdbook 0.4.x / 0.5.x ships highlight.js 10.1.1, which:
+//   * accepts keywords only as space-separated strings (NOT arrays)
+//   * exposes `hljs.highlightBlock` (NOT v11's `highlightElement`)
+// This file is written against v10 conventions and feature-detects
+// the highlight fn so it keeps working if mdbook upgrades.
+//
+// Load-order workaround: mdbook's `additional-js` always loads AFTER
+// book.js, which runs hljs.highlightBlock at top-level on every code
+// block — so by the time this file runs, the initial highlight pass
+// has already happened and ```aperio blocks fell through (warning:
+// "Could not find the language 'aperio'"). After registering the
+// language below, the trailing IIFE rehighlights every
+// `code.language-aperio` block: reset its textContent (collapses any
+// stale spans), strip the `.hljs` marker class, then call
+// highlightBlock again — now the language IS registered so it
+// produces real output.
 //
 // Aliased to `ap` so ```ap fences also work.
 
 hljs.registerLanguage('aperio', function (hljs) {
-  const KEYWORDS = {
-    keyword: [
+  // v10 wants space-separated strings, one per keyword category.
+  var KEYWORDS = {
+    keyword:
       // Declaration
-      'locus', 'type', 'perspective', 'interface', 'topic',
-      'import', 'const', 'fn', 'module', 'main',
+      'locus type perspective interface topic import const fn module main ' +
       // Locus members
-      'params', 'contract', 'bus', 'capacity', 'mode', 'closure', 'bindings',
+      'params contract bus capacity mode closure bindings ' +
       // Lifecycle
-      'birth', 'accept', 'run', 'drain', 'dissolve', 'on_failure',
+      'birth accept run drain dissolve on_failure ' +
       // Statement / control flow
-      'let', 'mut', 'if', 'else', 'match', 'for', 'in', 'while',
-      'return', 'break', 'continue', 'yield', 'as',
+      'let mut if else match for in while return break continue yield as ' +
       // Contract
-      'expose', 'consume', 'inferred',
+      'expose consume inferred ' +
       // Bus
-      'subscribe', 'publish', 'of',
+      'subscribe publish of ' +
       // Mode
-      'bulk', 'harmonic', 'resolution',
+      'bulk harmonic resolution ' +
       // Projection
-      'projection', 'rich', 'chunked', 'recognition',
-      'fixed_cell', 'shared_slab', 'spillover', 'summary_only',
+      'projection rich chunked recognition ' +
+      'fixed_cell shared_slab spillover summary_only ' +
       // Schedule
-      'schedule', 'cooperative', 'pinned',
+      'schedule cooperative pinned ' +
       // Closure
-      'epoch', 'persists_through', 'resets_on', 'approx', 'within',
+      'epoch persists_through resets_on approx within ' +
       // Recovery
-      'restart', 'restart_in_place', 'quarantine', 'reorganize', 'bubble',
+      'restart restart_in_place quarantine reorganize bubble ' +
       // Perspective
-      'stable_when', 'serialize_as',
+      'stable_when serialize_as ' +
       // Fallible
-      'fallible', 'fail', 'or', 'raise',
+      'fallible fail or raise ' +
       // Capacity slot
-      'pool', 'heap', 'indexed_by', 'as_parent_for',
+      'pool heap indexed_by as_parent_for ' +
       // Reserved
-      'trait', 'impl', 'async', 'await', 'macro', 'where', 'with',
-      'tier', 'self',
+      'trait impl async await macro where with tier self ' +
       // Transport (binding spec)
-      'in_memory', 'unix', 'tcp', 'nats', 'listen', 'connect'
-    ],
-    literal: ['true', 'false', 'nil'],
-    type: [
-      'Int', 'Uint', 'Float', 'Decimal', 'String', 'Bool',
-      'Time', 'Duration', 'Bytes',
-      'Rich', 'Chunked', 'Recognition'
-    ],
-    built_in: [
-      'print', 'println', 'eprint', 'eprintln',
-      'len', 'to_string', 'min', 'max', 'abs',
-      'sum', 'prod',
-      'starts_with', 'contains'
-    ]
+      'in_memory unix tcp nats listen connect',
+    literal: 'true false nil',
+    type:
+      'Int Uint Float Decimal String Bool ' +
+      'Time Duration Bytes ' +
+      'Rich Chunked Recognition',
+    built_in:
+      'print println eprint eprintln ' +
+      'len to_string min max abs ' +
+      'sum prod ' +
+      'starts_with contains'
   };
 
   return {
@@ -121,26 +124,30 @@ hljs.registerLanguage('aperio', function (hljs) {
 });
 
 // Re-highlight any aperio code blocks that book.js processed before
-// our language was registered. This is the load-order workaround
-// described in the file header.
+// our language was registered. See file header.
 (function rehighlightAperioBlocks() {
   if (typeof document === 'undefined' || typeof hljs === 'undefined') return;
-  var blocks = document.querySelectorAll('pre code.language-aperio, pre code.language-ap');
-  blocks.forEach(function (block) {
-    // Reset to plain text: collapse any hljs-* spans the first pass added.
+  // Feature-detect: v10 uses highlightBlock; v11 uses highlightElement.
+  var highlight = hljs.highlightElement || hljs.highlightBlock;
+  if (!highlight) return;
+  var blocks = document.querySelectorAll(
+    'pre code.language-aperio, pre code.language-ap'
+  );
+  Array.prototype.forEach.call(blocks, function (block) {
+    // Reset to plain text: collapses any hljs-* spans from the
+    // first pass.
     var src = block.textContent;
     block.textContent = src;
-    // Strip the .hljs class + any hljs-* state classes from the first pass.
+    // Strip the .hljs marker so highlightBlock processes again.
     block.classList.remove('hljs');
+    // Strip any hljs-* state classes the first pass added.
     Array.prototype.slice.call(block.classList).forEach(function (c) {
       if (c.indexOf('hljs-') === 0) block.classList.remove(c);
     });
-    // Mark as not-yet-highlighted so highlightElement runs cleanly.
-    delete block.dataset.highlighted;
     try {
-      hljs.highlightElement(block);
+      highlight.call(hljs, block);
     } catch (e) {
-      // If aperio still isn't resolvable for some reason, leave plain.
+      // Leave plain on failure.
     }
   });
 })();
