@@ -10,6 +10,19 @@ on:
     paths:
       - "docs/**"
       - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Pages deployment requires these tokens.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one in-flight Pages deploy at a time; cancel queued runs
+# but never interrupt a deploy already publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -38,10 +51,28 @@ jobs:
       - name: Build docs
         run: mdbook build docs
 
-      # Notes:
-      # - Deploy step intentionally absent. Docs stay local-only until
-      #   the language goes public. When that time comes, add an
-      #   actions/deploy-pages step here gated by the appropriate
-      #   event / ref.
-      # - mdbook-admonish + mdbook-linkcheck deferred — each has a
-      #   compat issue with mdbook 0.5.x. Re-add when upstream catches up.
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+      # mdbook-admonish + mdbook-linkcheck deferred — each has a
+      # compat issue with mdbook 0.5.x. Re-add when upstream catches up.
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

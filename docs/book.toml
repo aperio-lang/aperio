@@ -9,6 +9,12 @@ src = "src"
 default-theme = "light"
 preferred-dark-theme = "navy"
 no-section-label = false
+# Subdirectory the site is served from on GitHub Pages
+# (https://aperio-lang.github.io/aperio/). If a custom domain
+# is later configured to serve at the root, change this to "/".
+site-url = "/aperio/"
+git-repository-url = "https://github.com/aperio-lang/aperio"
+edit-url-template = "https://github.com/aperio-lang/aperio/edit/main/docs/{path}"
 
 [output.html.fold]
 enable = true

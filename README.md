@@ -53,8 +53,8 @@ dissolves. The result printed is `sum=10`.
 ## Try it
 
 ```sh
-git clone <this repo>
-cd lotus-lang
+git clone https://github.com/aperio-lang/aperio
+cd aperio
 cargo build --release
 cargo test --release --workspace
 ```
@@ -91,22 +91,20 @@ configuration needed. (Hand-vendored libraries stay under
 
 ## Where to go next
 
-- **`spec/`** — the language reference. Start with
-  [`spec/semantics.md`](./spec/semantics.md), then
-  [`spec/grammar.ebnf`](./spec/grammar.ebnf) and
-  [`spec/styleguide.md`](./spec/styleguide.md).
-- **`docs/`** — narrative documentation (work in progress; the
-  spec is the canonical source until docs catch up).
-- **`agents/`** — role-organized briefs for collaborating with
-  AI agents on this codebase. Three docs:
-  [`app-dev.md`](./agents/app-dev.md) (writing Aperio
-  programs), [`library-dev.md`](./agents/library-dev.md)
-  (extending the stdlib), and
-  [`compiler-dev.md`](./agents/compiler-dev.md) (working on the
-  compiler itself).
-- **`crates/aperio-codegen/tests/fixtures/examples/`** — small
-  example programs the parser is anchored against. Read them as
-  a tour of language features.
+- **Docs site** — <https://aperio-lang.github.io/aperio/>
+  (built from `docs/` via mdbook).
+- **`spec/`** — the canonical language reference. Start with
+  [`spec/styleguide.md`](./spec/styleguide.md), then
+  [`spec/semantics.md`](./spec/semantics.md) and
+  [`spec/grammar.ebnf`](./spec/grammar.ebnf).
+- **[`AGENTS.md`](./AGENTS.md)** — load-bearing prompt for AI
+  agents writing `.ap` programs. Compiler / stdlib / spec work
+  has separate briefs under [`agents/`](./agents/).
+- **Examples** — <https://github.com/aperio-lang/examples>.
+- **Benchmarks** — <https://github.com/aperio-lang/bench>.
+- **In-tree feature fixtures** —
+  `crates/aperio-codegen/tests/fixtures/examples/` (the parser
+  is anchored against these).
 
 ## Layout
 

@@ -9,12 +9,13 @@ The contributor flow is organized by role. Pick the one that
 matches what you're trying to do, and read the corresponding
 brief at the repo root:
 
-- [`agents/app-dev.md`](https://github.com/local/lotus-lang/blob/main/agents/app-dev.md) —
-  if you're writing an Aperio program.
-- [`agents/library-dev.md`](https://github.com/local/lotus-lang/blob/main/agents/library-dev.md) —
+- [`AGENTS.md`](https://github.com/aperio-lang/aperio/blob/main/AGENTS.md) —
+  if you're writing an Aperio program (also the load-bearing
+  prompt for AI agents authoring `.ap` code).
+- [`agents/library-dev.md`](https://github.com/aperio-lang/aperio/blob/main/agents/library-dev.md) —
   if you're extending the stdlib or writing a reusable Aperio
   library.
-- [`agents/compiler-dev.md`](https://github.com/local/lotus-lang/blob/main/agents/compiler-dev.md) —
+- [`agents/compiler-dev.md`](https://github.com/aperio-lang/aperio/blob/main/agents/compiler-dev.md) —
   if you're working on the compiler or runtime itself.
 
 Each brief is self-contained. Read the one for your task; you
