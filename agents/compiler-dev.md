@@ -75,6 +75,21 @@ Read recent commits before starting (`git log --oneline | head
   "lib/x" as alias;`).
 - F.20 structural interfaces (Phase A + B): `interface I { ... }`
   with vtable dispatch.
+- F.27 (v1.x-VIOLATE): `epoch inline` closure + `violate NAME;`
+  for inline structural failure from inside locus methods —
+  the bridge between the value channel and the structural
+  channel.
+- 2026-05-16 library-shape sweep (token-efficiency parity):
+  IoError fallible flip across `std::io::*`; `@form(vec)` sort
+  family (`sort` / `sort_by` / `sort_desc_by`) + `set`;
+  `@form(hashmap)` iteration (`key_at` / `entry_at`) + `bump`;
+  `std::text` byte-class predicates + `tokenize_words_into`;
+  `std::http::Server` route-dispatch locus; `std::json` escape
+  + flat-shape parse helpers; `or discard` disposition;
+  `std::env::arg_or`; `\xNN` ASCII-byte escape; readable
+  callee-unresolved diagnostic with substring-aware close-match
+  suggestion. Defensive alloca audit hoisted 5 escape-prone
+  sites to entry-block to mirror the cliff-lift fix.
 
 The full ledger is in `spec/stdlib.md` (per-phase tables) and
 the `notes/v1.x-checkpoint.md` (current work tracker).

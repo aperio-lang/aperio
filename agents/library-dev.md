@@ -65,7 +65,15 @@ The list below is not exhaustive but flags the most common
   payloads are records today.
 - Multiple distinct accept types in one locus.
 - HTTP keep-alive, custom request headers, header maps, bodies
-  > 8 KB — all out of scope for v1's std::http.
+  > 8 KB — all out of scope for v1's std::http. (The
+  `std::http::Server` locus shipped 2026-05-16 wraps accept +
+  parse + dispatch + write; route table is the user's
+  `handler: fn(Request) -> Response` callback.)
+- Nested JSON trees (tagged-union JsonValue with recursive
+  Object/Array) — Aperio lacks payload-bearing enums + Box, so
+  v1 ships flat-shape helpers only: `std::json::escape_string`
+  / `unescape_string`, `find_*_field` on flat objects,
+  `ArrayIter` for top-level array elements.
 - Cross-seed module import / `use` — the `module` keyword is
   reserved with no semantics.
 - Inline markdown formatting, graphics, UI, embedded shell.
@@ -81,11 +89,15 @@ library and see if the friction shape stabilizes" rather than
 The `@form(...)` annotations pick a lowering and synthesize a
 canonical method set:
 
-- `@form(vec)` — heap items, methods `push` / `get` / `pop` /
-  `len` / `is_empty`.
+- `@form(vec)` — heap items, methods `push` / `get` / `set` /
+  `pop` / `len` / `is_empty` / `sort` / `sort_by` /
+  `sort_desc_by`.
 - `@form(hashmap)` — pool entries indexed by a key field
   declared via `indexed_by`. Methods `set` / `get` / `has` /
-  `remove` / `len` / `is_empty`.
+  `remove` / `len` / `is_empty` / `key_at` / `entry_at` /
+  `bump`. `key_at` / `entry_at` iterate in hash-table order
+  (no parallel keys vec needed); `bump` is increment-or-init
+  for cells shaped `{key + one Int counter}`.
 - `@form(ring_buffer)` — fixed-cap pool with FIFO semantics.
 
 User-extension methods declared *on top of* a formed locus
