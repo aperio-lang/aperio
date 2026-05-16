@@ -94,7 +94,7 @@ Aperio. Plus the Phase 5 prerequisites that landed alongside.
 
 | Milestone | What it shipped |
 |-----------|-----------------|
-| m92 | `examples/docs-server/main.ap`. Real HTTP server in ~200 lines of Aperio that lists and renders markdown files from a configured directory. Composes Listener (m83) + parse_request (m84) + write_response (m85) + read_file (m74) + list_dir (m90) + md_to_html (m91) + Stream lifecycle (m82) + function pointers (m80). |
+| m92 | `examples/docs-server/main.ap`. Real HTTP server in ~200 lines of Aperio that lists and renders markdown files from a configured directory. Composes Listener (m83) + parse_request (m84) + write_response (m85) + read_file (m74) + the `list_dir_count` + `list_dir_at` index API (m90, post-2026-05-16 cleanup) + md_to_html (m91) + Stream lifecycle (m82) + function pointers (m80). |
 
 ## Stdlib organization — m93
 
@@ -246,8 +246,8 @@ resolves a specific friction-log entry.
 | Int → Float widening + `std::math::*` libm primitives | `lotus-harness` `float-surface-gaps` | Codegen widens Int → Float (via `sitofp`) at let-binding type ascriptions and fn-arg sites where the parameter is `Float`; one-way only, `Float → Int` and `Decimal` mixes still reject. `std::math::{sqrt, exp, log, floor, ceil}` (unary) + `std::math::pow` (binary) ship as path-call dispatches into libm. (Phase 2c) |
 | `[val; N]` array-literal repetition | `lotus-harness` `float-surface-gaps` (sub-bullet 3) | New `Expr::ArrayRepeat { val, count }`. `val` is evaluated once; the result is broadcast to N slots of an arena-allocated `[N x T]`. N is a non-negative Int literal at v0. (Phase 2d) |
 | Binary-safe TCP recv + Bytes/String surface | `apps/ws-echo` `tcp-recv-string-strlen-truncates-binary` | `Stream.recv_bytes(max) -> Bytes` (length-prefixed; embedded NULs survive) backed by `lotus_tcp_recv_bytes`. Companions: `std::bytes::from_string(s) -> Bytes`, `std::str::from_bytes(b) -> String`, `std::bytes::at(b, i) -> Int fallible(IndexError)` (flipped 2026-05-16; pre-flip returned -1 sentinel), `std::bytes::slice(b, lo, hi) -> Bytes`. All anchored in the global payload arena. Together they make a WebSocket frame parser straight-line Aperio. (Phase 2g) |
-| `list_dir` index API | `apps/ssg` `list_dir-newline-string` | `std::io::fs::list_dir_count(path) -> Int` + `std::io::fs::list_dir_at(path, i) -> String`. Both walk the same global-arena cache, so iteration becomes a 4-line `let n = count; while i < n { name = at(i); i = i + 1; }` — no manual newline-scanning. Real `[String]` return still waits on dynamic-array codegen; the existing `list_dir(path) -> String` shape stays for backwards compatibility. (Phase 2e) |
-| `read_file` errno status | `apps/ssg` `read_file-empty-vs-error` | `std::io::fs::read_file_status(path) -> Int` returns 0 on success or the platform errno on failure (ENOENT, EACCES, EISDIR, EIO). Pairs with `read_file` for content. **Superseded 2026-05-16 by the IoError flip:** `read_file` itself now returns `String fallible(IoError)`, carrying errno + kind tag on the err path. `read_file_status` remains as a legacy companion for callers that prefer the sentinel-pair idiom. (Phase 2f) |
+| `list_dir` index API | `apps/ssg` `list_dir-newline-string` | `std::io::fs::list_dir_count(path) -> Int fallible(IoError)` + `std::io::fs::list_dir_at(path, i) -> String fallible(IoError)`. Both walk the same global-arena cache, so iteration becomes a 4-line `let n = count; while i < n { name = at(i); i = i + 1; }` — no manual newline-scanning. **2026-05-16 cleanup:** the older newline-joined `list_dir(path) -> String` shape was removed; the index API is the only iteration form. (Phase 2e) |
+| `read_file` errno status | `apps/ssg` `read_file-empty-vs-error` | The Phase-2f legacy companion `read_file_status(path) -> Int` was **removed 2026-05-16**. Use `read_file(path) -> String fallible(IoError)` and address the err path with `or raise` / `or substitute` / `or handler(err)`; the `IoError` payload carries errno + kind tag. Distinguishes empty-file vs missing-file via the err arm rather than a paired status call. |
 | Stale-CLI rebuild check | `apps/log-router` `stale-cli-silent-drops-subscribers` | `crates/aperio-cli/build.rs` hashes `codegen.rs`, `lotus_arena.c`, and every `runtime/stdlib/*.ap` file at CLI-build time, bakes the hash + crate path into the binary via `cargo:rustc-env`. On every `aperio build` invocation, `check_stale_cli()` in main.rs recomputes from disk and emits a four-line warning when they diverge — catches the "edit codegen, run cargo test, forget to rebuild CLI" footgun without forcing an automatic rebuild. Skipped silently for installed binaries or when `APERIO_SKIP_STALE_CHECK=1`. (Phase 2i) |
 
 ## F.19 — per-directory seed model (2026-05-11)
@@ -290,14 +290,25 @@ value lower as indirect calls through `vtable[i]` with the data
 pointer passed as the implicit self arg. End-to-end coverage
 in `crates/aperio-codegen/tests/interface_dispatch.rs`.
 
-**Phase B follow-ups (deferred):** returning an interface value
-from a fn, storing one in a locus param/field, or putting
-interfaces in arrays/tuples — all need fat-pointer deep-copy
-across arena boundaries. The `std::text::Sink` stdlib
-migration (split into `StdoutSink` / `StringSink` / `FileSink`
-loci behind one `Sink` interface) shipped 2026-05-11 as a
-separate commit — see `std::text` in `spec/stdlib.md` and the
-`sink-as-tagged-locus` friction log entry.
+**Phase B follow-ups (partial):**
+- Interface values in locus param/field — **shipped 2026-05-16**
+  (`Server { handler: MyHandler { } }` where `handler:
+  std::http::Handler`). Codegen coerces locus → interface at the
+  struct/locus literal field-store site; field reads through the
+  fat pointer dispatch via vtable. Typechecker resolves
+  `self.field.method()` against the interface's method set when
+  the field's declared type is an interface.
+- Returning an interface value from a fn / interface in arrays
+  or tuples — still deferred (fat-pointer deep-copy across arena
+  boundaries).
+
+The `std::text::Sink` stdlib migration (split into `StdoutSink` /
+`StringSink` / `FileSink` loci behind one `Sink` interface)
+shipped 2026-05-11 as a separate commit — see `std::text` in
+`spec/stdlib.md` and the `sink-as-tagged-locus` friction log
+entry. The `std::http::Handler` interface (2026-05-16) is the
+second canonical use: stateful HTTP loci flow into the Server
+locus's `handler` field without needing closures.
 
 Resolves (partial) `notes/aperio-friction.md` 2026-05-10
 sink-as-tagged-locus. Spec entry: F.20 in
@@ -363,7 +374,7 @@ tree. Quick reference grouped by `std::*` namespace prefix:
 | `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `mkdir`, `list_dir`, `list_dir_count`, `list_dir_at` — all `fallible(IoError)`. `file_exists(path) -> Bool` (predicate, not failable). | `lotus_fs_*` C runtime primitives |
 | `std::io::stdin` | `read_line() -> String`, `read_line_status() -> Int` | `lotus_stdin_*` C runtime primitives (POSIX `getline` + payload-arena copy) |
 | `std::io::tcp` | `Listener` locus, `Stream` locus, `send`, `send_bytes`, `recv_bytes`. Path-calls `listen_socket`, `connect`, `accept_one` are `fallible(IoError)`. | `lotus_tcp_*` C runtime primitives |
-| `std::http` | `Request` + `Response` types, `parse_request`, `write_response`, case-insensitive `header` lookup, `Server` locus (accept loop + handler dispatch) | `runtime/stdlib/http.ap` |
+| `std::http` | `Request` + `Response` types (`Response.content_type` defaults to `"text/plain"`), `parse_request`, `write_response`, case-insensitive `header` lookup, `Handler` interface (`fn handle(req: Request) -> Response`), `Server` locus (accept loop dispatches each request to a `Handler`-typed locus's `handle` method — state lives on the handler's params; `handler:` is a required field on `Server`, no default) | `runtime/stdlib/http.ap` |
 | `std::json` | `Builder` locus (output assembly), `escape_string` / `unescape_string` (RFC 8259 string escaping), `find_string_field` / `find_int_field` / `find_bool_field` (flat-object field lookup), `ArrayIter` + `array_first` / `array_next` (flat-array iteration). No nested-tree shape at v1. | `runtime/stdlib/json.ap` |
 | `std::test` | `assert(cond, msg)`, `assert_eq_int`, `assert_eq_str` | `runtime/stdlib/test.ap` |
 | `std::log` | `Logger`, `LogEvent`, `StdoutSink` (subscribes `log.**`) | `runtime/stdlib/log.ap` |

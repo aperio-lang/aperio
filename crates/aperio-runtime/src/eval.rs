@@ -2653,6 +2653,33 @@ impl Interpreter {
             state.insert(init.name.name.clone(), v);
         }
 
+        // 2026-05-16 — required-param check. A param declared
+        // `name: T;` (no `= default`) must be supplied by the
+        // caller; otherwise the field is uninitialized at locus
+        // construction time and any read returns Unit, which
+        // surfaces as a spooky downstream type error instead of
+        // a clear "you forgot the param" message.
+        for member in &decl.members {
+            if let LocusMember::Params(pb) = member {
+                for p in &pb.params {
+                    if matches!(p.init, ParamInit::Inferred)
+                        && p.ty.is_some()
+                        && !state.contains_key(&p.name.name)
+                    {
+                        return Err(Signal::Error(format!(
+                            "locus `{}` instantiation: param `{}` is \
+                             required (no default) — supply it as \
+                             `{} {{ {}: ... }}`",
+                            decl.name.name,
+                            p.name.name,
+                            decl.name.name,
+                            p.name.name
+                        )));
+                    }
+                }
+            }
+        }
+
         // m43: count duration-epoch closures and seed the
         // last-fire timestamps to monotonic-now so the first
         // fire happens after `N` elapses since instantiation

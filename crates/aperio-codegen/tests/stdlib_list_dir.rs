@@ -1,10 +1,10 @@
-//! m90: std::io::fs::list_dir — directory enumeration.
+//! std::io::fs::list_dir_count + list_dir_at — directory enumeration.
 //!
-//! Returns a single newline-separated String of entry
-//! names (skipping `.` and `..`). Phase 5's doc server
-//! uses this to enumerate `.md` files in `docs/`. v0
-//! limit: filenames containing `\n` corrupt the format —
-//! POSIX-legal but extremely rare; documented in stdlib.
+//! The newline-joined `list_dir(path) -> String` shape was removed
+//! 2026-05-16. Iteration is now `for i in 0..count { let name =
+//! list_dir_at(path, i); ... }`. Both wrappers walk the same
+//! global-arena cache, so iteration is one stat + readdir per path
+//! regardless of count.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -37,11 +37,7 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn list_dir_returns_newline_separated_filenames() {
-    // Three known files in a fresh temp dir. The exact
-    // order of readdir depends on the filesystem, so the
-    // test asserts on presence of each name + on the
-    // newline-separator shape.
+fn list_dir_returns_each_filename_via_index_api() {
     let dir = unique_dir("three");
     for name in &["alpha.md", "beta.md", "gamma.md"] {
         std::fs::write(dir.join(name), "x").expect("write");
@@ -50,9 +46,14 @@ fn list_dir_returns_newline_separated_filenames() {
     let src = format!(
         r#"
         fn main() {{
-            let s = std::io::fs::list_dir("{}");
-            println("==", s, "==");
-            println("len=", len(s));
+            let n = std::io::fs::list_dir_count("{0}") or raise;
+            println("n=", n);
+            let mut i = 0;
+            while i < n {{
+                let name = std::io::fs::list_dir_at("{0}", i) or "";
+                println("entry=", name);
+                i = i + 1;
+            }}
         }}
         "#,
         dir.display()
@@ -64,6 +65,7 @@ fn list_dir_returns_newline_separated_filenames() {
 
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("n=3"), "got: {:?}", stdout);
     for name in &["alpha.md", "beta.md", "gamma.md"] {
         assert!(
             stdout.contains(name),
@@ -72,27 +74,24 @@ fn list_dir_returns_newline_separated_filenames() {
             stdout
         );
     }
-    // Each entry has a trailing `\n`; total length =
-    // sum(strlen + 1). 8 + 7 + 8 = 23, plus 3 newlines = 26.
-    assert!(
-        stdout.contains("len=26"),
-        "expected newline-separated length 26; got: {:?}",
-        stdout
-    );
 }
 
 #[test]
 fn list_dir_skips_dot_and_dotdot() {
-    // Every directory has `.` and `..`. The C primitive
-    // filters them so user code doesn't have to.
     let dir = unique_dir("just_dots");
     std::fs::write(dir.join("only_real_entry.txt"), "x").expect("write");
 
     let src = format!(
         r#"
         fn main() {{
-            let s = std::io::fs::list_dir("{}");
-            println("==", s, "==");
+            let n = std::io::fs::list_dir_count("{0}") or raise;
+            println("n=", n);
+            let mut i = 0;
+            while i < n {{
+                let name = std::io::fs::list_dir_at("{0}", i) or "";
+                println("entry=[", name, "]");
+                i = i + 1;
+            }}
         }}
         "#,
         dir.display()
@@ -104,34 +103,20 @@ fn list_dir_skips_dot_and_dotdot() {
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("only_real_entry.txt"),
-        "got: {:?}",
-        stdout
-    );
-    // Output should be `==only_real_entry.txt\n==\n` — neither
-    // a literal "." nor ".." should be present as a separated
-    // entry.
-    assert!(
-        !stdout.contains("==.\n"),
-        "leaked `.` entry; got: {:?}",
-        stdout
-    );
-    assert!(
-        !stdout.contains("==..\n"),
-        "leaked `..` entry; got: {:?}",
-        stdout
-    );
+    assert!(stdout.contains("n=1"), "got: {:?}", stdout);
+    assert!(stdout.contains("only_real_entry.txt"), "got: {:?}", stdout);
+    assert!(!stdout.contains("entry=[.]"), "leaked `.`; got: {:?}", stdout);
+    assert!(!stdout.contains("entry=[..]"), "leaked `..`; got: {:?}", stdout);
 }
 
 #[test]
-fn list_dir_on_missing_path_returns_empty() {
-    // Soft-fail like read_file / read_bytes — empty String,
-    // user checks via len().
+fn list_dir_on_missing_path_diverges_via_or_raise() {
+    // list_dir_count returns fallible(IoError); the `or substitute -1`
+    // arm sees the err, lets us report a sentinel.
     let src = r#"
         fn main() {
-            let s = std::io::fs::list_dir("/tmp/aperio_definitely_missing_xyz_91011");
-            println("len=", len(s));
+            let n = std::io::fs::list_dir_count("/tmp/aperio_definitely_missing_xyz_91011") or -1;
+            println("n=", n);
         }
     "#;
     let bin = build_aperio("missing", src);
@@ -139,17 +124,17 @@ fn list_dir_on_missing_path_returns_empty() {
     let _ = std::fs::remove_file(&bin);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("len=0"), "got: {:?}", stdout);
+    assert!(stdout.contains("n=-1"), "got: {:?}", stdout);
 }
 
 #[test]
-fn list_dir_on_empty_dir_returns_empty_string() {
+fn list_dir_on_empty_dir_returns_zero_count() {
     let dir = unique_dir("empty");
     let src = format!(
         r#"
         fn main() {{
-            let s = std::io::fs::list_dir("{}");
-            println("len=", len(s));
+            let n = std::io::fs::list_dir_count("{}") or raise;
+            println("n=", n);
         }}
         "#,
         dir.display()
@@ -160,5 +145,5 @@ fn list_dir_on_empty_dir_returns_empty_string() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("len=0"), "got: {:?}", stdout);
+    assert!(stdout.contains("n=0"), "got: {:?}", stdout);
 }

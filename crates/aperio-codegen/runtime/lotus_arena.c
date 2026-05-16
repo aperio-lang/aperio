@@ -3064,7 +3064,6 @@ void *lotus_bytes_slice(const void *b, int64_t lo, int64_t hi);
  * payload-arena wrappers below. */
 int64_t lotus_fs_list_dir_count(const char *path);
 const char *lotus_fs_list_dir_at(const char *path, int64_t idx);
-int32_t lotus_fs_read_file_status(const char *path);
 
 /*
  * m74: filesystem primitives (`std::io::fs::*` substrate).
@@ -4663,53 +4662,6 @@ const char *lotus_fs_list_dir_at(const char *path, int64_t idx) {
     memcpy(out, p, len);
     out[len] = '\0';
     return out;
-}
-
-/*
- * Phase 2f: errno-style status for read_file. Mirrors the
- * open/stat/read shape of lotus_fs_read_file but returns the
- * platform errno on failure (or 0 on success) so callers can
- * distinguish "file is genuinely empty" from "the read failed."
- * This is paired with `read_file(path)` for the content — both
- * calls share the global payload arena, so the stat+open+read
- * work runs twice but every page hit is hot from the kernel
- * dentry/page cache.
- *
- * Returns:
- *   0      — file opened, fstat'd, and read to EOF without error.
- *   errno  — open / fstat / read failed; the value matches
- *            <errno.h> (ENOENT, EACCES, EISDIR, EIO, ...).
- */
-int32_t lotus_fs_read_file_status(const char *path) {
-    if (!path) return EINVAL;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return errno ? errno : EIO;
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        int saved = errno;
-        close(fd);
-        return saved ? saved : EIO;
-    }
-    /* Drain the file; partial / mid-read failures surface as
-     * errno here. The actual content is supplied by read_file;
-     * this call cares only about success/failure status. */
-    size_t left = (size_t)st.st_size;
-    char buf[4096];
-    while (left > 0) {
-        size_t want = left < sizeof(buf) ? left : sizeof(buf);
-        ssize_t got = read(fd, buf, want);
-        if (got > 0) {
-            left -= (size_t)got;
-            continue;
-        }
-        if (got == 0) break;          /* short file vs stat — OK */
-        if (errno == EINTR) continue;
-        int saved = errno;
-        close(fd);
-        return saved ? saved : EIO;
-    }
-    close(fd);
-    return 0;
 }
 
 void lotus_bus_remote_destroy_all(void) {

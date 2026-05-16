@@ -36,7 +36,7 @@ indirect calls prepend it before user-visible args. See
 |---|---|---|
 | Slice / array | `[T]` or `[T; N]` | Dynamic or fixed-size |
 | Tuple | `(A, B, C)` | Fixed-size heterogeneous |
-| Struct | `type Foo { x: int; y: int; }` | Named record |
+| Struct | `type Foo { x: Int; y: Int = 0; }` | Named record. Each field can declare a default value (`= expr`); literals omitting a defaulted field fill it from the default at instantiation time. |
 | Enum | `type Foo = enum { A, B(int) };` | Tagged union (sum type) |
 | Function | `fn(A, B) -> C` | First-class function values |
 | Generic | `Foo<T>` | Parametric over type T |
@@ -288,10 +288,22 @@ Explicit `-> T` is required for any non-unit return.
 
 ### Locus params
 
-Params must declare types explicitly. `params { x: int = 0; }`
+Params must declare types explicitly. `params { x: Int = 0; }`
 is the full form. (Inference of param types from defaults is
 not supported in v0; explicit is preferred for the `inferred`-vs-
 `= default` distinction.)
+
+Three init shapes (2026-05-16):
+
+- `name: T = expr;` — default. Used when the caller omits the
+  field; evaluated in the caller's scope at instantiation time.
+- `name: T;` — **required**. The caller MUST supply the field at
+  the locus literal site; instantiation without it is a compile
+  error. Use for fields where no sensible default exists (e.g.
+  `Server { handler: ... }` where the handler is the whole
+  reason the locus exists).
+- `name: T : inferred;` — F.3 inference path; compiler /
+  runtime determines the value.
 
 ## `inferred` params
 

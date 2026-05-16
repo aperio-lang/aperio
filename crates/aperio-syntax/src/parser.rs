@@ -1285,6 +1285,13 @@ impl Parser {
     fn parse_bus_subject(&mut self, ctx: &str) -> Result<BusSubject, Diag> {
         let tok = self.peek_token().clone();
         match tok.kind {
+            // Literal-string subjects (`subscribe "log.**" as h of
+            // type T;`) remain accepted because the log namespace
+            // lotus relies on wildcard publish + runtime-computed
+            // subject strings, and the topic-decl form has no
+            // equivalent at v1. The topic form is preferred for
+            // simple 1:1 subject-payload bindings; literal subjects
+            // stay for wildcard / dynamic cases.
             TokenKind::StringLit(s) => {
                 self.bump();
                 Ok(BusSubject::Literal {

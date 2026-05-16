@@ -520,6 +520,7 @@ const STDLIB_AP_SOURCE: &str = concat!(
 /// review.
 const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "cli", "Resolver"], "__StdCliResolver"),
+    (&["std", "http", "Handler"], "__StdHttpHandler"),
     (&["std", "http", "Request"], "__StdHttpRequest"),
     (&["std", "http", "Response"], "__StdHttpResponse"),
     (&["std", "http", "Server"], "__StdHttpServer"),
@@ -1684,6 +1685,11 @@ const CHILDREN_CAP: u32 = 16;
 enum DefaultInit {
     Const(ParamValue),
     Expr(Expr),
+    /// 2026-05-16 — param has a typed declaration but no default
+    /// value. The user MUST supply it at the instantiation site;
+    /// `lower_locus_instantiation` errors with a clear message
+    /// otherwise.
+    Required,
 }
 
 /// Compiled user `type` (a plain data record). No methods, no
@@ -1700,6 +1706,13 @@ struct TypeInfo<'ctx> {
     /// declaration, and field stores still go to the right
     /// indexed slot.
     field_order: Vec<String>,
+    /// 2026-05-16 — field name → default-init expression, populated
+    /// from `f.default` on the source decl. Lets a struct literal
+    /// omit defaulted fields (e.g. `Response { status: 200, body:
+    /// "ok" }` with `content_type` defaulting to "text/plain").
+    /// The expression is evaluated at instantiation time in the
+    /// caller's scope, same as locus-param non-literal defaults.
+    defaults: BTreeMap<String, Expr>,
 }
 
 /// Carried on `Cx` while lowering a lifecycle method body so
@@ -2204,15 +2217,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             None,
         );
 
-        // m90: directory enumeration (newline-separated entries
-        // as a String). Lifetime via the global payload arena.
-        // declare ptr @lotus_fs_list_dir_global(ptr path)
-        let fs_list_dir_global_ty = ptr_t.fn_type(&[ptr_t.into()], false);
-        self.module.add_function(
-            "lotus_fs_list_dir_global",
-            fs_list_dir_global_ty,
-            None,
-        );
         let tcp_send_bytes_ty = i32_t_local.fn_type(
             &[self.context.i32_type().into(), ptr_t.into()],
             false,
@@ -2675,17 +2679,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ptr_t.fn_type(&[ptr_t.into(), i64_t.into()], false);
         self.module
             .add_function("lotus_fs_list_dir_at", list_dir_at_ty, None);
-
-        // Phase 2f: errno-style status for read_file. Returns 0
-        // on success or the platform errno on failure.
-        // declare i32 @lotus_fs_read_file_status(ptr path)
-        let read_file_status_ty = i32_t.fn_type(&[ptr_t.into()], false);
-        self.module
-            .add_function(
-                "lotus_fs_read_file_status",
-                read_file_status_ty,
-                None,
-            );
 
         // m75: filesystem primitives reachable from Aperio source
         // via the `std::io::fs::*` magic-path calls. The C-level
@@ -5473,6 +5466,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 struct_ty,
                 fields,
                 field_order,
+                defaults: BTreeMap::new(),
             },
         );
     }
@@ -5513,6 +5507,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 struct_ty,
                 fields,
                 field_order,
+                defaults: BTreeMap::new(),
             },
         );
     }
@@ -5543,6 +5538,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 struct_ty,
                 fields,
                 field_order,
+                defaults: BTreeMap::new(),
             },
         );
     }
@@ -5571,6 +5567,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 struct_ty,
                 fields,
                 field_order,
+                defaults: BTreeMap::new(),
             },
         );
     }
@@ -5608,6 +5605,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 struct_ty,
                 fields,
                 field_order,
+                defaults: BTreeMap::new(),
             },
         );
     }
@@ -5752,6 +5750,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         let mut fields: BTreeMap<String, (u32, CodegenTy)> = BTreeMap::new();
         let mut field_order: Vec<String> = Vec::new();
+        let mut defaults: BTreeMap<String, Expr> = BTreeMap::new();
         let mut llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
             Vec::new();
         for (idx, f) in struct_fields.iter().enumerate() {
@@ -5759,6 +5758,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             llvm_field_tys.push(self.llvm_basic_type(&ft));
             fields.insert(f.name.name.clone(), (idx as u32, ft));
             field_order.push(f.name.name.clone());
+            if let Some(d) = &f.default {
+                defaults.insert(f.name.name.clone(), d.clone());
+            }
         }
         let struct_ty = self
             .context
@@ -5771,6 +5773,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 struct_ty,
                 fields,
                 field_order,
+                defaults,
             },
         );
         Ok(())
@@ -7058,13 +7061,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             if let LocusMember::Params(pb) = member {
                 for p in &pb.params {
                     let default_expr = match &p.init {
-                        ParamInit::Value(e) => e,
+                        ParamInit::Value(e) => Some(e),
                         ParamInit::Inferred => {
-                            return Err(CodegenError::Unsupported(format!(
-                                "locus `{}` param `{}`: codegen requires a \
-                                 default value (literal or typed expression)",
-                                l.name.name, p.name.name
-                            )));
+                            // 2026-05-16 — `name: T;` with no `=`
+                            // declares a required param. The user
+                            // must supply it at instantiation time;
+                            // codegen accepts the param with an
+                            // ascribed type and no default.
+                            if p.ty.is_none() {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "locus `{}` param `{}`: required \
+                                     params need an explicit type \
+                                     ascription (`name: T;`)",
+                                    l.name.name, p.name.name
+                                )));
+                            }
+                            None
+                        }
+                    };
+                    let default_expr = match default_expr {
+                        Some(e) => e,
+                        None => {
+                            let ascribed = p.ty.as_ref().expect("required param has ty");
+                            let ty = self.type_expr_to_codegen_ty(ascribed)?;
+                            fields.insert(p.name.name.clone(), (idx, ty.clone()));
+                            defaults.push((p.name.name.clone(), DefaultInit::Required));
+                            llvm_field_tys.push(self.llvm_basic_type(&ty));
+                            idx += 1;
+                            continue;
                         }
                     };
                     // Try to lock in as a literal Const first; fall
@@ -10969,9 +10993,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "fs", "mkdir"] => Ok(Some(
                 self.lower_std_io_fs_mkdir_fallible(args, scope)?,
             )),
-            ["std", "io", "fs", "list_dir"] => Ok(Some(
-                self.lower_std_io_fs_list_dir_fallible(args, scope)?,
-            )),
             ["std", "io", "fs", "list_dir_count"] => Ok(Some(
                 self.lower_std_io_fs_list_dir_count_fallible(args, scope)?,
             )),
@@ -11021,7 +11042,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "math", "ceil"]
             | ["std", "math", "pow"]
             | ["std", "io", "fs", "file_exists"]
-            | ["std", "io", "fs", "read_file_status"]
             | ["std", "io", "tcp", "close_fd"]
             | ["std", "io", "stdin", "read_line"]
             | ["std", "io", "stdin", "read_line_status"]
@@ -11593,71 +11613,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         self.complete_io_fallible_call(is_err, path_val, None, "fs.mkdir")
-    }
-
-    /// `std::io::fs::list_dir(path) -> String fallible(IoError)`.
-    /// Returns the newline-separated entry list; empty string ON
-    /// SUCCESS (empty directory) is distinguishable from failure
-    /// because the failure path now diverges via IoError.
-    fn lower_std_io_fs_list_dir_fallible(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::io::fs::list_dir takes 1 arg (path), got {}",
-                args.len()
-            )));
-        }
-        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
-            return Err(CodegenError::Unsupported(format!(
-                "std::io::fs::list_dir: path must be String, got {:?}",
-                path_ty
-            )));
-        }
-        // Best-effort: file_exists check to distinguish missing/inaccessible
-        // from "empty dir". Sufficient for the IoError flip because the
-        // existing C primitive collapses error to empty-string.
-        let exists_fn = self
-            .module
-            .get_function("lotus_fs_file_exists")
-            .expect("lotus_fs_file_exists declared");
-        let exists = self
-            .builder
-            .build_call(exists_fn, &[path_val.into()], "list_dir.exists")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .expect("returns i32")
-            .into_int_value();
-        let is_err = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::EQ,
-                exists,
-                self.context.i32_type().const_zero(),
-                "list_dir.missing",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let list_fn = self
-            .module
-            .get_function("lotus_fs_list_dir_global")
-            .expect("lotus_fs_list_dir_global declared");
-        let list_ptr = self
-            .builder
-            .build_call(list_fn, &[path_val.into()], "list_dir.body")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .expect("returns ptr");
-        self.complete_io_fallible_call(
-            is_err,
-            path_val,
-            Some((list_ptr, CodegenTy::String)),
-            "fs.list_dir",
-        )
     }
 
     /// `std::io::fs::list_dir_count(path) -> Int fallible(IoError)`.
@@ -18873,10 +18828,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_fs_read_bytes(args, scope)?;
                 Ok(())
             }
-            ["std", "io", "fs", "list_dir"] => {
-                let _ = self.lower_std_io_fs_list_dir(args, scope)?;
-                Ok(())
-            }
             ["std", "io", "tcp", "__send_bytes"] => {
                 let _ = self.lower_std_io_tcp_send_bytes(args, scope)?;
                 Ok(())
@@ -18940,11 +18891,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "io", "fs", "list_dir_at"] => {
                 let _ = self.lower_std_io_fs_list_dir_at(args, scope)?;
-                Ok(())
-            }
-            // Phase 2f: read_file errno status.
-            ["std", "io", "fs", "read_file_status"] => {
-                let _ = self.lower_std_io_fs_read_file_status(args, scope)?;
                 Ok(())
             }
             ["std", "io", "fs", "read_file"] => {
@@ -19388,9 +19334,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "fs", "read_bytes"] => {
                 self.lower_std_io_fs_read_bytes(args, scope)
             }
-            ["std", "io", "fs", "list_dir"] => {
-                self.lower_std_io_fs_list_dir(args, scope)
-            }
             ["std", "io", "tcp", "__send_bytes"] => {
                 self.lower_std_io_tcp_send_bytes(args, scope)
             }
@@ -19434,10 +19377,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "io", "fs", "list_dir_at"] => {
                 self.lower_std_io_fs_list_dir_at(args, scope)
-            }
-            // Phase 2f: read_file errno status.
-            ["std", "io", "fs", "read_file_status"] => {
-                self.lower_std_io_fs_read_file_status(args, scope)
             }
             ["std", "io", "fs", "read_file"] => {
                 self.lower_std_io_fs_read_file(args, scope)
@@ -21218,43 +21157,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok((v, CodegenTy::Bytes))
     }
 
-    /// m90: Lower `std::io::fs::list_dir(path: String) -> String`.
-    /// Returns a newline-separated String of entry names (skipping
-    /// `.` and `..`). Empty string on error / missing dir / empty
-    /// dir — callers distinguish via `len(result) == 0`.
-    fn lower_std_io_fs_list_dir(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::io::fs::list_dir takes 1 arg (path), got {}",
-                args.len()
-            )));
-        }
-        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
-            return Err(CodegenError::Unsupported(format!(
-                "std::io::fs::list_dir: path must be String, got {:?}",
-                path_ty
-            )));
-        }
-        let f = self
-            .module
-            .get_function("lotus_fs_list_dir_global")
-            .expect("lotus_fs_list_dir_global declared");
-        let call = self
-            .builder
-            .build_call(f, &[path_val.into()], "fs.list_dir.ret")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let v = call
-            .try_as_basic_value()
-            .left()
-            .expect("lotus_fs_list_dir_global returns ptr");
-        Ok((v, CodegenTy::String))
-    }
-
     /// m89: Lower `std::io::tcp::__send_bytes(fd: Int, b: Bytes) -> Int`.
     /// Wraps `lotus_tcp_send_bytes` — same shape as `__send` but
     /// uses the explicit Bytes length, no NUL truncation. Returns
@@ -22531,55 +22433,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok((ptr, CodegenTy::String))
     }
 
-    /// Phase 2f: lower `std::io::fs::read_file_status(path:
-    /// String) -> Int`. Returns 0 on success or the platform
-    /// errno on failure — distinguishes "empty file" (status=0,
-    /// `read_file(path)` returns "") from "missing / unreadable
-    /// file" (status=errno, `read_file(path)` returns ""). Paired
-    /// with the existing `read_file` for content; both walk the
-    /// same kernel cache, so the cost of the second call is the
-    /// hot-cache stat+open+read.
-    fn lower_std_io_fs_read_file_status(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::io::fs::read_file_status takes 1 arg (path), got {}",
-                args.len()
-            )));
-        }
-        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
-            return Err(CodegenError::Unsupported(format!(
-                "std::io::fs::read_file_status: path must be String, got {:?}",
-                path_ty
-            )));
-        }
-        let i32_t = self.context.i32_type();
-        let i64_t = self.context.i64_type();
-        let f = self
-            .module
-            .get_function("lotus_fs_read_file_status")
-            .expect("lotus_fs_read_file_status declared");
-        let call = self
-            .builder
-            .build_call(f, &[path_val.into()], "rfs.ret")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let ret_i32 = call
-            .try_as_basic_value()
-            .left()
-            .expect("returns i32")
-            .into_int_value();
-        let _ = i32_t;
-        let ret_i64 = self
-            .builder
-            .build_int_s_extend(ret_i32, i64_t, "rfs.i64")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        Ok((ret_i64.into(), CodegenTy::Int))
-    }
-
     /// Lower `std::io::tcp::__close_fd(fd: Int) -> Int`. Returns
     /// 0 on success, -1 on error (errno set). Most callers
     /// discard the return.
@@ -23532,6 +23385,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 match default {
                     DefaultInit::Const(pv) => self.const_param(pv),
                     DefaultInit::Expr(e) => self.lower_expr(e, scope)?,
+                    DefaultInit::Required => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "locus `{}` instantiation: param `{}` is \
+                             required (no default) — supply it as \
+                             `{} {{ {}: ... }}`",
+                            locus_name, fname, locus_name, fname
+                        )));
+                    }
                 }
             };
             let (slot_idx, declared_ty) = info
@@ -23539,6 +23400,25 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .get(fname)
                 .cloned()
                 .expect("field declared by declare_locus_struct");
+            // 2026-05-16 — locus → interface coercion at struct/
+            // locus literal init. Mirrors the call-site coercion in
+            // lower_fn_call so a stateful locus can flow into an
+            // interface-typed field. Builds a fat pointer
+            // {data, vtable} and stores that.
+            let (val, val_ty) = if let (
+                CodegenTy::Interface(iface),
+                CodegenTy::LocusRef(l),
+            ) = (&declared_ty, &val_ty)
+            {
+                let fat = self.coerce_to_interface(
+                    val.into_pointer_value(),
+                    l,
+                    iface,
+                )?;
+                (fat.into(), declared_ty.clone())
+            } else {
+                (val, val_ty)
+            };
             if val_ty != declared_ty {
                 return Err(CodegenError::Unsupported(format!(
                     "locus `{}` field `{}` type mismatch: declared {:?}, \
@@ -27904,6 +27784,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let (val, _) = match default {
                     DefaultInit::Const(pv) => self.const_param(pv),
                     DefaultInit::Expr(e) => self.lower_expr(e, &scope)?,
+                    DefaultInit::Required => {
+                        // restart_in_place rewinds state to its
+                        // birth() configuration. A required param
+                        // has no resettable default — the user-
+                        // supplied value at instantiation is the
+                        // only state — so we leave the field's
+                        // current value in place. If the user
+                        // wants a different restart-time value,
+                        // they need a real default.
+                        continue;
+                    }
                 };
                 let (slot_idx, _) = info
                     .fields
@@ -28678,20 +28569,28 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .iter()
             .map(|i| (i.name.name.as_str(), &i.value))
             .collect();
+        // 2026-05-16 — fields with declared defaults may be omitted
+        // from the literal; the default expression evaluates in the
+        // caller's scope at instantiation time. Mirrors the
+        // locus-param default behavior.
         for fname in &info.field_order {
-            if !by_name.contains_key(fname.as_str()) {
+            if !by_name.contains_key(fname.as_str())
+                && !info.defaults.contains_key(fname.as_str())
+            {
                 return Err(CodegenError::Unsupported(format!(
-                    "type `{}` literal missing field `{}` (no defaults at \
-                     codegen v0)",
+                    "type `{}` literal missing field `{}`",
                     type_name, fname
                 )));
             }
         }
         for fname in &info.field_order {
-            let expr = by_name
-                .get(fname.as_str())
-                .copied()
-                .expect("field presence checked above");
+            let expr: &Expr = match by_name.get(fname.as_str()).copied() {
+                Some(e) => e,
+                None => info
+                    .defaults
+                    .get(fname.as_str())
+                    .expect("default presence checked above"),
+            };
             let (idx, declared_ty) = info
                 .fields
                 .get(fname)

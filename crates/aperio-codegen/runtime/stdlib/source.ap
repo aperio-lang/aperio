@@ -85,18 +85,16 @@ locus __StdSourceWalk {
     // iteration order.
     fn each_file(dir: String) -> String {
         let lang = std::lang::Lang { flavor: self.flavor };
-        let entries = std::io::fs::list_dir(dir);
-        if len(entries) == 0 { return ""; }
-        let it = std::iter::Lines { };
+        let n = std::io::fs::list_dir_count(dir) or 0;
         let mut out = "";
-        let mut from = 0;
-        while from >= 0 {
-            let name = it.line_at(entries, from);
-            from = it.next_idx(entries, from);
+        let mut i = 0;
+        while i < n {
+            let name = std::io::fs::list_dir_at(dir, i) or "";
+            i = i + 1;
             if len(name) == 0 { continue; }
             if std::io::fs::extension(name) != self.ext { continue; }
             let path = dir + "/" + name;
-            let src = std::io::fs::read_file(path);
+            let src = std::io::fs::read_file(path) or "";
             if len(src) == 0 { continue; }
             let tree = lang.parse(src);
             if tree == 0 { continue; }

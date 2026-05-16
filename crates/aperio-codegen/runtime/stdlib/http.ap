@@ -45,12 +45,14 @@ type __StdHttpRequest {
 // content_type and body. v0 emits a fixed header set
 // (Content-Type, Content-Length, Connection: close); user
 // code can't currently add custom headers without a future
-// header-map milestone. content_type defaults are convention
-// rather than required: the writer just emits whatever
-// String is set.
+// header-map milestone. `content_type` defaults to
+// "text/plain" so the common case (`Response { status: 200,
+// body: "ok" }`) writes a valid response without the agent
+// having to populate every field. Set it explicitly for
+// JSON / HTML / etc.
 type __StdHttpResponse {
     status: Int;
-    content_type: String;
+    content_type: String = "text/plain";
     body: String;
 }
 
@@ -240,52 +242,66 @@ fn __write_http_response(s: std::io::tcp::Stream, resp: std::http::Response) {
     s.send(resp.body);
 }
 
+// 2026-05-16 — std::http::Handler interface. The contract a
+// Server's `handler` field is typed against. Any locus whose
+// method set covers `fn handle(req: Request) -> Response`
+// satisfies the interface structurally (F.20) — no `impl I
+// for L` ceremony. State lives on the handler-locus's params;
+// the Server's accept loop dispatches each request to
+// `handler.handle(req)` through a fat-pointer vtable.
+//
+// This replaces the v0 `handler: fn(Request) -> Response`
+// shape, which had no place to put per-request state because
+// Aperio has no closures. Stateful HTTP (URL shortener, todo
+// list, session store) lands naturally now.
+interface __StdHttpHandler {
+    fn handle(req: std::http::Request) -> std::http::Response;
+}
+
 // 2026-05-16 — std::http::Server. Bundles the recv +
 // parse_request + dispatch + write_response loop every HTTP
 // program had to hand-roll on top of Listener. The agent
-// supplies a single `handler: fn(Request) -> Response`
-// callback; the locus owns the accept loop and the
-// per-connection scope.
+// supplies a handler-locus whose state lives in its params
+// and whose `fn handle(req: Request) -> Response` method
+// dispatches each request; the Server locus owns the accept
+// loop and the per-connection scope.
 //
 // Usage:
-//   fn dispatch(req: std::http::Request) -> std::http::Response {
-//       if req.method == "GET" && req.path == "/health" {
-//           return std::http::Response { status: 200, content_type: "text/plain", body: "ok" };
+//   locus Routes {
+//       params {
+//           hits: Int = 0;
 //       }
-//       return std::http::Response { status: 404, content_type: "text/plain", body: "not found" };
+//       fn handle(req: std::http::Request) -> std::http::Response {
+//           self.hits = self.hits + 1;
+//           if req.path == "/health" {
+//               return std::http::Response { status: 200, body: "ok" };
+//           }
+//           return std::http::Response { status: 404, body: "not found" };
+//       }
 //   }
 //   fn main() {
-//       std::http::Server { port: 8080, handler: dispatch };
+//       std::http::Server { port: 8080, handler: Routes { } };
 //   }
 //
-// Routes live inside the user-supplied handler — Aperio
-// doesn't have closures + fn-pointer collections that would
-// support a separate routes table cleanly, and a string-keyed
-// switch ladder inside one handler fn is sized for the small
-// route counts most apps actually have. The Server locus
-// covers the lifecycle (bind, accept loop, per-connection
-// Stream dissolution) and the wire protocol; the user owns
-// the routing logic.
-fn __default_http_handler(req: std::http::Request) -> std::http::Response {
-    let _ = req;
-    return std::http::Response {
-        status: 404,
-        content_type: "text/plain",
-        body: "no handler configured"
-    };
-}
+// Routes live inside the user-supplied handler's `handle`
+// body — Aperio doesn't have a separate route-table primitive
+// and a string-keyed switch ladder inside one handler is
+// sized for the small route counts most apps actually have.
+// The Server locus covers the lifecycle (bind, accept loop,
+// per-connection Stream dissolution) and the wire protocol;
+// the handler-locus owns routing + state.
 
 // Per-connection helper. Recv up to 8KB (matches the Listener
 // default; spec/runtime.md notes the streaming-reassembly
-// follow-up for oversized requests), parse it, call the
-// user's dispatcher, ship the response. The Stream locus
-// dissolves at fn-exit per the m82 scope-flush mechanism,
-// which closes the conn fd.
-fn __http_handle_one_conn(conn_fd: Int, dispatch_fn: fn(std::http::Request) -> std::http::Response) {
+// follow-up for oversized requests), parse it, dispatch to
+// the user's handler via interface vtable, ship the response.
+// The Stream locus dissolves at fn-exit per the m82
+// scope-flush mechanism, which closes the conn fd.
+fn __http_handle_one_conn(conn_fd: Int, h: std::http::Handler) {
     let s = std::io::tcp::Stream { conn_fd: conn_fd };
     let raw = s.recv(8192);
     let req = std::http::parse_request(raw);
-    let resp = dispatch_fn(req);
+    let resp = h.handle(req);
     std::http::write_response(s, resp);
 }
 
@@ -296,10 +312,13 @@ locus __StdHttpServer {
         // -1 = run forever (canonical server shape); >= 0 caps
         // the loop for tests + bounded workloads.
         max_accepts: Int = -1;
-        // The user-supplied dispatcher. Default returns 404
-        // so a Server with no handler still responds rather
-        // than hanging.
-        handler: fn(std::http::Request) -> std::http::Response = __default_http_handler;
+        // The user-supplied handler-locus, typed by the
+        // Handler interface so any locus with the right method
+        // shape satisfies it. Required — `Server { port: 8080 }`
+        // with no handler is a compile error so that "I forgot
+        // to wire up routes" surfaces immediately instead of
+        // shipping a server that 404s everything.
+        handler: std::http::Handler;
         // not-yet-bound sentinel so dissolve() on a
         // partially-constructed Server skips the close.
         listen_fd: Int = -1;

@@ -169,29 +169,140 @@ fn json_array_iter_empty_array_is_done_immediately() {
 // ===== HTTP Server =====================================================
 
 #[test]
-fn http_server_compiles_with_handler_and_max_accepts() {
-    // Compile-only — exercising the Listener-backed Server
-    // shape against a real socket would need a port + curl
-    // round-trip which is racy under the workspace test
-    // harness. The smoke test for end-to-end behavior lived in
-    // the brief-example verification during this session.
+fn http_server_compiles_with_handler_locus_and_max_accepts() {
+    // Compile-only smoke. The handler is a locus typed against
+    // std::http::Handler; state lives in its params so requests
+    // can mutate cross-request state (counter, store, etc.).
     let src = r#"
-        fn dispatch(req: std::http::Request) -> std::http::Response {
-            if req.method == "GET" && req.path == "/health" {
-                return std::http::Response {
-                    status: 200, content_type: "text/plain", body: "ok"
-                };
+        locus Routes {
+            params { hits: Int = 0; }
+            fn handle(req: std::http::Request) -> std::http::Response {
+                self.hits = self.hits + 1;
+                if req.method == "GET" && req.path == "/health" {
+                    return std::http::Response { status: 200, body: "ok" };
+                }
+                return std::http::Response { status: 404, body: "nf" };
             }
-            return std::http::Response {
-                status: 404, content_type: "text/plain", body: "nf"
-            };
         }
         fn main() {
-            std::http::Server { port: 18181, max_accepts: 1, handler: dispatch };
+            std::http::Server { port: 18181, max_accepts: 1, handler: Routes { } };
         }
     "#;
     let bin = build("http_server_compile", src);
     let _ = std::fs::remove_file(&bin);
+}
+
+#[test]
+fn http_server_without_handler_is_compile_error() {
+    // 2026-05-16 — Server requires `handler:`. Omitting it
+    // surfaces an immediate compile error so agents don't ship
+    // a server that 404s everything because they forgot to wire
+    // up routes.
+    let src = r#"
+        fn main() {
+            std::http::Server { port: 18182, max_accepts: 1 };
+        }
+    "#;
+    let program = aperio_syntax::parse_source(src).expect("parse");
+    let mut bin = std::env::temp_dir();
+    bin.push(format!("aperio_libshape_http_required_{}", std::process::id()));
+    let err = build_executable(&program, &bin).expect_err("expected compile error");
+    let msg = format!("{:?}", err);
+    assert!(
+        msg.contains("handler") && msg.contains("required"),
+        "diagnostic should name the missing handler param: {}",
+        msg
+    );
+}
+
+#[test]
+fn http_response_content_type_defaults_to_text_plain() {
+    // Response.content_type has a "text/plain" default; the
+    // common case (`{ status: 200, body: "ok" }`) writes a
+    // valid response without filling every field.
+    let src = r#"
+        fn main() {
+            let r = std::http::Response { status: 200, body: "hi" };
+            println(r.content_type);
+            println(r.body);
+        }
+    "#;
+    let (stdout, status) = build_and_run("http_resp_ct_default", src);
+    assert!(status.success(), "non-zero: {:?}", status);
+    assert!(stdout.contains("text/plain"), "default missing; got: {:?}", stdout);
+    assert!(stdout.contains("hi"), "body missing; got: {:?}", stdout);
+}
+
+#[test]
+fn http_handler_state_persists_across_dispatches() {
+    // The handler is a locus; its params are real state. Two
+    // calls to `handle` on the same instance see the same `n`
+    // field updated. Doesn't go through a real socket — invokes
+    // `handle` directly to verify the dispatch path produces
+    // monotonic results.
+    let src = r#"
+        locus Counter {
+            params { n: Int = 0; }
+            fn handle(req: std::http::Request) -> std::http::Response {
+                let _ = req;
+                self.n = self.n + 1;
+                return std::http::Response { status: 200, body: to_string(self.n) };
+            }
+        }
+        fn poke(h: std::http::Handler) -> Int {
+            let req = std::http::Request { method: "GET", path: "/", version: "", headers: "", body: "" };
+            let r = h.handle(req);
+            return std::str::parse_int(r.body);
+        }
+        fn main() {
+            let c = Counter { };
+            println("a=", poke(c));
+            println("b=", poke(c));
+            println("c=", poke(c));
+        }
+    "#;
+    let (stdout, status) = build_and_run("http_handler_state", src);
+    assert!(status.success(), "non-zero: {:?}", status);
+    assert!(stdout.contains("a=1"), "first; got: {:?}", stdout);
+    assert!(stdout.contains("b=2"), "second; got: {:?}", stdout);
+    assert!(stdout.contains("c=3"), "third; got: {:?}", stdout);
+}
+
+#[test]
+fn http_handler_satisfies_interface_structurally() {
+    // Two distinct locus shapes (one with state, one without)
+    // both satisfy std::http::Handler — same fn signature on
+    // each, no explicit `impl` ceremony.
+    let src = r#"
+        locus Stateless {
+            params { }
+            fn handle(req: std::http::Request) -> std::http::Response {
+                let _ = req;
+                return std::http::Response { status: 200, body: "stateless" };
+            }
+        }
+        locus Stateful {
+            params { tag: String = "default"; }
+            fn handle(req: std::http::Request) -> std::http::Response {
+                let _ = req;
+                return std::http::Response { status: 200, body: self.tag };
+            }
+        }
+        fn first_body(h: std::http::Handler) -> String {
+            let req = std::http::Request { method: "GET", path: "/", version: "", headers: "", body: "" };
+            return h.handle(req).body;
+        }
+        fn main() {
+            let a = Stateless { };
+            let b = Stateful { tag: "stateful" };
+            println(first_body(a));
+            println(first_body(b));
+        }
+    "#;
+    let (stdout, status) = build_and_run("http_handler_structural", src);
+    assert!(status.success(), "non-zero: {:?}", status);
+    assert!(stdout.contains("stateless"), "got: {:?}", stdout);
+    assert!(stdout.contains("stateful"), "got: {:?}", stdout);
 }
 
 // ===== TCP wrappers (regression for the typo'd C-fn lookups) ===========

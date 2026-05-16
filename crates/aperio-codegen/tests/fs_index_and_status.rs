@@ -1,17 +1,10 @@
-//! Phase 2e + 2f — list_dir index API + read_file errno status.
+//! Phase 2e — list_dir index API.
 //!
 //! 2e closes `apps/ssg/FRICTION.md` 2026-05-10 list_dir-newline-string:
-//! `list_dir(path) -> String` newline-joined still ships, but every
-//! caller paid the cost of a manual `index_of("\n") + slice +
-//! advance` loop. `list_dir_count` + `list_dir_at` route through
-//! the same global-arena cache, so iteration becomes a clean
+//! the older newline-joined `list_dir(path) -> String` was removed
+//! 2026-05-16. `list_dir_count` + `list_dir_at` route through the
+//! same global-arena cache, so iteration becomes a clean
 //! `while i < n` bounded by count.
-//!
-//! 2f closes `apps/ssg/FRICTION.md` 2026-05-10 read_file-empty-vs-error:
-//! `read_file(path)` returns `""` for both "empty file" and "missing
-//! file" because the C-layer `-1` clamps to `0` / empty-string at the
-//! Aperio surface. `read_file_status(path)` returns 0 on success or
-//! the platform errno on failure, so callers can disambiguate.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -152,79 +145,7 @@ fn list_dir_at_out_of_range_returns_empty_string() {
     assert!(stdout.contains("neg_len=0"), "got: {:?}", stdout);
 }
 
-#[test]
-fn read_file_status_zero_on_success() {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut path = std::env::temp_dir();
-    path.push(format!("aperio_rfs_success_{}.txt", nanos));
-    std::fs::write(&path, b"hello").expect("write");
-    let src = format!(
-        r#"
-        fn main() {{
-            let s = std::io::fs::read_file_status("{}");
-            println("status=", s);
-        }}
-        "#,
-        path.display()
-    );
-    let (stdout, status) = build_and_run("rfs_ok", &src);
-    let _ = std::fs::remove_file(&path);
-    assert!(status.success(), "exit: {:?}", status);
-    assert!(stdout.contains("status=0"), "got: {:?}", stdout);
-}
-
-#[test]
-fn read_file_status_enoent_on_missing_file() {
-    // The classic friction: an empty-on-success read returns "" /
-    // size=0; a missing-file read returns "" / size=-1 (clamped to
-    // 0 / empty-string at the Aperio surface). Pre-2f, both
-    // surface as `len(content) == 0` with no distinguisher.
-    // read_file_status returns the errno (ENOENT == 2 on Linux,
-    // ENOENT == 2 on macOS too) so callers can branch on it.
-    let src = r#"
-        fn main() {
-            let content = std::io::fs::read_file("/tmp/aperio_rfs_missing_xyz123_file.txt");
-            let status = std::io::fs::read_file_status("/tmp/aperio_rfs_missing_xyz123_file.txt");
-            println("content_len=", len(content));
-            println("status=", status);
-        }
-    "#;
-    let (stdout, exit) = build_and_run("rfs_missing", src);
-    assert!(exit.success(), "exit: {:?}", exit);
-    assert!(stdout.contains("content_len=0"), "got: {:?}", stdout);
-    // ENOENT is 2 on Linux/macOS — the canonical missing-file errno.
-    assert!(stdout.contains("status=2"), "expected ENOENT=2; got: {:?}", stdout);
-}
-
-#[test]
-fn read_file_status_zero_on_empty_file() {
-    // Empty file = success with zero bytes. status=0 + content_len=0;
-    // distinguishable from the missing-file case (status=2).
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut path = std::env::temp_dir();
-    path.push(format!("aperio_rfs_empty_{}.txt", nanos));
-    std::fs::write(&path, b"").expect("write empty");
-    let src = format!(
-        r#"
-        fn main() {{
-            let content = std::io::fs::read_file("{}");
-            let status = std::io::fs::read_file_status("{}");
-            println("content_len=", len(content));
-            println("status=", status);
-        }}
-        "#,
-        path.display(),
-        path.display()
-    );
-    let (stdout, exit) = build_and_run("rfs_empty", &src);
-    let _ = std::fs::remove_file(&path);
-    assert!(exit.success(), "exit: {:?}", exit);
-    assert!(stdout.contains("content_len=0"), "got: {:?}", stdout);
-    assert!(stdout.contains("status=0"), "got: {:?}", stdout);
-}
+// read_file_status was removed 2026-05-16 as a backwards-compat
+// shim; the modern shape is `read_file(path) -> String fallible(IoError)`
+// which carries errno + kind tag on the err path. Use the
+// fs_io_error_path.rs tests for the canonical shape.

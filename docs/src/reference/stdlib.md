@@ -33,7 +33,7 @@ Namespaces with path-call shape:
 | `std::str` | `parse_int` / `can_parse_int` / `parse_float` / `can_parse_float`, `index_of`, `lower` / `upper`, `trim`, `replace`, `repeat`, `pad_left` / `pad_right`, `from_bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` |
 | `std::bytes` | `at(b, i) -> Int fallible(IndexError)`, `slice(b, lo, hi)`, `from_string(s)` |
 | `std::text` | byte-class predicates `is_alpha`, `is_digit`, `is_alnum`, `is_whitespace`, `is_word_char` (`fn(Int) -> Bool`); `tokenize_words_into(s, target_vec)` populates a `@form(vec) of String` with lowercased word tokens |
-| `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `mkdir`, `list_dir`, `list_dir_count`, `list_dir_at` — all return `fallible(IoError)` (`kind: String`, `errno: Int`, `path: String`). `file_exists(path) -> Bool` is the only non-fallible predicate |
+| `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `mkdir`, `list_dir_count`, `list_dir_at` — all return `fallible(IoError)` (`kind: String`, `errno: Int`, `path: String`). `file_exists(path) -> Bool` is the only non-fallible predicate. Iterate directories via the index API (`for i in 0..count { let name = at(i); ... }`); the older newline-joined `list_dir(path) -> String` was removed 2026-05-16. |
 | `std::io::stdin` | `read_line() -> String`, `read_line_status() -> Int` |
 | `std::io::tcp` | path-call entry points `listen_socket(host, port) -> Int fallible(IoError)`, `connect(host, port) -> Int fallible(IoError)`, `accept_one(listen_fd) -> Int fallible(IoError)`, `close_fd(fd)` (infallible) |
 | `std::math` | `sqrt`, `exp`, `log`, `floor`, `ceil`, `pow` |
@@ -65,7 +65,7 @@ Namespaces with namespace-lotus shape:
 | Namespace | Loci / interfaces shipped |
 |---|---|
 | `std::io::tcp` | `Listener` (multi-accept loop, dispatch via `on_connection: fn(Stream)`), `Stream` (per-connection handle with `send` / `send_bytes` / `recv` / `recv_bytes` methods) |
-| `std::http` | `Request` and `Response` types, `parse_request`, `write_response`, case-insensitive `header` lookup, `Server` locus (wraps accept-recv-parse-dispatch-write; supplies single `handler: fn(Request) -> Response` callback) |
+| `std::http` | `Request` and `Response` types (`Response.content_type` defaults to `"text/plain"`), `parse_request`, `write_response`, case-insensitive `header` lookup, `Handler` interface (`fn handle(req: Request) -> Response`), `Server` locus (wraps accept-recv-parse-dispatch-write; `handler:` is a required field typed by `Handler`, takes any locus with a `handle` method — state lives in the handler-locus's params) |
 | `std::text` | `md_to_html`, `base64::encode` / `decode`, `Sink` interface with `StdoutSink` / `StringSink` / `FileSink` implementations (note: the byte-class predicates + `tokenize_words_into` are path-call surface, listed in the previous table) |
 | `std::cli` | `Resolver` for argv parsing |
 | `std::iter` | `Lines` iterator over text |

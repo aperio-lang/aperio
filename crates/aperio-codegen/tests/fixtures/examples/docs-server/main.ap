@@ -95,23 +95,17 @@ fn __wrap_html_page(title: String, body: String) -> String {
 
 fn __render_index() -> String {
     let dir = __docs_dir();
-    let listing = std::io::fs::list_dir(dir);
+    let n = std::io::fs::list_dir_count(dir) or 0;
     let mut body = "<h1>Aperio Docs</h1>\n";
-    if len(listing) == 0 {
+    if n == 0 {
         body = body + "<p>(no markdown files in " + dir + ")</p>\n";
         return __wrap_html_page("Aperio Docs", body);
     }
     body = body + "<ul>\n";
     let mut i = 0;
-    let total = len(listing);
-    while i < total {
-        let nl = std::str::index_of(listing[i..total], "\n");
-        let mut entry_end = total;
-        if nl >= 0 {
-            entry_end = i + nl;
-        }
-        let name = listing[i..entry_end];
-        i = entry_end + 1;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
         if len(name) == 0 { continue; }
         // Skip any non-.md entries (subdirs, README plaintext, etc.).
         let nlen = len(name);
@@ -130,7 +124,7 @@ fn __render_doc(name: String) -> String {
     if !std::io::fs::file_exists(path) {
         return "";
     }
-    let md = std::io::fs::read_file(path);
+    let md = std::io::fs::read_file(path) or "";
     let body_html = std::text::md_to_html(md);
     let nav = "<p><a href=\"/\">&larr; index</a></p>\n";
     return __wrap_html_page(name, nav + body_html);

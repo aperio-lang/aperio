@@ -1932,6 +1932,21 @@ impl<'a> Checker<'a> {
                         .find(|m| m.name == name)
                         .map(method_to_fn_ty)
                 }
+                // 2026-05-16 — method lookup on an interface-typed
+                // receiver. Resolves `obj.handle(req)` when `obj`
+                // has interface type, so call-site typecheck sees
+                // the method's signature instead of "no field".
+                // Codegen already routes the call through the fat
+                // pointer's vtable (lower_method_call's
+                // CodegenTy::Interface arm).
+                TopSymbol::Interface(info) => {
+                    info.methods.iter().find(|m| m.name == name).map(|m| {
+                        Ty::Function {
+                            params: m.params.iter().map(|(_, t)| t.clone()).collect(),
+                            ret: Box::new(m.ret.clone()),
+                        }
+                    })
+                }
                 _ => None,
             },
             Ty::Unknown => Some(Ty::Unknown),
@@ -2488,6 +2503,14 @@ impl<'a> Checker<'a> {
             }
         };
 
+        // 2026-05-16 — loci + perspectives now also enforce
+        // "missing field" when the param has no default
+        // (`has_default: false`). Previously omitted for loci
+        // because every param historically carried a default; the
+        // required-param form (`name: T;`) introduced 2026-05-16
+        // makes the check meaningful — otherwise `Server { port:
+        // 8080 }` (missing required `handler`) would silently fall
+        // through to codegen.
         let (fields, kind_label, requires_all): (Vec<(String, Ty, bool)>, &str, bool) = match sym {
             TopSymbol::Type(info) => match &info.kind {
                 TypeKind::Struct(fields) => (
@@ -2512,7 +2535,7 @@ impl<'a> Checker<'a> {
                     .map(|p| (p.name.clone(), p.ty.clone(), p.has_default))
                     .collect(),
                 "locus",
-                false,
+                true,
             ),
             TopSymbol::Perspective(info) => (
                 info.params
@@ -2520,7 +2543,7 @@ impl<'a> Checker<'a> {
                     .map(|p| (p.name.clone(), p.ty.clone(), p.has_default))
                     .collect(),
                 "perspective",
-                false,
+                true,
             ),
             _ => {
                 self.diags.push(Diag::ty(
@@ -2536,7 +2559,36 @@ impl<'a> Checker<'a> {
             let got = self.check_expr(&init.value);
             match fields.iter().find(|(n, _, _)| n == &init.name.name) {
                 Some((_, want, _)) => {
-                    if !want.assignable_from(&got) {
+                    // 2026-05-16 — locus → interface coercion at
+                    // struct/locus literal init. Mirrors the fn-arg
+                    // call-site coercion above so a stateful locus
+                    // can flow into an interface-typed field (e.g.
+                    // `Server { handler: MyHandler { } }` where
+                    // `handler: HttpHandler`).
+                    let interface_satisfied = if let (Ty::Named(iface_name), Ty::Named(arg_name)) =
+                        (want, &got)
+                    {
+                        if matches!(
+                            self.top.lookup(iface_name),
+                            Some(TopSymbol::Interface(_))
+                        ) {
+                            match self.check_structural_impl(arg_name, iface_name) {
+                                Ok(()) => true,
+                                Err(msg) => {
+                                    self.diags.push(Diag::ty(
+                                        init.value.span(),
+                                        msg,
+                                    ));
+                                    true
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !interface_satisfied && !want.assignable_from(&got) {
                         self.diags.push(Diag::ty(
                             init.value.span(),
                             format!(

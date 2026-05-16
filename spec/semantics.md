@@ -447,12 +447,22 @@ downstream pipeline (cooperative queue, mailbox post, transport
 fanout) is unchanged from the string-subject path. The wire-format
 subject for a topic named `Foo` is the bare string `"Foo"`.
 
-Coexistence: the legacy form (`subscribe "S" as h of type T;`) is
-still accepted, so existing examples continue to work unchanged.
-The two forms can be mixed within one program; they only collide
-if a topic name and a literal subject share the same wire-format
-string, which the type checker catches via the standard
-duplicate-symbol diagnostic.
+Coexistence: the literal-string form (`subscribe "S" as h of
+type T;`) is still accepted because the log namespace lotus
+relies on wildcard publish (`publish "log.**" of type LogEvent;`)
++ runtime-computed subject strings (`subj <- LogEvent { ... }`
+where `subj` is `"log." + self.full_path`), and the topic-decl
+form has no equivalent at v1. The two forms can be mixed within
+one program; they only collide if a topic name and a literal
+subject share the same wire-format string, which the type
+checker catches via the standard duplicate-symbol diagnostic.
+
+**Canonical form for new code:** prefer the topic-decl form
+(`topic Foo { payload: T; subject: "wire.subject"; }` +
+`subscribe Foo as h;`). Reach for the literal-string form only
+when you need a wildcard subscription or a runtime-computed
+publish subject — those are the cases the topic system doesn't
+cover at v1.
 
 ### Phase 2: hierarchy, subjects, bindings, intra-locus optimization
 
