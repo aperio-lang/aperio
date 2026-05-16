@@ -437,3 +437,240 @@ fn vec_of_struct_cells_get_round_trip() {
     assert!(stdout.contains("ok"), "expected ok, got: {:?}", stdout);
     assert!(!stdout.contains("FAIL"), "unexpected FAIL: {:?}", stdout);
 }
+
+/// #67 — `l.set(i, x)` mutates in place. Fallible(IndexError) on
+/// out-of-bounds. Closes the workload-driven gap that the spec
+/// originally deferred to FORM-2.
+#[test]
+fn set_overwrites_existing_index() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn main() {
+            let l = L { };
+            l.push(10);
+            l.push(20);
+            l.push(30);
+            l.set(1, 99) or raise;
+            let v = l.get(1) or raise;
+            println("v=", v);
+            // Boundaries unchanged.
+            let a = l.get(0) or raise;
+            let c = l.get(2) or raise;
+            println("a=", a, " c=", c);
+        }
+    "#;
+    let bin = build("set_overwrite", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("v=99"), "got: {:?}", stdout);
+    assert!(stdout.contains("a=10 c=30"), "got: {:?}", stdout);
+}
+
+#[test]
+fn set_out_of_bounds_substitute_uses_fallback() {
+    // `or` substitute on a Unit-success fallible. Same shape as
+    // hashmap.remove's or-clause handling.
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn noop(_e: IndexError) { }
+        fn main() {
+            let l = L { };
+            l.push(1);
+            l.set(99, 0) or noop(err);
+            println("ok");
+        }
+    "#;
+    let bin = build("set_oob_fallback", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ok"), "got: {:?}", stdout);
+}
+
+#[test]
+fn set_then_get_struct_cell_roundtrip() {
+    let src = r#"
+        type Pair { x: Int; y: Int; }
+        @form(vec)
+        locus L { capacity { heap items of Pair; } }
+        fn main() {
+            let l = L { };
+            l.push(Pair { x: 1, y: 2 });
+            l.set(0, Pair { x: 7, y: 8 }) or raise;
+            let p = l.get(0) or raise;
+            println("p=(", p.x, ",", p.y, ")");
+        }
+    "#;
+    let bin = build("set_struct_cell", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("p=(7,8)"), "got: {:?}", stdout);
+}
+
+/// `sort()` on a primitive-cell vec sorts ascending in place. The
+/// gap this closes: agents were hand-rolling O(n²) selection over
+/// `get` / `set` because the substrate didn't expose qsort, which
+/// burned ~30 lines per program and skewed token-efficiency runs.
+#[test]
+fn form_vec_sort_int_ascending() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn main() {
+            let l = L { };
+            l.push(3); l.push(1); l.push(4); l.push(1); l.push(5);
+            l.sort();
+            let mut i = 0;
+            while i < l.len() {
+                println(l.get(i) or raise);
+                i = i + 1;
+            }
+        }
+    "#;
+    let bin = build("sort_int_asc", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "1\n1\n3\n4\n5", "got: {:?}", stdout);
+}
+
+#[test]
+fn form_vec_sort_string_ascending() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of String; } }
+        fn main() {
+            let l = L { };
+            l.push("delta"); l.push("alpha"); l.push("charlie"); l.push("bravo");
+            l.sort();
+            let mut i = 0;
+            while i < l.len() {
+                println(l.get(i) or raise);
+                i = i + 1;
+            }
+        }
+    "#;
+    let bin = build("sort_str_asc", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "alpha\nbravo\ncharlie\ndelta",
+        "got: {:?}",
+        stdout
+    );
+}
+
+/// `sort_by(cmp)` lets the agent supply a custom strict-less-than
+/// comparator. The trampoline marshals each pair into the user's
+/// `fn(a, b) -> Bool` callback via indirect call.
+#[test]
+fn form_vec_sort_by_custom_cmp_descending() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn gt(a: Int, b: Int) -> Bool { return a > b; }
+        fn main() {
+            let l = L { };
+            l.push(3); l.push(1); l.push(4); l.push(1); l.push(5);
+            l.sort_by(gt);
+            let mut i = 0;
+            while i < l.len() {
+                println(l.get(i) or raise);
+                i = i + 1;
+            }
+        }
+    "#;
+    let bin = build("sort_by_desc", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "5\n4\n3\n1\n1", "got: {:?}", stdout);
+}
+
+#[test]
+fn form_vec_sort_desc_by_flips_supplied_lt() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn lt(a: Int, b: Int) -> Bool { return a < b; }
+        fn main() {
+            let l = L { };
+            l.push(3); l.push(1); l.push(4); l.push(1); l.push(5);
+            l.sort_desc_by(lt);
+            let mut i = 0;
+            while i < l.len() {
+                println(l.get(i) or raise);
+                i = i + 1;
+            }
+        }
+    "#;
+    let bin = build("sort_desc_by_lt", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "5\n4\n3\n1\n1", "got: {:?}", stdout);
+}
+
+/// `sort_by` works for struct cells too. The trampoline detects
+/// pointer-shaped cells and threads the element pointer through
+/// instead of loading by value.
+#[test]
+fn form_vec_sort_by_struct_cell() {
+    let src = r#"
+        type Point { x: Int; y: Int; }
+        @form(vec)
+        locus L { capacity { heap items of Point; } }
+        fn lt_x(a: Point, b: Point) -> Bool { return a.x < b.x; }
+        fn main() {
+            let l = L { };
+            l.push(Point { x: 3, y: 0 });
+            l.push(Point { x: 1, y: 0 });
+            l.push(Point { x: 2, y: 0 });
+            l.sort_by(lt_x);
+            let mut i = 0;
+            while i < l.len() {
+                let p = l.get(i) or raise;
+                println(p.x);
+                i = i + 1;
+            }
+        }
+    "#;
+    let bin = build("sort_by_struct", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "1\n2\n3", "got: {:?}", stdout);
+}
+
+#[test]
+fn form_vec_sort_empty_vec_is_noop() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn main() {
+            let l = L { };
+            l.sort();
+            println("len=", l.len());
+        }
+    "#;
+    let bin = build("sort_empty", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("len=0"), "got: {:?}", stdout);
+}

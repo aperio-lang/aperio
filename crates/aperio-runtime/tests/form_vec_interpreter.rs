@@ -193,6 +193,43 @@ fn fail_stmt_exits_via_error_path() {
 }
 
 #[test]
+fn set_overwrites_existing_index() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn main() {
+            let l = L { };
+            l.push(10);
+            l.push(20);
+            l.push(30);
+            l.set(1, 99) or raise;
+            let v = l.get(1) or raise;
+            if v != 99 { println("FAIL: set"); }
+            if (l.get(0) or raise) != 10 { println("FAIL: a"); }
+            if (l.get(2) or raise) != 30 { println("FAIL: c"); }
+            println("ok");
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+#[test]
+fn set_out_of_bounds_substitute_uses_fallback() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn noop(_e: IndexError) { }
+        fn main() {
+            let l = L { };
+            l.push(1);
+            l.set(99, 0) or noop(err);
+            println("ok");
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+#[test]
 fn vec_of_struct_cells() {
     let src = r#"
         type Pair { x: Int; y: Int; }
@@ -208,6 +245,88 @@ fn vec_of_struct_cells() {
             if first.x != 1 { println("FAIL: x"); }
             if first.y != 2 { println("FAIL: y"); }
             println("ok");
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+/// Sort family — interpreter parity with the codegen path. The
+/// program exits with `std::process::exit(1)` if any ordering
+/// invariant fails, so `run() == 0` actually tests behaviour.
+#[test]
+fn sort_int_ascending_interp() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn main() {
+            let l = L { };
+            l.push(3); l.push(1); l.push(4); l.push(1); l.push(5);
+            l.sort();
+            let mut i = 1;
+            while i < l.len() {
+                let prev = l.get(i - 1) or raise;
+                let cur = l.get(i) or raise;
+                if cur < prev { std::process::exit(1); }
+                i = i + 1;
+            }
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+#[test]
+fn sort_string_ascending_interp() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of String; } }
+        fn main() {
+            let l = L { };
+            l.push("delta"); l.push("alpha"); l.push("charlie");
+            l.sort();
+            let a = l.get(0) or raise;
+            let b = l.get(1) or raise;
+            let c = l.get(2) or raise;
+            if a != "alpha" { std::process::exit(1); }
+            if b != "charlie" { std::process::exit(1); }
+            if c != "delta" { std::process::exit(1); }
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+#[test]
+fn sort_by_custom_cmp_interp() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn gt(a: Int, b: Int) -> Bool { return a > b; }
+        fn main() {
+            let l = L { };
+            l.push(2); l.push(5); l.push(1); l.push(4);
+            l.sort_by(gt);
+            let a = l.get(0) or raise;
+            let b = l.get(3) or raise;
+            if a != 5 { std::process::exit(1); }
+            if b != 1 { std::process::exit(1); }
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+#[test]
+fn sort_desc_by_interp() {
+    let src = r#"
+        @form(vec)
+        locus L { capacity { heap items of Int; } }
+        fn lt(a: Int, b: Int) -> Bool { return a < b; }
+        fn main() {
+            let l = L { };
+            l.push(2); l.push(5); l.push(1); l.push(4);
+            l.sort_desc_by(lt);
+            let a = l.get(0) or raise;
+            let b = l.get(3) or raise;
+            if a != 5 { std::process::exit(1); }
+            if b != 1 { std::process::exit(1); }
         }
     "#;
     assert_eq!(run(src), 0);

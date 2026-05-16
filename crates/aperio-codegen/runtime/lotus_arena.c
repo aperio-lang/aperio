@@ -793,6 +793,18 @@ int lotus_vec_get(void *vec_ptr, size_t elem_size, int64_t i, void *out) {
     return 1;
 }
 
+/* In-place mutation. Mirrors lotus_vec_get: bounds-checked at
+ * [0, len). Returns 1 on success, 0 on out-of-bounds. Codegen
+ * lifts that bool into `Ty::Fallible { success: (), payload:
+ * IndexError }` at the call site. */
+int lotus_vec_set(void *vec_ptr, size_t elem_size, int64_t i, const void *elem) {
+    if (!vec_ptr || !elem) return 0;
+    lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
+    if (i < 0 || (size_t)i >= v->len) return 0;
+    memcpy(v->buf + (size_t)i * elem_size, elem, elem_size);
+    return 1;
+}
+
 int lotus_vec_pop(void *vec_ptr, size_t elem_size, void *out) {
     if (!vec_ptr || !out) return 0;
     lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
@@ -812,6 +824,68 @@ int lotus_vec_is_empty(void *vec_ptr) {
     if (!vec_ptr) return 1;
     lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
     return v->len == 0 ? 1 : 0;
+}
+
+/* Typed comparators for the primitive `sort()` variants. qsort
+ * is happy with these directly — no cookie / no trampoline. */
+static int cmp_i64(const void *a, const void *b) {
+    int64_t av = *(const int64_t *)a;
+    int64_t bv = *(const int64_t *)b;
+    return (av > bv) - (av < bv);
+}
+static int cmp_f64(const void *a, const void *b) {
+    double av = *(const double *)a;
+    double bv = *(const double *)b;
+    if (av < bv) return -1;
+    if (av > bv) return  1;
+    return 0;
+}
+static int cmp_str(const void *a, const void *b) {
+    const char *av = *(const char *const *)a;
+    const char *bv = *(const char *const *)b;
+    return strcmp(av, bv);
+}
+
+void lotus_vec_sort_int(void *vec_ptr) {
+    if (!vec_ptr) return;
+    lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
+    if (v->len < 2 || !v->buf) return;
+    qsort(v->buf, v->len, sizeof(int64_t), cmp_i64);
+}
+void lotus_vec_sort_float(void *vec_ptr) {
+    if (!vec_ptr) return;
+    lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
+    if (v->len < 2 || !v->buf) return;
+    qsort(v->buf, v->len, sizeof(double), cmp_f64);
+}
+void lotus_vec_sort_string(void *vec_ptr) {
+    if (!vec_ptr) return;
+    lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
+    if (v->len < 2 || !v->buf) return;
+    qsort(v->buf, v->len, sizeof(const char *), cmp_str);
+}
+
+/* sort_by / sort_desc_by infrastructure. The trampoline pattern:
+ * codegen emits a per-cell-type wrapper that loads (a, b) from
+ * the buffer, calls the user's `fn(T, T) -> Bool` comparator,
+ * and returns -1/0/+1 the way qsort expects. The cookie carries
+ * (arena, user_cmp_fn, reverse_flag) — reverse_flag flips the
+ * result so sort_desc_by reuses the same trampoline with a true
+ * flag. */
+typedef int (*lotus_vec_trampoline_t)(const void *a, const void *b, void *cookie);
+
+void lotus_vec_sort_by(void *vec_ptr,
+                       size_t elem_size,
+                       lotus_vec_trampoline_t cmp,
+                       void *cookie) {
+    if (!vec_ptr || !cmp) return;
+    lotus_vec_t *v = (lotus_vec_t *)vec_ptr;
+    if (v->len < 2 || !v->buf) return;
+    /* qsort_r is GNU-extension; the arg order matches glibc's
+     * `(base, nmemb, size, compar, arg)` form. */
+    qsort_r(v->buf, v->len, elem_size,
+            (int (*)(const void *, const void *, void *))cmp,
+            cookie);
 }
 
 void lotus_vec_destroy(void *vec_ptr) {
@@ -3194,6 +3268,52 @@ int lotus_fs_file_exists(const char *path) {
     }
     struct stat st;
     return stat(path, &st) == 0 ? 1 : 0;
+}
+
+/* Surface the current platform errno to the LLVM-side fallible-
+ * dispatch wrappers. Each `std::io::fs::*` / `std::io::tcp::*`
+ * primitive sets errno on failure; the codegen-side wrapper
+ * reads it back via this helper and synthesizes an `IoError`
+ * payload. Same global-state contract as POSIX itself — assumes
+ * the wrapper calls this immediately after the failing call
+ * with no intervening errno-setting syscalls. */
+int32_t lotus_get_errno(void) {
+    return (int32_t)errno;
+}
+
+/* Map a platform errno code to a stable kind-tag string the
+ * IoError payload carries. Returns a pointer into a static
+ * table; caller must not free. The kind taxonomy is the
+ * agent-facing vocabulary — keep it small and intuitive.
+ * Unmapped codes return "io" as the catch-all. */
+const char *lotus_io_error_kind(int32_t errno_val) {
+    switch (errno_val) {
+        case 0:           return "";
+        case ENOENT:      return "not_found";
+        case EACCES:      return "permission_denied";
+        case EPERM:       return "permission_denied";
+        case EISDIR:      return "is_dir";
+        case ENOTDIR:     return "not_dir";
+        case EEXIST:      return "already_exists";
+        case ENOTEMPTY:   return "not_empty";
+        case ENOSPC:      return "no_space";
+        case ENAMETOOLONG: return "name_too_long";
+        case EINVAL:      return "invalid";
+        case EAGAIN:      return "would_block";
+#if defined(EWOULDBLOCK) && (EWOULDBLOCK != EAGAIN)
+        case EWOULDBLOCK: return "would_block";
+#endif
+        case ETIMEDOUT:   return "timeout";
+        case ECONNREFUSED: return "connection_refused";
+        case ECONNRESET:  return "connection_reset";
+        case ECONNABORTED: return "connection_aborted";
+        case EHOSTUNREACH: return "host_unreachable";
+        case ENETUNREACH: return "network_unreachable";
+        case EADDRINUSE:  return "address_in_use";
+        case EPIPE:       return "broken_pipe";
+        case EINTR:       return "interrupted";
+        default:          return "io";
+    }
 }
 
 /* Locates the extension within `path` — including the leading

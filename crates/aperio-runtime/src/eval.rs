@@ -1693,7 +1693,8 @@ impl Interpreter {
         };
         if !matches!(
             method_name.as_str(),
-            "push" | "get" | "pop" | "len" | "is_empty"
+            "push" | "get" | "set" | "pop" | "len" | "is_empty"
+            | "sort" | "sort_by" | "sort_desc_by"
         ) {
             return Ok(None);
         }
@@ -1775,6 +1776,37 @@ impl Interpreter {
                     Ok(Some(items[i as usize].clone()))
                 }
             }
+            "set" => {
+                if arg_vs.len() != 2 {
+                    return Err(Signal::Error(format!(
+                        "@form(vec).set expects 2 args (idx, value), got {}",
+                        arg_vs.len()
+                    )));
+                }
+                let mut iter = arg_vs.into_iter();
+                let idx_v = iter.next().unwrap();
+                let new_v = iter.next().unwrap();
+                let i = match idx_v {
+                    Value::Int(n) => n,
+                    other => {
+                        return Err(Signal::Error(format!(
+                            "@form(vec).set index must be Int; got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let mut items = items_rc.borrow_mut();
+                if i < 0 || (i as usize) >= items.len() {
+                    let len = items.len() as i64;
+                    drop(items);
+                    Ok(Some(Value::FallibleErr(Box::new(
+                        index_error_value("out_of_bounds", i, len),
+                    ))))
+                } else {
+                    items[i as usize] = new_v;
+                    Ok(Some(Value::Unit))
+                }
+            }
             "pop" => {
                 if !arg_vs.is_empty() {
                     return Err(Signal::Error(format!(
@@ -1807,6 +1839,99 @@ impl Interpreter {
                     )));
                 }
                 Ok(Some(Value::Bool(items_rc.borrow().is_empty())))
+            }
+            "sort" => {
+                if !arg_vs.is_empty() {
+                    return Err(Signal::Error(format!(
+                        "@form(vec).sort expects 0 args, got {}",
+                        arg_vs.len()
+                    )));
+                }
+                let mut items = items_rc.borrow_mut();
+                let mismatch = items.iter().find_map(|v| match v {
+                    Value::Int(_) | Value::Float(_) | Value::String(_) => None,
+                    other => Some(other.type_name().to_string()),
+                });
+                if let Some(t) = mismatch {
+                    return Err(Signal::Error(format!(
+                        "@form(vec).sort: cell type must be Int, Float, or \
+                         String; got element of type {}. Use sort_by(cmp) \
+                         for other cell types.",
+                        t
+                    )));
+                }
+                items.sort_by(|a, b| match (a, b) {
+                    (Value::Int(x), Value::Int(y)) => x.cmp(y),
+                    (Value::Float(x), Value::Float(y)) => {
+                        x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    (Value::String(x), Value::String(y)) => x.cmp(y),
+                    _ => std::cmp::Ordering::Equal,
+                });
+                Ok(Some(Value::Unit))
+            }
+            "sort_by" | "sort_desc_by" => {
+                let reverse = method_name == "sort_desc_by";
+                if arg_vs.len() != 1 {
+                    return Err(Signal::Error(format!(
+                        "@form(vec).{} expects 1 arg (cmp), got {}",
+                        method_name,
+                        arg_vs.len()
+                    )));
+                }
+                let cmp_fn = match arg_vs.into_iter().next().unwrap() {
+                    Value::Fn(f) => f,
+                    other => {
+                        return Err(Signal::Error(format!(
+                            "@form(vec).{}: cmp must be a fn-pointer, got {}",
+                            method_name,
+                            other.type_name()
+                        )));
+                    }
+                };
+                // Take a working copy so we can release the borrow
+                // while invoking user code (which may re-borrow).
+                let mut working = items_rc.borrow().clone();
+                let len = working.len();
+                let mut err_slot: Option<Signal> = None;
+                // Simple insertion sort — small N typical; keeps the
+                // call surface to call_fn without re-entering the
+                // borrow_mut held by Rust's sort_by closure.
+                // cmp(a, b) == true means "a should come before b".
+                // For sort_desc_by, we swap arg order so the same
+                // user predicate yields the reverse ordering.
+                for i in 1..len {
+                    let mut j = i;
+                    while j > 0 {
+                        // Ask: should working[j] come before working[j-1]?
+                        let (a, b) = if reverse {
+                            (working[j - 1].clone(), working[j].clone())
+                        } else {
+                            (working[j].clone(), working[j - 1].clone())
+                        };
+                        let res = match self.call_fn(&cmp_fn, &[a, b]) {
+                            Ok(v) => v,
+                            Err(s) => {
+                                err_slot = Some(s);
+                                break;
+                            }
+                        };
+                        let goes_before = matches!(res, Value::Bool(true));
+                        if !goes_before {
+                            break;
+                        }
+                        working.swap(j - 1, j);
+                        j -= 1;
+                    }
+                    if err_slot.is_some() {
+                        break;
+                    }
+                }
+                if let Some(s) = err_slot {
+                    return Err(s);
+                }
+                *items_rc.borrow_mut() = working;
+                Ok(Some(Value::Unit))
             }
             _ => unreachable!("filtered at the top of the fn"),
         }
@@ -3977,6 +4102,14 @@ fn eval_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
         (Gt, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
         (LtEq, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
         (GtEq, Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
+        // Lexicographic on String — codegen uses strcmp; the
+        // interpreter uses Rust's standard String ordering, which
+        // is byte-level identical for ASCII and produces the same
+        // observable order for UTF-8 (well-formed input).
+        (Lt, Value::String(a), Value::String(b)) => Ok(Value::Bool(a < b)),
+        (Gt, Value::String(a), Value::String(b)) => Ok(Value::Bool(a > b)),
+        (LtEq, Value::String(a), Value::String(b)) => Ok(Value::Bool(a <= b)),
+        (GtEq, Value::String(a), Value::String(b)) => Ok(Value::Bool(a >= b)),
         (And, a, b) => Ok(Value::Bool(a.truthy() && b.truthy())),
         (Or, a, b) => Ok(Value::Bool(a.truthy() || b.truthy())),
         (BitAnd, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a & b)),
@@ -4120,6 +4253,21 @@ fn empty_error_value(kind: &str) -> Value {
     fields.insert("kind".to_string(), Value::String(kind.to_string()));
     Value::Struct {
         name: "EmptyError".to_string(),
+        fields: Rc::new(RefCell::new(fields)),
+    }
+}
+
+/// Construct an `IoError` value for the `std::io::fs::*` /
+/// `std::io::tcp::*` fallible path-calls. Same three-field
+/// shape (`kind`, `errno`, `path`) as the codegen-side struct
+/// — agents read all three uniformly.
+pub(crate) fn io_error_value(kind: &str, errno: i64, path: &str) -> Value {
+    let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+    fields.insert("kind".to_string(), Value::String(kind.to_string()));
+    fields.insert("errno".to_string(), Value::Int(errno));
+    fields.insert("path".to_string(), Value::String(path.to_string()));
+    Value::Struct {
+        name: "IoError".to_string(),
         fields: Rc::new(RefCell::new(fields)),
     }
 }

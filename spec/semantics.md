@@ -89,7 +89,9 @@ view.
 
 Producing a `Bytes`:
 
-- `std::io::fs::read_bytes(path) -> Bytes` (m89).
+- `std::io::fs::read_bytes(path) -> Bytes fallible(IoError)` (m89;
+  IoError flip 2026-05-16). Caller addresses with
+  `or raise` / `or fallback(err)`.
 - `Stream.recv_bytes(max: Int) -> Bytes` — binary-safe TCP
   receive (Phase 2g).
 - `std::bytes::from_string(s: String) -> Bytes` — copies the

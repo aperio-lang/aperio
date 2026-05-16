@@ -168,12 +168,13 @@ locus Listener {
         on_connection: fn(std::io::tcp::Stream) = default_on_connection;
     }
     birth() {
-        self.listen_fd = std::io::tcp::listen_socket(self.host, self.port);
+        self.listen_fd = std::io::tcp::listen_socket(self.host, self.port)
+            or raise;
     }
     run() {
         let mut accepted = 0;
         while self.max_accepts < 0 || accepted < self.max_accepts {
-            let conn = std::io::tcp::accept_one(self.listen_fd);
+            let conn = std::io::tcp::accept_one(self.listen_fd) or raise;
             handle_one_connection(conn, self.on_connection);
             accepted = accepted + 1;
         }
@@ -576,9 +577,12 @@ underlying surface lands.
   (`0` / `""` / `-1` / `false` / `nil`) paired with a sibling
   bool predicate (`parse_int` + `can_parse_int`). For true error
   paths where diagnostic context matters, declare the function
-  `fallible(E)` (v1.x-FORM-1; free fns and stdlib-synthesized
-  `@form(...)` methods only, per the two-channel rule in
-  `spec/semantics.md` § "Fallible call semantics").
+  `fallible(E)` (v1.x-FORM-1; free fns, stdlib-synthesized
+  `@form(...)` methods, and stdlib path-call wrappers — e.g.
+  `std::io::fs::*` / `std::io::tcp::*` returning
+  `fallible(IoError)` — per the two-channel rule in
+  `spec/semantics.md` § "Fallible call semantics". Locus methods
+  on user-declared loci cannot declare `fallible(E)`.).
 - **Empty `if` bodies parse-fail.** Put a `// note` comment
   inside, or refactor to a positive condition.
 - **`aperio run` rejects qualified-name struct/locus literals**

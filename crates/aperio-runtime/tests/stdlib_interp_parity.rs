@@ -67,7 +67,29 @@ fn main() {{
 }
 
 #[test]
+fn fs_read_file_missing_returns_io_error() {
+    // #68 — read_file is fallible(IoError). Interpreter parity:
+    // failures route to FallibleErr, addressable via `or`.
+    let src = r#"
+fn report(e: IoError) -> String {
+    return e.kind;
+}
+fn main() {
+    let s = std::io::fs::read_file("/no/such/path/aperio_interp_parity")
+        or report(err);
+    println(s);
+}
+"#;
+    // The println output isn't captured here, but the program
+    // exits 0 — the FallibleErr was addressed without diverging.
+    assert_eq!(run(src), 0);
+}
+
+#[test]
 fn fs_write_then_read_round_trip() {
+    // Updated after the #68 fallible-fs flip: write_file now
+    // returns `() fallible(IoError)`; callers address the error
+    // with `or raise` / `or <fallback>`.
     use std::fs;
     let path = std::env::temp_dir().join("aperio_interp_parity_write.txt");
     let path_str = path.display().to_string();
@@ -76,8 +98,8 @@ fn fs_write_then_read_round_trip() {
         r#"
 fn main() {{
     let p = "{}";
-    if std::io::fs::write_file(p, "round-trip") != 0 {{ return 1; }}
-    let c = std::io::fs::read_file(p);
+    std::io::fs::write_file(p, "round-trip") or raise;
+    let c = std::io::fs::read_file(p) or raise;
     if c != "round-trip" {{ return 2; }}
     return 0;
 }}

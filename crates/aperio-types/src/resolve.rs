@@ -1057,6 +1057,12 @@ fn synthesize_form_vec_methods(methods: &mut Vec<MethodInfo>, cell_ty: &Ty) {
         fallible: Some(index_err.clone()),
     });
     methods.push(MethodInfo {
+        name: "set".to_string(),
+        params: vec![Ty::Prim(PrimType::Int), cell_ty.clone()],
+        ret: Ty::Unit,
+        fallible: Some(index_err.clone()),
+    });
+    methods.push(MethodInfo {
         name: "pop".to_string(),
         params: Vec::new(),
         ret: cell_ty.clone(),
@@ -1072,6 +1078,33 @@ fn synthesize_form_vec_methods(methods: &mut Vec<MethodInfo>, cell_ty: &Ty) {
         name: "is_empty".to_string(),
         params: Vec::new(),
         ret: Ty::Prim(PrimType::Bool),
+        fallible: None,
+    });
+    // Sort family. `sort()` is primitive-only at v1 (codegen
+    // rejects struct cells with a clear diagnostic pointing at
+    // `sort_by`). `sort_by` / `sort_desc_by` take a user
+    // comparator `fn(T, T) -> Bool` meaning "a comes before b";
+    // sort_desc_by flips it. All in-place, no return value.
+    let cmp_ty = Ty::Function {
+        params: vec![cell_ty.clone(), cell_ty.clone()],
+        ret: Box::new(Ty::Prim(PrimType::Bool)),
+    };
+    methods.push(MethodInfo {
+        name: "sort".to_string(),
+        params: Vec::new(),
+        ret: Ty::Unit,
+        fallible: None,
+    });
+    methods.push(MethodInfo {
+        name: "sort_by".to_string(),
+        params: vec![cmp_ty.clone()],
+        ret: Ty::Unit,
+        fallible: None,
+    });
+    methods.push(MethodInfo {
+        name: "sort_desc_by".to_string(),
+        params: vec![cmp_ty],
+        ret: Ty::Unit,
         fallible: None,
     });
 }
@@ -1277,6 +1310,46 @@ pub(crate) fn inject_form_stdlib_types(scope: &mut TopScope) {
                     has_default: false,
                     span: zero,
                 }]),
+                span: zero,
+            }),
+        );
+    }
+    // IoError for the `std::io::fs::*` and `std::io::tcp::*`
+    // path-calls that return `fallible(IoError)`. One Error type
+    // for I/O surfaces uniform pattern-matching in the agent —
+    // the same `or fallback(err)` clause shape works for both
+    // file and network operations. Fields:
+    //   - kind: a string tag — "not_found", "permission_denied",
+    //     "is_dir", "io", "would_block", "connection_refused",
+    //     "timeout", "host_unreachable" (extensible).
+    //   - errno: raw platform errno for callers that want it.
+    //   - path: file path / connection target / "stdin" / "" —
+    //     diagnostic context naming what failed.
+    if !scope.symbols.contains_key("IoError") {
+        scope.symbols.insert(
+            "IoError".to_string(),
+            TopSymbol::Type(TypeInfo {
+                name: "IoError".to_string(),
+                kind: TypeKind::Struct(vec![
+                    FieldInfo {
+                        name: "kind".to_string(),
+                        ty: Ty::Prim(PrimType::String),
+                        has_default: false,
+                        span: zero,
+                    },
+                    FieldInfo {
+                        name: "errno".to_string(),
+                        ty: Ty::Prim(PrimType::Int),
+                        has_default: false,
+                        span: zero,
+                    },
+                    FieldInfo {
+                        name: "path".to_string(),
+                        ty: Ty::Prim(PrimType::String),
+                        has_default: false,
+                        span: zero,
+                    },
+                ]),
                 span: zero,
             }),
         );

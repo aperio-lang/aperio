@@ -471,6 +471,19 @@ is used only inside one locus and has no binding.
 
 - **stdout / stderr** for `print` / `println`. That's it for
   runtime-level I/O. Files, networking, etc. live in stdlib.
+- **Errno surface helpers** (2026-05-16, used by the fallible
+  `std::io::fs::*` / `std::io::tcp::*` wrappers):
+  - `lotus_get_errno() -> i32` — surfaces the current platform
+    `errno` to LLVM. Each fallible wrapper calls this
+    immediately after the failing primitive (POSIX errno is
+    sticky until the next syscall sets it).
+  - `lotus_io_error_kind(errno_val: i32) -> *const char` —
+    maps errno to a stable kind-tag string (`"not_found"`,
+    `"permission_denied"`, `"is_dir"`, `"already_exists"`,
+    `"would_block"`, `"connection_refused"`, `"timeout"`,
+    `"host_unreachable"`, `"broken_pipe"`, `"interrupted"`,
+    ..., catch-all `"io"`). Returns a static-table pointer;
+    caller must not free.
 
 ### Text + string primitives (v1.x adds)
 
@@ -564,10 +577,15 @@ Defined in `crates/aperio-codegen/runtime/lotus_arena.c`
 | `void lotus_vec_init(void *v)`                        | Zero-init: cap=0, len=0, buf=NULL |
 | `void lotus_vec_push(void *v, size_t es, const void *x)` | Append; doubles cap on overflow |
 | `int  lotus_vec_get(void *v, size_t es, int64_t i, void *out)` | Bounds-checked read; returns 1=OK, 0=out-of-bounds |
+| `int  lotus_vec_set(void *v, size_t es, int64_t i, const void *x)` | Bounds-checked in-place write; returns 1=OK, 0=out-of-bounds (does not extend the vec) |
 | `int  lotus_vec_pop(void *v, size_t es, void *out)` | Returns 1=OK, 0=empty |
 | `int64_t lotus_vec_len(void *v)`                      | Element count |
 | `int  lotus_vec_is_empty(void *v)`                    | 1=empty, 0=non-empty |
 | `void lotus_vec_destroy(void *v)`                     | `free(buf)`; called at locus dissolve |
+| `void lotus_vec_sort_int(void *v)`                    | In-place ascending sort of an `int64_t`-cell vec via `qsort` |
+| `void lotus_vec_sort_float(void *v)`                  | In-place ascending sort of a `double`-cell vec; NaN treated as equal-to-anything |
+| `void lotus_vec_sort_string(void *v)`                 | In-place ascending sort of a `char *`-cell vec under `strcmp` ordering |
+| `void lotus_vec_sort_by(void *v, size_t es, int (*cmp)(const void *, const void *, void *), void *cookie)` | `qsort_r` wrapper; cmp is a codegen-synthesized per-(cell_type, direction) trampoline |
 
 `es` (elem_size) is the cell type's size in bytes — codegen
 passes `sizeof(T)` at each call site.
@@ -582,15 +600,22 @@ passes `sizeof(T)` at each call site.
 
 ### Failure shapes
 
-- `lotus_vec_get` / `lotus_vec_pop` return 0 on contract
-  break (out-of-bounds / empty). Codegen wraps this into the
-  `Ty::Fallible { success: T, payload: IndexError }` surface
-  via a small adapter that synthesizes the `IndexError`
-  struct from the bool + the call args (shipped v1.x-FORM-2
-  PR5/6).
+- `lotus_vec_get` / `lotus_vec_set` / `lotus_vec_pop` return 0
+  on contract break (out-of-bounds / empty). Codegen wraps this
+  into the `Ty::Fallible { success: T, payload: IndexError }`
+  surface (Unit-success for `set`) via a small adapter that
+  synthesizes the `IndexError` struct from the bool + the call
+  args (shipped v1.x-FORM-2 PR5/6; `set` added 2026-05-16).
 - `lotus_vec_push` OOM routes through the substrate-trap →
   closure-violation channel per the two-channel rule (shipped
   v1.x-FORM-2 PR6).
+- Sort family (`sort`, `sort_by`, `sort_desc_by`, added
+  2026-05-16) is infallible from the language surface; `sort_*`
+  C wrappers do not return a status code. If the user-supplied
+  comparator in `sort_by` faults (a fallible call inside the
+  comparator body raised through `or raise`), the fault
+  propagates and `qsort_r` stops mid-sort — the vec is left
+  with every element still present, ordering partially applied.
 
 ### Interpreter parity
 

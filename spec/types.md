@@ -451,21 +451,23 @@ common base — there is no `Error` trait, no `impl Error for
 ParseError`. Failure is a single anonymous fact; the payload is
 just a value tagged onto the failure for diagnostic purposes.
 
-### Synthesized `IndexError` (form-vec)
+### Synthesized stdlib payload types
 
-When any locus in the bundle uses `@form(vec)`, the resolver
-injects an `IndexError` type into the top scope:
+The resolver injects four fallible-payload types into the top
+scope so user code can name them in `fallible(...)` markers and
+`or` substitute clauses. All are idempotent — a user-declared
+type with the same name wins.
 
-```aperio
-type IndexError {
-    kind: String;   // "out_of_bounds" or "empty"
-    index: Int;     // requested index (0 for empty-pop)
-    len: Int;       // vec len at fail time
-}
-```
+| Trigger | Type | Fields |
+|---|---|---|
+| `@form(vec)` | `IndexError` | `kind: String`, `index: Int`, `len: Int` |
+| `@form(hashmap)` | `KeyError` | `kind: String` |
+| `@form(ring_buffer)` | `EmptyError` | `kind: String` |
+| `std::io::fs::*` / `std::io::tcp::*` | `IoError` | `kind: String`, `errno: Int`, `path: String` |
 
-User-declared `IndexError` wins (the injection is idempotent
-and first-come).
+The `IoError` payload (2026-05-16) is the unified shape for the
+fallible I/O surface — see `spec/stdlib.md` § "IoError" for the
+errno → kind tag taxonomy.
 
 ## Recovery-primitive typing
 

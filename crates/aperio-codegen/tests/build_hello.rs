@@ -111,6 +111,59 @@ fn build_comparisons_yield_bool() {
 }
 
 #[test]
+fn build_string_lexicographic_ordering() {
+    // strcmp-based < / > / <= / >= on String. Agents reflexively
+    // sort / compare strings; before this lit-up they hit
+    // "binop Lt on String" with no workaround in scope.
+    let src = r#"
+        fn main() {
+            let a = "alpha";
+            let b = "beta";
+            if a < b { println("a<b"); }
+            if b > a { println("b>a"); }
+            if a <= a { println("a<=a"); }
+            if a >= a { println("a>=a"); }
+            if !(b < a) { println("not b<a"); }
+        }
+    "#;
+    let (stdout, status) = build_and_run("string_cmp", src);
+    assert!(status.success());
+    assert!(stdout.contains("a<b"), "got: {:?}", stdout);
+    assert!(stdout.contains("b>a"), "got: {:?}", stdout);
+    assert!(stdout.contains("a<=a"), "got: {:?}", stdout);
+    assert!(stdout.contains("a>=a"), "got: {:?}", stdout);
+    assert!(stdout.contains("not b<a"), "got: {:?}", stdout);
+}
+
+#[test]
+fn build_bool_equality_and_inequality() {
+    // Eq / NotEq on Bool — closes a codegen-arm gap. Before:
+    // `if a == b { ... }` for two Bools fell through binop
+    // dispatch with "binop Eq on Bool" rejection.
+    let src = r#"
+        fn main() {
+            let t = true;
+            let f = false;
+            let eq = t == t;
+            let ne = t != f;
+            let mix = (t == f);
+            println("eq=", eq, " ne=", ne, " mix=", mix);
+            if t == true {
+                println("t-is-true");
+            }
+            if f != true {
+                println("f-is-not-true");
+            }
+        }
+    "#;
+    let (stdout, status) = build_and_run("bool_eq", src);
+    assert!(status.success());
+    assert!(stdout.contains("eq=true ne=true mix=false"), "got: {:?}", stdout);
+    assert!(stdout.contains("t-is-true"), "got: {:?}", stdout);
+    assert!(stdout.contains("f-is-not-true"), "got: {:?}", stdout);
+}
+
+#[test]
 fn build_let_mut_and_assign() {
     let src = r#"
         fn main() {

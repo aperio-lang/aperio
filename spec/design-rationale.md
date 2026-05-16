@@ -1940,7 +1940,10 @@ locus DbConnection {
 
     closure fatal_io { captures: last_error; epoch inline; }
 
-    birth()    { self.conn_fd = std::io::tcp::connect(self.host, self.port); }
+    birth()    {
+        self.conn_fd = std::io::tcp::connect(self.host, self.port)
+            or self.handle_io(DbError { kind: "connect_failed", detail: err.kind });
+    }
     dissolve() { if self.conn_fd >= 0 { std::io::tcp::close_fd(self.conn_fd); } }
 
     fn handle_io(e: DbError) -> Row {

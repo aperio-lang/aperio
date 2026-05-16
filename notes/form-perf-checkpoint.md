@@ -156,6 +156,64 @@ costs that are layout-conditioned by The Design. They wait on
 either a different lifecycle design or a workload that makes
 the cost measurably load-bearing.
 
+## 2026-05-16 — cliff-lift session + O2 pipeline shift
+
+The parallel perf session reported lifting all six known cliffs
+via two fixes:
+
+1. **alloca-hoist:** raw `build_alloca` calls landing inside loop
+   bodies accumulated frame-bytes per iter until SIGSEGV. The fix
+   routed the offending sites through
+   `alloca_in_entry_with_nulled_arena` (and `alloca_in_entry` for
+   non-arena slots) so the slot lives at fn-entry and is reused
+   across iterations.
+2. **arena-reclaim:** the chunked-projection accept() path now
+   returns dissolved sub-region slots to the parent's free-list
+   so peak slot space stays O(concurrent children alive) instead
+   of O(K).
+
+Reported ceilings (parallel perf session, unverified here):
+
+| Path                                   | Pre-fix cap | Pre-fix segfault | After-fix clean |
+|----------------------------------------|-------------|-------------------|-----------------|
+| Statement-position locus instantiation | 100k        | 500k              | 10M+            |
+| Bus pub/sub round-trip                 | 10k         | 50k               | 1M+             |
+| @form(vec).push                        | 500k        | 1M                | 20M+            |
+| @form(vec).get                         | 200k        | 300k              | 10M+            |
+| @form(hashmap).get                     | 150k        | 200k              | clean (ceiling unverified) |
+| accept() hook in loop                  | k=20        | k≈25              | k=20000+ (800×) |
+
+The bench harness also shifted to running through the O2
+pipeline; codegen-time emission unchanged but optimizer pass
+ordering now matches the production-build path.
+
+## 2026-05-16 — follow-up alloca audit
+
+This session walked the remaining `build_alloca` call sites
+looking for the same loop-body-leak pattern the cliff-lift
+session fixed. Four sites had the matching shape: a raw
+`build_alloca` whose address escapes to a C interop call, where
+LLVM's mem2reg can't hoist it because of the escape. None of
+these have benches today, so no number movement to report —
+treat the changes as defensive hardening against future hot-loop
+patterns:
+
+- `std::time::monotonic` — `timespec` alloca passed to
+  `clock_gettime`. A monotonic-clock-in-tight-loop bench would
+  have leaked 16 B/iter.
+- `std::time::sleep` — `req` and `rem` allocas passed to
+  `nanosleep`. Same shape; less practical risk since the body of
+  a loop calling sleep is rarely the throughput-critical path.
+- Decimal `to_string` rendering — 64-byte buffer alloca passed
+  to `lotus_decimal_to_string`. Decimal-heavy fmt in a loop
+  would have accumulated 64 B/iter.
+- `pthread_create`'s tid alloca on locus instantiation —
+  parallel-class loci instantiated in a loop would have leaked
+  8 B/iter on top of the locus struct itself (which the
+  cliff-lift session already hoisted).
+- `@form(vec).sort_by`'s qsort_r cookie (16 B) — introduced in
+  this session; preemptively hoisted at the same time.
+
 ## What's still open for the FORM-3 gate
 
 The original spec/forms.md FORM-3 gate text ("within 10% of
@@ -176,3 +234,18 @@ Worth a spec amendment that distinguishes:
   spec should commit to "within 2× of C on amortized
   workloads," which `fn_scratch_work` (0.92×) and now
   `form_vec_push` (1.00×) demonstrate as reachable.
+
+The 2026-05-16 cliff lifts mean the surviving headline
+overheads (the 167× on `locus_instantiation`, etc.) are now the
+*real* steady-state numbers — not artifacts of an iter cap
+chosen to dodge a segfault. The perf session also flagged that
+`loop_overhead` is now a closed-form-optimized no-op (~60ns
+under LLVM at the new opt level) and needs a non-trivial loop
+body to measure what it claims to measure; that adjustment
+lives in the bench repo, not here.
+
+Suggested next sweep: re-run each lifted bench at 2-3× its
+new "tested clean" mark. Each fix shifted the bottleneck;
+the next-tier cliff is often a different mechanism (alloca →
+arena fragmentation → libc malloc churn) and is worth surfacing
+before the FORM-3 numbers are locked in.

@@ -1949,6 +1949,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             false,
         );
         self.module.add_function("lotus_vec_get", vec_get_ty, None);
+        // declare i32 @lotus_vec_set(ptr vec, i64 elem_size, i64 i, ptr elem)
+        // Same C ABI as lotus_vec_get, opposite direction: caller
+        // hands a pointer to the new element. Returns 1=OK, 0=OOB.
+        let vec_set_ty = i32_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function("lotus_vec_set", vec_set_ty, None);
         let vec_pop_ty =
             i32_t.fn_type(&[ptr_t.into(), i64_t.into(), ptr_t.into()], false);
         self.module.add_function("lotus_vec_pop", vec_pop_ty, None);
@@ -1960,6 +1968,28 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let vec_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_vec_destroy", vec_destroy_ty, None);
+        // declare void @lotus_vec_sort_int(ptr vec)
+        // declare void @lotus_vec_sort_float(ptr vec)
+        // declare void @lotus_vec_sort_string(ptr vec)
+        // declare void @lotus_vec_sort_by(ptr vec, i64 elem_size,
+        //                                  ptr trampoline_fn, ptr cookie)
+        // Primitive sorts use qsort with typed comparators baked
+        // into the C runtime; sort_by takes a per-T trampoline
+        // synthesized at codegen + a cookie carrying the user's
+        // comparator fn-pointer + caller arena + reverse flag.
+        let vec_sort_prim_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_vec_sort_int", vec_sort_prim_ty, None);
+        self.module
+            .add_function("lotus_vec_sort_float", vec_sort_prim_ty, None);
+        self.module
+            .add_function("lotus_vec_sort_string", vec_sort_prim_ty, None);
+        let vec_sort_by_ty = void_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_vec_sort_by", vec_sort_by_ty, None);
 
         // v1.x-FORM-4: @form(hashmap) C runtime primitives. The
         // hashmap lives inline as { i64 cap, i64 len, i64 key_size,
@@ -2639,6 +2669,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // via the `std::io::fs::*` magic-path calls. The C-level
         // surface is in lotus_arena.c (m74 ship); these
         // declarations let codegen emit calls into them.
+
+        // IoError synthesis helpers (used by the fallible-fs/tcp
+        // dispatcher in `try_lower_fallible_stdlib_path_call`).
+        // declare i32 @lotus_get_errno(void)
+        let get_errno_ty = i32_t.fn_type(&[], false);
+        self.module
+            .add_function("lotus_get_errno", get_errno_ty, None);
+        // declare ptr @lotus_io_error_kind(i32 errno_val)
+        let io_kind_ty = ptr_t.fn_type(&[i32_t.into()], false);
+        self.module
+            .add_function("lotus_io_error_kind", io_kind_ty, None);
 
         // declare i64 @lotus_fs_read_file(ptr path, ptr out_buf, i64 out_cap)
         // returns bytes read (>=0) or -1.
@@ -4365,6 +4406,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // v1.x-FORM-5: synthesized @form(ring_buffer) `pop`
         // surfaces a typed `EmptyError` payload.
         self.declare_builtin_empty_error_type();
+        // Synthesized `IoError` payload for the fallible
+        // `std::io::fs::*` / `std::io::tcp::*` wrappers
+        // (#68 — IoError flip). Mirror of the typecheck-side
+        // injection alongside the other error types.
+        self.declare_builtin_io_error_type();
 
         // F.20: register interface declarations by name. The
         // codegen layer uses this in two places: signature lowering
@@ -5499,6 +5545,43 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         struct_ty.set_body(&llvm_field_tys, false);
         self.user_types.insert(
             "EmptyError".to_string(),
+            TypeInfo {
+                struct_ty,
+                fields,
+                field_order,
+            },
+        );
+    }
+
+    /// Register the built-in `IoError` record so the fallible
+    /// `std::io::fs::*` / `std::io::tcp::*` codegen wrappers can
+    /// allocate it. Mirror of `inject_form_stdlib_types` for
+    /// IoError in aperio-types/src/resolve.rs. Fields:
+    ///   - kind: String (errno-derived tag from
+    ///     `lotus_io_error_kind`)
+    ///   - errno: Int (raw platform errno)
+    ///   - path: String (file path / connection target)
+    fn declare_builtin_io_error_type(&mut self) {
+        if self.user_types.contains_key("IoError") {
+            return;
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let mut fields: BTreeMap<String, (u32, CodegenTy)> = BTreeMap::new();
+        fields.insert("kind".into(), (0, CodegenTy::String));
+        fields.insert("errno".into(), (1, CodegenTy::Int));
+        fields.insert("path".into(), (2, CodegenTy::String));
+        let field_order = vec![
+            "kind".to_string(),
+            "errno".to_string(),
+            "path".to_string(),
+        ];
+        let llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
+            vec![ptr_t.into(), i64_t.into(), ptr_t.into()];
+        let struct_ty = self.context.opaque_struct_type("type.IoError");
+        struct_ty.set_body(&llvm_field_tys, false);
+        self.user_types.insert(
+            "IoError".to_string(),
             TypeInfo {
                 struct_ty,
                 fields,
@@ -10569,12 +10652,46 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )));
             }
         };
-        let id = match callee {
-            Expr::Ident(id) => id,
+        // Resolve callee to a free-fn name in `user_fns`. Three
+        // shapes route here:
+        //   - `Expr::Ident(id)` — bare free-fn call.
+        //   - `Expr::Field { receiver, name }` — method call;
+        //     dispatched to lower_fallible_method_call.
+        //   - `Expr::Path(qn)` — path-qualified call. Two
+        //     sub-cases: imported-lib free fns resolve via
+        //     `mangled_for_path` into `user_fns` exactly like
+        //     bare idents; stdlib path-calls (`std::io::fs::*`,
+        //     etc.) route to `try_lower_fallible_stdlib_path_call`
+        //     for the per-path synthesis (see #68 / IoError flip).
+        let resolved_name: String = match callee {
+            Expr::Ident(id) => id.name.clone(),
             Expr::Field { receiver, name, .. } => {
                 return self.lower_fallible_method_call(
                     receiver, &name.name, args, scope,
                 );
+            }
+            Expr::Path(qn) => {
+                let segs: Vec<&str> =
+                    qn.segments.iter().map(|s| s.name.as_str()).collect();
+                // Try stdlib fallible synth first — the fs/tcp
+                // path-calls that #68 flipped to fallible(IoError)
+                // emit their wrappers inline here.
+                if let Some(result) =
+                    self.try_lower_fallible_stdlib_path_call(&segs, args, scope)?
+                {
+                    return Ok(result);
+                }
+                // Otherwise the path is either an imported-lib free
+                // fn (mangled name lives in `user_fns`) or unknown.
+                match self.mangled_for_path(&segs) {
+                    Some(mangled) => mangled,
+                    None => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "`or` over unknown path call `{}`",
+                            segs.join("::")
+                        )));
+                    }
+                }
             }
             _ => {
                 return Err(CodegenError::Unsupported(format!(
@@ -10585,30 +10702,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         };
         let sig = self
             .user_fns
-            .get(&id.name)
+            .get(&resolved_name)
             .cloned()
             .ok_or_else(|| {
                 CodegenError::Unsupported(format!(
                     "`or` over call to unknown fn `{}`",
-                    id.name
+                    resolved_name
                 ))
             })?;
         let payload_ty = sig.fallible.clone().ok_or_else(|| {
             CodegenError::Unsupported(format!(
                 "`or` applied to non-fallible fn `{}`",
-                id.name
+                resolved_name
             ))
         })?;
         let success_ty = sig.ret.clone().ok_or_else(|| {
             CodegenError::Unsupported(format!(
                 "fallible fn `{}` has no declared return type",
-                id.name
+                resolved_name
             ))
         })?;
         if args.len() > sig.params.len() {
             return Err(CodegenError::Unsupported(format!(
                 "fallible fn `{}` expects at most {} args, got {}",
-                id.name,
+                resolved_name,
                 sig.params.len(),
                 args.len()
             )));
@@ -10618,7 +10735,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 return Err(CodegenError::Unsupported(format!(
                     "fallible fn `{}`: required param at position {} not \
                      provided (only {} args given)",
-                    id.name,
+                    resolved_name,
                     i,
                     args.len()
                 )));
@@ -10660,14 +10777,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let widened = self.coerce_to_float(
                     v,
                     &ty,
-                    &format!("fallible fn `{}` arg {}", id.name, i),
+                    &format!("fallible fn `{}` arg {}", resolved_name, i),
                 )?;
                 widened.into()
             } else if ty != sig.params[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "fallible fn `{}` arg {} type mismatch: expected {:?}, \
                      got {:?}",
-                    id.name, i, sig.params[i], ty
+                    resolved_name, i, sig.params[i], ty
                 )));
             } else {
                 v
@@ -10682,7 +10799,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_call(
                 sig.func,
                 &llvm_args,
-                &format!("{}.fallible.call", id.name),
+                &format!("{}.fallible.call", resolved_name),
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let i1_path = call
@@ -10698,6 +10815,1080 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             success_ty: Some(success_ty),
             payload_ty,
         })
+    }
+
+    /// Dispatcher for `path or raise` where the path resolves to a
+    /// fallible stdlib path-call (`std::io::fs::read_file`, etc.).
+    /// Returns:
+    ///   - `Ok(Some(result))` — the path matched a known fallible
+    ///     stdlib surface; the call was lowered.
+    ///   - `Ok(None)` — the path didn't match; caller falls through
+    ///     to other resolution paths.
+    ///   - `Err(_)` — the path matched but lowering failed (arity,
+    ///     type, etc.).
+    /// Specific paths are wired by individual `lower_std_*_fallible`
+    /// methods that this dispatcher routes to. See the IoError flip
+    /// for the fs/tcp surface.
+    fn try_lower_fallible_stdlib_path_call(
+        &mut self,
+        segs: &[&str],
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<Option<FallibleCallResult<'ctx>>, CodegenError> {
+        // Per-path wrappers for the fs/tcp surfaces flipped to
+        // `fallible(IoError)`. Each helper evaluates args, calls
+        // the underlying C primitive, and feeds the sentinel
+        // result + path into `complete_io_fallible_call` to build
+        // the lazy-IoError branch.
+        match segs {
+            ["std", "io", "fs", "read_file"] => Ok(Some(
+                self.lower_std_io_fs_read_file_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "read_bytes"] => Ok(Some(
+                self.lower_std_io_fs_read_bytes_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "write_file"] => Ok(Some(
+                self.lower_std_io_fs_write_file_fallible(
+                    args, scope, "lotus_fs_write_file",
+                )?,
+            )),
+            ["std", "io", "fs", "write_file_append"] => Ok(Some(
+                self.lower_std_io_fs_write_file_fallible(
+                    args, scope, "lotus_fs_write_file_append",
+                )?,
+            )),
+            ["std", "io", "fs", "file_size"] => Ok(Some(
+                self.lower_std_io_fs_file_size_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "mkdir"] => Ok(Some(
+                self.lower_std_io_fs_mkdir_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "list_dir"] => Ok(Some(
+                self.lower_std_io_fs_list_dir_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "list_dir_count"] => Ok(Some(
+                self.lower_std_io_fs_list_dir_count_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "list_dir_at"] => Ok(Some(
+                self.lower_std_io_fs_list_dir_at_fallible(args, scope)?,
+            )),
+            ["std", "io", "tcp", "listen_socket"] => Ok(Some(
+                self.lower_std_io_tcp_listen_socket_fallible(args, scope)?,
+            )),
+            ["std", "io", "tcp", "connect"] => Ok(Some(
+                self.lower_std_io_tcp_connect_fallible(args, scope)?,
+            )),
+            ["std", "io", "tcp", "accept_one"] => Ok(Some(
+                self.lower_std_io_tcp_accept_one_fallible(args, scope)?,
+            )),
+            ["std", "bytes", "at"] => Ok(Some(
+                self.lower_std_bytes_at_fallible(args, scope)?,
+            )),
+            // Known stdlib paths that AREN'T fallible — surface a
+            // focused diagnostic instead of "unknown path call".
+            // Each name here is a path-call that returns a value
+            // directly (no error channel); the user accidentally
+            // wrapped it in `or`. The fix is to remove the clause.
+            ["std", "bytes", "slice"]
+            | ["std", "bytes", "from_string"]
+            | ["std", "str", "from_bytes"]
+            | ["std", "str", "lower"]
+            | ["std", "str", "upper"]
+            | ["std", "str", "trim"]
+            | ["std", "str", "replace"]
+            | ["std", "str", "repeat"]
+            | ["std", "str", "pad_left"]
+            | ["std", "str", "pad_right"]
+            | ["std", "str", "index_of"]
+            | ["std", "str", "parse_int"]
+            | ["std", "str", "can_parse_int"]
+            | ["std", "str", "parse_float"]
+            | ["std", "str", "can_parse_float"]
+            | ["std", "str", "builder_new"]
+            | ["std", "str", "builder_append"]
+            | ["std", "str", "builder_len"]
+            | ["std", "str", "builder_finish"]
+            | ["std", "math", "sqrt"]
+            | ["std", "math", "exp"]
+            | ["std", "math", "log"]
+            | ["std", "math", "floor"]
+            | ["std", "math", "ceil"]
+            | ["std", "math", "pow"]
+            | ["std", "io", "fs", "file_exists"]
+            | ["std", "io", "fs", "read_file_status"]
+            | ["std", "io", "tcp", "close_fd"]
+            | ["std", "io", "stdin", "read_line"]
+            | ["std", "io", "stdin", "read_line_status"]
+            | ["std", "env", "args_count"]
+            | ["std", "env", "arg"]
+            | ["std", "env", "var"]
+            | ["std", "env", "var_exists"]
+            | ["std", "process", "pid"]
+            | ["std", "time", "monotonic"]
+            | ["std", "time", "sleep"] => Err(CodegenError::Unsupported(format!(
+                "`{}` is not a fallible call — remove the `or` clause. \
+                 Returns its value directly; failures (if any) use the \
+                 sentinel-with-discriminator idiom or are infallible.",
+                segs.join("::")
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// `std::bytes::at(b, i) -> Int fallible(IndexError)`.
+    /// Replaces the legacy -1 sentinel — agents reflexively wrap
+    /// `bytes_at(b, i) or raise`, same shape as `vec.get(i)`.
+    fn lower_std_bytes_at_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::at takes 2 args (b, i), got {}",
+                args.len()
+            )));
+        }
+        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
+        if b_ty != CodegenTy::Bytes {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::at: b must be Bytes, got {:?}. To read \
+                 a byte from a String, convert first via \
+                 `std::bytes::from_string(s)`.",
+                b_ty
+            )));
+        }
+        let (i_val, i_ty) = self.lower_expr(&args[1], scope)?;
+        if i_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::at: i must be Int, got {:?}",
+                i_ty
+            )));
+        }
+        let at_fn = self
+            .module
+            .get_function("lotus_bytes_at")
+            .expect("lotus_bytes_at declared");
+        let raw = self
+            .builder
+            .build_call(
+                at_fn,
+                &[b_val.into(), i_val.into()],
+                "bytes.at.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_bytes_at returns i64")
+            .into_int_value();
+        // -1 sentinel from the C primitive.
+        let neg_one = self
+            .context
+            .i64_type()
+            .const_int((-1i64) as u64, true);
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                raw,
+                neg_one,
+                "bytes.at.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // Mirror the vec.get lazy-IndexError pattern. We need
+        // bytes_len for the IndexError's `len` field — fetched
+        // only on the err path.
+        let payload_ty = CodegenTy::TypeRef("IndexError".to_string());
+        let out_val_slot = self.alloca_for(&CodegenTy::Int, "bytes.at.out_val")?;
+        let out_err_slot = self.alloca_for(&payload_ty, "bytes.at.out_err")?;
+        self.builder
+            .build_store(out_val_slot, raw)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let func = self
+            .current_fn
+            .expect("bytes.at inside fn body");
+        let lazy_err_bb = self
+            .context
+            .append_basic_block(func, "bytes.at.lazy_err");
+        let join_bb = self
+            .context
+            .append_basic_block(func, "bytes.at.join");
+        self.builder
+            .build_conditional_branch(is_err, lazy_err_bb, join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(lazy_err_bb);
+        let len_fn = self
+            .module
+            .get_function("lotus_bytes_len")
+            .expect("lotus_bytes_len declared");
+        let len_ssa = self
+            .builder
+            .build_call(len_fn, &[b_val.into()], "bytes.len.for_err")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+        let ie_ptr = self.emit_index_error_alloc(
+            "out_of_bounds",
+            i_val.into_int_value(),
+            len_ssa,
+        )?;
+        self.builder
+            .build_store(out_err_slot, ie_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(join_bb);
+        Ok(FallibleCallResult {
+            i1_path: is_err,
+            out_val_slot: Some(out_val_slot),
+            out_err_slot,
+            success_ty: Some(CodegenTy::Int),
+            payload_ty,
+        })
+    }
+
+    /// Shared completion helper for the IoError-bearing fallible
+    /// path-calls. The caller has evaluated args, run the C
+    /// primitive, and computed `is_err: i1` from the primitive's
+    /// sentinel return. This helper:
+    ///   1. Branches on is_err.
+    ///   2. On err path: emits the lazy IoError into out_err_slot.
+    ///   3. Joins; returns the FallibleCallResult.
+    /// `success_value` is Some(value, ty) for value-returning
+    /// surfaces (read_file → String, file_size → Int) or None for
+    /// Unit-returning surfaces (write_file, mkdir).
+    fn complete_io_fallible_call(
+        &mut self,
+        is_err: IntValue<'ctx>,
+        path_str_ptr: BasicValueEnum<'ctx>,
+        success_value: Option<(BasicValueEnum<'ctx>, CodegenTy)>,
+        label: &str,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        let payload_ty = CodegenTy::TypeRef("IoError".to_string());
+        let out_err_slot = self.alloca_for(
+            &payload_ty,
+            &format!("{}.out_err.slot", label),
+        )?;
+        let (out_val_slot_opt, success_ty_opt) = match &success_value {
+            Some((_, ty)) => (
+                Some(self.alloca_for(
+                    ty,
+                    &format!("{}.out_val.slot", label),
+                )?),
+                Some(ty.clone()),
+            ),
+            None => (None, None),
+        };
+
+        let func = self
+            .current_fn
+            .expect("fallible-stdlib-path call inside fn body");
+        let lazy_err_bb = self.context.append_basic_block(
+            func,
+            &format!("{}.lazy_err", label),
+        );
+        let store_ok_bb = self.context.append_basic_block(
+            func,
+            &format!("{}.store_ok", label),
+        );
+        let join_bb = self.context.append_basic_block(
+            func,
+            &format!("{}.join", label),
+        );
+
+        self.builder
+            .build_conditional_branch(is_err, lazy_err_bb, store_ok_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // err path: build IoError, store in out_err_slot.
+        self.builder.position_at_end(lazy_err_bb);
+        let ie_ptr = self.emit_io_error_alloc(path_str_ptr)?;
+        self.builder
+            .build_store(out_err_slot, ie_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // ok path: store the success value (if any).
+        self.builder.position_at_end(store_ok_bb);
+        if let (Some(out_val_slot), Some((val, _))) = (out_val_slot_opt, &success_value) {
+            self.builder
+                .build_store(out_val_slot, *val)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(join_bb);
+        Ok(FallibleCallResult {
+            i1_path: is_err,
+            out_val_slot: out_val_slot_opt,
+            out_err_slot,
+            success_ty: success_ty_opt,
+            payload_ty,
+        })
+    }
+
+    /// `std::io::fs::read_file(path) -> String fallible(IoError)`.
+    /// Mirrors lower_std_io_fs_read_file's read-into-payload-arena
+    /// shape but branches on `raw_n < 0` to emit IoError instead
+    /// of silently clamping to an empty string.
+    fn lower_std_io_fs_read_file_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_file takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_file: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let i8_t = self.context.i8_type();
+        let zero64 = i64_t.const_zero();
+
+        // file_size for sizing the buffer.
+        let size_fn = self
+            .module
+            .get_function("lotus_fs_file_size")
+            .expect("lotus_fs_file_size declared");
+        let raw_size = self
+            .builder
+            .build_call(size_fn, &[path_val.into()], "fs.size")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+        let size_neg = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                raw_size,
+                zero64,
+                "size.neg",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let safe_size = self
+            .builder
+            .build_select(size_neg, zero64, raw_size, "size.safe")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        // +1 for NUL terminator.
+        let alloc_size = self
+            .builder
+            .build_int_add(safe_size, i64_t.const_int(1, false), "alloc.size")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let alloc_fn = self
+            .module
+            .get_function("lotus_bus_payload_arena_alloc")
+            .expect("lotus_bus_payload_arena_alloc declared");
+        let buf_ptr = self
+            .builder
+            .build_call(
+                alloc_fn,
+                &[alloc_size.into(), i64_t.const_int(1, false).into()],
+                "fs.buf",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr")
+            .into_pointer_value();
+        let read_fn = self
+            .module
+            .get_function("lotus_fs_read_file")
+            .expect("lotus_fs_read_file declared");
+        let raw_n = self
+            .builder
+            .build_call(
+                read_fn,
+                &[path_val.into(), buf_ptr.into(), safe_size.into()],
+                "fs.read",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                raw_n,
+                zero64,
+                "read.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // NUL-terminate at offset safe_n (clamp to 0 if err).
+        let safe_n = self
+            .builder
+            .build_select(is_err, zero64, raw_n, "n.safe")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let nul_ptr = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, buf_ptr, &[safe_n], "nul.ptr")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.builder
+            .build_store(nul_ptr, i8_t.const_zero())
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let _ = i32_t;
+        self.complete_io_fallible_call(
+            is_err,
+            path_val,
+            Some((buf_ptr.into(), CodegenTy::String)),
+            "fs.read_file",
+        )
+    }
+
+    /// `std::io::fs::read_bytes(path) -> Bytes fallible(IoError)`.
+    fn lower_std_io_fs_read_bytes_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_bytes takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::read_bytes: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        // Global-arena wrapper — returns a pointer in the bus
+        // payload arena so the value survives the call frame.
+        let read_bytes_fn = self
+            .module
+            .get_function("lotus_fs_read_bytes_global")
+            .expect("lotus_fs_read_bytes_global declared");
+        let bytes_ptr = self
+            .builder
+            .build_call(
+                read_bytes_fn,
+                &[path_val.into()],
+                "fs.read_bytes",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr")
+            .into_pointer_value();
+        // NULL pointer => error.
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                self.builder
+                    .build_ptr_to_int(
+                        bytes_ptr,
+                        self.context.i64_type(),
+                        "bytes.as_int",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?,
+                self.context.i64_type().const_zero(),
+                "read_bytes.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let _ = ptr_t;
+        self.complete_io_fallible_call(
+            is_err,
+            path_val,
+            Some((bytes_ptr.into(), CodegenTy::Bytes)),
+            "fs.read_bytes",
+        )
+    }
+
+    /// `std::io::fs::write_file{,append}(path, content) -> () fallible(IoError)`.
+    fn lower_std_io_fs_write_file_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        c_fn_name: &str,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::{} takes 2 args (path, content), got {}",
+                c_fn_name.trim_start_matches("lotus_fs_"),
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: path must be String, got {:?}",
+                c_fn_name, path_ty
+            )));
+        }
+        let (content_val, content_ty) = self.lower_expr(&args[1], scope)?;
+        if content_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: content must be String, got {:?}",
+                c_fn_name, content_ty
+            )));
+        }
+        let len_fn = self
+            .module
+            .get_function("lotus_str_len")
+            .expect("lotus_str_len declared");
+        let len_v = self
+            .builder
+            .build_call(len_fn, &[content_val.into()], "wr.len")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        let write_fn = self
+            .module
+            .get_function(c_fn_name)
+            .unwrap_or_else(|| panic!("{} declared", c_fn_name));
+        let ret = self
+            .builder
+            .build_call(
+                write_fn,
+                &[path_val.into(), content_val.into(), len_v.into()],
+                "wr.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret,
+                self.context.i32_type().const_zero(),
+                "wr.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(is_err, path_val, None, "fs.write_file")
+    }
+
+    /// `std::io::fs::file_size(path) -> Int fallible(IoError)`.
+    fn lower_std_io_fs_file_size_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::file_size takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::file_size: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let size_fn = self
+            .module
+            .get_function("lotus_fs_file_size")
+            .expect("lotus_fs_file_size declared");
+        let raw_size = self
+            .builder
+            .build_call(size_fn, &[path_val.into()], "fs.size")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                raw_size,
+                self.context.i64_type().const_zero(),
+                "size.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            path_val,
+            Some((raw_size.into(), CodegenTy::Int)),
+            "fs.file_size",
+        )
+    }
+
+    /// `std::io::fs::mkdir(path) -> () fallible(IoError)`.
+    fn lower_std_io_fs_mkdir_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::mkdir takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::mkdir: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let mkdir_fn = self
+            .module
+            .get_function("lotus_fs_mkdir")
+            .expect("lotus_fs_mkdir declared");
+        let ret = self
+            .builder
+            .build_call(mkdir_fn, &[path_val.into()], "mkdir.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret,
+                self.context.i32_type().const_zero(),
+                "mkdir.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(is_err, path_val, None, "fs.mkdir")
+    }
+
+    /// `std::io::fs::list_dir(path) -> String fallible(IoError)`.
+    /// Returns the newline-separated entry list; empty string ON
+    /// SUCCESS (empty directory) is distinguishable from failure
+    /// because the failure path now diverges via IoError.
+    fn lower_std_io_fs_list_dir_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        // Best-effort: file_exists check to distinguish missing/inaccessible
+        // from "empty dir". Sufficient for the IoError flip because the
+        // existing C primitive collapses error to empty-string.
+        let exists_fn = self
+            .module
+            .get_function("lotus_fs_file_exists")
+            .expect("lotus_fs_file_exists declared");
+        let exists = self
+            .builder
+            .build_call(exists_fn, &[path_val.into()], "list_dir.exists")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                exists,
+                self.context.i32_type().const_zero(),
+                "list_dir.missing",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let list_fn = self
+            .module
+            .get_function("lotus_fs_list_dir_global")
+            .expect("lotus_fs_list_dir_global declared");
+        let list_ptr = self
+            .builder
+            .build_call(list_fn, &[path_val.into()], "list_dir.body")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        self.complete_io_fallible_call(
+            is_err,
+            path_val,
+            Some((list_ptr, CodegenTy::String)),
+            "fs.list_dir",
+        )
+    }
+
+    /// `std::io::fs::list_dir_count(path) -> Int fallible(IoError)`.
+    fn lower_std_io_fs_list_dir_count_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_count takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_count: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let exists_fn = self
+            .module
+            .get_function("lotus_fs_file_exists")
+            .expect("lotus_fs_file_exists declared");
+        let exists = self
+            .builder
+            .build_call(exists_fn, &[path_val.into()], "ldc.exists")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                exists,
+                self.context.i32_type().const_zero(),
+                "ldc.missing",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let count_fn = self
+            .module
+            .get_function("lotus_fs_list_dir_count")
+            .expect("lotus_fs_list_dir_count declared");
+        let count = self
+            .builder
+            .build_call(count_fn, &[path_val.into()], "ldc.body")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        self.complete_io_fallible_call(
+            is_err,
+            path_val,
+            Some((count, CodegenTy::Int)),
+            "fs.list_dir_count",
+        )
+    }
+
+    /// `std::io::fs::list_dir_at(path, i) -> String fallible(IoError)`.
+    fn lower_std_io_fs_list_dir_at_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_at takes 2 args (path, i), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_at: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let (idx_val, idx_ty) = self.lower_expr(&args[1], scope)?;
+        if idx_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::list_dir_at: index must be Int, got {:?}",
+                idx_ty
+            )));
+        }
+        let at_fn = self
+            .module
+            .get_function("lotus_fs_list_dir_at")
+            .expect("lotus_fs_list_dir_at declared");
+        let s_ptr = self
+            .builder
+            .build_call(
+                at_fn,
+                &[path_val.into(), idx_val.into()],
+                "lda.body",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr")
+            .into_pointer_value();
+        // NULL pointer => error (OOB or path issue).
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                self.builder
+                    .build_ptr_to_int(
+                        s_ptr,
+                        self.context.i64_type(),
+                        "lda.as_int",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?,
+                self.context.i64_type().const_zero(),
+                "lda.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            path_val,
+            Some((s_ptr.into(), CodegenTy::String)),
+            "fs.list_dir_at",
+        )
+    }
+
+    /// `std::io::tcp::listen_socket(host, port) -> Int fallible(IoError)`.
+    /// Path field of the IoError carries "host:port".
+    fn lower_std_io_tcp_listen_socket_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::listen_socket takes 2 args (host, port), got {}",
+                args.len()
+            )));
+        }
+        let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
+        if host_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::listen_socket: host must be String, got {:?}",
+                host_ty
+            )));
+        }
+        let (port_val, port_ty) = self.lower_expr(&args[1], scope)?;
+        if port_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::listen_socket: port must be Int, got {:?}",
+                port_ty
+            )));
+        }
+        let listen_fn = self
+            .module
+            .get_function("lotus_tcp_listen")
+            .expect("lotus_tcp_listen declared");
+        let port_i32 = self
+            .builder
+            .build_int_truncate(
+                port_val.into_int_value(),
+                self.context.i32_type(),
+                "listen.port.i32",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let fd_i32 = self
+            .builder
+            .build_call(
+                listen_fn,
+                &[host_val.into(), port_i32.into()],
+                "listen.fd",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                fd_i32,
+                self.context.i32_type().const_zero(),
+                "listen.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let fd_i64 = self
+            .builder
+            .build_int_s_extend(
+                fd_i32,
+                self.context.i64_type(),
+                "listen.fd.i64",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            host_val,
+            Some((fd_i64.into(), CodegenTy::Int)),
+            "tcp.listen_socket",
+        )
+    }
+
+    /// `std::io::tcp::connect(host, port) -> Int fallible(IoError)`.
+    fn lower_std_io_tcp_connect_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::connect takes 2 args (host, port), got {}",
+                args.len()
+            )));
+        }
+        let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
+        if host_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::connect: host must be String, got {:?}",
+                host_ty
+            )));
+        }
+        let (port_val, port_ty) = self.lower_expr(&args[1], scope)?;
+        if port_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::connect: port must be Int, got {:?}",
+                port_ty
+            )));
+        }
+        let connect_fn = self
+            .module
+            .get_function("lotus_tcp_connect")
+            .expect("lotus_tcp_connect declared");
+        let port_i32 = self
+            .builder
+            .build_int_truncate(
+                port_val.into_int_value(),
+                self.context.i32_type(),
+                "connect.port.i32",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let fd_i32 = self
+            .builder
+            .build_call(
+                connect_fn,
+                &[host_val.into(), port_i32.into()],
+                "connect.fd",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                fd_i32,
+                self.context.i32_type().const_zero(),
+                "connect.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let fd_i64 = self
+            .builder
+            .build_int_s_extend(
+                fd_i32,
+                self.context.i64_type(),
+                "connect.fd.i64",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            host_val,
+            Some((fd_i64.into(), CodegenTy::Int)),
+            "tcp.connect",
+        )
+    }
+
+    /// `std::io::tcp::accept_one(listen_fd) -> Int fallible(IoError)`.
+    /// Path carries "" — no file path; agents inspect errno to
+    /// distinguish "would block" from "listen fd closed."
+    fn lower_std_io_tcp_accept_one_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::accept_one takes 1 arg (listen_fd), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::accept_one: listen_fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let accept_fn = self
+            .module
+            .get_function("lotus_tcp_accept")
+            .expect("lotus_tcp_accept declared");
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(
+                fd_val.into_int_value(),
+                self.context.i32_type(),
+                "accept.lfd.i32",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let conn_i32 = self
+            .builder
+            .build_call(accept_fn, &[fd_i32.into()], "accept.conn")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                conn_i32,
+                self.context.i32_type().const_zero(),
+                "accept.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let conn_i64 = self
+            .builder
+            .build_int_s_extend(
+                conn_i32,
+                self.context.i64_type(),
+                "accept.conn.i64",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Empty-string path — no filename for socket ops.
+        let empty_path = self.global_string("");
+        self.complete_io_fallible_call(
+            is_err,
+            empty_path.into(),
+            Some((conn_i64.into(), CodegenTy::Int)),
+            "tcp.accept_one",
+        )
     }
 
     /// v1.x-FORM-2 PR6: lower the err branch of an `or raise`.
@@ -10923,7 +12114,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         else {
             return Ok(None);
         };
-        if !matches!(method_name, "get" | "pop") {
+        if !matches!(method_name, "get" | "set" | "pop") {
             return Ok(None);
         }
         let elem_ty = slot.elem_ty.clone();
@@ -10942,8 +12133,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
-        let out_val_slot = self
-            .alloca_for(&elem_ty, &format!("vec.{}.out_val.slot", method_name))?;
+        // `set` is Unit-success — only get/pop need an out_val_slot.
+        let out_val_slot_opt = if method_name == "set" {
+            None
+        } else {
+            Some(self.alloca_for(
+                &elem_ty,
+                &format!("vec.{}.out_val.slot", method_name),
+            )?)
+        };
         let out_err_slot = self.alloca_for(
             &payload_ty,
             &format!("vec.{}.out_err.slot", method_name),
@@ -10985,7 +12183,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             vec_field_ptr.into(),
                             elem_size.into(),
                             idx_i64.into(),
-                            out_val_slot.into(),
+                            out_val_slot_opt.unwrap().into(),
                         ],
                         &format!("{}.get.call", locus_name),
                     )
@@ -10993,6 +12191,64 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .try_as_basic_value()
                     .left()
                     .expect("lotus_vec_get returns i32")
+                    .into_int_value();
+                (c_ret, idx_i64)
+            }
+            "set" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.set: expects 2 args (idx, value), got {}",
+                        locus_name,
+                        args.len()
+                    )));
+                }
+                let (idx_val, idx_ty) = self.lower_expr(&args[0], scope)?;
+                if idx_ty != CodegenTy::Int {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.set: index must be Int, got {:?}",
+                        locus_name, idx_ty
+                    )));
+                }
+                let idx_i64 = idx_val.into_int_value();
+                let (val, val_ty) = self.lower_expr(&args[1], scope)?;
+                if val_ty != elem_ty {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.set: value type mismatch: expected \
+                         {:?}, got {:?}",
+                        locus_name, elem_ty, val_ty
+                    )));
+                }
+                // The C ABI takes the new element as a pointer
+                // (matching lotus_vec_get's out-pointer shape). Stash
+                // the SSA value into a stack alloca, hand its address
+                // to the call.
+                let val_alloca = self.alloca_for(
+                    &elem_ty,
+                    &format!("vec.{}.val.slot", method_name),
+                )?;
+                self.builder
+                    .build_store(val_alloca, val)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let set_fn = self
+                    .module
+                    .get_function("lotus_vec_set")
+                    .expect("lotus_vec_set declared");
+                let c_ret = self
+                    .builder
+                    .build_call(
+                        set_fn,
+                        &[
+                            vec_field_ptr.into(),
+                            elem_size.into(),
+                            idx_i64.into(),
+                            val_alloca.into(),
+                        ],
+                        &format!("{}.set.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_vec_set returns i32")
                     .into_int_value();
                 (c_ret, idx_i64)
             }
@@ -11015,7 +12271,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         &[
                             vec_field_ptr.into(),
                             elem_size.into(),
-                            out_val_slot.into(),
+                            out_val_slot_opt.unwrap().into(),
                         ],
                         &format!("{}.pop.call", locus_name),
                     )
@@ -11041,7 +12297,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
         let kind_str = match method_name {
-            "get" => "out_of_bounds",
+            "get" | "set" => "out_of_bounds",
             "pop" => "empty",
             _ => unreachable!(),
         };
@@ -11068,7 +12324,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         self.builder.position_at_end(lazy_err_bb);
         let len_ssa: IntValue<'ctx> = match method_name {
-            "get" => {
+            "get" | "set" => {
                 // GEP into the inline vec struct's `len` field
                 // (index 1 of `{ i64 cap, i64 len, ptr buf }`)
                 // and load it directly — no function-call ABI.
@@ -11111,11 +12367,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         self.builder.position_at_end(join_bb);
 
+        let success_ty = if method_name == "set" {
+            None
+        } else {
+            Some(elem_ty)
+        };
         Ok(Some(FallibleCallResult {
             i1_path: is_err,
-            out_val_slot: Some(out_val_slot),
+            out_val_slot: out_val_slot_opt,
             out_err_slot,
-            success_ty: Some(elem_ty),
+            success_ty,
             payload_ty,
         }))
     }
@@ -11636,6 +12897,119 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder
             .build_store(kind_field_ptr, kind_str_ptr)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(alloc_ptr)
+    }
+
+    /// Allocate an `IoError` struct in the current arena and
+    /// populate its three fields (kind / errno / path). Used by
+    /// every fallible stdlib I/O wrapper (`std::io::fs::*`,
+    /// `std::io::tcp::*`). The errno is fetched via the runtime
+    /// helper `lotus_get_errno` and the kind tag via
+    /// `lotus_io_error_kind(errno)` — both immediately after the
+    /// failing primitive call (POSIX errno is sticky until the
+    /// next syscall sets it).
+    fn emit_io_error_alloc(
+        &mut self,
+        path_str_ptr: BasicValueEnum<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let info = self
+            .user_types
+            .get("IoError")
+            .cloned()
+            .expect("IoError injected by aperio-types resolver");
+        let size = info
+            .struct_ty
+            .size_of()
+            .expect("IoError has known size");
+        let alloc_ptr = self.arena_alloc(size, "IoError.alloc")?;
+
+        // Fetch errno + kind from the runtime.
+        let get_errno_fn = self
+            .module
+            .get_function("lotus_get_errno")
+            .expect("lotus_get_errno declared");
+        let errno_i32 = self
+            .builder
+            .build_call(get_errno_fn, &[], "ioerr.errno.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_get_errno returns i32")
+            .into_int_value();
+        let i64_t = self.context.i64_type();
+        let errno_i64 = self
+            .builder
+            .build_int_s_extend(errno_i32, i64_t, "ioerr.errno.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let kind_fn = self
+            .module
+            .get_function("lotus_io_error_kind")
+            .expect("lotus_io_error_kind declared");
+        let kind_ptr = self
+            .builder
+            .build_call(kind_fn, &[errno_i32.into()], "ioerr.kind.ptr")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_io_error_kind returns ptr");
+
+        // Store fields. Order matches inject_form_stdlib_types:
+        // kind (0), errno (1), path (2).
+        let (kind_idx, _) = info
+            .fields
+            .get("kind")
+            .cloned()
+            .expect("IoError.kind field");
+        let kind_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                kind_idx,
+                "IoError.kind.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(kind_field_ptr, kind_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let (errno_idx, _) = info
+            .fields
+            .get("errno")
+            .cloned()
+            .expect("IoError.errno field");
+        let errno_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                errno_idx,
+                "IoError.errno.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(errno_field_ptr, errno_i64)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let (path_idx, _) = info
+            .fields
+            .get("path")
+            .cloned()
+            .expect("IoError.path field");
+        let path_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                path_idx,
+                "IoError.path.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(path_field_ptr, path_str_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
         Ok(alloc_ptr)
     }
 
@@ -16260,6 +17634,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok((v.into(), CodegenTy::Bool))
             }
+            (BinOp::Eq | BinOp::NotEq, CodegenTy::Bool) => {
+                let l = lv.into_int_value();
+                let r = rv.into_int_value();
+                let pred = match op {
+                    BinOp::Eq => IP::EQ,
+                    BinOp::NotEq => IP::NE,
+                    _ => unreachable!(),
+                };
+                let v = self
+                    .builder
+                    .build_int_compare(pred, l, r, "bcmp")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), CodegenTy::Bool))
+            }
             // m47-followup + payloads: enum equality.
             //   - No-payload enums: values are i32 tags; integer
             //     compare directly.
@@ -16348,6 +17736,43 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .left()
                     .expect("lotus_str_concat returns ptr");
                 Ok((v, CodegenTy::String))
+            }
+            // Lexicographic ordering on String via libc strcmp.
+            // strcmp returns <0 / 0 / >0; we map to the requested
+            // predicate by comparing the result against 0.
+            (BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq, CodegenTy::String) => {
+                let strcmp = self
+                    .module
+                    .get_function("strcmp")
+                    .expect("strcmp declared");
+                let raw = self
+                    .builder
+                    .build_call(
+                        strcmp,
+                        &[
+                            lv.into_pointer_value().into(),
+                            rv.into_pointer_value().into(),
+                        ],
+                        "str.cmp",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("strcmp returns i32")
+                    .into_int_value();
+                let zero = self.context.i32_type().const_zero();
+                let pred = match op {
+                    BinOp::Lt => IP::SLT,
+                    BinOp::Gt => IP::SGT,
+                    BinOp::LtEq => IP::SLE,
+                    BinOp::GtEq => IP::SGE,
+                    _ => unreachable!(),
+                };
+                let v = self
+                    .builder
+                    .build_int_compare(pred, raw, zero, "str.ord")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((v.into(), CodegenTy::Bool))
             }
             // m36: String equality / inequality via strcmp wrapper.
             // The C helper returns i32 0/1; we truncate to i1.
@@ -16517,10 +17942,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .build_int_truncate(hi_wide, i64_t, "dec_hi")
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     let buf_ty = self.context.i8_type().array_type(64);
-                    let buf = self
-                        .builder
-                        .build_alloca(buf_ty, "dec_buf")
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let buf = self.alloca_in_entry(buf_ty.into(), "dec_buf")?;
                     let dec_to_str = self
                         .module
                         .get_function("lotus_decimal_to_string")
@@ -16737,10 +18159,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_path_call_expr(qn, args, scope)?;
                 Ok(())
             }
-            _ => Err(CodegenError::Unsupported(format!(
-                "path call `{}`",
-                segs.join("::")
-            ))),
+            _ => {
+                // Same did-you-mean hint as the expr-position
+                // dispatcher: bare `env::args_count` (missing
+                // `std::` prefix) is the canonical typo.
+                const STDLIB_ROOTS: &[&str] = &[
+                    "env", "process", "time", "str", "bytes", "math",
+                    "io", "text", "log", "http", "test",
+                ];
+                if let Some(first) = segs.first() {
+                    if STDLIB_ROOTS.contains(first) && segs.len() >= 2 {
+                        return Err(CodegenError::Unsupported(format!(
+                            "path call `{}` is unresolved — did you mean \
+                             `std::{}`? The stdlib lives under the `std::` \
+                             prefix.",
+                            segs.join("::"),
+                            segs.join("::")
+                        )));
+                    }
+                }
+                Err(CodegenError::Unsupported(format!(
+                    "path call `{}`",
+                    segs.join("::")
+                )))
+            }
         }
     }
 
@@ -16811,10 +18253,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )?;
                 Ok((ptr.into(), CodegenTy::Enum(enum_name.to_string())))
             }
-            _ => Err(CodegenError::Unsupported(format!(
-                "path call `{}` in expression position",
-                segs.join("::")
-            ))),
+            _ => {
+                // If the first segment is a known stdlib namespace
+                // root (used without the `std::` prefix), surface
+                // the typo directly. Saves the agent a debug round-
+                // trip on `env::args_count` vs `std::env::args_count`.
+                const STDLIB_ROOTS: &[&str] = &[
+                    "env", "process", "time", "str", "bytes", "math",
+                    "io", "text", "log", "http", "test",
+                ];
+                if let Some(first) = segs.first() {
+                    if STDLIB_ROOTS.contains(first) && segs.len() >= 2 {
+                        return Err(CodegenError::Unsupported(format!(
+                            "path call `{}` is unresolved — did you mean \
+                             `std::{}`? The stdlib lives under the `std::` \
+                             prefix.",
+                            segs.join("::"),
+                            segs.join("::")
+                        )));
+                    }
+                }
+                Err(CodegenError::Unsupported(format!(
+                    "path call `{}` in expression position",
+                    segs.join("::")
+                )))
+            }
         }
     }
 
@@ -16836,10 +18299,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let i64_t = self.context.i64_type();
         let ts_t = self.timespec_type();
 
-        let ts = self
-            .builder
-            .build_alloca(ts_t, "ts")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ts = self.alloca_in_entry(ts_t.into(), "ts")?;
         let cgt = self
             .module
             .get_function("clock_gettime")
@@ -16931,14 +18391,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_int_signed_rem(ns, billion, "ts.nsec")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
-        let req = self
-            .builder
-            .build_alloca(ts_t, "req")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let rem = self
-            .builder
-            .build_alloca(ts_t, "rem")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let req = self.alloca_in_entry(ts_t.into(), "req")?;
+        let rem = self.alloca_in_entry(ts_t.into(), "rem")?;
 
         let req_sec_ptr = self
             .builder
@@ -17273,7 +18727,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok(())
             }
             ["std", "str", "builder_append"] => {
-                self.lower_std_str_builder_append(args, scope)
+                let _ = self.lower_std_str_builder_append(args, scope)?;
+                Ok(())
             }
             ["std", "str", "builder_len"] => {
                 let _ = self.lower_std_str_builder_len(args, scope)?;
@@ -17620,6 +19075,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "builder_new"] => {
                 self.lower_std_str_builder_new(args)
+            }
+            ["std", "str", "builder_append"] => {
+                self.lower_std_str_builder_append(args, scope)
             }
             ["std", "str", "builder_len"] => {
                 self.lower_std_str_builder_len(args, scope)
@@ -18322,9 +19780,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
         if s_ty != CodegenTy::String {
+            let hint = if matches!(s_ty, CodegenTy::Bytes) {
+                " — use `std::str::from_bytes(b)` to convert"
+            } else {
+                ""
+            };
             return Err(CodegenError::Unsupported(format!(
-                "std::str::{}: s must be String, got {:?}",
-                which, s_ty
+                "std::str::{}: s must be String, got {:?}{}",
+                which, s_ty, hint
             )));
         }
         let extern_name = match which {
@@ -18525,13 +19988,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok((ptr, CodegenTy::Bytes))
     }
 
-    /// v1.x-15: `std::str::builder_append(b: Bytes, s: String)`.
-    /// Void-returning; statement-position only.
+    /// v1.x-15: `std::str::builder_append(b: Bytes, s: String) -> Bytes`.
+    /// Mutates the builder in place; returns the builder pointer so
+    /// both statement (`builder_append(b, "x");`) and expression
+    /// (`let b2 = builder_append(b, "x");`, fluent chaining) usages
+    /// work. The pointer is the same one passed in — the type-level
+    /// return lets the expression dispatcher hand back a usable value.
     fn lower_std_str_builder_append(
         &mut self,
         args: &[Expr],
         scope: &Scope<'ctx>,
-    ) -> Result<(), CodegenError> {
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
         if args.len() != 2 {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::builder_append takes 2 args (b, s), got {}",
@@ -18560,7 +20027,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder
             .build_call(f, &[b_val.into(), s_val.into()], "sb.append")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        Ok(())
+        Ok((b_val, CodegenTy::Bytes))
     }
 
     /// v1.x-15: `std::str::builder_len(b: Bytes) -> Int`. Inspect
@@ -19915,9 +21382,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
         if b_ty != CodegenTy::Bytes {
+            let hint = if matches!(b_ty, CodegenTy::String) {
+                " — use `std::bytes::from_string(s)` to convert"
+            } else {
+                ""
+            };
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::at: b must be Bytes, got {:?}",
-                b_ty
+                "std::bytes::at: b must be Bytes, got {:?}{}",
+                b_ty, hint
             )));
         }
         let (i_val, i_ty) = self.lower_expr(&args[1], scope)?;
@@ -19961,7 +21433,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
         if b_ty != CodegenTy::Bytes {
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::slice: b must be Bytes, got {:?}",
+                "std::bytes::slice: b must be Bytes, got {:?} \
+                 (use `std::bytes::from_string(s)` to convert from String)",
                 b_ty
             )));
         }
@@ -22118,11 +23591,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // the instantiation (pthread_create) emits there.
             self.builder.position_at_end(saved_block);
 
-            // pthread_t alloca in the enclosing fn frame.
+            // pthread_t alloca in the enclosing fn frame — hoisted
+            // to entry so a locus-instantiation-in-loop pattern
+            // doesn't leak stack per iter (mirrors the cliff-lift
+            // session's fix for the locus .self struct alloca).
             let tid_alloca = self
-                .builder
-                .build_alloca(i64_t, &format!("{}.tid", locus_name))
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                .alloca_in_entry(i64_t.into(), &format!("{}.tid", locus_name))?;
             let thread_main_ptr =
                 thread_main.as_global_value().as_pointer_value();
             let null_attr = ptr_t.const_null();
@@ -23356,6 +24830,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let is_synth = matches!(
             method_name,
             "push" | "get" | "pop" | "len" | "is_empty"
+            | "sort" | "sort_by" | "sort_desc_by"
         );
         if !is_synth {
             return Ok(None);
@@ -23501,6 +24976,135 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = ptr_t;
                 Ok(Some(Some((result_i1.into(), CodegenTy::Bool))))
             }
+            "sort" => {
+                if !args.is_empty() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.sort takes no args, got {}",
+                        locus_name,
+                        args.len()
+                    )));
+                }
+                let sort_fn_name = match slot.elem_ty {
+                    CodegenTy::Int => "lotus_vec_sort_int",
+                    CodegenTy::Float => "lotus_vec_sort_float",
+                    CodegenTy::String => "lotus_vec_sort_string",
+                    ref other => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "@form(vec) `{}`.sort: cell type {:?} has no \
+                             default ordering — use `sort_by(less_than)` \
+                             with a user comparator instead.",
+                            locus_name, other
+                        )));
+                    }
+                };
+                let sort_fn = self
+                    .module
+                    .get_function(sort_fn_name)
+                    .expect("lotus_vec_sort_<prim> declared");
+                self.builder
+                    .build_call(
+                        sort_fn,
+                        &[vec_field_ptr.into()],
+                        &format!("{}.sort.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok(Some(None))
+            }
+            "sort_by" | "sort_desc_by" => {
+                let reverse = method_name == "sort_desc_by";
+                if args.len() != 1 {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.{}: expects 1 arg (cmp), got {}",
+                        locus_name,
+                        method_name,
+                        args.len()
+                    )));
+                }
+                let (cmp_val, cmp_ty) = self.lower_expr(&args[0], scope)?;
+                let (cmp_params, cmp_ret) = match &cmp_ty {
+                    CodegenTy::FnPtr { args: params, ret } => {
+                        (params.clone(), ret.clone())
+                    }
+                    other => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "@form(vec) `{}`.{}: cmp must be a fn-pointer \
+                             `fn(T, T) -> Bool`, got {:?}",
+                            locus_name, method_name, other
+                        )));
+                    }
+                };
+                if cmp_params.len() != 2
+                    || cmp_params[0] != slot.elem_ty
+                    || cmp_params[1] != slot.elem_ty
+                {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.{}: cmp parameter types must \
+                         both be {:?}, got {:?}",
+                        locus_name, method_name, slot.elem_ty, cmp_params
+                    )));
+                }
+                if cmp_ret.as_deref() != Some(&CodegenTy::Bool) {
+                    return Err(CodegenError::Unsupported(format!(
+                        "@form(vec) `{}`.{}: cmp must return Bool, got {:?}",
+                        locus_name, method_name, cmp_ret
+                    )));
+                }
+                let cmp_fn_ptr = cmp_val.into_pointer_value();
+                let tramp_fn = self.emit_or_get_sort_trampoline(
+                    &slot.elem_ty,
+                    reverse,
+                )?;
+                // Cookie: { arena: ptr, cmp: ptr }. Hoist to the
+                // entry block — a raw build_alloca at the call site
+                // would leak ~16 bytes/iter when sort_by runs inside
+                // a hot loop (same pattern the cliff-lift session
+                // fixed for locus instantiation).
+                let cookie_ty = self.context.struct_type(
+                    &[ptr_t.into(), ptr_t.into()],
+                    false,
+                );
+                let cookie_alloca = self.alloca_in_entry(
+                    cookie_ty.into(),
+                    "sort.cookie",
+                )?;
+                let arena_at_call = self.current_arena_ptr()?;
+                let arena_field = self
+                    .builder
+                    .build_struct_gep(cookie_ty, cookie_alloca, 0, "cookie.arena.ptr")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(arena_field, arena_at_call)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let cmp_field = self
+                    .builder
+                    .build_struct_gep(cookie_ty, cookie_alloca, 1, "cookie.cmp.ptr")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_store(cmp_field, cmp_fn_ptr)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let llvm_elem_ty = self.llvm_basic_type(&slot.elem_ty);
+                let elem_size = llvm_elem_ty
+                    .size_of()
+                    .expect("cell type has known size");
+                let sort_by_fn = self
+                    .module
+                    .get_function("lotus_vec_sort_by")
+                    .expect("lotus_vec_sort_by declared");
+                let tramp_ptr = tramp_fn.as_global_value().as_pointer_value();
+                self.builder
+                    .build_call(
+                        sort_by_fn,
+                        &[
+                            vec_field_ptr.into(),
+                            elem_size.into(),
+                            tramp_ptr.into(),
+                            cookie_alloca.into(),
+                        ],
+                        &format!("{}.{}.call", locus_name, method_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok(Some(None))
+            }
             "get" | "pop" => Err(CodegenError::Unsupported(format!(
                 "@form(vec) `{}`.{}: fallible method must be addressed via \
                  `or raise` / `or <expr>` / `or handler(err)`",
@@ -23508,6 +25112,213 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ))),
             _ => unreachable!("is_synth guard"),
         }
+    }
+
+    /// Synthesize (or look up the cached) qsort_r trampoline for a
+    /// (cell_type, reverse_flag) pair. The trampoline matches
+    /// glibc's qsort_r ABI:
+    ///   `int tramp(const void *a, const void *b, void *cookie)`
+    /// Cookie layout: `{ arena: ptr, user_cmp: ptr }`. The
+    /// trampoline loads (a, b) per the cell-type ABI (primitives
+    /// by value; structs by pointer), invokes the user comparator
+    /// via indirect call, and returns -1/0/+1.
+    fn emit_or_get_sort_trampoline(
+        &mut self,
+        elem_ty: &CodegenTy,
+        reverse: bool,
+    ) -> Result<inkwell::values::FunctionValue<'ctx>, CodegenError> {
+        let elem_tag = match elem_ty {
+            CodegenTy::Int => "Int".to_string(),
+            CodegenTy::Float => "Float".to_string(),
+            CodegenTy::Bool => "Bool".to_string(),
+            CodegenTy::String => "String".to_string(),
+            CodegenTy::Bytes => "Bytes".to_string(),
+            CodegenTy::Decimal => "Decimal".to_string(),
+            CodegenTy::Duration => "Duration".to_string(),
+            CodegenTy::Time => "Time".to_string(),
+            CodegenTy::TypeRef(name) => format!("type_{}", name),
+            CodegenTy::Enum(name) => format!("enum_{}", name),
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "@form(vec).sort_by: cell type {:?} not supported",
+                    other
+                )));
+            }
+        };
+        let suffix = if reverse { "desc" } else { "asc" };
+        let tramp_name = format!("__lotus_sort_tramp_{}_{}", elem_tag, suffix);
+        if let Some(existing) = self.module.get_function(&tramp_name) {
+            return Ok(existing);
+        }
+
+        // Save and restore builder position around trampoline synthesis.
+        let saved_bb = self.builder.get_insert_block();
+
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        // tramp(a: ptr, b: ptr, cookie: ptr) -> i32
+        let tramp_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        let tramp_fn = self.module.add_function(&tramp_name, tramp_ty, None);
+        let entry = self.context.append_basic_block(tramp_fn, "entry");
+        self.builder.position_at_end(entry);
+
+        let a_ptr = tramp_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let b_ptr = tramp_fn.get_nth_param(1).unwrap().into_pointer_value();
+        let cookie_ptr = tramp_fn.get_nth_param(2).unwrap().into_pointer_value();
+
+        // Cookie layout: { ptr arena, ptr user_cmp }.
+        let cookie_ty = self.context.struct_type(
+            &[ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        let arena_field = self
+            .builder
+            .build_struct_gep(cookie_ty, cookie_ptr, 0, "ck.arena.p")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let arena_val = self
+            .builder
+            .build_load(ptr_t, arena_field, "ck.arena")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let cmp_field = self
+            .builder
+            .build_struct_gep(cookie_ty, cookie_ptr, 1, "ck.cmp.p")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let cmp_fn_ptr = self
+            .builder
+            .build_load(ptr_t, cmp_field, "ck.cmp")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+
+        // Load (av, bv) per the cell-type ABI. Primitives go by
+        // value (loaded from a_ptr / b_ptr). Struct cells (TypeRef
+        // / Enum) are pointer-shaped already — pass a_ptr / b_ptr
+        // through.
+        let is_ptr_shaped = matches!(
+            elem_ty,
+            CodegenTy::String | CodegenTy::Bytes | CodegenTy::TypeRef(_)
+            | CodegenTy::Enum(_) | CodegenTy::LocusRef(_)
+        );
+        let (av, bv): (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) = if is_ptr_shaped {
+            // For pointer-shaped types qsort hands us &elem
+            // (pointer to a slot containing a pointer); load the
+            // inner pointer.
+            let av = self
+                .builder
+                .build_load(ptr_t, a_ptr, "av")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let bv = self
+                .builder
+                .build_load(ptr_t, b_ptr, "bv")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            (av, bv)
+        } else {
+            let llvm_ty = self.llvm_basic_type(elem_ty);
+            let av = self
+                .builder
+                .build_load(llvm_ty, a_ptr, "av")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let bv = self
+                .builder
+                .build_load(llvm_ty, b_ptr, "bv")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            (av, bv)
+        };
+
+        // user_cmp signature: i1 (ptr arena, T, T)
+        let llvm_param_ty: inkwell::types::BasicMetadataTypeEnum =
+            if is_ptr_shaped {
+                ptr_t.into()
+            } else {
+                self.llvm_basic_type(elem_ty).into()
+            };
+        let user_cmp_fn_ty = self.context.bool_type().fn_type(
+            &[ptr_t.into(), llvm_param_ty, llvm_param_ty],
+            false,
+        );
+
+        // For sort_desc_by: swap arg order — instead of asking
+        // "does a come before b?" we ask "does b come before a?".
+        // Equivalent to flipping the result of the original cmp.
+        let (first, second, first_rev, second_rev) =
+            (av, bv, bv, av);
+
+        let args_ab: [inkwell::values::BasicMetadataValueEnum<'ctx>; 3] = if reverse {
+            [arena_val.into(), first_rev.into(), second_rev.into()]
+        } else {
+            [arena_val.into(), first.into(), second.into()]
+        };
+        let cmp_ab = self
+            .builder
+            .build_indirect_call(
+                user_cmp_fn_ty,
+                cmp_fn_ptr,
+                &args_ab,
+                "cmp.ab",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("user cmp returns i1")
+            .into_int_value();
+
+        // Branch on cmp_ab: if true → return -1; else check cmp(b,a).
+        let then_neg_bb = self.context.append_basic_block(tramp_fn, "ret.neg");
+        let check_b_a_bb = self.context.append_basic_block(tramp_fn, "check.ba");
+        let then_pos_bb = self.context.append_basic_block(tramp_fn, "ret.pos");
+        let ret_zero_bb = self.context.append_basic_block(tramp_fn, "ret.zero");
+        self.builder
+            .build_conditional_branch(cmp_ab, then_neg_bb, check_b_a_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(then_neg_bb);
+        self.builder
+            .build_return(Some(&i32_t.const_int((-1i32) as u64, true)))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(check_b_a_bb);
+        let args_ba: [inkwell::values::BasicMetadataValueEnum<'ctx>; 3] = if reverse {
+            [arena_val.into(), second_rev.into(), first_rev.into()]
+        } else {
+            [arena_val.into(), second.into(), first.into()]
+        };
+        let cmp_ba = self
+            .builder
+            .build_indirect_call(
+                user_cmp_fn_ty,
+                cmp_fn_ptr,
+                &args_ba,
+                "cmp.ba",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("user cmp returns i1")
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(cmp_ba, then_pos_bb, ret_zero_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(then_pos_bb);
+        self.builder
+            .build_return(Some(&i32_t.const_int(1, false)))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(ret_zero_bb);
+        self.builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let _ = i64_t;
+        // Restore the caller's builder position.
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        Ok(tramp_fn)
     }
 
     /// v1.x-FORM-4: dispatcher for the infallible synth methods on

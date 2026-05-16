@@ -87,6 +87,47 @@ fn resolve_and_mangle_lib(
 }
 
 #[test]
+fn or_on_path_callee_for_imported_fallible_fn() {
+    // #66 regression: `alias::fn(args) or raise` and
+    // `alias::fn(args) or fallback` codegen against a path
+    // callee. Before the fix the Path callee shape rejected
+    // with "or callee shape not yet supported: Discriminant(2)".
+    let lib_dir = fixtures_dir().join("lib-fallible");
+    let consumer_src_path = fixtures_dir()
+        .join("import-fallible-consumer")
+        .join("main.ap");
+
+    let consumer_src = std::fs::read_to_string(&consumer_src_path)
+        .expect("read consumer main.ap");
+    let mut consumer_prog =
+        parse_source(&consumer_src).expect("parse consumer");
+    consumer_prog.imports.clear();
+
+    let (lib_items, renames) = resolve_and_mangle_lib(&lib_dir, "lp");
+    consumer_prog.items.extend(lib_items);
+
+    let mut bin = std::env::temp_dir();
+    bin.push(format!(
+        "aperio_or_on_path_callee_{}",
+        std::process::id()
+    ));
+    build_executable_with_imports(&consumer_prog, &bin, &renames)
+        .expect("build consumer + lib");
+
+    let out = Command::new(&bin).output().expect("run consumer");
+    let _ = std::fs::remove_file(&bin);
+    assert!(
+        out.status.success(),
+        "non-zero exit: {:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("a=4"), "got: {:?}", stdout);
+    assert!(stdout.contains("b=99"), "got: {:?}", stdout);
+}
+
+#[test]
 fn consumer_uses_greeter_and_formatted_from_lib_toy() {
     let lib_dir = fixtures_dir().join("lib-toy");
     let consumer_src_path = fixtures_dir()

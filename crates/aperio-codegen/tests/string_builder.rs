@@ -124,3 +124,24 @@ fn builder_appends_can_be_interleaved_with_other_work() {
     assert!(status.success());
     assert!(stdout.contains("ace"), "got: {:?}", stdout);
 }
+
+#[test]
+fn builder_append_is_callable_in_expression_position() {
+    // Previously builder_append was statement-only; any expression
+    // use ("let _ = builder_append(...);", fluent chaining,
+    // passing as arg) rejected at codegen. Now returns the builder
+    // pointer (Bytes) so both shapes work.
+    let src = r#"
+        fn main() {
+            let b = std::str::builder_new();
+            // Expression position — bind the returned builder.
+            let b2 = std::str::builder_append(b, "hello ");
+            // Same underlying allocation — append to either alias.
+            std::str::builder_append(b2, "world");
+            println(std::str::builder_finish(b));
+        }
+    "#;
+    let (stdout, status) = build_and_run("append_in_expr", src);
+    assert!(status.success());
+    assert!(stdout.contains("hello world"), "got: {:?}", stdout);
+}

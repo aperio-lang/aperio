@@ -84,7 +84,7 @@ not declare them; call sites resolve as if they were declared.
 @form(vec)
 locus ItemList<T> {
     capacity { heap items of T; }
-    // push, get, pop, len, is_empty come from @form(vec).
+    // push, get, set, pop, len, is_empty come from @form(vec).
 }
 
 fn main() {
@@ -292,9 +292,13 @@ for parent-owns-children.
 ```
 fn push(x: T) -> ()                          # infallible
 fn get(i: Int) -> T fallible(IndexError)
+fn set(i: Int, x: T) -> () fallible(IndexError)
 fn pop() -> T fallible(IndexError)
 fn len() -> Int                              # infallible
 fn is_empty() -> Bool                        # infallible
+fn sort() -> ()                              # infallible; T in {Int, Float, String}
+fn sort_by(cmp: fn(T, T) -> Bool) -> ()      # infallible
+fn sort_desc_by(cmp: fn(T, T) -> Bool) -> () # infallible
 ```
 
 The fallible methods return the locus-defined `IndexError`
@@ -348,6 +352,23 @@ let first = vec.get(0) or default_value;    # substitute
 let nth = vec.get(i) or handle_oob(err);    # custom handler
 ```
 
+### `set`
+
+```
+fn set(i: Int, x: T) -> () fallible(IndexError)
+```
+
+Overwrites the element at index `i` (0-based) with `x`. If
+`i < 0` or `i >= len()`, fails with `IndexError { kind:
+"out_of_bounds", index: i, len: self.len() }`. `set` does not
+extend the vec — index must be inside the current length;
+appending new elements uses `push`.
+
+```aperio
+vec.set(0, new_first) or raise;
+vec.set(i, x)         or noop(err);   # swallow OOB
+```
+
 ### `pop`
 
 ```
@@ -370,6 +391,62 @@ fn is_empty() -> Bool
 `len()` returns the number of elements currently in the vec.
 `is_empty()` is sugar for `len() == 0`. Both are infallible and
 O(1).
+
+### `sort`
+
+```
+fn sort() -> ()
+```
+
+Sorts the vec in place in ascending order. The cell type T MUST
+be one of `Int`, `Float`, or `String`; any other T (struct, enum,
+bytes, etc.) is a typecheck error suggesting `sort_by(cmp)`.
+String comparison is lexicographic on the underlying byte
+sequence (i.e., the C `strcmp` ordering); Float comparison
+treats `NaN` as equal-to-anything to keep the ordering total
+(no panic on NaN-bearing inputs).
+
+`sort` is infallible. The substrate uses C `qsort` under the
+hood — average O(N log N), worst-case O(N²) on pathological
+inputs.
+
+### `sort_by` and `sort_desc_by`
+
+```
+fn sort_by(cmp: fn(T, T) -> Bool) -> ()
+fn sort_desc_by(cmp: fn(T, T) -> Bool) -> ()
+```
+
+Sort the vec in place under a user-supplied strict-less-than
+comparator. The comparator's semantics: `cmp(a, b) == true`
+means "a should come before b in the result." This is the
+strict-`<` shape — `cmp(a, a)` SHOULD return `false` for any
+`a`; a reflexive `<=` produces an unstable ordering but does
+not panic.
+
+`sort_desc_by(cmp)` is equivalent to `sort_by(|a, b| cmp(b, a))`
+with the arg order swapped under the hood, so the same user
+predicate produces the reverse ordering. Provided as a
+convenience for the common "descending under the same key
+extractor" pattern.
+
+Both methods are infallible from the language surface. If `cmp`
+itself faults (e.g., raises via `or raise` on a fallible call
+inside the comparator body), the fault propagates through the
+sort and the vec is left in an unspecified but valid state
+(every element still present, ordering partially applied).
+
+```aperio
+fn by_x(a: Point, b: Point) -> Bool { return a.x < b.x; }
+points.sort_by(by_x);          # ascending by x
+points.sort_desc_by(by_x);     # descending by x — same cmp
+```
+
+The cell type T may be any sortable shape, including structs and
+enums. The substrate uses `qsort_r` with a per-(cell-type,
+direction) trampoline synthesized at codegen time; the cookie
+threads the caller's arena pointer through so the comparator's
+body can use stdlib calls that allocate.
 
 ## Lowering strategy
 
@@ -530,11 +607,10 @@ implementation details of the literal F.22 heap-slot lowering
 (e.g. memory addresses of individual cells across pushes) will
 not behave the same under `@form(vec)`.
 
-## Open questions deferred to FORM-2 / FORM-3
+## Open questions
 
-These are spec-level questions the FORM-2 implementation work
-will answer concretely. They don't block FORM-1 because the
-contract above is independent of them.
+Spec-level questions not blocking the current `@form(vec)`
+contract; will be answered as workloads surface demand.
 
 1. **Iteration surface.** A `for x in vec.items { ... }` form
    is natural, but the loop construct's lowering depends on
@@ -542,11 +618,7 @@ contract above is independent of them.
    until the implementation pass.
 2. **Bulk operations.** `extend(other: @form(vec))`, `clear()`,
    `truncate(n: Int)`. Useful but not foundational. Add after
-   the core five methods land.
-3. **Mutation in place.** `set(i: Int, x: T) -> () fallible(IndexError)`.
-   Mirrors `get` for write. Likely added in FORM-2; left out of
-   the v1 core only because the bench workloads don't require
-   it.
+   the core methods land.
 
 ---
 

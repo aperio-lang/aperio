@@ -127,9 +127,14 @@ header documents its constraint.
 
 ## What landed but isn't yet a phase capstone
 
-- **Errno surface.** Errors still collapse to `-1` / `false` /
+- ~~**Errno surface.** Errors still collapse to `-1` / `false` /
   empty string. Disambiguation between "missing" and "permission
-  denied" needs an error-introspection follow-up.
+  denied" needs an error-introspection follow-up.~~
+  **Closed 2026-05-16** by the `IoError` flip — `std::io::fs::*`
+  and `std::io::tcp::*` path-calls now return
+  `fallible(IoError)`; the agent addresses failures with
+  `or raise` / `or fallback(err)`. See "IoError + fallible I/O"
+  below.
 - **Inline markdown.** Bold, italic, inline code, links — m92+.
 - **HTTP keep-alive, custom headers, large bodies.** v0 hardcodes
   `Connection: close`, no header-map type, single-recv assumption
@@ -232,17 +237,17 @@ resolves a specific friction-log entry.
 
 | Add | Resolves | Surface |
 |---|---|---|
-| `std::io::fs::mkdir(path) -> Int` | `apps/ssg` `no-mkdir` | Single-level mkdir, mode 0755. Returns 0 / -1. Wraps libc `mkdir`; not recursive. |
-| `std::io::fs::write_file_append(path, content) -> Int` | `apps/log-router` `write-file-truncates-no-append` | Companion to `write_file`. Opens with `O_WRONLY \| O_CREAT \| O_APPEND` (no truncate). Returns 0 / -1. |
+| `std::io::fs::mkdir(path) -> () fallible(IoError)` | `apps/ssg` `no-mkdir` | Single-level mkdir, mode 0755. Wraps libc `mkdir`; not recursive. Flipped to `fallible(IoError)` 2026-05-16; pre-flip shape returned `Int` (0 / -1). |
+| `std::io::fs::write_file_append(path, content) -> () fallible(IoError)` | `apps/log-router` `write-file-truncates-no-append` | Companion to `write_file`. Opens with `O_WRONLY \| O_CREAT \| O_APPEND` (no truncate). Flipped to `fallible(IoError)` 2026-05-16; pre-flip returned `Int` (0 / -1). |
 | `eprintln(args...)` / `eprint(args...)` builtins | `apps/log-router` `no-eprintln-cant-isolate-debug-output` | Bare-name builtins like `print` / `println`. Route through `dprintf(2, ...)` to avoid the cross-libc `stderr` FILE* macro. Same compose-many-args shape as `println`. |
 | `String + <printable>` auto-coerce | `apps/tcp-echo` `to_string-int-via-concatenation` | Mixed-type `+` where one side is `String` and the other is `Int` / `Float` / `Bool` / `Decimal` / `Duration` / `Time` / enum auto-coerces the non-String side via `value_to_string`. Symmetric (`port + " is the port"` works) and chained. |
 | `approx` / `within` contextual narrowing | `lotus-harness` `closure-keyword-shadows-helper-ident` | The closure-assertion long-form spellings `approx` and `within` now lex as ordinary idents; the parser recognizes them as assertion vocabulary only inside `closure { ... }` bodies (F.10-style narrowing). Frees `approx`/`within` as fn / variable / field names everywhere else. (Phase 2a) |
 | `if` and block as expression | `lotus-harness` `if-needs-block-value` | `Block` carries `tail: Option<Box<Expr>>`. A block's last item without a trailing `;` is the block's value when the block is used in expression position. `if cond { i } else { j }` produces a value via phi-merge of the arm tails; the else branch is required for the value form, and arm types must match. Composes with let-bindings inside arms. (Phase 2b) |
 | Int → Float widening + `std::math::*` libm primitives | `lotus-harness` `float-surface-gaps` | Codegen widens Int → Float (via `sitofp`) at let-binding type ascriptions and fn-arg sites where the parameter is `Float`; one-way only, `Float → Int` and `Decimal` mixes still reject. `std::math::{sqrt, exp, log, floor, ceil}` (unary) + `std::math::pow` (binary) ship as path-call dispatches into libm. (Phase 2c) |
 | `[val; N]` array-literal repetition | `lotus-harness` `float-surface-gaps` (sub-bullet 3) | New `Expr::ArrayRepeat { val, count }`. `val` is evaluated once; the result is broadcast to N slots of an arena-allocated `[N x T]`. N is a non-negative Int literal at v0. (Phase 2d) |
-| Binary-safe TCP recv + Bytes/String surface | `apps/ws-echo` `tcp-recv-string-strlen-truncates-binary` | `Stream.recv_bytes(max) -> Bytes` (length-prefixed; embedded NULs survive) backed by `lotus_tcp_recv_bytes`. Companions: `std::bytes::from_string(s) -> Bytes`, `std::str::from_bytes(b) -> String`, `std::bytes::at(b, i) -> Int`, `std::bytes::slice(b, lo, hi) -> Bytes`. All anchored in the global payload arena. Together they make a WebSocket frame parser straight-line Aperio. (Phase 2g) |
+| Binary-safe TCP recv + Bytes/String surface | `apps/ws-echo` `tcp-recv-string-strlen-truncates-binary` | `Stream.recv_bytes(max) -> Bytes` (length-prefixed; embedded NULs survive) backed by `lotus_tcp_recv_bytes`. Companions: `std::bytes::from_string(s) -> Bytes`, `std::str::from_bytes(b) -> String`, `std::bytes::at(b, i) -> Int fallible(IndexError)` (flipped 2026-05-16; pre-flip returned -1 sentinel), `std::bytes::slice(b, lo, hi) -> Bytes`. All anchored in the global payload arena. Together they make a WebSocket frame parser straight-line Aperio. (Phase 2g) |
 | `list_dir` index API | `apps/ssg` `list_dir-newline-string` | `std::io::fs::list_dir_count(path) -> Int` + `std::io::fs::list_dir_at(path, i) -> String`. Both walk the same global-arena cache, so iteration becomes a 4-line `let n = count; while i < n { name = at(i); i = i + 1; }` — no manual newline-scanning. Real `[String]` return still waits on dynamic-array codegen; the existing `list_dir(path) -> String` shape stays for backwards compatibility. (Phase 2e) |
-| `read_file` errno status | `apps/ssg` `read_file-empty-vs-error` | `std::io::fs::read_file_status(path) -> Int` returns 0 on success or the platform errno on failure (ENOENT, EACCES, EISDIR, EIO). Pairs with `read_file` for content; both calls share the kernel cache. Callers distinguish "intentionally empty" (status=0, len(content)=0) from "missing/unreadable" (status != 0). (Phase 2f) |
+| `read_file` errno status | `apps/ssg` `read_file-empty-vs-error` | `std::io::fs::read_file_status(path) -> Int` returns 0 on success or the platform errno on failure (ENOENT, EACCES, EISDIR, EIO). Pairs with `read_file` for content. **Superseded 2026-05-16 by the IoError flip:** `read_file` itself now returns `String fallible(IoError)`, carrying errno + kind tag on the err path. `read_file_status` remains as a legacy companion for callers that prefer the sentinel-pair idiom. (Phase 2f) |
 | Stale-CLI rebuild check | `apps/log-router` `stale-cli-silent-drops-subscribers` | `crates/aperio-cli/build.rs` hashes `codegen.rs`, `lotus_arena.c`, and every `runtime/stdlib/*.ap` file at CLI-build time, bakes the hash + crate path into the binary via `cargo:rustc-env`. On every `aperio build` invocation, `check_stale_cli()` in main.rs recomputes from disk and emits a four-line warning when they diverge — catches the "edit codegen, run cargo test, forget to rebuild CLI" footgun without forcing an automatic rebuild. Skipped silently for installed binaries or when `APERIO_SKIP_STALE_CHECK=1`. (Phase 2i) |
 
 ## F.19 — per-directory seed model (2026-05-11)
@@ -353,11 +358,11 @@ tree. Quick reference grouped by `std::*` namespace prefix:
 | `std::env` | `args_count()`, `arg(i)`, `var(name)`, `var_exists(name)` | path-call dispatch + main-prelude argv stash |
 | `std::time` | `monotonic() -> Duration`, `sleep(d: Duration)` | `clock_gettime(CLOCK_MONOTONIC)` + EINTR-retrying `clock_nanosleep` |
 | `std::str` | `parse_int` / `can_parse_int` / `parse_float` / `can_parse_float`, `index_of`, `lower` / `upper`, `trim`, `replace`, `repeat`, `pad_left` / `pad_right`, `from_bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` | `lotus_str_*` C runtime primitives |
-| `std::bytes` | `at(b, i) -> Int`, `slice(b, lo, hi) -> Bytes`, `from_string(s) -> Bytes` | `lotus_bytes_*` C runtime primitives |
+| `std::bytes` | `at(b, i) -> Int fallible(IndexError)`, `slice(b, lo, hi) -> Bytes`, `from_string(s) -> Bytes` | `lotus_bytes_*` C runtime primitives |
 | `std::text` | `md_to_html(md) -> String`, `base64::encode` / `base64::decode`, `Sink` interface + `StdoutSink` / `StringSink` / `FileSink` loci | `runtime/stdlib/text.ap` + C runtime |
-| `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `file_exists`, `mkdir`, `list_dir`, `list_dir_count`, `list_dir_at` | `lotus_fs_*` C runtime primitives |
+| `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `mkdir`, `list_dir`, `list_dir_count`, `list_dir_at` — all `fallible(IoError)`. `file_exists(path) -> Bool` (predicate, not failable). | `lotus_fs_*` C runtime primitives |
 | `std::io::stdin` | `read_line() -> String`, `read_line_status() -> Int` | `lotus_stdin_*` C runtime primitives (POSIX `getline` + payload-arena copy) |
-| `std::io::tcp` | `Listener` locus, `Stream` locus, `send`, `send_bytes`, `recv_bytes` | `lotus_tcp_*` C runtime primitives |
+| `std::io::tcp` | `Listener` locus, `Stream` locus, `send`, `send_bytes`, `recv_bytes`. Path-calls `listen_socket`, `connect`, `accept_one` are `fallible(IoError)`. | `lotus_tcp_*` C runtime primitives |
 | `std::http` | `Request` + `Response` types, `parse_request`, `write_response`, case-insensitive `header` lookup | `runtime/stdlib/http.ap` |
 | `std::test` | `assert(cond, msg)`, `assert_eq_int`, `assert_eq_str` | `runtime/stdlib/test.ap` |
 | `std::log` | `Logger`, `LogEvent`, `StdoutSink` (subscribes `log.**`) | `runtime/stdlib/log.ap` |
@@ -441,13 +446,57 @@ or pattern-matched in `match`. They are NOT importable via
 `std::*` (they are not in a namespace); their names live at
 the top level.
 
-| Form         | Synthesized type | Fields |
-|--------------|------------------|--------|
-| `@form(vec)` | `IndexError`     | `kind: String`, `index: Int`, `len: Int` |
+| Form                  | Synthesized type | Fields |
+|-----------------------|------------------|--------|
+| `@form(vec)`          | `IndexError`     | `kind: String`, `index: Int`, `len: Int` |
+| `@form(hashmap)`      | `KeyError`       | `kind: String` |
+| `@form(ring_buffer)`  | `EmptyError`     | `kind: String` |
+| `std::io::fs` / `std::io::tcp` | `IoError` | `kind: String`, `errno: Int`, `path: String` |
 
 Idempotency: if a user / library declares a type with the same
 name, the user declaration wins. The injection only runs if the
 target name is not already in scope.
+
+### `IoError` — unified I/O failure payload (2026-05-16)
+
+`std::io::fs::*` (except `file_exists`) and the path-call surface
+of `std::io::tcp::*` (`listen_socket`, `connect`, `accept_one`)
+return `fallible(IoError)`. Agents address failures uniformly:
+
+```aperio
+let s = std::io::fs::read_file(path) or raise;
+let n = std::io::fs::file_size(path) or 0;
+std::io::fs::mkdir(out_dir) or show(err);
+```
+
+The `kind` tag is errno-derived via `lotus_io_error_kind` —
+`"not_found"`, `"permission_denied"`, `"is_dir"`,
+`"already_exists"`, `"would_block"`, `"connection_refused"`,
+`"timeout"`, `"host_unreachable"`, `"broken_pipe"`,
+`"interrupted"`, etc., with `"io"` as the catch-all for unmapped
+codes. `errno` carries the raw platform errno for callers that
+want it; `path` carries the file path / connection target /
+empty string for socket-fd ops without a useful path label.
+
+`Stream.send` / `Stream.recv_bytes` / `Stream.send_bytes` are
+*locus methods*, not path-calls, and per the two-channel rule
+(`spec/semantics.md` § "Fallible call semantics") locus methods
+cannot declare `fallible(E)`. They keep the legacy sentinel
+shape (returning -1 / 0 on failure). The same is true of
+`std::io::stdin::read_line` (path-call but pairs with
+`read_line_status` for the EOF-vs-error distinction; EOF is a
+natural non-error terminator in the typical loop).
+
+The interpreter and codegen runtimes both wire failures through
+`Value::FallibleErr` / sret-path-indicator respectively; both
+construct the same `IoError { kind, errno, path }` shape.
+
+Closes the v1 errno-disambiguation follow-up. Before the flip,
+agents reaching for the modern shape (`read_file(path) or raise`)
+were blocked twice: (a) `IoError` didn't exist, (b) `or` over a
+Path callee didn't codegen. Both gaps closed together — `or` now
+accepts Path callees and the IoError synth wraps every flipped
+path-call's sentinel return into a typed payload.
 
 ## Why batteries-included
 

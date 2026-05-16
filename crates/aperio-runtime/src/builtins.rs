@@ -15,7 +15,31 @@
 
 use std::rc::Rc;
 
+use crate::eval::io_error_value;
 use crate::value::{BuiltinRef, Value};
+
+/// Map a `std::io::Error` to the IoError shape the agents see.
+/// Mirrors `lotus_io_error_kind`'s errno → kind taxonomy in the
+/// C runtime so both runtimes report the same tags.
+fn io_error_from_std(e: &std::io::Error, path: &str) -> Value {
+    use std::io::ErrorKind as K;
+    let kind = match e.kind() {
+        K::NotFound => "not_found",
+        K::PermissionDenied => "permission_denied",
+        K::AlreadyExists => "already_exists",
+        K::ConnectionRefused => "connection_refused",
+        K::ConnectionReset => "connection_reset",
+        K::ConnectionAborted => "connection_aborted",
+        K::TimedOut => "timeout",
+        K::Interrupted => "interrupted",
+        K::WouldBlock => "would_block",
+        K::InvalidInput | K::InvalidData => "invalid",
+        K::WriteZero | K::UnexpectedEof => "io",
+        _ => "io",
+    };
+    let errno = e.raw_os_error().unwrap_or(0) as i64;
+    io_error_value(kind, errno, path)
+}
 
 pub fn install_builtins(env: &crate::env::Env) {
     env.define(
@@ -858,13 +882,18 @@ fn std_str_builder_append(args: &[Value]) -> Result<Value, String> {
             ));
         }
     };
-    let mut a = handle.borrow_mut();
-    if let Some(Value::Bytes(buf)) = a.get_mut(0) {
+    {
+        let mut a = handle.borrow_mut();
+        let buf = match a.get_mut(0) {
+            Some(Value::Bytes(buf)) => buf,
+            _ => return Err("std::str::builder_append: corrupt builder handle".to_string()),
+        };
         buf.extend_from_slice(chunk.as_bytes());
-        Ok(Value::Unit)
-    } else {
-        Err("std::str::builder_append: corrupt builder handle".to_string())
     }
+    // Return the builder handle so the call is usable in expression
+    // position (e.g. `let b2 = builder_append(b, "x");` or fluent
+    // chaining). Same shape the codegen path exposes.
+    Ok(Value::Array(handle))
 }
 
 fn std_str_builder_len(args: &[Value]) -> Result<Value, String> {
@@ -1194,9 +1223,10 @@ fn std_io_fs_read_file(args: &[Value]) -> Result<Value, String> {
             ))
         }
     };
-    Ok(Value::String(
-        std::fs::read_to_string(path).unwrap_or_default(),
-    ))
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Value::String(s)),
+        Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, path)))),
+    }
 }
 
 fn std_io_fs_write_file(args: &[Value]) -> Result<Value, String> {
@@ -1225,12 +1255,9 @@ fn fs_write(args: &[Value], append: bool, label: &str) -> Result<Value, String> 
             ))
         }
     };
-    let content = match &args[1] {
-        Value::String(s) => s.clone(),
-        Value::Bytes(b) => {
-            // Bytes content path: encode as raw bytes.
-            return Ok(Value::Int(write_bytes_to_path(&path, b, append)));
-        }
+    let bytes: std::borrow::Cow<[u8]> = match &args[1] {
+        Value::String(s) => std::borrow::Cow::Owned(s.as_bytes().to_vec()),
+        Value::Bytes(b) => std::borrow::Cow::Borrowed(b),
         other => {
             return Err(format!(
                 "std::io::fs::{}: content must be String or Bytes, got {}",
@@ -1239,14 +1266,17 @@ fn fs_write(args: &[Value], append: bool, label: &str) -> Result<Value, String> 
             ))
         }
     };
-    Ok(Value::Int(write_bytes_to_path(
-        &path,
-        content.as_bytes(),
-        append,
-    )))
+    match write_bytes_to_path(&path, &bytes, append) {
+        Ok(()) => Ok(Value::Unit),
+        Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, &path)))),
+    }
 }
 
-fn write_bytes_to_path(path: &str, bytes: &[u8], append: bool) -> i64 {
+fn write_bytes_to_path(
+    path: &str,
+    bytes: &[u8],
+    append: bool,
+) -> Result<(), std::io::Error> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true);
@@ -1255,13 +1285,9 @@ fn write_bytes_to_path(path: &str, bytes: &[u8], append: bool) -> i64 {
     } else {
         opts.truncate(true);
     }
-    match opts.open(path) {
-        Ok(mut f) => match f.write_all(bytes) {
-            Ok(_) => 0,
-            Err(_) => -1,
-        },
-        Err(_) => -1,
-    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    Ok(())
 }
 
 fn std_io_fs_file_exists(args: &[Value]) -> Result<Value, String> {
@@ -1299,8 +1325,10 @@ fn std_io_fs_file_size(args: &[Value]) -> Result<Value, String> {
             ))
         }
     };
-    let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(-1);
-    Ok(Value::Int(size))
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(Value::Int(m.len() as i64)),
+        Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, path)))),
+    }
 }
 
 fn std_io_fs_mkdir(args: &[Value]) -> Result<Value, String> {
@@ -1319,8 +1347,10 @@ fn std_io_fs_mkdir(args: &[Value]) -> Result<Value, String> {
             ))
         }
     };
-    let r = std::fs::create_dir(path).map(|_| 0i64).unwrap_or(-1);
-    Ok(Value::Int(r))
+    match std::fs::create_dir(path) {
+        Ok(_) => Ok(Value::Unit),
+        Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, path)))),
+    }
 }
 
 // === str parsing =============================================
