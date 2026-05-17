@@ -1380,6 +1380,35 @@ pub(crate) fn inject_form_stdlib_types(scope: &mut TopScope) {
             }),
         );
     }
+    // 2026-05-17 — ParseError for `std::str::parse_int` /
+    // `parse_float` after their flip to fallible. Carries:
+    //   - kind: "parse_int" / "parse_float" — surfaces which
+    //     parser rejected the input.
+    //   - input: the original String that failed to parse —
+    //     for diagnostic messages.
+    if !scope.symbols.contains_key("ParseError") {
+        scope.symbols.insert(
+            "ParseError".to_string(),
+            TopSymbol::Type(TypeInfo {
+                name: "ParseError".to_string(),
+                kind: TypeKind::Struct(vec![
+                    FieldInfo {
+                        name: "kind".to_string(),
+                        ty: Ty::Prim(PrimType::String),
+                        has_default: false,
+                        span: zero,
+                    },
+                    FieldInfo {
+                        name: "input".to_string(),
+                        ty: Ty::Prim(PrimType::String),
+                        has_default: false,
+                        span: zero,
+                    },
+                ]),
+                span: zero,
+            }),
+        );
+    }
 }
 
 /// Best-effort literal-typing for params declared with a value

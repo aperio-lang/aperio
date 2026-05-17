@@ -319,12 +319,22 @@ locus __StdHttpServer {
         // to wire up routes" surfaces immediately instead of
         // shipping a server that 404s everything.
         handler: std::http::Handler;
+        // 2026-05-17 — opt-in "I'm ready" announce. When
+        // non-empty, birth() prints this string after the
+        // listen socket binds successfully, so test oracles /
+        // supervisors can wait for it instead of polling
+        // connect-with-retry. Empty (the default) skips the
+        // print entirely. Canonical value: "READY".
+        ready_signal: String = "";
         // not-yet-bound sentinel so dissolve() on a
         // partially-constructed Server skips the close.
         listen_fd: Int = -1;
     }
     birth() {
         self.listen_fd = std::io::tcp::__listen_socket(self.host, self.port);
+        if len(self.ready_signal) > 0 {
+            println(self.ready_signal);
+        }
     }
     run() {
         let mut accepted = 0;

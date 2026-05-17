@@ -4786,6 +4786,39 @@ const char *lotus_str_trim(const char *s) {
 }
 
 /*
+ * 2026-05-17 — substring extraction. Returns s[lo..hi) clamped
+ * to the input's byte range; negative lo / hi past the end /
+ * inverted bounds all collapse to "". Operates on raw bytes
+ * (same shape as bytes::slice + str::from_bytes composed), so
+ * non-ASCII multi-byte sequences are split at byte boundaries
+ * — slice high-byte ASCII / Bytes via std::bytes::slice if you
+ * need codepoint discipline. Result lives in the global payload
+ * arena.
+ */
+const char *lotus_str_substring(const char *s, int64_t lo, int64_t hi) {
+    if (!s) return "";
+    int64_t n = (int64_t)strlen(s);
+    if (lo < 0) lo = 0;
+    if (hi > n) hi = n;
+    if (lo >= hi) return "";
+    size_t out_len = (size_t)(hi - lo);
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            return "";
+        }
+    }
+    char *out = (char *)lotus_arena_alloc(g_bus_payload_arena, out_len + 1, 1);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    if (!out) return "";
+    memcpy(out, s + lo, out_len);
+    out[out_len] = '\0';
+    return out;
+}
+
+/*
  * Replace every occurrence of `needle` with `replacement` in `s`.
  * Naive O(n*m) scan. Empty needle returns `s` unchanged (replacing
  * "" infinitely is undefined). Overlap is greedy-forward — each

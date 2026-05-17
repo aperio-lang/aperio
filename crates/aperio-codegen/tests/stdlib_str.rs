@@ -16,12 +16,16 @@ fn build_and_run(name: &str, source: &str) -> (String, std::process::ExitStatus)
 
 #[test]
 fn parse_int_handles_basic_digit_strings() {
+    // 2026-05-17 — parse_int returns `Int fallible(ParseError)`.
+    // For known-valid inputs the test uses `or raise` to surface
+    // an interpreter panic if the parser ever rejects something
+    // it should have accepted.
     let src = r#"
         fn main() {
-            let a = std::str::parse_int("42");
-            let b = std::str::parse_int("0");
-            let c = std::str::parse_int("-7");
-            let d = std::str::parse_int("9999999999");
+            let a = std::str::parse_int("42") or raise;
+            let b = std::str::parse_int("0") or raise;
+            let c = std::str::parse_int("-7") or raise;
+            let d = std::str::parse_int("9999999999") or raise;
             println("a=", a);
             println("b=", b);
             println("c=", c);
@@ -37,13 +41,16 @@ fn parse_int_handles_basic_digit_strings() {
 }
 
 #[test]
-fn parse_int_returns_zero_on_garbage_input() {
+fn parse_int_err_arm_substitutes_zero_on_garbage_input() {
+    // The fallible flip means "garbage in" routes through `or`
+    // rather than silently returning 0. Test uses `or 0` as the
+    // substitute so the expected sentinel still appears.
     let src = r#"
         fn main() {
-            let bad1 = std::str::parse_int("abc");
-            let bad2 = std::str::parse_int("12abc");
-            let bad3 = std::str::parse_int("");
-            let bad4 = std::str::parse_int("  42  ");
+            let bad1 = std::str::parse_int("abc") or 0;
+            let bad2 = std::str::parse_int("12abc") or 0;
+            let bad3 = std::str::parse_int("") or 0;
+            let bad4 = std::str::parse_int("  42  ") or 0;
             println("bad1=", bad1);
             println("bad2=", bad2);
             println("bad3=", bad3);
@@ -52,13 +59,33 @@ fn parse_int_returns_zero_on_garbage_input() {
     "#;
     let (stdout, status) = build_and_run("garbage", src);
     assert!(status.success());
-    // strtoll's strict check: trailing non-NUL chars reject.
-    // "  42  " rejects because the trailing spaces aren't
-    // consumed.
+    // strtoll-ish: trailing non-NUL chars reject. "  42  "
+    // rejects because the trailing spaces aren't consumed.
     assert!(stdout.contains("bad1=0"), "got: {:?}", stdout);
     assert!(stdout.contains("bad2=0"), "got: {:?}", stdout);
     assert!(stdout.contains("bad3=0"), "got: {:?}", stdout);
     assert!(stdout.contains("bad4=0"), "got: {:?}", stdout);
+}
+
+#[test]
+fn parse_int_err_payload_carries_kind_and_input() {
+    // The substitute RHS sees `err: ParseError { kind, input }`
+    // — both fields readable in scope for diagnostics / logging.
+    let src = r#"
+        fn main() {
+            let s = "totally bogus";
+            let n = std::str::parse_int(s) or {
+                println("kind=", err.kind, " input=", err.input);
+                -1
+            };
+            println("n=", n);
+        }
+    "#;
+    let (stdout, status) = build_and_run("err_payload", src);
+    assert!(status.success(), "non-zero: {:?}", status);
+    assert!(stdout.contains("kind=parse_int"), "got: {:?}", stdout);
+    assert!(stdout.contains("input=totally bogus"), "got: {:?}", stdout);
+    assert!(stdout.contains("n=-1"), "got: {:?}", stdout);
 }
 
 #[test]
@@ -92,7 +119,7 @@ fn parse_int_round_trips_with_arithmetic() {
     // compared, arithmetic'd, etc. — not some opaque thing.
     let src = r#"
         fn main() {
-            let n = std::str::parse_int("100");
+            let n = std::str::parse_int("100") or raise;
             let doubled = n * 2;
             if n > 50 {
                 println("doubled=", doubled);

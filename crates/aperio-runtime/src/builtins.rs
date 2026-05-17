@@ -15,7 +15,7 @@
 
 use std::rc::Rc;
 
-use crate::eval::io_error_value;
+use crate::eval::{io_error_value, parse_error_value};
 use crate::value::{BuiltinRef, Value};
 
 /// Map a `std::io::Error` to the IoError shape the agents see.
@@ -305,6 +305,15 @@ fn builtin_to_string(args: &[Value]) -> Result<Value, String> {
                 format!("{}::{}({})", enum_name, variant_name, parts.join(", "))
             }
         }
+        Value::Struct { name, .. } => {
+            return Err(format!(
+                "to_string on `{}` (a user `type` record) isn't supported \
+                 — Aperio has no auto-derived debug shape at v1. Either \
+                 access a primitive field (e.g. `to_string(x.id)`) or \
+                 render it explicitly via `std::json::Builder`",
+                name
+            ));
+        }
         other => {
             return Err(format!(
                 "`to_string` not supported for {}",
@@ -522,6 +531,10 @@ pub fn resolve_path(segments: &[&str]) -> Option<Value> {
         ["std", "str", "trim"] => Some(Value::Builtin(BuiltinRef {
             name: "std::str::trim",
             func: Rc::new(std_str_trim),
+        })),
+        ["std", "str", "substring"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::str::substring",
+            func: Rc::new(std_str_substring),
         })),
         ["std", "str", "replace"] => Some(Value::Builtin(BuiltinRef {
             name: "std::str::replace",
@@ -904,6 +917,34 @@ fn std_str_trim(args: &[Value]) -> Result<Value, String> {
     }
 }
 
+fn std_str_substring(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "std::str::substring expects 3 args (s, lo, hi), got {}",
+            args.len()
+        ));
+    }
+    let (s, lo, hi) = match (&args[0], &args[1], &args[2]) {
+        (Value::String(s), Value::Int(lo), Value::Int(hi)) => (s.as_bytes(), *lo, *hi),
+        (a, b, c) => {
+            return Err(format!(
+                "std::str::substring expects (String, Int, Int), got ({}, {}, {})",
+                a.type_name(),
+                b.type_name(),
+                c.type_name()
+            ));
+        }
+    };
+    let n = s.len() as i64;
+    let lo = if lo < 0 { 0 } else { lo };
+    let hi = if hi > n { n } else { hi };
+    if lo >= hi {
+        return Ok(Value::String(String::new()));
+    }
+    let slice = &s[lo as usize..hi as usize];
+    Ok(Value::String(String::from_utf8_lossy(slice).into_owned()))
+}
+
 fn std_str_repeat(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!(
@@ -1114,10 +1155,12 @@ fn std_str_parse_float(args: &[Value]) -> Result<Value, String> {
     match &args[0] {
         Value::String(s) => match s.parse::<f64>() {
             Ok(v) => Ok(Value::Float(v)),
-            // Match codegen contract: empty / non-numeric / partial
-            // tail returns 0.0 rather than an error, so callers can
-            // gate on can_parse_float and use a defaulting shape.
-            Err(_) => Ok(Value::Float(0.0)),
+            // 2026-05-17 — fallible. Empty / non-numeric / partial
+            // tail diverges via ParseError so the caller's `or`
+            // clause sees the input.
+            Err(_) => Ok(Value::FallibleErr(Box::new(parse_error_value(
+                "parse_float", s,
+            )))),
         },
         other => Err(format!(
             "std::str::parse_float expects String, got {}",
@@ -1567,9 +1610,15 @@ fn std_str_parse_int(args: &[Value]) -> Result<Value, String> {
             ))
         }
     };
-    // Permissive: strtoll-style. Leading whitespace + optional
-    // sign accepted; trailing garbage rejects to 0.
-    Ok(Value::Int(s.trim().parse::<i64>().unwrap_or(0)))
+    // 2026-05-17 — fallible. strtoll-ish parse: leading whitespace
+    // + optional sign accepted; trailing garbage diverges via
+    // ParseError so the caller's `or` clause sees the input.
+    match s.trim().parse::<i64>() {
+        Ok(n) => Ok(Value::Int(n)),
+        Err(_) => Ok(Value::FallibleErr(Box::new(parse_error_value(
+            "parse_int", s,
+        )))),
+    }
 }
 
 fn std_str_can_parse_int(args: &[Value]) -> Result<Value, String> {

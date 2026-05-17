@@ -113,10 +113,14 @@ fn main() {{
 
 #[test]
 fn str_parse_int_recognizes_int_and_garbage() {
+    // 2026-05-17 — parse_int returns Int fallible(ParseError).
+    // Substitute path on garbage yields 0; valid input yields 42.
     let src = r#"
 fn main() {
-    if std::str::parse_int("42") != 42 { return 1; }
-    if std::str::parse_int("garbage") != 0 { return 2; }
+    let a = std::str::parse_int("42") or -1;
+    if a != 42 { return 1; }
+    let b = std::str::parse_int("garbage") or 0;
+    if b != 0 { return 2; }
     if !std::str::can_parse_int("42") { return 3; }
     if std::str::can_parse_int("garbage") { return 4; }
     return 0;

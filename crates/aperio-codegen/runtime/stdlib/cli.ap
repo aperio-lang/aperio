@@ -112,7 +112,6 @@ locus __StdCliResolver {
     fn get_int(key: String, fallback: Int) -> Int {
         let s = self.get(key, "");
         if len(s) == 0 { return fallback; }
-        if !std::str::can_parse_int(s) { return fallback; }
-        return std::str::parse_int(s);
+        return std::str::parse_int(s) or fallback;
     }
 }

@@ -2846,6 +2846,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // declare ptr @lotus_str_upper(ptr s)
         self.module
             .add_function("lotus_str_upper", case_fold_ty, None);
+        // declare ptr @lotus_str_substring(ptr s, i64 lo, i64 hi)
+        let str_substring_ty = ptr_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_str_substring", str_substring_ty, None);
+
         // declare ptr @lotus_str_trim(ptr s)
         self.module
             .add_function("lotus_str_trim", case_fold_ty, None);
@@ -4426,6 +4434,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // (#68 — IoError flip). Mirror of the typecheck-side
         // injection alongside the other error types.
         self.declare_builtin_io_error_type();
+        // 2026-05-17 — `ParseError` payload for the
+        // `std::str::parse_int` / `parse_float` fallible flip.
+        self.declare_builtin_parse_error_type();
 
         // F.20: register interface declarations by name. The
         // codegen layer uses this in two places: signature lowering
@@ -5563,6 +5574,36 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         struct_ty.set_body(&llvm_field_tys, false);
         self.user_types.insert(
             "EmptyError".to_string(),
+            TypeInfo {
+                struct_ty,
+                fields,
+                field_order,
+                defaults: BTreeMap::new(),
+            },
+        );
+    }
+
+    /// 2026-05-17 — register the built-in `ParseError` record so
+    /// the fallible `std::str::parse_int` / `parse_float` codegen
+    /// wrappers can allocate it. Mirror of the resolver's
+    /// inject_form_stdlib_types ParseError entry. Fields:
+    ///   - kind: String ("parse_int" / "parse_float")
+    ///   - input: String (the offending input string)
+    fn declare_builtin_parse_error_type(&mut self) {
+        if self.user_types.contains_key("ParseError") {
+            return;
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let mut fields: BTreeMap<String, (u32, CodegenTy)> = BTreeMap::new();
+        fields.insert("kind".into(), (0, CodegenTy::String));
+        fields.insert("input".into(), (1, CodegenTy::String));
+        let field_order = vec!["kind".to_string(), "input".to_string()];
+        let llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
+            vec![ptr_t.into(), ptr_t.into()];
+        let struct_ty = self.context.opaque_struct_type("type.ParseError");
+        struct_ty.set_body(&llvm_field_tys, false);
+        self.user_types.insert(
+            "ParseError".to_string(),
             TypeInfo {
                 struct_ty,
                 fields,
@@ -11011,6 +11052,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "bytes", "at"] => Ok(Some(
                 self.lower_std_bytes_at_fallible(args, scope)?,
             )),
+            ["std", "str", "parse_int"] => Ok(Some(
+                self.lower_std_str_parse_int_fallible(args, scope)?,
+            )),
+            ["std", "str", "parse_float"] => Ok(Some(
+                self.lower_std_str_parse_float_fallible(args, scope)?,
+            )),
             // Known stdlib paths that AREN'T fallible — surface a
             // focused diagnostic instead of "unknown path call".
             // Each name here is a path-call that returns a value
@@ -11022,14 +11069,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "str", "lower"]
             | ["std", "str", "upper"]
             | ["std", "str", "trim"]
+            | ["std", "str", "substring"]
             | ["std", "str", "replace"]
             | ["std", "str", "repeat"]
             | ["std", "str", "pad_left"]
             | ["std", "str", "pad_right"]
             | ["std", "str", "index_of"]
-            | ["std", "str", "parse_int"]
             | ["std", "str", "can_parse_int"]
-            | ["std", "str", "parse_float"]
             | ["std", "str", "can_parse_float"]
             | ["std", "str", "builder_new"]
             | ["std", "str", "builder_append"]
@@ -11269,6 +11315,270 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             success_ty: success_ty_opt,
             payload_ty,
         })
+    }
+
+    /// 2026-05-17 — analog of `complete_io_fallible_call` for
+    /// `std::str::parse_int` / `parse_float`. Difference: the err
+    /// payload is `ParseError { kind, input }` instead of IoError.
+    /// Caller provides the kind tag string + input pointer.
+    fn complete_parse_fallible_call(
+        &mut self,
+        is_err: IntValue<'ctx>,
+        input_str_ptr: BasicValueEnum<'ctx>,
+        kind_tag: &str,
+        success_value: Option<(BasicValueEnum<'ctx>, CodegenTy)>,
+        label: &str,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        let payload_ty = CodegenTy::TypeRef("ParseError".to_string());
+        let out_err_slot = self.alloca_for(
+            &payload_ty,
+            &format!("{}.out_err.slot", label),
+        )?;
+        let (out_val_slot_opt, success_ty_opt) = match &success_value {
+            Some((_, ty)) => (
+                Some(self.alloca_for(
+                    ty,
+                    &format!("{}.out_val.slot", label),
+                )?),
+                Some(ty.clone()),
+            ),
+            None => (None, None),
+        };
+
+        let func = self
+            .current_fn
+            .expect("fallible-stdlib-path call inside fn body");
+        let lazy_err_bb = self.context.append_basic_block(
+            func,
+            &format!("{}.lazy_err", label),
+        );
+        let store_ok_bb = self.context.append_basic_block(
+            func,
+            &format!("{}.store_ok", label),
+        );
+        let join_bb = self.context.append_basic_block(
+            func,
+            &format!("{}.join", label),
+        );
+
+        self.builder
+            .build_conditional_branch(is_err, lazy_err_bb, store_ok_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // err path: build ParseError, store in out_err_slot.
+        self.builder.position_at_end(lazy_err_bb);
+        let pe_ptr = self.emit_parse_error_alloc(input_str_ptr, kind_tag)?;
+        self.builder
+            .build_store(out_err_slot, pe_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // ok path: store the success value (if any).
+        self.builder.position_at_end(store_ok_bb);
+        if let (Some(out_val_slot), Some((val, _))) =
+            (out_val_slot_opt, &success_value)
+        {
+            self.builder
+                .build_store(out_val_slot, *val)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(join_bb);
+        Ok(FallibleCallResult {
+            i1_path: is_err,
+            out_val_slot: out_val_slot_opt,
+            out_err_slot,
+            success_ty: success_ty_opt,
+            payload_ty,
+        })
+    }
+
+    /// Allocate a `ParseError { kind, input }` in the current
+    /// arena, populate, return pointer.
+    fn emit_parse_error_alloc(
+        &mut self,
+        input_str_ptr: BasicValueEnum<'ctx>,
+        kind_tag: &str,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let info = self
+            .user_types
+            .get("ParseError")
+            .cloned()
+            .expect("ParseError declared by declare_builtin_parse_error_type");
+        let size = info
+            .struct_ty
+            .size_of()
+            .expect("ParseError has known size");
+        let alloc_ptr = self.arena_alloc(size, "ParseError.alloc")?;
+
+        let kind_ptr = self.global_string(kind_tag);
+        let (kind_idx, _) = info
+            .fields
+            .get("kind")
+            .cloned()
+            .expect("ParseError.kind field");
+        let kind_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                kind_idx,
+                "ParseError.kind.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(kind_field_ptr, kind_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let (input_idx, _) = info
+            .fields
+            .get("input")
+            .cloned()
+            .expect("ParseError.input field");
+        let input_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                input_idx,
+                "ParseError.input.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(input_field_ptr, input_str_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        Ok(alloc_ptr)
+    }
+
+    /// 2026-05-17 — `std::str::parse_int(s) -> Int
+    /// fallible(ParseError)`. Composes `lotus_str_can_parse_int`
+    /// (success predicate) with `lotus_str_parse_int` (value
+    /// extractor) so the err arm fires when the input isn't
+    /// parseable.
+    fn lower_std_str_parse_int_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::parse_int takes 1 arg (s), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::parse_int: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let can_fn = self
+            .module
+            .get_function("lotus_str_can_parse_int")
+            .expect("lotus_str_can_parse_int declared");
+        let can_i32 = self
+            .builder
+            .build_call(can_fn, &[s_val.into()], "parse_int.can")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                can_i32,
+                self.context.i32_type().const_zero(),
+                "parse_int.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let parse_fn = self
+            .module
+            .get_function("lotus_str_parse_int")
+            .expect("lotus_str_parse_int declared");
+        let value_i64 = self
+            .builder
+            .build_call(parse_fn, &[s_val.into()], "parse_int.value")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        self.complete_parse_fallible_call(
+            is_err,
+            s_val,
+            "parse_int",
+            Some((value_i64, CodegenTy::Int)),
+            "str.parse_int",
+        )
+    }
+
+    /// 2026-05-17 — `std::str::parse_float(s) -> Float
+    /// fallible(ParseError)`. Same shape as parse_int_fallible.
+    fn lower_std_str_parse_float_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::parse_float takes 1 arg (s), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::parse_float: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let can_fn = self
+            .module
+            .get_function("lotus_str_can_parse_float")
+            .expect("lotus_str_can_parse_float declared");
+        let can_i32 = self
+            .builder
+            .build_call(can_fn, &[s_val.into()], "parse_float.can")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                can_i32,
+                self.context.i32_type().const_zero(),
+                "parse_float.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let parse_fn = self
+            .module
+            .get_function("lotus_str_parse_float")
+            .expect("lotus_str_parse_float declared");
+        let value_f64 = self
+            .builder
+            .build_call(parse_fn, &[s_val.into()], "parse_float.value")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns f64");
+        self.complete_parse_fallible_call(
+            is_err,
+            s_val,
+            "parse_float",
+            Some((value_f64, CodegenTy::Float)),
+            "str.parse_float",
+        )
     }
 
     /// `std::io::fs::read_file(path) -> String fallible(IoError)`.
@@ -14968,6 +15278,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 self.lower_enum_with_payload_to_string(&info, &enum_name, v)
             }
+            CodegenTy::TypeRef(name) => Err(CodegenError::Unsupported(format!(
+                "to_string on `{}` (a user `type` record) isn't supported \
+                 — Aperio has no auto-derived debug shape at v1. Either \
+                 access a primitive field (e.g. `to_string(x.id)`) or \
+                 render it explicitly via `std::json::Builder`",
+                name
+            ))),
+            CodegenTy::LocusRef(name) => Err(CodegenError::Unsupported(format!(
+                "to_string on `{}` (a locus value) isn't supported — \
+                 locus state has no canonical text form. Access a specific \
+                 field (e.g. `to_string(x.field)`)",
+                name
+            ))),
             other => Err(CodegenError::Unsupported(format!(
                 "`to_string` not supported for type {:?}",
                 other
@@ -18949,14 +19272,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_index_of(args, scope)?;
                 Ok(())
             }
-            ["std", "str", "parse_int"] => {
-                let _ = self.lower_std_str_parse_int(args, scope)?;
-                Ok(())
-            }
-            ["std", "str", "parse_float"] => {
-                let _ = self.lower_std_str_parse_float(args, scope)?;
-                Ok(())
-            }
             ["std", "str", "can_parse_float"] => {
                 let _ = self.lower_std_str_can_parse_float(args, scope)?;
                 Ok(())
@@ -18971,6 +19286,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "trim"] => {
                 let _ = self.lower_std_str_case_fold(args, scope, "trim")?;
+                Ok(())
+            }
+            ["std", "str", "substring"] => {
+                let _ = self.lower_std_str_substring(args, scope)?;
                 Ok(())
             }
             ["std", "str", "replace"] => {
@@ -19415,12 +19734,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "str", "index_of"] => {
                 self.lower_std_str_index_of(args, scope)
             }
-            ["std", "str", "parse_int"] => {
-                self.lower_std_str_parse_int(args, scope)
-            }
-            ["std", "str", "parse_float"] => {
-                self.lower_std_str_parse_float(args, scope)
-            }
             ["std", "str", "can_parse_float"] => {
                 self.lower_std_str_can_parse_float(args, scope)
             }
@@ -19432,6 +19745,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "trim"] => {
                 self.lower_std_str_case_fold(args, scope, "trim")
+            }
+            ["std", "str", "substring"] => {
+                self.lower_std_str_substring(args, scope)
             }
             ["std", "str", "replace"] => {
                 self.lower_std_str_replace(args, scope)
@@ -19662,6 +19978,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "text", "is_word_char"] => {
                 self.lower_std_text_byte_pred("is_word_char", args, scope)
+            }
+            // 2026-05-17 — parse_int / parse_float are fallible-
+            // only at the expression dispatch; surface a clear
+            // "this returns fallible" diagnostic when the caller
+            // forgets the `or` clause. (Other fallible-flipped
+            // paths like fs::read_file still have a non-fallible
+            // expression-dispatch sibling for legacy reasons —
+            // this arm doesn't shadow them.)
+            ["std", "str", "parse_int"] | ["std", "str", "parse_float"] => {
+                Err(CodegenError::Unsupported(format!(
+                    "`{}` returns a fallible value — address the error with \
+                     `or raise`, `or <substitute>`, or `or self.handle(err)`",
+                    segs.join("::")
+                )))
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "stdlib path `{}` in expression position — not implemented",
@@ -20161,39 +20491,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// returns 0 on parse failure or empty input. Disambiguate
     /// via `std::str::can_parse_int` if needed. Strict trailing-
     /// char check — "42abc" rejects, returns 0.
-    fn lower_std_str_parse_int(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::str::parse_int takes 1 arg (s), got {}",
-                args.len()
-            )));
-        }
-        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
-            return Err(CodegenError::Unsupported(format!(
-                "std::str::parse_int: s must be String, got {:?}",
-                s_ty
-            )));
-        }
-        let f = self
-            .module
-            .get_function("lotus_str_parse_int")
-            .expect("lotus_str_parse_int declared");
-        let call = self
-            .builder
-            .build_call(f, &[s_val.into()], "parse.int.ret")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let v = call
-            .try_as_basic_value()
-            .left()
-            .expect("returns i64");
-        Ok((v, CodegenTy::Int))
-    }
-
     /// Lower `std::str::index_of(s: String, sub: String) -> Int`.
     /// Returns the byte index of the first occurrence of `sub` in
     /// `s`, or -1 when `sub` doesn't appear. Empty needle returns
@@ -20290,42 +20587,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok((ret_bool.into(), CodegenTy::Bool))
     }
 
-    /// v1.x-16: `std::str::parse_float(s: String) -> Float`. Strict
-    /// trailing-NUL parse; empty / non-numeric / partial-tail inputs
-    /// return 0.0. Disambiguate via `std::str::can_parse_float`.
-    fn lower_std_str_parse_float(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::str::parse_float takes 1 arg (s), got {}",
-                args.len()
-            )));
-        }
-        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
-            return Err(CodegenError::Unsupported(format!(
-                "std::str::parse_float: s must be String, got {:?}",
-                s_ty
-            )));
-        }
-        let f = self
-            .module
-            .get_function("lotus_str_parse_float")
-            .expect("lotus_str_parse_float declared");
-        let call = self
-            .builder
-            .build_call(f, &[s_val.into()], "parse.float.ret")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let v = call
-            .try_as_basic_value()
-            .left()
-            .expect("returns f64");
-        Ok((v, CodegenTy::Float))
-    }
-
     /// v1.x: `std::str::lower(s)` / `std::str::upper(s)` (ASCII
     /// case folding) and `std::str::trim(s)` (whitespace strip).
     /// All take one String, return a new String in the bus
@@ -20373,6 +20634,60 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .try_as_basic_value()
             .left()
             .expect("returns ptr");
+        Ok((v, CodegenTy::String))
+    }
+
+    /// 2026-05-17: `std::str::substring(s, lo, hi) -> String`.
+    /// Byte-indexed slice over a String. Same shape as the
+    /// compose `std::str::from_bytes(std::bytes::slice(
+    /// std::bytes::from_string(s), lo, hi))` but one call.
+    /// Negative lo / hi past end / inverted bounds collapse to
+    /// "". Result lives in the global payload arena.
+    fn lower_std_str_substring(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::substring takes 3 args (s, lo, hi), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if s_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::substring: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let (lo_val, lo_ty) = self.lower_expr(&args[1], scope)?;
+        if lo_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::substring: lo must be Int, got {:?}",
+                lo_ty
+            )));
+        }
+        let (hi_val, hi_ty) = self.lower_expr(&args[2], scope)?;
+        if hi_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::substring: hi must be Int, got {:?}",
+                hi_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_str_substring")
+            .expect("lotus_str_substring declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[s_val.into(), lo_val.into(), hi_val.into()],
+                "str.substring.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call.try_as_basic_value().left().expect("returns ptr");
         Ok((v, CodegenTy::String))
     }
 

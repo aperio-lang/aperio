@@ -38,7 +38,7 @@ fn main() {
     // ---- resolve port (argv[1] > default) ----
     let mut port: Int = 9876;
     if std::env::args_count() > 1 {
-        let parsed = std::str::parse_int(std::env::arg(1));
+        let parsed = std::str::parse_int(std::env::arg(1)) or 0;
         if parsed > 0 {
             port = parsed;
         }

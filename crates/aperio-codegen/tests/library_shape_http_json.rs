@@ -252,7 +252,7 @@ fn http_handler_state_persists_across_dispatches() {
         fn poke(h: std::http::Handler) -> Int {
             let req = std::http::Request { method: "GET", path: "/", version: "", headers: "", body: "" };
             let r = h.handle(req);
-            return std::str::parse_int(r.body);
+            return std::str::parse_int(r.body) or raise;
         }
         fn main() {
             let c = Counter { };

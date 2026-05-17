@@ -4531,6 +4531,20 @@ pub(crate) fn io_error_value(kind: &str, errno: i64, path: &str) -> Value {
     }
 }
 
+/// 2026-05-17 — analog of `io_error_value` for the fallible
+/// `std::str::parse_int` / `parse_float` paths. Same `kind +
+/// input` shape as the codegen-side ParseError struct so agents
+/// pattern-match identically on both paths.
+pub(crate) fn parse_error_value(kind: &str, input: &str) -> Value {
+    let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+    fields.insert("kind".to_string(), Value::String(kind.to_string()));
+    fields.insert("input".to_string(), Value::String(input.to_string()));
+    Value::Struct {
+        name: "ParseError".to_string(),
+        fields: Rc::new(RefCell::new(fields)),
+    }
+}
+
 /// v1.x-FORM-4 PR6: extract the indexed-by field from a struct
 /// value at `set` call time. Returns `None` when the value isn't
 /// a struct or doesn't carry the named field — both of which

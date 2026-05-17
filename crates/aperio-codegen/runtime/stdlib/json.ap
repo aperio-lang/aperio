@@ -18,7 +18,36 @@
 // correct for current consumers. The hook exists so a future
 // escaping pass lands without touching every call site.
 locus __StdJsonBuilder {
-    params { }
+    // 2026-05-17 — Builder now supports two styles, sharing
+    // state on one locus:
+    //
+    //   1. **Wrapping** (original v0 shape) — `append_entry` /
+    //      `wrap_object` / `wrap_array` / `build_array` build a
+    //      single expression by hand. Good for one-liners.
+    //
+    //   2. **Streaming** — `begin_object` / `field` / `end_object`
+    //      mutate `self.buf` directly, matching the shape
+    //      familiar from Go's `json.Encoder`, Rust's
+    //      `serde_json::ser`, JS's `JSON.stringify`. Best for
+    //      programs assembling a payload across multiple
+    //      branches/loops. Finish with `self.result()` to read
+    //      the accumulated JSON.
+    //
+    // The two styles can be mixed (e.g. `field` value can come
+    // from `wrap_array` over a pre-built CSV); pick whichever
+    // matches the call-site shape.
+    //
+    // Streaming state:
+    //   - `buf`  — accumulated wire bytes.
+    //   - `ctx`  — open-scope stack, one char per open scope:
+    //              `o` = empty object, `O` = object with at
+    //              least one field, `a` / `A` = array variants.
+    //              Lets `field` / `value` know whether to emit
+    //              a leading ", " separator.
+    params {
+        buf: String = "";
+        ctx: String = "";
+    }
 
     // Append `entry` to `arr`, prefixing with ", " when `arr`
     // already has content. Returns the new accumulator.
@@ -81,6 +110,125 @@ locus __StdJsonBuilder {
             inner = self.append_entry(inner, self.quote(line));
         }
         return self.wrap_array(inner);
+    }
+
+    // ===== streaming API ============================================
+
+    // If we're inside a non-empty container, emit ", " so the
+    // next field/value reads as a sibling. Then mark the
+    // current container as non-empty (uppercase top char).
+    fn __bump_separator() {
+        let n = len(self.ctx);
+        if n == 0 { return; }
+        let top = self.ctx[(n - 1)..n];
+        if top == "O" || top == "A" {
+            self.buf = self.buf + ", ";
+        } else {
+            // empty container becomes non-empty after this write.
+            let upper = if top == "o" { "O" } else { "A" };
+            self.ctx = std::str::substring(self.ctx, 0, n - 1) + upper;
+        }
+    }
+
+    // Open an object. Emits "{" and pushes `o` onto the ctx
+    // stack so subsequent field calls know to insert "" rather
+    // than ", " before the first field.
+    fn begin_object() {
+        self.__bump_separator();
+        self.buf = self.buf + "{";
+        self.ctx = self.ctx + "o";
+    }
+
+    // Close the most recently opened object. The caller is
+    // responsible for keeping begin/end balanced; mismatched
+    // close at v1 just emits "}" and leaves ctx stack as-is.
+    fn end_object() {
+        self.buf = self.buf + "}";
+        let n = len(self.ctx);
+        if n > 0 {
+            self.ctx = std::str::substring(self.ctx, 0, n - 1);
+        }
+    }
+
+    // Open an array. Mirror of begin_object with "[" / 'a'.
+    fn begin_array() {
+        self.__bump_separator();
+        self.buf = self.buf + "[";
+        self.ctx = self.ctx + "a";
+    }
+
+    // Close the most recently opened array.
+    fn end_array() {
+        self.buf = self.buf + "]";
+        let n = len(self.ctx);
+        if n > 0 {
+            self.ctx = std::str::substring(self.ctx, 0, n - 1);
+        }
+    }
+
+    // Inside an object: emit `"name": value`. `value` is the raw
+    // wire bytes (already quoted / formatted). For the common
+    // shapes use the typed helpers below.
+    fn field(name: String, value: String) {
+        self.__bump_separator();
+        self.buf = self.buf + self.quote(name) + ": " + value;
+    }
+
+    // Typed field helpers. Each call writes one object field
+    // with the right wire shape — string fields are quoted +
+    // escaped, ints / bools render directly.
+    fn string_field(name: String, value: String) {
+        self.field(name, self.quote(value));
+    }
+    fn int_field(name: String, value: Int) {
+        self.field(name, to_string(value));
+    }
+    fn bool_field(name: String, value: Bool) {
+        let s: String = if value { "true" } else { "false" };
+        self.field(name, s);
+    }
+    fn null_field(name: String) {
+        self.field(name, "null");
+    }
+
+    // Open a nested object as a field on the current object.
+    // Equivalent to `field(name, ...)` where `...` is built
+    // with subsequent streaming calls then closed by
+    // `end_object`. Pairs as
+    //   `begin_object_field(name); ... ; end_object();`.
+    fn begin_object_field(name: String) {
+        self.__bump_separator();
+        self.buf = self.buf + self.quote(name) + ": {";
+        self.ctx = self.ctx + "o";
+    }
+
+    // Open a nested array as a field on the current object.
+    // Pairs with `end_array`.
+    fn begin_array_field(name: String) {
+        self.__bump_separator();
+        self.buf = self.buf + self.quote(name) + ": [";
+        self.ctx = self.ctx + "a";
+    }
+
+    // Inside an array: emit one element. Mirror of `field` for
+    // arrays — no name, just the value.
+    fn value(v: String) {
+        self.__bump_separator();
+        self.buf = self.buf + v;
+    }
+    fn string_value(s: String) { self.value(self.quote(s)); }
+    fn int_value(n: Int)       { self.value(to_string(n)); }
+    fn bool_value(b: Bool) {
+        let s: String = if b { "true" } else { "false" };
+        self.value(s);
+    }
+    fn null_value() { self.value("null"); }
+
+    // Read the accumulated wire bytes. Doesn't reset state, so
+    // a Builder is "snapshot the wire so far" — callers that
+    // want a fresh start instantiate a new Builder.
+    fn result() -> String {
+        return self.buf;
     }
 }
 
@@ -277,7 +425,7 @@ fn __json_find_string_field(json: String, name: String) -> String {
 fn __json_find_int_field(json: String, name: String) -> Int {
     let raw = __json_find_field_raw(json, name);
     if len(raw) == 0 { return 0; }
-    return std::str::parse_int(raw);
+    return std::str::parse_int(raw) or 0;
 }
 
 fn __json_find_bool_field(json: String, name: String) -> Bool {

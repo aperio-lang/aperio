@@ -23,9 +23,11 @@ fn build_and_run(name: &str, source: &str) -> (String, std::process::ExitStatus)
 
 #[test]
 fn parse_float_basic() {
+    // 2026-05-17 — parse_float returns Float fallible(ParseError);
+    // known-valid input uses `or raise`.
     let src = r#"
         fn main() {
-            let f = std::str::parse_float("3.14159");
+            let f = std::str::parse_float("3.14159") or raise;
             println(f);
         }
     "#;
@@ -35,10 +37,12 @@ fn parse_float_basic() {
 }
 
 #[test]
-fn parse_float_returns_zero_on_failure() {
+fn parse_float_err_arm_substitutes_zero_on_failure() {
+    // Garbage input routes through the err arm rather than
+    // returning 0.0 silently. Use `or 0.0` substitute.
     let src = r#"
         fn main() {
-            let f = std::str::parse_float("not a number");
+            let f = std::str::parse_float("not a number") or 0.0;
             println(f);
         }
     "#;
@@ -68,8 +72,8 @@ fn can_parse_float_discriminates() {
 fn parse_float_round_trip_through_arithmetic() {
     let src = r#"
         fn main() {
-            let a = std::str::parse_float("2.5");
-            let b = std::str::parse_float("1.5");
+            let a = std::str::parse_float("2.5") or raise;
+            let b = std::str::parse_float("1.5") or raise;
             let s = a + b;
             println(s);
         }

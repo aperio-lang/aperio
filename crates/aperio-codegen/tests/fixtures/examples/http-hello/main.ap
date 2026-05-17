@@ -51,7 +51,7 @@ fn handle_request(s: std::io::tcp::Stream) {
 fn main() {
     let mut port: Int = 8080;
     if std::env::args_count() > 1 {
-        let parsed = std::str::parse_int(std::env::arg(1));
+        let parsed = std::str::parse_int(std::env::arg(1)) or 0;
         if parsed > 0 {
             port = parsed;
         }
@@ -59,7 +59,7 @@ fn main() {
 
     let mut max_accepts: Int = -1;
     if std::env::args_count() > 2 {
-        let parsed = std::str::parse_int(std::env::arg(2));
+        let parsed = std::str::parse_int(std::env::arg(2)) or 0;
         if parsed > 0 {
             max_accepts = parsed;
         }
