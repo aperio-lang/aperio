@@ -491,6 +491,32 @@ pub fn time_monotonic(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Duration(ns))
 }
 
+/// C7 (pond follow-up): `time::now()` — wall-clock seconds since
+/// the Unix epoch as `Int`. Wraps `clock_gettime(CLOCK_REALTIME,
+/// &ts)` and returns `ts.tv_sec`. Observation only — NTP slewing
+/// and leap seconds can warp the value, so `time::monotonic`
+/// stays the basis for scheduling. Pond surfaces this for
+/// session-cookie expiries that must survive a process restart
+/// (the monotonic origin resets at boot; the wall-clock origin
+/// does not).
+pub fn time_now(args: &[Value]) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "time::now takes no arguments, got {}",
+            args.len()
+        ));
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    if r != 0 {
+        return Err(format!(
+            "clock_gettime(CLOCK_REALTIME) failed: errno {}",
+            r
+        ));
+    }
+    Ok(Value::Int(ts.tv_sec as i64))
+}
+
 pub fn resolve_path(segments: &[&str]) -> Option<Value> {
     match segments {
         // Canonical `std::time::*` paths (matches the codegen
@@ -504,6 +530,14 @@ pub fn resolve_path(segments: &[&str]) -> Option<Value> {
         ["std", "time", "monotonic"] | ["time", "monotonic"] => Some(Value::Builtin(BuiltinRef {
             name: "time::monotonic",
             func: Rc::new(time_monotonic),
+        })),
+        // C7 (pond follow-up): wall-clock seconds-since-epoch.
+        // Mirrors the codegen-side `std::time::now` path-call
+        // dispatch. No legacy bare-`time::now` alias because the
+        // surface ships fresh under the canonical `std::*` prefix.
+        ["std", "time", "now"] => Some(Value::Builtin(BuiltinRef {
+            name: "time::now",
+            func: Rc::new(time_now),
         })),
         // v1.x-16: parse_float / can_parse_float / base64::decode.
         // String-parsing primitives (interpreter parity with codegen).
@@ -642,6 +676,19 @@ pub fn resolve_path(segments: &[&str]) -> Option<Value> {
         ["std", "io", "fs", "mkdir"] => Some(Value::Builtin(BuiltinRef {
             name: "std::io::fs::mkdir",
             func: Rc::new(std_io_fs_mkdir),
+        })),
+        // C9 (pond/logfmt + pond/agent/sandbox).
+        ["std", "io", "fs", "rename"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::io::fs::rename",
+            func: Rc::new(std_io_fs_rename),
+        })),
+        ["std", "io", "fs", "unlink"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::io::fs::unlink",
+            func: Rc::new(std_io_fs_unlink),
+        })),
+        ["std", "io", "fs", "mktemp"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::io::fs::mktemp",
+            func: Rc::new(std_io_fs_mktemp),
         })),
         // str — the parse_int family (used in CLI argument
         // parsing).
@@ -1590,6 +1637,126 @@ fn std_io_fs_mkdir(args: &[Value]) -> Result<Value, String> {
         Ok(_) => Ok(Value::Unit),
         Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, path)))),
     }
+}
+
+// C9 (pond/logfmt rotation): rename src → dst. Same diagnostic-
+// path convention as codegen: the IoError.path field carries
+// `dst` because the destination is the more diagnostic of the
+// two on the common failure modes.
+fn std_io_fs_rename(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "std::io::fs::rename takes 2 args (src, dst), got {}",
+            args.len()
+        ));
+    }
+    let src = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(format!(
+                "std::io::fs::rename: src must be String, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let dst = match &args[1] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(format!(
+                "std::io::fs::rename: dst must be String, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    match std::fs::rename(&src, &dst) {
+        Ok(_) => Ok(Value::Unit),
+        Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, &dst)))),
+    }
+}
+
+// C9 (pond/logfmt rotation): unlink path. POSIX unlink(2) on
+// regular files / symlinks; EISDIR on a directory.
+fn std_io_fs_unlink(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "std::io::fs::unlink takes 1 arg (path), got {}",
+            args.len()
+        ));
+    }
+    let path = match &args[0] {
+        Value::String(s) => s,
+        other => {
+            return Err(format!(
+                "std::io::fs::unlink: path must be String, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    match std::fs::remove_file(path) {
+        Ok(_) => Ok(Value::Unit),
+        Err(e) => Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, path)))),
+    }
+}
+
+// C9 (pond/agent/sandbox): race-free tempfile path allocator.
+// Assembles prefix + "XXXXXX" + suffix, calls mkstemps(3) via
+// libc, closes the fd, returns the path. Caller owns cleanup.
+// IoError.path on failure is the assembled template.
+fn std_io_fs_mktemp(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "std::io::fs::mktemp takes 2 args (prefix, suffix), got {}",
+            args.len()
+        ));
+    }
+    let prefix = match &args[0] {
+        Value::String(s) => s.as_str(),
+        other => {
+            return Err(format!(
+                "std::io::fs::mktemp: prefix must be String, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let suffix = match &args[1] {
+        Value::String(s) => s.as_str(),
+        other => {
+            return Err(format!(
+                "std::io::fs::mktemp: suffix must be String, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    let template = format!("{}XXXXXX{}", prefix, suffix);
+    // mkstemps needs a writable C string with the XXXXXX template.
+    let mut buf: Vec<u8> = template.as_bytes().to_vec();
+    buf.push(0);
+    let suffix_len = suffix.len() as libc::c_int;
+    let fd = unsafe {
+        libc::mkstemps(buf.as_mut_ptr() as *mut libc::c_char, suffix_len)
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, &template))));
+    }
+    unsafe { libc::close(fd) };
+    // mkstemps mutated buf in place — pull the path back out
+    // (drop the trailing NUL).
+    buf.pop();
+    let path = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(_) => {
+            // Pathological — POSIX paths are bytes, the substituted
+            // X's are alphanumeric, so as long as prefix+suffix are
+            // valid UTF-8 the result is too. Map to invalid.
+            let e = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mktemp produced non-UTF-8 path",
+            );
+            return Ok(Value::FallibleErr(Box::new(io_error_from_std(&e, &template))));
+        }
+    };
+    Ok(Value::String(path))
 }
 
 // === str parsing =============================================

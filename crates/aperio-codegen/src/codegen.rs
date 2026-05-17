@@ -2841,6 +2841,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_rand_next_int", rand_next_ty, None);
 
+        // C7 (pond follow-up): wall-clock seconds since the Unix
+        // epoch. Backs `std::time::now() -> Int`. Thin wrapper
+        // around clock_gettime(CLOCK_REALTIME, &ts) in
+        // lotus_arena.c — kept as a named C primitive (rather than
+        // inlining like `time::monotonic` does) so the spec's
+        // `lotus_time_now_seconds` symbol is observable from the
+        // linked object.
+        // declare i64 @lotus_time_now_seconds()
+        let time_now_seconds_ty = i64_t.fn_type(&[], false);
+        self.module.add_function(
+            "lotus_time_now_seconds",
+            time_now_seconds_ty,
+            None,
+        );
+
         // Phase 2e: list_dir index API. count + at over the
         // cached newline-blob; both share the global payload arena.
         // declare i64 @lotus_fs_list_dir_count(ptr path)
@@ -2898,6 +2913,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let fs_mkdir_ty = i32_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_fs_mkdir", fs_mkdir_ty, None);
+
+        // C9 (pond/logfmt rotation):
+        // declare i32 @lotus_fs_rename(ptr src, ptr dst)
+        // Returns 0 on success, -1 on error (errno set).
+        let fs_rename_ty =
+            i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_rename", fs_rename_ty, None);
+
+        // C9 (pond/logfmt rotation):
+        // declare i32 @lotus_fs_unlink(ptr path)
+        // Returns 0 on success, -1 on error (errno set).
+        let fs_unlink_ty = i32_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_unlink", fs_unlink_ty, None);
+
+        // C9 (pond/agent/sandbox):
+        // declare ptr @lotus_fs_mktemp(ptr prefix, ptr suffix)
+        // mkstemps(3) wrapper. Returns an arena-anchored path
+        // string on success, NULL on error (errno set). Same
+        // String-fallible shape as lotus_fs_read_file.
+        let fs_mktemp_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_fs_mktemp", fs_mktemp_ty, None);
 
         // declare i64 @lotus_fs_file_size(ptr path)
         // returns size or -1.
@@ -11553,6 +11593,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "fs", "mkdir"] => Ok(Some(
                 self.lower_std_io_fs_mkdir_fallible(args, scope)?,
             )),
+            // C9 (pond/logfmt + pond/agent/sandbox).
+            ["std", "io", "fs", "rename"] => Ok(Some(
+                self.lower_std_io_fs_rename_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "unlink"] => Ok(Some(
+                self.lower_std_io_fs_unlink_fallible(args, scope)?,
+            )),
+            ["std", "io", "fs", "mktemp"] => Ok(Some(
+                self.lower_std_io_fs_mktemp_fallible(args, scope)?,
+            )),
             ["std", "io", "fs", "list_dir_count"] => Ok(Some(
                 self.lower_std_io_fs_list_dir_count_fallible(args, scope)?,
             )),
@@ -12442,6 +12492,218 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         self.complete_io_fallible_call(is_err, path_val, None, "fs.mkdir")
+    }
+
+    /// C9: `std::io::fs::rename(src, dst) -> () fallible(IoError)`.
+    /// Anchors the IoError.path to `dst` because the destination is
+    /// the more diagnostic of the two on the common failure modes
+    /// (target dir missing, target already a non-empty dir,
+    /// cross-fs EXDEV).
+    fn lower_std_io_fs_rename_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::rename takes 2 args (src, dst), got {}",
+                args.len()
+            )));
+        }
+        let (src_val, src_ty) = self.lower_expr(&args[0], scope)?;
+        if src_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::rename: src must be String, got {:?}",
+                src_ty
+            )));
+        }
+        let (dst_val, dst_ty) = self.lower_expr(&args[1], scope)?;
+        if dst_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::rename: dst must be String, got {:?}",
+                dst_ty
+            )));
+        }
+        let rename_fn = self
+            .module
+            .get_function("lotus_fs_rename")
+            .expect("lotus_fs_rename declared");
+        let ret = self
+            .builder
+            .build_call(
+                rename_fn,
+                &[src_val.into(), dst_val.into()],
+                "rename.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret,
+                self.context.i32_type().const_zero(),
+                "rename.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Diagnostic-path is the destination — see fn doc.
+        self.complete_io_fallible_call(is_err, dst_val, None, "fs.rename")
+    }
+
+    /// C9: `std::io::fs::unlink(path) -> () fallible(IoError)`.
+    fn lower_std_io_fs_unlink_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::unlink takes 1 arg (path), got {}",
+                args.len()
+            )));
+        }
+        let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
+        if path_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::unlink: path must be String, got {:?}",
+                path_ty
+            )));
+        }
+        let unlink_fn = self
+            .module
+            .get_function("lotus_fs_unlink")
+            .expect("lotus_fs_unlink declared");
+        let ret = self
+            .builder
+            .build_call(unlink_fn, &[path_val.into()], "unlink.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret,
+                self.context.i32_type().const_zero(),
+                "unlink.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(is_err, path_val, None, "fs.unlink")
+    }
+
+    /// C9: `std::io::fs::mktemp(prefix, suffix) -> String fallible(IoError)`.
+    /// Wraps mkstemps(3). Returns an arena-anchored path; caller
+    /// owns cleanup. NULL pointer => error. The IoError.path field
+    /// is the assembled `prefix + "XXXXXX" + suffix` template so
+    /// agents can see which prefix/dir failed.
+    fn lower_std_io_fs_mktemp_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::mktemp takes 2 args (prefix, suffix), got {}",
+                args.len()
+            )));
+        }
+        let (prefix_val, prefix_ty) = self.lower_expr(&args[0], scope)?;
+        if prefix_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::mktemp: prefix must be String, got {:?}",
+                prefix_ty
+            )));
+        }
+        let (suffix_val, suffix_ty) = self.lower_expr(&args[1], scope)?;
+        if suffix_ty != CodegenTy::String {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::fs::mktemp: suffix must be String, got {:?}",
+                suffix_ty
+            )));
+        }
+        // Compose the IoError.path string at call time:
+        //   prefix + "XXXXXX" + suffix
+        // The runtime mktemp builds the same shape; we reproduce
+        // it here so the agent sees the template that failed
+        // (not just the bare prefix or suffix). Anchored in the
+        // current arena — only consumed on the err path, but
+        // arena lifetime matches that of the surrounding fn so
+        // it outlives any error-handler call site.
+        let arena_ptr = self.current_arena_ptr()?;
+        let xxx_ptr = self
+            .builder
+            .build_global_string_ptr("XXXXXX", "mktemp.xxx")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
+        let concat_fn = self
+            .module
+            .get_function("lotus_str_concat")
+            .expect("lotus_str_concat declared");
+        let tmp1 = self
+            .builder
+            .build_call(
+                concat_fn,
+                &[arena_ptr.into(), prefix_val.into(), xxx_ptr.into()],
+                "mktemp.tpl.lhs",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        let template_path = self
+            .builder
+            .build_call(
+                concat_fn,
+                &[arena_ptr.into(), tmp1.into(), suffix_val.into()],
+                "mktemp.tpl",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        let mktemp_fn = self
+            .module
+            .get_function("lotus_fs_mktemp")
+            .expect("lotus_fs_mktemp declared");
+        let result_ptr = self
+            .builder
+            .build_call(
+                mktemp_fn,
+                &[prefix_val.into(), suffix_val.into()],
+                "mktemp.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr")
+            .into_pointer_value();
+        // NULL => error.
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                self.builder
+                    .build_ptr_to_int(
+                        result_ptr,
+                        self.context.i64_type(),
+                        "mktemp.as_int",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?,
+                self.context.i64_type().const_zero(),
+                "mktemp.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            template_path,
+            Some((result_ptr.into(), CodegenTy::String)),
+            "fs.mktemp",
+        )
     }
 
     /// `std::io::fs::list_dir_count(path) -> Int fallible(IoError)`.
@@ -19671,6 +19933,40 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok((total.into(), CodegenTy::Duration))
     }
 
+    /// C7 (pond follow-up): lower `std::time::now() -> Int` to a
+    /// call into `lotus_time_now_seconds`, which wraps
+    /// `clock_gettime(CLOCK_REALTIME, &ts)` and returns `ts.tv_sec`
+    /// as i64. Wall-clock seconds since the Unix epoch — drives
+    /// `pond/sessions` cookie expiries that must survive a
+    /// process restart. Observation only; `time::monotonic` stays
+    /// the basis for scheduling (NTP slewing / leap seconds can
+    /// warp this value).
+    fn lower_std_time_now(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "std::time::now takes 0 arguments, got {}",
+                args.len()
+            )));
+        }
+        let now_fn = self
+            .module
+            .get_function("lotus_time_now_seconds")
+            .expect("lotus_time_now_seconds declared");
+        let call = self
+            .builder
+            .build_call(now_fn, &[], "time.now.sec")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let sec = call
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_time_now_seconds returns i64")
+            .into_int_value();
+        Ok((sec.into(), CodegenTy::Int))
+    }
+
     /// Lower `time::sleep(duration)` to a monotonic-clock,
     /// EINTR-retrying `clock_nanosleep` call. The lowered IR is:
     ///
@@ -20229,6 +20525,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_time_monotonic(args)?;
                 Ok(())
             }
+            // C7 (pond follow-up): wall-clock seconds-since-epoch.
+            // Statement position discards the return; expression
+            // sibling lives in lower_stdlib_path_call_expr.
+            ["std", "time", "now"] => {
+                let _ = self.lower_std_time_now(args)?;
+                Ok(())
+            }
             // m79: std::process::exit. Calls libc exit() with the
             // user-supplied code, then emits unreachable + a fresh
             // basic block so subsequent statements (dead but
@@ -20243,6 +20546,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // Unit; the target vec is the output channel.
             ["std", "text", "tokenize_words_into"] => {
                 self.lower_std_text_tokenize_words_into(args, scope)
+            }
+            // C9: new fallible-only fs surfaces. Same "use `or`"
+            // diagnostic shape as the parse_int family.
+            ["std", "io", "fs", "rename"]
+            | ["std", "io", "fs", "unlink"]
+            | ["std", "io", "fs", "mktemp"] => {
+                Err(CodegenError::Unsupported(format!(
+                    "`{}` returns a fallible value — address the error with \
+                     `or raise`, `or <substitute>`, or `or self.handle(err)`",
+                    segs.join("::")
+                )))
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "stdlib path `{}` — not implemented",
@@ -20665,6 +20979,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // sleep is statement-only; trying to use it in an
             // expression falls through to the catch-all error.
             ["std", "time", "monotonic"] => self.lower_time_monotonic(args),
+            // C7 (pond follow-up): wall-clock seconds-since-epoch
+            // as Int. Statement-position sibling lives in
+            // lower_stdlib_path_call.
+            ["std", "time", "now"] => self.lower_std_time_now(args),
             // std::math::* libm Float primitives. Resolves
             // notes/aperio-friction.md 2026-05-10 float-surface-gaps
             // (the `std::math` sub-bullet). v0 cut: unary
@@ -20718,6 +21036,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // expression-dispatch sibling for legacy reasons —
             // this arm doesn't shadow them.)
             ["std", "str", "parse_int"] | ["std", "str", "parse_float"] => {
+                Err(CodegenError::Unsupported(format!(
+                    "`{}` returns a fallible value — address the error with \
+                     `or raise`, `or <substitute>`, or `or self.handle(err)`",
+                    segs.join("::")
+                )))
+            }
+            // C9: new fallible-only fs surfaces. No legacy non-
+            // fallible sibling, so the diagnostic is the friendly
+            // "use `or`" reminder — same shape as parse_int above.
+            ["std", "io", "fs", "rename"]
+            | ["std", "io", "fs", "unlink"]
+            | ["std", "io", "fs", "mktemp"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",

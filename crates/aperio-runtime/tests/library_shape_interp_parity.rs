@@ -109,3 +109,23 @@ fn env_arg_or_default_interp() {
     "#;
     assert_eq!(run(src), 0);
 }
+
+// C9 — interpreter parity for fs::rename / unlink / mktemp.
+// Same end-to-end shape as the codegen test: mktemp → write
+// → rename → read-back → unlink → file_exists check.
+#[test]
+fn fs_mktemp_rename_unlink_roundtrip_interp() {
+    let src = r#"
+        fn main() {
+            let original = std::io::fs::mktemp("/tmp/aperio_interp_c9_", ".tmp") or raise;
+            std::io::fs::write_file(original, "interp c9 payload") or raise;
+            let renamed = original + ".renamed";
+            std::io::fs::rename(original, renamed) or raise;
+            let got = std::io::fs::read_file(renamed) or raise;
+            if got != "interp c9 payload" { std::process::exit(1); }
+            std::io::fs::unlink(renamed) or raise;
+            if std::io::fs::file_exists(renamed) { std::process::exit(1); }
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}

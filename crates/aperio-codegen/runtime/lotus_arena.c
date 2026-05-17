@@ -3072,11 +3072,12 @@ void *lotus_bytes_from_str(const char *s);
 int64_t lotus_bytes_at(const void *b, int64_t i);
 void *lotus_bytes_slice(const void *b, int64_t lo, int64_t hi);
 
-/* Phase 2e + 2f: list_dir index API + read_file errno surface.
- * Same forward-decl pattern; bodies live with the other global-
- * payload-arena wrappers below. */
+/* Phase 2e + 2f + C9: forward decls for fs primitives whose
+ * bodies need g_bus_payload_arena (declared further below) so
+ * the returned String outlives the call frame. */
 int64_t lotus_fs_list_dir_count(const char *path);
 const char *lotus_fs_list_dir_at(const char *path, int64_t idx);
+const char *lotus_fs_mktemp(const char *prefix, const char *suffix);
 
 /*
  * m74: filesystem primitives (`std::io::fs::*` substrate).
@@ -3357,6 +3358,40 @@ int lotus_fs_mkdir(const char *path) {
         return -1;
     }
     if (mkdir(path, 0755) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* C9 (pond/logfmt rotation): atomic rename `src` → `dst`. POSIX
+ * rename(2); atomic on the same filesystem, EXDEV cross-fs.
+ * Returns 0 on success, -1 on error (errno set). The codegen
+ * wrapper anchors the IoError.path to `dst` because the
+ * destination is the more diagnostic of the two on the common
+ * failure modes (target dir missing, target already a non-empty
+ * dir, cross-fs, etc.). */
+int lotus_fs_rename(const char *src, const char *dst) {
+    if (!src || !dst) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (rename(src, dst) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* C9 (pond/logfmt rotation): unlink `path`. POSIX unlink(2) —
+ * removes a regular file or symlink. Directories require rmdir
+ * (not yet exposed). Returns 0 on success, -1 on error (errno
+ * set; ENOENT when the path didn't exist, EISDIR on a directory
+ * target). */
+int lotus_fs_unlink(const char *path) {
+    if (!path) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (unlink(path) < 0) {
         return -1;
     }
     return 0;
@@ -4695,6 +4730,74 @@ const char *lotus_fs_list_dir_at(const char *path, int64_t idx) {
     if (!out) return empty;
     memcpy(out, p, len);
     out[len] = '\0';
+    return out;
+}
+
+/*
+ * C9 (pond/agent/sandbox): race-free tempfile-path allocator.
+ * Assembles `prefix + "XXXXXX" + suffix` into a writable buffer,
+ * calls mkstemps(3) to atomically open+create the file (mode
+ * 0600) with the XXXXXX template substituted, immediately closes
+ * the fd, and returns the resulting path string anchored in the
+ * lazy global payload arena. NULL on error (errno set; EINVAL on
+ * NULL args, ENOMEM on alloc failure, anything mkstemps can set
+ * on its own — typically ENOENT/EACCES on the prefix dir).
+ *
+ * The caller owns cleanup — they wanted a path, not an fd —
+ * matching the pond friction-log ask and the standard mktemp(3)
+ * shape. There IS a window between our close() and the caller's
+ * reopen (an attacker with write-access to the parent dir could
+ * unlink + replace), but the pond contract is "race-free path
+ * allocation" rather than "race-free path lifecycle" — that's
+ * the standard mktemp shape and the friction-log ask explicitly
+ * names this contract. Callers needing a held-open fd should
+ * grow a sibling `mkstemp_fd` primitive later.
+ */
+const char *lotus_fs_mktemp(const char *prefix, const char *suffix) {
+    if (!prefix || !suffix) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t plen = strlen(prefix);
+    size_t slen = strlen(suffix);
+    /* prefix + "XXXXXX" + suffix + NUL */
+    size_t total = plen + 6 + slen + 1;
+    char *tmpl = (char *)malloc(total);
+    if (!tmpl) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(tmpl, prefix, plen);
+    memcpy(tmpl + plen, "XXXXXX", 6);
+    memcpy(tmpl + plen + 6, suffix, slen);
+    tmpl[total - 1] = '\0';
+    int fd = mkstemps(tmpl, (int)slen);
+    if (fd < 0) {
+        int saved = errno;
+        free(tmpl);
+        errno = saved;
+        return NULL;
+    }
+    close(fd);
+    /* Anchor the assembled path in the bus payload arena so it
+     * outlives this call frame, then drop the malloc buffer. */
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            free(tmpl);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    char *out = lotus_str_clone(g_bus_payload_arena, tmpl);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    free(tmpl);
+    if (!out) {
+        errno = ENOMEM;
+        return NULL;
+    }
     return out;
 }
 
