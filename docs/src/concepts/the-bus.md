@@ -160,6 +160,11 @@ test (in-memory), single-binary (in-memory), and multi-binary
 (unix / tcp / nats) deployments. The library writer doesn't
 choose; the application writer does.
 
+For the end-to-end mechanics — two binaries, a shared
+topic, what the build invocations look like, what `unix(...)
+: listen` actually wires up — see
+[Run a topic across binaries](../how-tos/multi-binary-bus.md).
+
 ## Hierarchical topics + wildcards
 
 Topics can declare a parent and inherit a dotted wire-subject

@@ -136,6 +136,11 @@ everything; pinned is for latency-critical work that genuinely
 shouldn't share the scheduler thread (real-time data ingest,
 high-frequency tick handling).
 
+A worked example of two pinned loci publishing to a
+cooperative aggregator — including how the bus crosses
+thread boundaries — lives at
+[Mix pinned + cooperative threads](../how-tos/threading.md).
+
 ## Cooperative yield points
 
 Inside a cooperative locus, the substrate yields between

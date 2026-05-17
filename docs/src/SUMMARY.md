@@ -19,6 +19,17 @@
 - [Perspective & observation](./concepts/perspective.md)
 - [Modeling — how to think in Aperio](./concepts/modeling.md)
 
+# How-tos
+
+- [Project layout & build commands](./how-tos/project-layout.md)
+- [Build an HTTP server](./how-tos/http-server.md)
+- [Read CLI args & config](./how-tos/cli-and-config.md)
+- [Read & write files](./how-tos/files-and-fallible.md)
+- [Read & write JSON](./how-tos/json.md)
+- [Structured logging](./how-tos/logging.md)
+- [Run a topic across binaries](./how-tos/multi-binary-bus.md)
+- [Mix pinned + cooperative threads](./how-tos/threading.md)
+
 # Reference
 
 - [Language reference](./reference/language.md)

@@ -50,4 +50,5 @@ methods, and (as you'll see next) bus interfaces and methods.
 Continue to [A small program with shape](./a-small-program.md)
 to see two loci communicating across the typed bus. After that,
 the **Concepts** chapters walk through the structural model in
-depth.
+depth, and the **How-tos** show common recipes — HTTP server,
+CLI parsing, file I/O, multi-binary deployment, and more.
