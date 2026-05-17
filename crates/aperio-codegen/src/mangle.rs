@@ -203,7 +203,18 @@ impl<'a> Mangler<'a> {
             LocusMember::Bus(b) => {
                 for bm in &mut b.members {
                     match bm {
-                        BusMember::Subscribe { handler, ty, .. } => {
+                        BusMember::Subscribe { subject, handler, ty, .. } => {
+                            // A1 (G1/G32): rewrite the topic-ref ident so a
+                            // cross-seed `subscribe alias::Foo as h;` resolves
+                            // to the mangled topic decl in the imported seed.
+                            // Literal-string subjects are unaffected.
+                            // A7 (G16): QualifiedTopic carries a multi-segment
+                            // path resolved later through the per-build
+                            // path-rename table; the mangler leaves it alone
+                            // (same shape as multi-segment Expr::Path).
+                            if let BusSubject::Topic(ident) = subject {
+                                self.rewrite_ident(&mut ident.name);
+                            }
                             // Handler resolves against top-level fns in
                             // the seed; rewrite if it's one of ours.
                             self.rewrite_ident(&mut handler.name);
@@ -211,7 +222,10 @@ impl<'a> Mangler<'a> {
                                 self.walk_type_expr(t);
                             }
                         }
-                        BusMember::Publish { ty, .. } => {
+                        BusMember::Publish { subject, ty, .. } => {
+                            if let BusSubject::Topic(ident) = subject {
+                                self.rewrite_ident(&mut ident.name);
+                            }
                             if let Some(t) = ty {
                                 self.walk_type_expr(t);
                             }
@@ -764,6 +778,96 @@ mod tests {
         }
         // as_parent_for → __lib_toy_main_Child
         assert_eq!(slot.as_parent_for.as_ref().unwrap().name, "__lib_toy_main_Child");
+    }
+
+    #[test]
+    fn rewrites_topic_ref_in_publish_and_subscribe() {
+        // A1 (G1/G32) regression. A seed that declares a topic and
+        // publishes / subscribes to it via the topic-ref form must
+        // have BOTH the decl and the bus-member references rewritten.
+        let src = r#"
+            type Tick { n: Int; }
+            topic Ticks { payload: Tick; }
+            locus Pub {
+                bus { publish Ticks; }
+            }
+            locus Sub {
+                bus { subscribe Ticks as on_tick; }
+                fn on_tick(t: Tick) { }
+            }
+        "#;
+        let mut prog = parse(src);
+        mangle_program(&mut prog, "toy", "main");
+
+        // The topic decl renames.
+        let topic_renamed = prog.items.iter().any(|d| matches!(d,
+            TopDecl::Topic(t) if t.name.name == "__lib_toy_main_Ticks"));
+        assert!(topic_renamed, "topic decl should be mangled");
+
+        // The publish-site subject ident renames.
+        let pub_locus = find_locus(&prog, "__lib_toy_main_Pub").expect("Pub renamed");
+        let pub_bus = pub_locus.members.iter().find_map(|m| match m {
+            LocusMember::Bus(b) => Some(b),
+            _ => None,
+        }).expect("Pub.bus");
+        match &pub_bus.members[0] {
+            BusMember::Publish { subject: BusSubject::Topic(i), .. } => {
+                assert_eq!(i.name, "__lib_toy_main_Ticks",
+                    "publish topic ident should be mangled");
+            }
+            other => panic!("expected Publish topic-ref, got {:?}", other),
+        }
+
+        // The subscribe-site subject ident renames.
+        let sub_locus = find_locus(&prog, "__lib_toy_main_Sub").expect("Sub renamed");
+        let sub_bus = sub_locus.members.iter().find_map(|m| match m {
+            LocusMember::Bus(b) => Some(b),
+            _ => None,
+        }).expect("Sub.bus");
+        match &sub_bus.members[0] {
+            BusMember::Subscribe { subject: BusSubject::Topic(i), .. } => {
+                assert_eq!(i.name, "__lib_toy_main_Ticks",
+                    "subscribe topic ident should be mangled");
+            }
+            other => panic!("expected Subscribe topic-ref, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn literal_bus_subject_not_rewritten() {
+        // Defensive: legacy literal-string subjects must not be
+        // touched — they're already wire-format strings and would
+        // not collide with anything the mangler cares about.
+        let src = r#"
+            type Event { msg: String; }
+            locus Logger {
+                bus {
+                    subscribe "log.error" as on_err of type Event;
+                    publish "log.info" of type Event;
+                }
+                fn on_err(e: Event) { }
+            }
+        "#;
+        let mut prog = parse(src);
+        mangle_program(&mut prog, "toy", "main");
+        let locus = find_locus(&prog, "__lib_toy_main_Logger").expect("Logger renamed");
+        let bus = locus.members.iter().find_map(|m| match m {
+            LocusMember::Bus(b) => Some(b),
+            _ => None,
+        }).expect("bus block");
+        // Both members should still carry literal subjects unchanged.
+        match &bus.members[0] {
+            BusMember::Subscribe { subject: BusSubject::Literal { subject, .. }, .. } => {
+                assert_eq!(subject, "log.error");
+            }
+            other => panic!("expected literal subscribe, got {:?}", other),
+        }
+        match &bus.members[1] {
+            BusMember::Publish { subject: BusSubject::Literal { subject, .. }, .. } => {
+                assert_eq!(subject, "log.info");
+            }
+            other => panic!("expected literal publish, got {:?}", other),
+        }
     }
 
     #[test]

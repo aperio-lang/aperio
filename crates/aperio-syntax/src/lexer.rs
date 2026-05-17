@@ -363,6 +363,16 @@ impl<'a> Lexer<'a> {
             return self.lex_fstring(start).map(Some);
         }
 
+        // B2 / G5: bytes literal `b"..."`. Same body as a string
+        // literal, but escapes pass through as raw bytes (no UTF-
+        // 8 promotion) so `\xNN` accepts the full 0x00..0xFF range.
+        // Must precede the generic ident path so a lone `b`
+        // followed by `"` doesn't lex as an identifier.
+        if b == b'b' && self.source.as_bytes().get(self.pos + 1) == Some(&b'"') {
+            self.pos += 1; // consume the leading `b`
+            return self.lex_bytes(start).map(Some);
+        }
+
         // Identifier or keyword
         if b.is_ascii_alphabetic() || b == b'_' {
             return Ok(Some(self.lex_ident_or_keyword(start)));
@@ -839,6 +849,96 @@ impl<'a> Lexer<'a> {
                     self.pos += ch.len_utf8();
                     s.push(ch);
                     let _ = b;
+                }
+            }
+        }
+    }
+
+    /// B2 / G5: lex a `b"..."` bytes literal. Same escapes as
+    /// strings, but UTF-8 promotion is off — `\xNN` accepts the
+    /// full 0x00..0xFF range, and non-ASCII source bytes in the
+    /// body emit one entry per UTF-8 byte. Callers that need
+    /// arbitrary bytes used to wire through
+    /// `std::bytes::from_string("...")`; B2 / G5 removes that
+    /// workaround.
+    fn lex_bytes(&mut self, start: usize) -> Result<Token, Diag> {
+        // Consume opening quote.
+        self.pos += 1;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(Diag::lex(
+                        Span::new(start, self.pos),
+                        "unterminated bytes literal",
+                    ));
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    let span = Span::new(start, self.pos);
+                    return Ok(Token::new(TokenKind::BytesLit(bytes), span));
+                }
+                Some(b'\\') => {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(b'n') => {
+                            bytes.push(b'\n');
+                            self.pos += 1;
+                        }
+                        Some(b't') => {
+                            bytes.push(b'\t');
+                            self.pos += 1;
+                        }
+                        Some(b'r') => {
+                            bytes.push(b'\r');
+                            self.pos += 1;
+                        }
+                        Some(b'\\') => {
+                            bytes.push(b'\\');
+                            self.pos += 1;
+                        }
+                        Some(b'"') => {
+                            bytes.push(b'"');
+                            self.pos += 1;
+                        }
+                        Some(b'0') => {
+                            bytes.push(0);
+                            self.pos += 1;
+                        }
+                        Some(b'x') => {
+                            self.pos += 1;
+                            let h1 = self.peek().and_then(hex_digit);
+                            let h2 = self.peek_at(1).and_then(hex_digit);
+                            match (h1, h2) {
+                                (Some(a), Some(b)) => {
+                                    bytes.push((a << 4) | b);
+                                    self.pos += 2;
+                                }
+                                _ => {
+                                    return Err(Diag::lex(
+                                        Span::new(self.pos - 1, self.pos + 1),
+                                        "\\x escape needs two hex digits (e.g. \\x01, \\xff)",
+                                    ));
+                                }
+                            }
+                        }
+                        Some(other) => {
+                            return Err(Diag::lex(
+                                Span::new(self.pos - 1, self.pos + 1),
+                                format!("unknown bytes escape: \\{}", other as char),
+                            ));
+                        }
+                        None => {
+                            return Err(Diag::lex(
+                                Span::new(self.pos - 1, self.pos),
+                                "bytes literal ended after backslash",
+                            ));
+                        }
+                    }
+                }
+                Some(b) => {
+                    bytes.push(b);
+                    self.pos += 1;
                 }
             }
         }

@@ -1,0 +1,12 @@
+// lib-three-file/b.ap — references a's type, declares its own.
+type Beta {
+    inner: Alpha;
+    counter: Int;
+}
+
+fn make_beta(label: String, counter: Int) -> Beta {
+    return Beta {
+        inner: Alpha { label: label },
+        counter: counter,
+    };
+}

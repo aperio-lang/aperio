@@ -233,21 +233,32 @@ The mangling shape mirrors the existing hand-spelled
 stdlib and moa seeds carry; cross-seed imports extend the same
 discipline automatically.
 
-### Strict barrier: no re-exports
+### Per-importer scoped imports (A4, 2026-05-17)
 
-If library A imports library B, B's decls are NOT visible to
-A's importers. Each importer must declare its own dependencies
-at its own top level.
+If library A imports library B, B's decls become reachable
+**inside A's body only** under the alias A chose for B. A's own
+importers (apps or other libraries) do NOT see B unless they
+import it themselves. The mechanism: the resolver recurses into
+each imported library's `import` directives with the library's
+own directory as the new importer dir, so relative paths resolve
+the way the library author wrote them.
 
-The mechanism: imports inside imported library files are not
-followed by the resolver. The lib's own source may have
-`import` lines (they parse fine), but the build does not
-resolve them transitively. Cross-library composition that
-needs shared types today must route through the std seed.
+This is the per-library-scoped-import shape called out as future
+work in the v1 IMPORT milestone — A4 lifts the v1 strict barrier
+to unblock the `pond/_util/*` retrofit (libraries that share
+internal helper libs without forcing every consumer to vendor
+them).
 
-A future milestone may relax this — supporting per-library
-import scopes would let a lib internally reference another lib
-without exposing it — but the v1 commitment is strict.
+**No re-exports.** B's decls are not visible to A's importers
+unless they declare their own dependency on B. Mangled prefixes
+embed the importer's alias (`__lib_<alias>_<stem>_<name>`), so a
+util library reached through two different importers ships
+twice in the binary — no dedup, no shared identity across paths,
+just per-importer namespacing.
+
+**Cycles.** The CLI's canonical-path `visited` set bounds the
+walk; a lib that imports itself or two libs that mutually import
+each other resolve once each and stop.
 
 ### No `pub` / `export`
 
@@ -343,9 +354,12 @@ Explicit non-features of the v1 project / import system. A
 future milestone may relax some of them when concrete friction
 demonstrates the need.
 
-- **No transitive resolution.** Imports declared in imported
-  libraries are NOT followed (see "Strict barrier" above). If a
-  library has its own deps, the consumer must vendor them too.
+- **No transitive deduplication.** A library reached through two
+  different import paths ships as two compiled copies — per-
+  importer mangling, no shared identity. The recursive resolution
+  added in A4 (2026-05-17) follows each library's own imports
+  scoped to that library, but does not unify references across
+  importers.
 - **No registry / version ranges / semver.** Dependency pins
   are exact git refs. See `spec/packages.md` § "What's NOT in
   v1" for the full list of package-management non-features.

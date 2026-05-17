@@ -124,6 +124,9 @@ fn desugar_rewrites_topic_refs_to_literals() {
                                     BusSubject::Topic(_) => {
                                         panic!("expected literal subject after desugar");
                                     }
+                                    BusSubject::QualifiedTopic(_) => {
+                                        panic!("expected literal subject after desugar; got qualified");
+                                    }
                                 }
                                 assert!(ty.is_some(), "ty filled after desugar");
                             }
@@ -134,6 +137,9 @@ fn desugar_rewrites_topic_refs_to_literals() {
                                     }
                                     BusSubject::Topic(_) => {
                                         panic!("expected literal subject after desugar");
+                                    }
+                                    BusSubject::QualifiedTopic(_) => {
+                                        panic!("expected literal subject after desugar; got qualified");
                                     }
                                 }
                                 assert!(ty.is_some(), "publish ty filled after desugar");

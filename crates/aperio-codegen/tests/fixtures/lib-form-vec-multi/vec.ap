@@ -1,0 +1,7 @@
+// lib-form-vec-multi/vec.ap — declares an @form(vec) locus.
+// Companion file `helpers.ap` references its synthesized methods.
+
+@form(vec)
+locus IntVec {
+    capacity { heap items of Int; }
+}

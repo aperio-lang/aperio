@@ -1,0 +1,13 @@
+// lib-topic-source/topics.ap — declares a topic the consumer
+// subscribes to via `source::Heartbeat` (cross-seed qualified
+// path). The topic name and payload type are distinct so the
+// rename table carries one entry per top-level decl.
+
+type Beat {
+    n: Int;
+}
+
+topic Heartbeat {
+    payload: Beat;
+    subject: "src.heartbeat";
+}

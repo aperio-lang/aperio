@@ -1512,6 +1512,19 @@ impl Interpreter {
                             let _ = payload;
                             Ok(Value::Unit)
                         }
+                        OrDisposition::Fail(new_payload, _) => {
+                            // B3 / G6: `or fail X` — drop the
+                            // inner payload, evaluate X as the
+                            // enclosing fallible fn's payload,
+                            // and exit via the same Return-with-
+                            // FallibleErr path that Stmt::Fail
+                            // uses. Typecheck has already
+                            // verified the enclosing fn is
+                            // fallible(T) and X: T.
+                            let _ = payload;
+                            let new_v = self.eval_expr(new_payload)?;
+                            Err(Signal::Return(Value::FallibleErr(Box::new(new_v))))
+                        }
                         OrDisposition::Substitute(rhs) => {
                             // Bind `err` to the payload in scope
                             // and evaluate the substitute body.

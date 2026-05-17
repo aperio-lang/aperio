@@ -1,0 +1,32 @@
+// import-topic-consumer/main.ap — A7 (G16) regression.
+//
+// Cross-seed subscribe and publish over an imported lib's topic
+// decl. The consumer references `source::Heartbeat` as the topic
+// and `source::Beat` as the payload type — parser produces
+// `BusSubject::QualifiedTopic`, codegen's pre-pass resolves
+// through the per-build path-rename table.
+
+import "../lib-topic-source" as source;
+
+locus Sub {
+    params { count: Int = 0; }
+    bus { subscribe source::Heartbeat as on_beat; }
+    fn on_beat(b: source::Beat) {
+        self.count = self.count + 1;
+        println("got n=" + b.n);
+    }
+}
+
+locus Pub {
+    bus { publish source::Heartbeat; }
+    run() {
+        source::Heartbeat <- source::Beat { n: 42 };
+        source::Heartbeat <- source::Beat { n: 99 };
+    }
+}
+
+fn main() {
+    let s = Sub { };
+    Pub { };
+    println("done");
+}

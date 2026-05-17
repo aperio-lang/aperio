@@ -2246,6 +2246,19 @@ void *lotus_bytes_data(void *b) {
     return (char *)b + sizeof(int64_t);
 }
 
+/* B2 / G5 bytes-literal helper: allocate a Bytes blob in `a` and
+ * copy `len` bytes from `src` into it. Used by codegen to lower
+ * `b"..."` literals without a per-literal dance of create +
+ * memcpy at the IR level. `src` may be NULL when `len == 0`. */
+void *lotus_bytes_from_buf(lotus_arena_t *a, const void *src, int64_t len) {
+    void *blob = lotus_bytes_create(a, len);
+    if (!blob || len <= 0) {
+        return blob;
+    }
+    memcpy(lotus_bytes_data(blob), src, (size_t)len);
+    return blob;
+}
+
 int64_t lotus_str_index_of(const char *s, const char *sub) {
     if (!s || !sub) return -1;
     if (*sub == '\0') return 0;

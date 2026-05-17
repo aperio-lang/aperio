@@ -128,6 +128,195 @@ fn or_on_path_callee_for_imported_fallible_fn() {
 }
 
 #[test]
+fn cross_seed_form_vec_split_across_two_files() {
+    // A9 (G27) regression. A lib's `@form(vec)` locus lives in
+    // `vec.ap`; a sibling file `helpers.ap` calls `v.push(...)` —
+    // a synthesized method. The consumer imports the lib and uses
+    // `lib::double_push(...)` + `v.get(...)` end-to-end. Lock-in
+    // test: ensures cross-file synthesized-method resolution
+    // continues to work after the multi-file mangling pass.
+    let lib_dir = fixtures_dir().join("lib-form-vec-multi");
+    let consumer_src_path = fixtures_dir()
+        .join("import-form-vec-multi-consumer")
+        .join("main.ap");
+    let consumer_src = std::fs::read_to_string(&consumer_src_path)
+        .expect("read consumer main.ap");
+    let mut consumer_prog =
+        parse_source(&consumer_src).expect("parse consumer");
+    consumer_prog.imports.clear();
+
+    let (lib_items, renames) = resolve_and_mangle_lib(&lib_dir, "lib");
+    consumer_prog.items.extend(lib_items);
+
+    let mut bin = std::env::temp_dir();
+    bin.push(format!(
+        "aperio_cross_seed_form_vec_multi_{}",
+        std::process::id()
+    ));
+    build_executable_with_imports(&consumer_prog, &bin, &renames)
+        .expect("build consumer + lib");
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("5"), "missing first push: {:?}", stdout);
+    assert!(stdout.contains("10"), "missing second push: {:?}", stdout);
+}
+
+#[test]
+fn cross_seed_topic_subscribe_and_publish() {
+    // A7 (G16) regression. The consumer subscribes to and
+    // publishes on a topic declared in an imported lib via the
+    // qualified path `source::Heartbeat`. Before A7, the bus_subject
+    // grammar admitted only single-segment idents, so this parse
+    // errored. Codegen also has to resolve the QualifiedTopic
+    // through the per-build path-rename table before the desugar
+    // pass runs.
+    let lib_dir = fixtures_dir().join("lib-topic-source");
+    let consumer_src_path = fixtures_dir()
+        .join("import-topic-consumer")
+        .join("main.ap");
+
+    let consumer_src = std::fs::read_to_string(&consumer_src_path)
+        .expect("read consumer main.ap");
+    let mut consumer_prog =
+        parse_source(&consumer_src).expect("parse consumer");
+    consumer_prog.imports.clear();
+
+    let (lib_items, renames) = resolve_and_mangle_lib(&lib_dir, "source");
+    consumer_prog.items.extend(lib_items);
+
+    let mut bin = std::env::temp_dir();
+    bin.push(format!("aperio_cross_seed_topic_{}", std::process::id()));
+    build_executable_with_imports(&consumer_prog, &bin, &renames)
+        .expect("build consumer + lib");
+
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(
+        out.status.success(),
+        "non-zero exit: {:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("got n=42"), "missing tick 1: {:?}", stdout);
+    assert!(stdout.contains("got n=99"), "missing tick 2: {:?}", stdout);
+    assert!(stdout.contains("done"), "missing done sentinel: {:?}", stdout);
+}
+
+#[test]
+fn three_file_lib_exposes_decls_from_every_file() {
+    // A6 (G28) regression. A lib split across 3 files (a/b/c.ap)
+    // with intra-seed cross-file references must expose every
+    // top-level decl through the per-build path-rename table.
+    // `build_seed_renames` walks every file, so this works in
+    // principle — the test locks it in defensively against any
+    // future refactor of the multi-file mangling path.
+    let lib_dir = fixtures_dir().join("lib-three-file");
+    let consumer_src_path = fixtures_dir()
+        .join("import-three-file-consumer")
+        .join("main.ap");
+
+    let consumer_src = std::fs::read_to_string(&consumer_src_path)
+        .expect("read consumer main.ap");
+    let mut consumer_prog =
+        parse_source(&consumer_src).expect("parse consumer");
+    consumer_prog.imports.clear();
+
+    let (lib_items, renames) = resolve_and_mangle_lib(&lib_dir, "lib");
+    consumer_prog.items.extend(lib_items);
+
+    // Every file's decl should appear in the rename table.
+    let rename_strings: Vec<String> = renames
+        .iter()
+        .map(|(segs, mangled)| format!("{} -> {}", segs.join("::"), mangled))
+        .collect();
+    let has = |needle: &str| rename_strings.iter().any(|s| s.contains(needle));
+    assert!(has("__lib_lib_a_Alpha"), "no Alpha rename: {:?}", rename_strings);
+    assert!(has("__lib_lib_b_Beta"), "no Beta rename: {:?}", rename_strings);
+    assert!(
+        has("__lib_lib_b_make_beta"),
+        "no make_beta rename: {:?}",
+        rename_strings
+    );
+    assert!(
+        has("__lib_lib_c_render"),
+        "no render rename: {:?}",
+        rename_strings
+    );
+
+    let mut bin = std::env::temp_dir();
+    bin.push(format!("aperio_three_file_lib_{}", std::process::id()));
+    build_executable_with_imports(&consumer_prog, &bin, &renames)
+        .expect("build consumer + lib");
+
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(
+        out.status.success(),
+        "non-zero exit: {:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ok:7"), "missing make_beta+render: {:?}", stdout);
+    assert!(
+        stdout.contains("directly:100"),
+        "missing direct construction: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn cross_seed_non_fallible_free_fn_call_in_expr_and_stmt_positions() {
+    // A3 (G11) regression. Before A3, the catch-all arm in
+    // `lower_path_call_expr` (and stmt sibling) didn't consult the
+    // per-build import-rename table, so `alias::fn(...)` for a
+    // non-fallible imported fn errored. Fallible cross-seed calls
+    // worked because `lower_fallible_call` already had the
+    // rename-table lookup.
+    let lib_dir = fixtures_dir().join("lib-nonfallible-fn");
+    let consumer_src_path = fixtures_dir()
+        .join("import-nonfallible-consumer")
+        .join("main.ap");
+
+    let consumer_src = std::fs::read_to_string(&consumer_src_path)
+        .expect("read consumer main.ap");
+    let mut consumer_prog =
+        parse_source(&consumer_src).expect("parse consumer");
+    consumer_prog.imports.clear();
+
+    let (lib_items, renames) = resolve_and_mangle_lib(&lib_dir, "h");
+    consumer_prog.items.extend(lib_items);
+
+    let mut bin = std::env::temp_dir();
+    bin.push(format!(
+        "aperio_cross_seed_nonfallible_{}",
+        std::process::id()
+    ));
+    build_executable_with_imports(&consumer_prog, &bin, &renames)
+        .expect("build consumer + lib");
+
+    let out = Command::new(&bin).output().expect("run consumer");
+    let _ = std::fs::remove_file(&bin);
+    assert!(
+        out.status.success(),
+        "non-zero exit: {:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("sum=5"), "expr-position Int call: {:?}", stdout);
+    assert!(
+        stdout.contains("hello, agent"),
+        "expr-position String call: {:?}",
+        stdout
+    );
+    assert!(stdout.contains("touched"), "stmt-position unit call: {:?}", stdout);
+}
+
+#[test]
 fn consumer_uses_greeter_and_formatted_from_lib_toy() {
     let lib_dir = fixtures_dir().join("lib-toy");
     let consumer_src_path = fixtures_dir()

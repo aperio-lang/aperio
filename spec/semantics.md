@@ -969,6 +969,16 @@ non-error value, that value is the expression's value
   value-bearing calls with a message pointing at
   `or <default>` or `or raise`. Sugar for the previously-
   idiomatic `or noop(err)` pattern with a no-op handler fn.
+- **`or fail <payload>`** (added 2026-05-17, B3 / G6) —
+  symmetric to `or raise`, but the caller picks a fresh
+  payload of the enclosing fallible fn's declared error type
+  instead of forwarding the inner call's payload verbatim.
+  Lets a caller translate one error shape into another
+  inline (`std::str::parse_int(s) or fail AppErr { msg: "bad
+  number" }`) rather than bouncing through a helper fn. Same
+  divergence rule: chain value type collapses to the inner
+  success type. Typechecker rejects outside a fallible fn
+  body with a hint to use `or raise` or `or <fallback>`.
 
 Chains are right-associative: `a() or b() or raise` reduces
 the value to the success type level by level.

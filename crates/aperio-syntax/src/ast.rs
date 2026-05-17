@@ -442,6 +442,15 @@ pub enum BusSubject {
     /// `topic Foo` reference. The Ident span is the topic name's
     /// source location for diagnostics.
     Topic(Ident),
+    /// A7 (G16): multi-segment cross-seed topic reference,
+    /// e.g. `subscribe alias::Foo as h;`. Parsed when the bus
+    /// subject is a qualified path. The codegen pre-pass at
+    /// `build_executable_with_imports` resolves the alias chain
+    /// through the per-build path-rename table and rewrites this
+    /// variant into a single-segment `Topic(Ident(mangled_name))`
+    /// before the existing desugar runs. Multi-segment subjects
+    /// never reach desugar/codegen proper.
+    QualifiedTopic(QualifiedName),
 }
 
 impl BusSubject {
@@ -449,6 +458,7 @@ impl BusSubject {
         match self {
             BusSubject::Literal { span, .. } => *span,
             BusSubject::Topic(i) => i.span,
+            BusSubject::QualifiedTopic(qn) => qn.span,
         }
     }
 
@@ -462,13 +472,25 @@ impl BusSubject {
         match self {
             BusSubject::Literal { subject, .. } => subject.as_str(),
             BusSubject::Topic(i) => i.name.as_str(),
+            BusSubject::QualifiedTopic(qn) => qn
+                .segments
+                .last()
+                .map(|s| s.name.as_str())
+                .unwrap_or(""),
         }
     }
 }
 
 impl std::fmt::Display for BusSubject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.canonical())
+        match self {
+            BusSubject::QualifiedTopic(qn) => {
+                let parts: Vec<&str> =
+                    qn.segments.iter().map(|s| s.name.as_str()).collect();
+                f.write_str(&parts.join("::"))
+            }
+            _ => f.write_str(self.canonical()),
+        }
     }
 }
 
@@ -1056,6 +1078,12 @@ pub enum OrDisposition {
     /// Unit; otherwise the typechecker rejects with a hint to
     /// use an explicit substitute value.
     Discard(Span),
+    /// B3 / G6 — `or fail <payload>`: symmetric to `or raise` but
+    /// the err branch builds a fresh payload value of the
+    /// enclosing fallible fn's declared error type, then exits
+    /// via the error path. Lets a caller translate one error
+    /// payload into another without bouncing through a helper.
+    Fail(Box<Expr>, Span),
 }
 
 impl Expr {

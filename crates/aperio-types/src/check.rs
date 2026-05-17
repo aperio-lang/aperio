@@ -1097,10 +1097,16 @@ impl<'a> Checker<'a> {
                              assertions + `on_failure` routing; value-level \
                              `fallible(E)` lives on free fns and stdlib-\
                              synthesized methods over `@form(...)` \
-                             containers. Wrap a fallible free fn if you \
-                             need value-level error semantics: write `fn \
-                             op() -> T fallible(E)` outside the locus and \
-                             call it from the method with `or <fallback>`",
+                             containers. Three workarounds (styleguide § 7): \
+                             (1) wrap as a free fn — write `fn op() -> T \
+                             fallible(E)` outside the locus and call it \
+                             from the method with `or <fallback>` / `or \
+                             raise`; (2) error-check fn + `violate NAME;` \
+                             — keep the method infallible and route \
+                             structural failure through an inline closure \
+                             so on_failure can pick it up; (3) sentinel-\
+                             predicate — return a Bool / Option-like shape \
+                             from the method and let the caller branch.",
                             f.name.name
                         ),
                     ));
@@ -2284,6 +2290,41 @@ impl<'a> Checker<'a> {
                         let _ = payload;
                         Ty::Unit
                     }
+                    OrDisposition::Fail(payload_expr, span) => {
+                        // B3 / G6: `or fail X` diverges via the
+                        // enclosing fallible fn's error path. The
+                        // payload's type must match the enclosing
+                        // fn's declared error type — not the
+                        // inner call's payload. Same divergence
+                        // rule as `or raise`: expression type
+                        // collapses to the inner success type.
+                        let _ = payload;
+                        let new_payload_ty = self.check_expr_addressed(payload_expr);
+                        match &self.fallible_ctx {
+                            None => self.diags.push(Diag::ty(
+                                *span,
+                                "`or fail X`: only valid inside a fallible \
+                                 fn body (declared with `fallible(T)`). \
+                                 Use `or raise` to propagate the inner \
+                                 payload, or `or <fallback>` to substitute \
+                                 a value".to_string(),
+                            )),
+                            Some((_, expected_payload)) => {
+                                if !expected_payload.assignable_from(&new_payload_ty) {
+                                    self.diags.push(Diag::ty(
+                                        payload_expr.span(),
+                                        format!(
+                                            "`or fail`: expected payload \
+                                             type `{}`, got `{}`",
+                                            expected_payload.display(),
+                                            new_payload_ty.display()
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        success
+                    }
                     OrDisposition::Substitute(rhs) => {
                         // The implicit `err` binding is in scope
                         // on the RHS, typed as the payload type.
@@ -2441,8 +2482,22 @@ impl<'a> Checker<'a> {
                 return Ty::Prim(PrimType::String);
             }
         }
+        // B13 / G30: F.23 Int → Float widening in binary-op
+        // position. If exactly one side is Int and the other is
+        // Float, the result is Float. Decimal stays strict —
+        // F.23 explicitly does NOT widen Int/Float into Decimal
+        // (Decimal precision must not silently promote out from
+        // monetary scale-9). Mirrors the codegen-side coercion.
+        let is_int_float_mix = matches!(
+            (lt, rt),
+            (Ty::Prim(PrimType::Int), Ty::Prim(PrimType::Float))
+                | (Ty::Prim(PrimType::Float), Ty::Prim(PrimType::Int))
+        );
         match op {
             Add | Sub | Mul | Div | Mod | BitAnd | BitOr | BitXor | Shl | Shr => {
+                if is_int_float_mix {
+                    return Ty::Prim(PrimType::Float);
+                }
                 if !lt.assignable_from(rt) && !rt.assignable_from(lt) {
                     self.diags.push(Diag::ty(
                         span,
@@ -2460,6 +2515,9 @@ impl<'a> Checker<'a> {
                 }
             }
             Eq | NotEq | Lt | Gt | LtEq | GtEq => {
+                if is_int_float_mix {
+                    return Ty::Prim(PrimType::Bool);
+                }
                 if !lt.assignable_from(rt) && !rt.assignable_from(lt) {
                     self.diags.push(Diag::ty(
                         span,

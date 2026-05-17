@@ -1,0 +1,35 @@
+// three-hop-lib-mid/wrap.ap — the middle layer.
+//
+// Imports the util layer (`u::Box`, `u::make_box`, `u::unbox`)
+// and re-shapes those primitives for the app. Before A4 (G34),
+// the middle layer's imports were dropped (strict barrier) so
+// `u::Box { ... }` and `u::make_box(...)` references here failed
+// codegen.
+
+import "../three-hop-lib-util" as u;
+
+type Wrapped {
+    inner: u::Box;
+    note: String;
+}
+
+fn make_wrapped(label: String, value: Int, note: String) -> Wrapped {
+    return Wrapped {
+        inner: u::make_box(label, value),
+        note: note,
+    };
+}
+
+fn describe(w: Wrapped) -> String {
+    return u::unbox(w.inner) + " [" + w.note + "]";
+}
+
+// A5 (G18/G33) regression check: a qualified cross-seed type
+// (`u::Box` here) is admissible as a fn-param type *inside* the
+// mid lib's body. Before A4 lifted the strict barrier, the
+// rename table didn't carry the util lib's decls when mid was
+// imported, so this param type errored with "qualified type
+// `u::Box` not in stdlib path-renames table".
+fn label_of(b: u::Box) -> String {
+    return b.label;
+}

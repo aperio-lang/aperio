@@ -399,6 +399,37 @@ fn resolve_bus_subject(
                 }
             }
         }
+        BusSubject::QualifiedTopic(qn) => {
+            // A7 (G16): cross-seed `subscribe alias::Foo as h;`.
+            // The typechecker can't reach the imported topic decl
+            // without seeing the merged + mangled program (cross-
+            // seed visibility lives at the codegen pre-pass that
+            // build_executable_with_imports runs after mangle).
+            // For typecheck-only consumers, accept the path and
+            // treat the payload as Unknown — the codegen-side
+            // resolution will catch unresolved paths.
+            if let Some(te) = ty {
+                diags.push(Diag::ty(
+                    te.span(),
+                    format!(
+                        "{} `{}` is a topic reference; `of type T` is forbidden \
+                         (the topic carries the payload type)",
+                        ctx,
+                        qn.segments
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::")
+                    ),
+                ));
+            }
+            let leaf = qn
+                .segments
+                .last()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            (leaf, Ty::Unknown)
+        }
     }
 }
 

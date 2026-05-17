@@ -273,8 +273,13 @@ fn collect_target_files(t: &ImportTarget) -> Result<Vec<PathBuf>, String> {
 /// `(["<alias>", "<TopName>"], mangled_name)` entries so the
 /// codegen can resolve `alias::Name` references downstream.
 ///
-/// Imports inside the imported libs themselves are NOT followed
-/// (strict barrier / no re-exports — see v1.x-IMPORT handoff).
+/// Imports inside the imported libs ARE followed (A4, G34): for
+/// each lib file's own `import` directives, recurse with the lib's
+/// directory as the importer_dir. The `visited` canonical-path set
+/// breaks cycles. Each lib gets its own alias-prefixed mangled
+/// names, so a transitive util lib reached through two different
+/// libs lives twice in the binary — no re-export, no dedup, just
+/// per-importer scoped resolution.
 fn resolve_imports(
     imports: &[aperio_syntax::ast::Import],
     importer_dir: &Path,
@@ -391,6 +396,38 @@ fn resolve_imports(
         for (name, mangled) in &seed_renames {
             renames.push((vec![alias.clone(), name.clone()], mangled.clone()));
         }
+        // A4 (G34): lift the v1 strict barrier — follow each
+        // imported lib's own `import "..." as ...;` directives,
+        // recursing with the lib's own directory as the importer
+        // dir so its relative paths resolve correctly. Cycles are
+        // bounded by the canonical-path `visited` set. The renames
+        // table is shared across the whole build so every transitive
+        // alias::Name reference resolves at codegen time. Mangled
+        // prefixes embed the importer's alias, so two parallel
+        // import paths to the same lib produce different mangled
+        // copies (per-importer namespacing, no collision).
+        let lib_dir = match &target {
+            ImportTarget::Directory(d) => d.clone(),
+            ImportTarget::SingleFile(p) => p
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| importer_dir.to_path_buf()),
+        };
+        for pf in parsed_files.iter() {
+            if pf.program.imports.is_empty() {
+                continue;
+            }
+            resolve_imports(
+                &pf.program.imports,
+                &lib_dir,
+                workspace_root,
+                visited,
+                sources,
+                errors,
+                merged_items,
+                renames,
+            )?;
+        }
         // Move mangled items into the merged program; stash sources.
         for pf in parsed_files {
             merged_items.extend(pf.program.items);
@@ -403,9 +440,13 @@ fn resolve_imports(
 
 /// Parse a single-file entry, follow its `import "..." as alias;`
 /// directives, and produce the merged Program + per-build path-
-/// rename table. Imports inside imported libs are NOT followed
-/// (strict barrier). Cycles are tolerated by canonical-path
-/// short-circuit.
+/// rename table. Imports inside imported libs ARE followed
+/// recursively (A4, G34) — relative paths are resolved against
+/// each lib's own directory so a two-hop chain
+/// `app → lib → lib/_util` works. The mangled prefix embeds the
+/// importer's alias, so two parallel paths to the same lib live
+/// as separate compiled copies (per-importer namespacing). Cycles
+/// are bounded by the canonical-path `visited` set.
 fn parse_with_imports(
     entry: &Path,
 ) -> Result<

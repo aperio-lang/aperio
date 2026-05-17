@@ -1,0 +1,24 @@
+// import-three-file-consumer/main.ap — A6 regression.
+//
+// Lib has decls split across three files (a.ap, b.ap, c.ap)
+// with intra-seed cross-file references chained:
+//   a.ap declares Alpha
+//   b.ap references Alpha + declares Beta + make_beta
+//   c.ap references Beta + declares render
+//
+// Consumer reaches all three through the same alias. Verifies
+// `build_seed_renames` registers every top-level decl across
+// every file in the seed (not just the first), and that the
+// rename table consumers see exposes all three under one alias.
+
+import "../lib-three-file" as lib;
+
+fn main() {
+    let b: lib::Beta = lib::make_beta("ok", 7);
+    println(lib::render(b));
+    // Construct Alpha directly (from a.ap) and Beta directly
+    // (from b.ap) — both via the same alias.
+    let a = lib::Alpha { label: "directly" };
+    let b2 = lib::Beta { inner: a, counter: 100 };
+    println(lib::render(b2));
+}

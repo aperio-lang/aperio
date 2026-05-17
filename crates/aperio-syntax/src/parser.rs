@@ -1300,8 +1300,17 @@ impl Parser {
                 })
             }
             TokenKind::Ident(_) => {
-                let ident = self.expect_ident("topic name")?;
-                Ok(BusSubject::Topic(ident))
+                // A7 (G16): admit `alias::Foo` (qualified path) so
+                // cross-seed subscribe / publish over an imported
+                // lib's topic decl parses. Single-segment paths
+                // remain `BusSubject::Topic(Ident)` so the existing
+                // desugar pass handles them unchanged.
+                let qn = self.parse_qualified_name()?;
+                if qn.segments.len() == 1 {
+                    Ok(BusSubject::Topic(qn.segments.into_iter().next().unwrap()))
+                } else {
+                    Ok(BusSubject::QualifiedTopic(qn))
+                }
             }
             other => Err(Diag::parse(
                 tok.span,
@@ -2623,12 +2632,21 @@ impl Parser {
         self.bump(); // consume `or`
         let is_raise = matches!(self.peek(), TokenKind::Ident(s) if s == "raise");
         let is_discard = matches!(self.peek(), TokenKind::Ident(s) if s == "discard");
+        // B3 / G6 — `or fail <payload>` as an or_clause RHS. `fail`
+        // is a contextual ident (same narrowing pattern as `raise`
+        // / `discard`); recognized here in expression position.
+        let is_fail = matches!(self.peek(), TokenKind::Ident(s) if s == "fail");
         let (disposition, end_span) = if is_raise {
             let raise_tok = self.bump();
             (OrDisposition::Raise(raise_tok.span), raise_tok.span)
         } else if is_discard {
             let discard_tok = self.bump();
             (OrDisposition::Discard(discard_tok.span), discard_tok.span)
+        } else if is_fail {
+            let fail_tok = self.bump();
+            let payload = self.parse_expr()?;
+            let span = fail_tok.span.merge(payload.span());
+            (OrDisposition::Fail(Box::new(payload), span), span)
         } else {
             // Substitute: RHS is itself a full expression (which
             // may chain another `or` — that's how we get

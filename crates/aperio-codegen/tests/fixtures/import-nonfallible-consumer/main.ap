@@ -1,0 +1,16 @@
+// import-nonfallible-consumer/main.ap — A3 regression consumer.
+//
+// Calls three cross-seed non-fallible free fns:
+//   - `h::add(...)` in let-RHS (expr position)
+//   - `h::greet(...)` in let-RHS (expr position; String return)
+//   - `h::touch()` as a bare statement (stmt position)
+
+import "../lib-nonfallible-fn" as h;
+
+fn main() {
+    let s = h::add(2, 3);
+    println("sum=" + s);
+    let g = h::greet("agent");
+    println(g);
+    h::touch();
+}

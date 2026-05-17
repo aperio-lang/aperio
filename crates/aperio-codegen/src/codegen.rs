@@ -197,6 +197,19 @@ pub fn build_executable_with_imports(
     output_path: &Path,
     import_renames: &[(Vec<String>, String)],
 ) -> Result<(), CodegenError> {
+    // A7 (G16): resolve `BusSubject::QualifiedTopic(alias::Foo)`
+    // — cross-seed topic refs the parser admits — to plain
+    // single-segment `BusSubject::Topic(Ident(mangled_name))`
+    // BEFORE desugar runs. The mangling table built by the CLI
+    // (`import_renames`) plus the static stdlib path-renames hold
+    // every alias-qualified topic decl in the merged program;
+    // looking up the path here gives the same mangled name the
+    // topic decl ends up at, so desugar's existing Topic→Literal
+    // pass uses the topic's declared wire subject. The fallback
+    // keeps the leaf segment name so a downstream "unknown topic"
+    // diagnostic has something to cite.
+    let mut program_owned = program.clone();
+    resolve_qualified_bus_subjects(&mut program_owned, import_renames);
     // Topic-reference desugaring: rewrite `BusSubject::Topic`
     // and `Foo <- expr` (where Foo is a topic) into the
     // equivalent literal-subject forms. The rest of codegen
@@ -208,7 +221,6 @@ pub fn build_executable_with_imports(
     // optimizable Send statements into direct `self.handler(...)`
     // method calls. desugar_topics then handles whatever bus refs
     // remain.
-    let mut program_owned = program.clone();
     aperio_syntax::desugar::desugar_intra_locus_topics(&mut program_owned);
     aperio_syntax::desugar::desugar_topics(&mut program_owned);
     let program = &program_owned;
@@ -248,7 +260,9 @@ pub fn build_executable_with_imports(
         loops: Vec::new(),
         user_fns: BTreeMap::new(),
         user_loci: BTreeMap::new(),
+        pending_locus_names: BTreeSet::new(),
         user_types: BTreeMap::new(),
+        pending_type_names: BTreeSet::new(),
         user_enums: BTreeMap::new(),
         user_interfaces: BTreeSet::new(),
         import_renames: import_renames
@@ -559,6 +573,144 @@ fn stdlib_mangled_for_path(segs: &[&str]) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// A7 (G16): walk the program before desugar and resolve every
+/// `BusSubject::QualifiedTopic(alias::Foo)` ref to the mangled
+/// single-segment ident the imported topic decl ends up at.
+/// Leaves the variant in place if the path doesn't resolve so a
+/// downstream "unknown topic" diagnostic can cite the source path.
+fn resolve_qualified_bus_subjects(
+    program: &mut aperio_syntax::ast::Program,
+    import_renames: &[(Vec<String>, String)],
+) {
+    use aperio_syntax::ast::{
+        BusMember, BusSubject, Ident, LocusMember, TopDecl,
+    };
+    fn lookup<'a>(
+        segs: &[&str],
+        import_renames: &'a [(Vec<String>, String)],
+    ) -> Option<String> {
+        if let Some(s) = stdlib_mangled_for_path(segs) {
+            return Some(s.to_string());
+        }
+        let key: Vec<String> = segs.iter().map(|s| s.to_string()).collect();
+        import_renames
+            .iter()
+            .find(|(k, _)| k == &key)
+            .map(|(_, v)| v.clone())
+    }
+    fn rewrite(
+        subject: &mut BusSubject,
+        import_renames: &[(Vec<String>, String)],
+    ) {
+        if let BusSubject::QualifiedTopic(qn) = subject {
+            let segs: Vec<&str> =
+                qn.segments.iter().map(|s| s.name.as_str()).collect();
+            if let Some(mangled) = lookup(&segs, import_renames) {
+                let span = qn.span;
+                *subject = BusSubject::Topic(Ident { name: mangled, span });
+            }
+        }
+    }
+    use aperio_syntax::ast::{Block, ElseBranch, Expr, MatchArmBody, Stmt};
+    fn rewrite_send_subject(
+        e: &mut Expr,
+        import_renames: &[(Vec<String>, String)],
+    ) {
+        // `source::Heartbeat <- payload;` — Expr::Path multi-segment
+        // resolves to a single-segment Ident with the mangled topic
+        // name so the desugar's Stmt::Send rewriter (which only
+        // looks at Expr::Ident) handles it uniformly with intra-
+        // seed sends.
+        if let Expr::Path(qn) = e {
+            if qn.segments.len() > 1 {
+                let segs: Vec<&str> =
+                    qn.segments.iter().map(|s| s.name.as_str()).collect();
+                if let Some(mangled) = lookup(&segs, import_renames) {
+                    let span = qn.span;
+                    *e = Expr::Ident(Ident { name: mangled, span });
+                }
+            }
+        }
+    }
+    fn walk_if(
+        i: &mut aperio_syntax::ast::IfStmt,
+        import_renames: &[(Vec<String>, String)],
+    ) {
+        walk_block(&mut i.then_block, import_renames);
+        if let Some(eb) = &mut i.else_block {
+            match eb.as_mut() {
+                ElseBranch::Else(b) => walk_block(b, import_renames),
+                ElseBranch::ElseIf(nested) => walk_if(nested, import_renames),
+            }
+        }
+    }
+    fn walk_block(
+        b: &mut Block,
+        import_renames: &[(Vec<String>, String)],
+    ) {
+        for s in &mut b.stmts {
+            walk_stmt(s, import_renames);
+        }
+        // Tail expr can't be a Send (Send is statement-only).
+        let _ = &b.tail;
+    }
+    fn walk_stmt(
+        s: &mut Stmt,
+        import_renames: &[(Vec<String>, String)],
+    ) {
+        match s {
+            Stmt::Send { subject, .. } => {
+                rewrite_send_subject(subject, import_renames);
+            }
+            Stmt::If(i) => walk_if(i, import_renames),
+            Stmt::Match(m) => {
+                for arm in &mut m.arms {
+                    if let MatchArmBody::Block(b) = &mut arm.body {
+                        walk_block(b, import_renames);
+                    }
+                }
+            }
+            Stmt::For { body, .. } | Stmt::While { body, .. } => {
+                walk_block(body, import_renames);
+            }
+            Stmt::Block(b) => walk_block(b, import_renames),
+            _ => {}
+        }
+    }
+    for item in &mut program.items {
+        if let TopDecl::Locus(l) = item {
+            for m in &mut l.members {
+                match m {
+                    LocusMember::Bus(b) => {
+                        for bm in &mut b.members {
+                            match bm {
+                                BusMember::Subscribe { subject, .. } => {
+                                    rewrite(subject, import_renames);
+                                }
+                                BusMember::Publish { subject, .. } => {
+                                    rewrite(subject, import_renames);
+                                }
+                            }
+                        }
+                    }
+                    LocusMember::Lifecycle(lc) => {
+                        walk_block(&mut lc.body, import_renames);
+                    }
+                    LocusMember::Mode(md) => {
+                        walk_block(&mut md.body, import_renames);
+                    }
+                    LocusMember::Fn(fd) => {
+                        walk_block(&mut fd.body, import_renames);
+                    }
+                    _ => {}
+                }
+            }
+        } else if let TopDecl::Fn(fd) = item {
+            walk_block(&mut fd.body, import_renames);
+        }
+    }
+}
+
 
 struct Cx<'ctx, 'p> {
     context: &'ctx Context,
@@ -589,11 +741,25 @@ struct Cx<'ctx, 'p> {
     /// `lower_program`; carries the LLVM struct type for the
     /// locus's params + the lifecycle methods compiled against it.
     user_loci: BTreeMap<String, LocusInfo<'ctx>>,
+    /// B10: pre-collected locus names (concrete monomorphs +
+    /// raw decls), populated before `declare_locus_struct` runs.
+    /// Lets `type_expr_to_codegen_ty` resolve a forward-referenced
+    /// locus name to `LocusRef(name)` even when the referenced
+    /// locus's `LocusInfo` isn't in `user_loci` yet. The full
+    /// info shows up in `user_loci` later in the same pass.
+    pending_locus_names: BTreeSet<String>,
     /// User-defined `type` declarations indexed by name. Filled
     /// in pass A0 of `lower_program`; carries the LLVM struct
     /// type and field map for plain data records (no methods).
     /// Used for type literals like `Point { x: 3, y: 4 }`.
     user_types: BTreeMap<String, TypeInfo<'ctx>>,
+    /// B8: pre-collected user/stdlib type names, populated
+    /// before `declare_user_type` runs. Parallel to
+    /// `pending_locus_names` — lets a user `type Ctx { req:
+    /// std::http::Request; }` resolve the path-qualified field
+    /// type even when the stdlib type's full TypeInfo hasn't
+    /// been registered yet.
+    pending_type_names: BTreeSet<String>,
     /// m47: user-defined enum declarations indexed by name. Each
     /// entry carries the variant-name → tag-index map. v0.1
     /// supports no-payload-only enums; an enum value is an i32
@@ -1240,6 +1406,7 @@ fn expr_reads_self_children(e: &Expr) -> bool {
             match disposition {
                 OrDisposition::Raise(_) | OrDisposition::Discard(_) => false,
                 OrDisposition::Substitute(rhs) => expr_reads_self_children(rhs),
+                OrDisposition::Fail(payload, _) => expr_reads_self_children(payload),
             }
         }
     }
@@ -2201,6 +2368,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let bytes_data_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_bytes_data", bytes_data_ty, None);
+        // B2 / G5: bytes-literal helper.
+        // declare ptr @lotus_bytes_from_buf(ptr arena, ptr src, i64 len)
+        let bytes_from_buf_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
+        self.module
+            .add_function("lotus_bytes_from_buf", bytes_from_buf_ty, None);
 
         // m89: file/socket I/O on Bytes.
         // declare ptr @lotus_fs_read_bytes(ptr arena, ptr path)
@@ -3756,6 +3929,55 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .build_store(cursor_alloca, after)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
+                CodegenTy::Bytes => {
+                    // A8 (G15): Bytes payload field. The in-memory
+                    // blob is `[i64 len][u8 data[len]]` (per
+                    // memory.md § Bytes); the wire format matches.
+                    // Load the Bytes pointer, read its length
+                    // prefix, then memcpy `8 + len` bytes from
+                    // the blob to dst. The deserializer mirrors
+                    // this — allocate `8 + len`, memcpy, store
+                    // the pointer.
+                    let bytes_ptr = self
+                        .builder
+                        .build_load(
+                            self.context.ptr_type(AddressSpace::default()),
+                            src_field_ptr,
+                            "ser.bytes.ptr",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_pointer_value();
+                    let bytes_len = self
+                        .builder
+                        .build_load(i64_t, bytes_ptr, "ser.bytes.len")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let total = self
+                        .builder
+                        .build_int_add(
+                            bytes_len,
+                            i64_t.const_int(8, false),
+                            "ser.bytes.total",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.emit_memcpy_call(
+                        dst_at_cursor,
+                        bytes_ptr,
+                        total,
+                        "ser.bytes.memcpy",
+                    )?;
+                    let after = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            total,
+                            "ser.cursor.after.bytes",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
                 CodegenTy::TypeRef(nested_name) => {
                     // Nested user-struct: recurse on its field
                     // layout. The slot at `src_field_ptr` holds a
@@ -3805,9 +4027,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "bus payload field `{}: {:?}` — m70 wire format \
-                         supports primitives, String, and nested structs \
-                         (whose leaves are primitives/String); arrays / \
-                         tuples / enums cross-process are post-v1 polish",
+                         supports primitives, String, Bytes, and nested \
+                         structs (whose leaves are primitives/String/Bytes); \
+                         arrays / tuples / enums cross-process are post-v1 \
+                         polish",
                         fname, other
                     )));
                 }
@@ -3990,6 +4213,78 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             cursor_iv,
                             nbytes_iv,
                             "de.cursor.after",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+                CodegenTy::Bytes => {
+                    // A8 (G15) — mirror of the serializer.
+                    // Read 8-byte length prefix at the cursor;
+                    // allocate `8 + len` bytes in the bus payload
+                    // arena, memcpy the length-prefixed blob,
+                    // store the pointer into the dst field. The
+                    // blob's first 8 bytes ARE the length, so a
+                    // subsequent `len(b)` read returns the
+                    // wire-level length directly.
+                    let len_alloca = self
+                        .builder
+                        .build_alloca(i64_t, "de.bytes.len.alloca")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.emit_memcpy_call(
+                        len_alloca,
+                        src_at_cursor,
+                        i64_t.const_int(8, false),
+                        "de.bytes.memcpy.len",
+                    )?;
+                    let bytes_len = self
+                        .builder
+                        .build_load(i64_t, len_alloca, "de.bytes.len")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let total = self
+                        .builder
+                        .build_int_add(
+                            bytes_len,
+                            i64_t.const_int(8, false),
+                            "de.bytes.total",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let alloc_fn = self
+                        .module
+                        .get_function("lotus_bus_payload_arena_alloc")
+                        .expect("lotus_bus_payload_arena_alloc declared");
+                    let buf = self
+                        .builder
+                        .build_call(
+                            alloc_fn,
+                            &[
+                                total.into(),
+                                i64_t.const_int(8, false).into(),
+                            ],
+                            "de.bytes.alloc",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("payload arena alloc returns ptr")
+                        .into_pointer_value();
+                    self.emit_memcpy_call(
+                        buf,
+                        src_at_cursor,
+                        total,
+                        "de.bytes.memcpy.blob",
+                    )?;
+                    self.builder
+                        .build_store(dst_field_ptr, buf)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let after = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            total,
+                            "de.cursor.after.bytes",
                         )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     self.builder
@@ -4240,6 +4535,74 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .build_store(cursor_alloca, after)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
+                CodegenTy::Bytes => {
+                    // A8 (G15) — nested-struct variant. Same shape
+                    // as the top-level Bytes deserializer above:
+                    // read 8-byte length, alloc `8 + len`, memcpy
+                    // the prefixed blob, store ptr into dst.
+                    let len_alloca = self
+                        .builder
+                        .build_alloca(i64_t, "de.nested.bytes.len.alloca")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.emit_memcpy_call(
+                        len_alloca,
+                        src_at_cursor,
+                        i64_t.const_int(8, false),
+                        "de.nested.bytes.memcpy.len",
+                    )?;
+                    let bytes_len = self
+                        .builder
+                        .build_load(i64_t, len_alloca, "de.nested.bytes.len")
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let total = self
+                        .builder
+                        .build_int_add(
+                            bytes_len,
+                            i64_t.const_int(8, false),
+                            "de.nested.bytes.total",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let alloc_fn = self
+                        .module
+                        .get_function("lotus_bus_payload_arena_alloc")
+                        .expect("lotus_bus_payload_arena_alloc declared");
+                    let buf = self
+                        .builder
+                        .build_call(
+                            alloc_fn,
+                            &[
+                                total.into(),
+                                i64_t.const_int(8, false).into(),
+                            ],
+                            "de.nested.bytes.alloc",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .try_as_basic_value()
+                        .left()
+                        .expect("payload arena alloc returns ptr")
+                        .into_pointer_value();
+                    self.emit_memcpy_call(
+                        buf,
+                        src_at_cursor,
+                        total,
+                        "de.nested.bytes.memcpy.blob",
+                    )?;
+                    self.builder
+                        .build_store(dst_field_ptr, buf)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let after = self
+                        .builder
+                        .build_int_add(
+                            cursor_iv,
+                            total,
+                            "de.nested.cursor.after.bytes",
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(cursor_alloca, after)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
                 CodegenTy::TypeRef(nested_name) => {
                     let nested_info = self
                         .user_types
@@ -4300,7 +4663,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 other => {
                     return Err(CodegenError::Unsupported(format!(
                         "bus payload field `{}: {:?}` — m70 wire format \
-                         supports primitives, String, and nested structs",
+                         supports primitives, String, Bytes, and nested \
+                         structs",
                         fname, other
                     )));
                 }
@@ -4670,6 +5034,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
         }
 
+        // B8: pre-register every concrete type name so fields
+        // typed as a forward-referenced or path-qualified stdlib
+        // type resolve cleanly. Parallels the pending_locus_names
+        // pre-pass for loci. Full TypeInfo lands in
+        // `declare_user_type` below; this set just keeps the
+        // existence check optimistic so cross-decl references
+        // don't fail on declaration order.
+        for t in &type_decls {
+            if t.generics.is_empty() {
+                self.pending_type_names.insert(t.name.name.clone());
+            }
+        }
+
         // Now declare concrete user-written non-generic decls.
         // The generic templates themselves are skipped inside
         // declare_user_type (m61: generic decls produce no LLVM
@@ -4693,6 +5070,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // loci with the mangled names.
         let mut locus_decls: Vec<LocusDecl> = raw_locus_decls.clone();
         locus_decls.extend(synthesized_loci);
+        // B10: pre-register every locus name so a forward-
+        // referenced locus type in another locus's `params { x:
+        // OtherLocus; }` resolves cleanly. The full LocusInfo
+        // shows up later in the same pass; this set just makes
+        // the existence check succeed during type_expr lowering.
+        for l in &locus_decls {
+            self.pending_locus_names.insert(l.name.name.clone());
+        }
         for l in &locus_decls {
             self.declare_locus_struct(l)?;
         }
@@ -5312,7 +5697,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 if generic_args.is_empty() && path.segments.len() == 1 =>
             {
                 let name = &path.segments[0].name;
-                if self.user_loci.contains_key(name) {
+                if self.user_loci.contains_key(name)
+                    || self.pending_locus_names.contains(name)
+                {
+                    // B10: `pending_locus_names` lets a locus that
+                    // hasn't been fully declared yet still resolve
+                    // as a LocusRef target. The opaque struct body
+                    // gets populated when the referenced locus's
+                    // own `declare_locus_struct` runs later in the
+                    // same pass.
                     Ok(CodegenTy::LocusRef(name.clone()))
                 } else if self.user_types.contains_key(name) {
                     Ok(CodegenTy::TypeRef(name.clone()))
@@ -5325,6 +5718,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     // built at the call site, dispatch through
                     // the vtable is emitted at the method-call site.
                     Ok(CodegenTy::Interface(name.clone()))
+                } else if name == "LocusRef" || name == "TypeRef" {
+                    // B16 / G14: `LocusRef` / `TypeRef` are
+                    // codegen-internal kinds, not user-spellable
+                    // types. Spell the locus or type by name
+                    // directly — there's no separate "reference"
+                    // type in v1.
+                    Err(CodegenError::Unsupported(format!(
+                        "type `{}` is not user-spellable in v1; \
+                         spell the locus or type by name directly \
+                         (e.g. `params {{ x: MyLocus; }}` for a \
+                         borrowed locus reference)",
+                        name
+                    )))
                 } else {
                     Err(CodegenError::Unsupported(format!(
                         "unknown type name `{}` in signature",
@@ -5355,12 +5761,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     ))
                 })?;
                 let mangled: &str = &mangled_owned;
-                if self.user_loci.contains_key(mangled) {
+                if self.user_loci.contains_key(mangled)
+                    || self.pending_locus_names.contains(mangled)
+                {
                     Ok(CodegenTy::LocusRef(mangled.to_string()))
-                } else if self.user_types.contains_key(mangled) {
+                } else if self.user_types.contains_key(mangled)
+                    || self.pending_type_names.contains(mangled)
+                {
                     // m84: path-qualified stdlib `type` records.
                     // `std::http::Request` in a fn signature
                     // resolves to TypeRef("__StdHttpRequest").
+                    // B8: pending_type_names lets cross-decl
+                    // references resolve regardless of source
+                    // order (user `type Ctx { req: std::http::
+                    // Request; }` works even when the stdlib
+                    // type is declared after the user type).
                     Ok(CodegenTy::TypeRef(mangled.to_string()))
                 } else if self.user_interfaces.contains(mangled) {
                     // F.20 Phase B + Sink-migration follow-up:
@@ -7125,23 +7540,66 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         for member in &l.members {
             if let LocusMember::Params(pb) = member {
                 for p in &pb.params {
+                    // B7 / G19: when the param's ascribed type is
+                    // a user-defined struct whose every field has
+                    // a default, synthesize `T { }` as the param's
+                    // own default. This drops the `=` requirement
+                    // for the common "wrap an all-defaulted record
+                    // in a locus param" pattern (e.g. config
+                    // bundles, settings structs).
+                    let synthesized_struct_default: Option<Expr> =
+                        if matches!(&p.init, ParamInit::Inferred) {
+                            p.ty.as_ref().and_then(|te| {
+                                let TypeExpr::Named { path, generic_args, .. } = te
+                                else { return None };
+                                if !generic_args.is_empty() {
+                                    return None;
+                                }
+                                if path.segments.len() != 1 {
+                                    return None;
+                                }
+                                let name = &path.segments[0].name;
+                                let info = self.user_types.get(name)?;
+                                if info.field_order.is_empty() {
+                                    return None;
+                                }
+                                if !info
+                                    .field_order
+                                    .iter()
+                                    .all(|f| info.defaults.contains_key(f))
+                                {
+                                    return None;
+                                }
+                                Some(Expr::Struct {
+                                    path: path.clone(),
+                                    inits: Vec::new(),
+                                    span: p.name.span,
+                                })
+                            })
+                        } else {
+                            None
+                        };
                     let default_expr = match &p.init {
                         ParamInit::Value(e) => Some(e),
                         ParamInit::Inferred => {
-                            // 2026-05-16 — `name: T;` with no `=`
-                            // declares a required param. The user
-                            // must supply it at instantiation time;
-                            // codegen accepts the param with an
-                            // ascribed type and no default.
-                            if p.ty.is_none() {
+                            if let Some(synth) = synthesized_struct_default.as_ref() {
+                                Some(synth)
+                            } else if p.ty.is_none() {
+                                // 2026-05-16 — `name: T;` with no `=`
+                                // declares a required param. The
+                                // user must supply it at
+                                // instantiation time; codegen
+                                // accepts the param with an
+                                // ascribed type and no default.
                                 return Err(CodegenError::Unsupported(format!(
                                     "locus `{}` param `{}`: required \
                                      params need an explicit type \
                                      ascription (`name: T;`)",
                                     l.name.name, p.name.name
                                 )));
+                            } else {
+                                None
                             }
-                            None
                         }
                     };
                     let default_expr = match default_expr {
@@ -9266,7 +9724,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             param_tys.push(lt);
             defaults.push(p.default.clone());
         }
-        let ret_ty = match &f.ret {
+        // A2 (G2): treat `-> ()` (parsed as an empty tuple) as
+        // Unit, equivalent to omitting the return type. The downstream
+        // ABI shape — both for the non-fallible and the fallible
+        // path — is keyed off `Option<CodegenTy>` ret, where `None`
+        // means Unit. Without this rewrite, `type_expr_to_codegen_ty`
+        // rejects the empty tuple at line ~5439.
+        let ret_te_normalized: Option<&TypeExpr> = match &f.ret {
+            Some(TypeExpr::Tuple(parts, _)) if parts.is_empty() => None,
+            other => other.as_ref(),
+        };
+        let ret_ty = match ret_te_normalized {
             Some(t) => Some(self.type_expr_to_codegen_ty(t)?),
             None => None,
         };
@@ -9278,10 +9746,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // allocates both slots and branches on the i1; see
         // commit-3 call-site plumbing.
         //
-        // v1 reject void+fallible: every fallible fn the stdlib
-        // and interpreter parity tests produce has a declared ret
-        // type, so the path is unreachable; surface a clear
-        // diagnostic instead of silently emitting a half-shape.
+        // A2 (G2): `-> () fallible(E)` (Unit success) skips the
+        // out_val sret slot — only out_err is plumbed through.
+        // emit_fallible_fn_exit_epilogue's ok-branch already guards
+        // on `(sig.ret, out_val_param)` so a None ret + None
+        // out_val_param falls through to cleanup without a copy.
         let fallible_payload_ty: Option<CodegenTy> =
             match (&f.fallible, &ret_ty) {
                 (Some(payload_te), Some(_)) => {
@@ -9293,12 +9762,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     llvm_param_tys.push(ptr_t.into());
                     Some(pt)
                 }
-                (Some(_), None) => {
-                    return Err(CodegenError::Unsupported(format!(
-                        "fn `{}`: v1 requires fallible(E) fns to declare a \
-                         return type",
-                        f.name.name
-                    )));
+                (Some(payload_te), None) => {
+                    let pt = self.type_expr_to_codegen_ty(payload_te)?;
+                    let ptr_t = self.context.ptr_type(AddressSpace::default());
+                    // Unit success: only the out_err sret slot.
+                    llvm_param_tys.push(ptr_t.into());
+                    Some(pt)
                 }
                 (None, _) => None,
             };
@@ -10194,11 +10663,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 Ok(new_struct.into())
             }
-            CodegenTy::LocusRef(_) => Err(CodegenError::Unsupported(format!(
-                "free-fn return of {:?}: locus references shouldn't \
-                 cross arena boundaries — pass via bus instead",
-                ty
-            ))),
+            CodegenTy::LocusRef(_) => {
+                // B1 / G3: free fns returning a LocusRef. The
+                // m90 heap-alloc path in `lower_locus_instantiation`
+                // (triggered by `current_user_fn_ret` matching the
+                // locus name) routes the instantiation into the
+                // lazy global payload arena, so the returned
+                // pointer is already program-lifetime-safe.
+                // Pass-through here — same shape as the Bytes
+                // arm above. Matches the locus-method m90 return
+                // path that already covers `fn(...) -> Self`
+                // inside a locus body.
+                Ok(value)
+            }
             CodegenTy::Interface(_) => Err(CodegenError::Unsupported(format!(
                 "free-fn return of {:?}: interface values shouldn't \
                  cross arena boundaries at v0 — the data pointer \
@@ -10697,6 +11174,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     self.lower_or_raise(&call)?;
                     None
                 }
+                OrDisposition::Fail(payload, _) => {
+                    // B3 / G6: `or fail X` — evaluate X as the
+                    // enclosing fallible fn's declared payload type
+                    // and divert to the err-path exit. Symmetric to
+                    // `or raise` but the caller picks the payload
+                    // (often to translate one error shape into
+                    // another), rather than re-emitting the inner
+                    // call's payload verbatim.
+                    self.lower_or_fail(payload, &call, scope)?;
+                    None
+                }
                 OrDisposition::Discard(_) => {
                     // `or discard`: success type must be Unit;
                     // err branch is a no-op (no fallback expr
@@ -10911,12 +11399,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 resolved_name
             ))
         })?;
-        let success_ty = sig.ret.clone().ok_or_else(|| {
-            CodegenError::Unsupported(format!(
-                "fallible fn `{}` has no declared return type",
-                resolved_name
-            ))
-        })?;
+        // A2 (G2): `-> () fallible(E)` is the Unit-success shape.
+        // `success_ty` stays None; out_val sret slot is skipped at
+        // call site; FallibleCallResult carries `out_val_slot: None`
+        // so the downstream `or` machinery falls through cleanly.
+        let success_ty: Option<CodegenTy> = sig.ret.clone();
         if args.len() > sig.params.len() {
             return Err(CodegenError::Unsupported(format!(
                 "fallible fn `{}` expects at most {} args, got {}",
@@ -10941,7 +11428,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // alloca lands in the entry block (LLVM's mem2sem treats
         // entry-block allocas specially) and the slot pointers
         // are stable across arg-expression lowering.
-        let out_val_slot = self.alloca_for(&success_ty, "or.out_val.slot")?;
+        // A2 (G2): Unit-success fallible fns have no out_val slot —
+        // skip the alloca + arg push entirely. The callee's ABI is
+        // `(__caller_arena, params..., out_err) -> i1`.
+        let out_val_slot: Option<PointerValue<'ctx>> = match &success_ty {
+            Some(st) => Some(self.alloca_for(st, "or.out_val.slot")?),
+            None => None,
+        };
         let out_err_slot = self.alloca_for(&payload_ty, "or.out_err.slot")?;
 
         let caller_arena_at_call = self.current_arena_ptr()?;
@@ -10986,7 +11479,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             };
             llvm_args.push(v.into());
         }
-        llvm_args.push(out_val_slot.into());
+        if let Some(slot) = &out_val_slot {
+            llvm_args.push((*slot).into());
+        }
         llvm_args.push(out_err_slot.into());
 
         let call = self
@@ -11005,9 +11500,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         Ok(FallibleCallResult {
             i1_path,
-            out_val_slot: Some(out_val_slot),
+            out_val_slot,
             out_err_slot,
-            success_ty: Some(success_ty),
+            success_ty,
             payload_ty,
         })
     }
@@ -12301,6 +12796,74 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// from it): call `lotus_root_panic` and emit unreachable.
     /// Either way the err branch terminates — the caller's join
     /// block has only the ok branch as a predecessor.
+    /// B3 / G6: `or fail X` shares the err-exit shape of
+    /// `or raise` — only the source of the payload differs.
+    /// Reject if the enclosing fn isn't fallible (the payload
+    /// has no slot to land in), and reject if the payload type
+    /// doesn't match the fn's declared error type.
+    fn lower_or_fail(
+        &mut self,
+        payload: &Expr,
+        _call: &FallibleCallResult<'ctx>,
+        scope: &Scope<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let enclosing = self.current_user_fn_fallible.clone().ok_or_else(|| {
+            CodegenError::Unsupported(
+                "`or fail X` outside a fallible(E) fn (use `or raise` \
+                 if you want to propagate the inner call's payload, or \
+                 `or <fallback>` to substitute a value)".into(),
+            )
+        })?;
+
+        // m67-style rewrite: bare-name struct literals in fail
+        // position resolve against the declared payload type,
+        // matching the Stmt::Fail and lower_return shapes.
+        let payload_ty = enclosing.payload_ty.clone();
+        let rewritten;
+        let e_to_lower: &Expr = match payload {
+            Expr::Struct { path, inits, span } => {
+                match self.resolve_generic_struct_path_for_codegen_ty(
+                    path,
+                    &payload_ty,
+                ) {
+                    Some(new_path) => {
+                        rewritten = Expr::Struct {
+                            path: new_path,
+                            inits: inits.clone(),
+                            span: *span,
+                        };
+                        &rewritten
+                    }
+                    None => payload,
+                }
+            }
+            _ => payload,
+        };
+
+        let (v, got_ty) = self.lower_expr(e_to_lower, scope)?;
+        if got_ty != payload_ty {
+            return Err(CodegenError::Unsupported(format!(
+                "`or fail` payload type mismatch: enclosing fn declared \
+                 fallible({:?}), got {:?}",
+                payload_ty, got_ty
+            )));
+        }
+        self.builder
+            .build_store(enclosing.err_alloca, v)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let bool_t = self.context.bool_type();
+        self.builder
+            .build_store(enclosing.path_alloca, bool_t.const_int(1, false))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let exit_bb = self
+            .current_user_fn_exit_bb
+            .expect("exit_bb set inside a fn body");
+        self.builder
+            .build_unconditional_branch(exit_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
     fn lower_or_raise(
         &mut self,
         call: &FallibleCallResult<'ctx>,
@@ -12613,13 +13176,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 let idx_i64 = idx_val.into_int_value();
                 let (val, val_ty) = self.lower_expr(&args[1], scope)?;
-                if val_ty != elem_ty {
+                // A10 (G20): locus → interface coercion on set.
+                let val = if let (
+                    CodegenTy::Interface(iface),
+                    CodegenTy::LocusRef(l),
+                ) = (&elem_ty, &val_ty)
+                {
+                    self.coerce_to_interface(
+                        val.into_pointer_value(),
+                        l,
+                        iface,
+                    )?
+                    .into()
+                } else if val_ty != elem_ty {
                     return Err(CodegenError::Unsupported(format!(
                         "@form(vec) `{}`.set: value type mismatch: expected \
                          {:?}, got {:?}",
                         locus_name, elem_ty, val_ty
                     )));
-                }
+                } else {
+                    val
+                };
                 // The C ABI takes the new element as a pointer
                 // (matching lotus_vec_get's out-pointer shape). Stash
                 // the SSA value into a stack alloca, hand its address
@@ -16864,6 +17441,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let p = self.global_string(s);
                 Ok((p.into(), CodegenTy::String))
             }
+            // B2 / G5: `b"..."` bytes literal. Stash the bytes as a
+            // private global i8 array; allocate a fresh Bytes blob
+            // in the current arena and memcpy via lotus_bytes_from_buf.
+            // Length is the literal's byte count (NUL-safe).
+            Expr::Literal(Literal::Bytes(bs), _) => {
+                let len = bs.len() as i64;
+                let src_ptr = self.global_bytes(bs);
+                let arena_ptr = self.current_arena_ptr()?;
+                let from_buf = self
+                    .module
+                    .get_function("lotus_bytes_from_buf")
+                    .expect("lotus_bytes_from_buf declared");
+                let i64_t = self.context.i64_type();
+                let len_v = i64_t.const_int(len as u64, true);
+                let call = self
+                    .builder
+                    .build_call(
+                        from_buf,
+                        &[arena_ptr.into(), src_ptr.into(), len_v.into()],
+                        "bytes.lit.from_buf",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let blob = call
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_bytes_from_buf returns ptr");
+                Ok((blob, CodegenTy::Bytes))
+            }
             Expr::Literal(Literal::Duration(ns), _) => {
                 // Duration literals are i64 nanoseconds at the
                 // lowered level; tracked as Duration so callers
@@ -16998,140 +17603,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         ))
                     },
                 )?;
-                // 3b: F.16 built-in `self.k_max`. Computed from
-                // the locus's B / c / sigma / phi params on every
-                // read so the bound floats with mutable params.
-                // Formula: `k_max = B / [(1-phi)c + phi*sigma]`.
-                // The interpreter computes the same expression in
-                // `read_field` for Value::Locus; codegen lowers it
-                // here so `aperio build` matches `aperio run` for
-                // capacity-cascade demos. Int params are widened
-                // to Float before the arithmetic; phi must already
-                // be Float.
+                // F.16 / F.27 synthetic fields. B14 lifted the bodies
+                // into helpers so non-`self` locus receivers
+                // (`g.k_max`, `g.draining`) hit the same lowering.
                 if name.name == "k_max" {
-                    let load_field = |this: &mut Self, fname: &str| {
-                        let (fidx, fty) = cs
-                            .fields
-                            .get(fname)
-                            .cloned()
-                            .ok_or_else(|| {
-                                CodegenError::Unsupported(format!(
-                                    "self.k_max requires param `{}` on locus `{}`",
-                                    fname, cs.locus_name
-                                ))
-                            })?;
-                        let ptr = this
-                            .builder
-                            .build_struct_gep(
-                                cs.struct_ty,
-                                cs.self_ptr,
-                                fidx,
-                                &format!("self.{}.k_max.ptr", fname),
-                            )
-                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                        let llvm_ty = this.llvm_basic_type(&fty);
-                        let val = this
-                            .builder
-                            .build_load(
-                                llvm_ty,
-                                ptr,
-                                &format!("self.{}.k_max", fname),
-                            )
-                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                        Ok::<_, CodegenError>((val, fty))
-                    };
-                    let (b_v, b_ty) = load_field(self, "B")?;
-                    let (c_v, c_ty) = load_field(self, "c")?;
-                    let (sigma_v, sigma_ty) = load_field(self, "sigma")?;
-                    let (phi_v, phi_ty) = load_field(self, "phi")?;
-                    let b_f = self.coerce_to_float(b_v, &b_ty, "self.k_max.B")?;
-                    let c_f = self.coerce_to_float(c_v, &c_ty, "self.k_max.c")?;
-                    let sigma_f = self.coerce_to_float(
-                        sigma_v,
-                        &sigma_ty,
-                        "self.k_max.sigma",
-                    )?;
-                    let phi_f = match phi_ty {
-                        CodegenTy::Float => phi_v.into_float_value(),
-                        other => {
-                            return Err(CodegenError::Unsupported(format!(
-                                "self.k_max requires param `phi` of type \
-                                 Float, got {:?}",
-                                other
-                            )));
-                        }
-                    };
-                    let f64_t = self.context.f64_type();
-                    let one = f64_t.const_float(1.0);
-                    let one_minus_phi = self
-                        .builder
-                        .build_float_sub(one, phi_f, "k_max.1mphi")
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    let term_left = self
-                        .builder
-                        .build_float_mul(one_minus_phi, c_f, "k_max.term_left")
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    let term_right = self
-                        .builder
-                        .build_float_mul(phi_f, sigma_f, "k_max.term_right")
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    let denom = self
-                        .builder
-                        .build_float_add(
-                            term_left,
-                            term_right,
-                            "k_max.denom",
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    let k_max = self
-                        .builder
-                        .build_float_div(b_f, denom, "k_max")
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    return Ok((k_max.into(), CodegenTy::Float));
+                    return self.lower_locus_kmax(
+                        &cs.locus_name,
+                        cs.struct_ty,
+                        cs.self_ptr,
+                        &cs.fields,
+                    );
                 }
-                // v1.x-VIOLATE (F.27): `self.draining` reads the
-                // synthetic `__drain_requested: i64` field and
-                // returns it as a Bool. Set by `violate NAME;` —
-                // user code reads it (canonically as
-                // `if !self.draining { ... }`) to gate
-                // downstream effects after a structural failure.
                 if name.name == "draining" {
-                    let info = self
-                        .user_loci
-                        .get(&cs.locus_name)
-                        .cloned()
-                        .ok_or_else(|| {
-                            CodegenError::Unsupported(format!(
-                                "self.draining: no LocusInfo for `{}`",
-                                cs.locus_name
-                            ))
-                        })?;
-                    let dr_ptr = self
-                        .builder
-                        .build_struct_gep(
-                            cs.struct_ty,
-                            cs.self_ptr,
-                            info.drain_requested_field_idx,
-                            "self.draining.ptr",
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    let i64_t = self.context.i64_type();
-                    let raw = self
-                        .builder
-                        .build_load(i64_t, dr_ptr, "self.draining.raw")
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                        .into_int_value();
-                    let zero = i64_t.const_int(0, false);
-                    let as_bool = self
-                        .builder
-                        .build_int_compare(
-                            inkwell::IntPredicate::NE,
-                            raw,
-                            zero,
-                            "self.draining",
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    return Ok((as_bool.into(), CodegenTy::Bool));
+                    return self.lower_locus_draining(
+                        &cs.locus_name,
+                        cs.struct_ty,
+                        cs.self_ptr,
+                    );
                 }
                 let (idx, ty) = cs.fields.get(&name.name).cloned().ok_or_else(
                     || {
@@ -17204,6 +17692,37 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .build_load(elem_llvm, slot, &format!("tup.{}", i))
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     return Ok((val, elems[i].clone()));
+                }
+                // B14: synthetic `k_max` / `draining` reads on a
+                // non-self LocusRef receiver. The typechecker
+                // already accepts these on any locus (see
+                // `field_ty` in check.rs); codegen now matches.
+                if let CodegenTy::LocusRef(n) = &recv_ty {
+                    if name.name == "k_max" {
+                        let info = self
+                            .user_loci
+                            .get(n)
+                            .cloned()
+                            .expect("LocusRef points to a declared locus");
+                        return self.lower_locus_kmax(
+                            n,
+                            info.struct_ty,
+                            recv_val.into_pointer_value(),
+                            &info.fields,
+                        );
+                    }
+                    if name.name == "draining" {
+                        let info = self
+                            .user_loci
+                            .get(n)
+                            .cloned()
+                            .expect("LocusRef points to a declared locus");
+                        return self.lower_locus_draining(
+                            n,
+                            info.struct_ty,
+                            recv_val.into_pointer_value(),
+                        );
+                    }
                 }
                 let (struct_ty, fields, ref_kind) = match &recv_ty {
                     CodegenTy::LocusRef(n) => {
@@ -17306,6 +17825,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         let coerced = self.value_to_string(lv, &lt)?;
                         return self.lower_binop(*op, coerced, rv, &CodegenTy::String);
                     }
+                }
+                // B13 / G30: F.23 Int → Float widening in
+                // binary-op position. Symmetric — either side
+                // can be the Int that gets widened. Must NOT
+                // cross Float → Decimal or Int → Decimal (F.23
+                // explicitly carves those out: Decimal stays
+                // strict for monetary precision).
+                if lt == CodegenTy::Float && rt == CodegenTy::Int {
+                    let rv2 = self.coerce_to_float(rv, &rt, "binop rhs")?;
+                    return self.lower_binop(*op, lv, rv2.into(), &CodegenTy::Float);
+                }
+                if lt == CodegenTy::Int && rt == CodegenTy::Float {
+                    let lv2 = self.coerce_to_float(lv, &lt, "binop lhs")?;
+                    return self.lower_binop(*op, lv2.into(), rv, &CodegenTy::Float);
                 }
                 if lt != rt {
                     return Err(CodegenError::Unsupported(format!(
@@ -17811,6 +18344,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             .into(),
                     )),
                 }
+            }
+            // B9: `self` in value position (e.g. `helper(self, ...)`)
+            // lowers to the current locus self_ptr typed as LocusRef.
+            Expr::KwSelf(_) => {
+                let cs = self.current_self.as_ref().ok_or_else(|| {
+                    CodegenError::Unsupported(
+                        "`self` outside a locus method".into(),
+                    )
+                })?;
+                Ok((
+                    cs.self_ptr.into(),
+                    CodegenTy::LocusRef(cs.locus_name.clone()),
+                ))
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "expression form {:?}",
@@ -18444,6 +18990,128 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
     }
 
+    /// B14: lower the synthetic `k_max` read on a locus receiver.
+    /// `cs` describes the receiver — `self_ptr` may be the current
+    /// self or any other LocusRef value, so the same lowering serves
+    /// `self.k_max` and `g.k_max`.
+    fn lower_locus_kmax(
+        &mut self,
+        locus_name: &str,
+        struct_ty: StructType<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+        fields: &BTreeMap<String, (u32, CodegenTy)>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        let load_field = |this: &mut Self, fname: &str| {
+            let (fidx, fty) = fields.get(fname).cloned().ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "k_max requires param `{}` on locus `{}`",
+                    fname, locus_name
+                ))
+            })?;
+            let ptr = this
+                .builder
+                .build_struct_gep(
+                    struct_ty,
+                    self_ptr,
+                    fidx,
+                    &format!("kmax.{}.ptr", fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let llvm_ty = this.llvm_basic_type(&fty);
+            let val = this
+                .builder
+                .build_load(llvm_ty, ptr, &format!("kmax.{}", fname))
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            Ok::<_, CodegenError>((val, fty))
+        };
+        let (b_v, b_ty) = load_field(self, "B")?;
+        let (c_v, c_ty) = load_field(self, "c")?;
+        let (sigma_v, sigma_ty) = load_field(self, "sigma")?;
+        let (phi_v, phi_ty) = load_field(self, "phi")?;
+        let b_f = self.coerce_to_float(b_v, &b_ty, "k_max.B")?;
+        let c_f = self.coerce_to_float(c_v, &c_ty, "k_max.c")?;
+        let sigma_f = self.coerce_to_float(sigma_v, &sigma_ty, "k_max.sigma")?;
+        let phi_f = match phi_ty {
+            CodegenTy::Float => phi_v.into_float_value(),
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "k_max requires param `phi` of type Float, got {:?}",
+                    other
+                )));
+            }
+        };
+        let f64_t = self.context.f64_type();
+        let one = f64_t.const_float(1.0);
+        let one_minus_phi = self
+            .builder
+            .build_float_sub(one, phi_f, "k_max.1mphi")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let term_left = self
+            .builder
+            .build_float_mul(one_minus_phi, c_f, "k_max.term_left")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let term_right = self
+            .builder
+            .build_float_mul(phi_f, sigma_f, "k_max.term_right")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let denom = self
+            .builder
+            .build_float_add(term_left, term_right, "k_max.denom")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let k_max = self
+            .builder
+            .build_float_div(b_f, denom, "k_max")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((k_max.into(), CodegenTy::Float))
+    }
+
+    /// B14: lower the synthetic `draining` read on a locus receiver.
+    /// Mirror of the `self.draining` path that pulls the
+    /// `__drain_requested` i64 slot and returns it as a Bool.
+    fn lower_locus_draining(
+        &mut self,
+        locus_name: &str,
+        struct_ty: StructType<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        let info = self
+            .user_loci
+            .get(locus_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "draining: no LocusInfo for `{}`",
+                    locus_name
+                ))
+            })?;
+        let dr_ptr = self
+            .builder
+            .build_struct_gep(
+                struct_ty,
+                self_ptr,
+                info.drain_requested_field_idx,
+                "draining.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let i64_t = self.context.i64_type();
+        let raw = self
+            .builder
+            .build_load(i64_t, dr_ptr, "draining.raw")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let zero = i64_t.const_int(0, false);
+        let as_bool = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                raw,
+                zero,
+                "draining",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((as_bool.into(), CodegenTy::Bool))
+    }
+
     fn lower_unop(
         &mut self,
         op: UnaryOp,
@@ -18483,6 +19151,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_not(v.into_int_value(), "not")
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 Ok((r.into(), CodegenTy::Bool))
+            }
+            (UnaryOp::BitNot, CodegenTy::Int) => {
+                let r = self
+                    .builder
+                    .build_not(v.into_int_value(), "bitnot")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                Ok((r.into(), CodegenTy::Int))
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "unop {:?} on {:?}",
@@ -18783,6 +19458,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok(())
             }
             _ => {
+                // A3 (G11): cross-seed non-fallible free-fn at
+                // statement position. Consult the per-build
+                // import-rename table; dispatch via `lower_user_fn_call`
+                // and discard the result (statement form).
+                if let Some(mangled) = self.mangled_for_path(&segs) {
+                    if self.user_fns.contains_key(&mangled) {
+                        let _ =
+                            self.lower_user_fn_call(&mangled, args, scope)?;
+                        return Ok(());
+                    }
+                }
                 // Same did-you-mean hint as the expr-position
                 // dispatcher: bare `env::args_count` (missing
                 // `std::` prefix) is the canonical typo.
@@ -18877,6 +19563,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Ok((ptr.into(), CodegenTy::Enum(enum_name.to_string())))
             }
             _ => {
+                // A3 (G11): cross-seed non-fallible free-fn calls.
+                // The mangler rewrites the lib's decls to
+                // `__lib_<alias>_<stem>_<name>`; the consumer writes
+                // `alias::fn(...)` which lowers here. Consult the
+                // per-build import-rename table and dispatch through
+                // `lower_user_fn_call`. The fallible analogue at
+                // `lower_fallible_call` already had this shape;
+                // expression-position non-fallible was the gap.
+                if let Some(mangled) = self.mangled_for_path(&segs) {
+                    if self.user_fns.contains_key(&mangled) {
+                        let result =
+                            self.lower_user_fn_call(&mangled, args, scope)?;
+                        return result.ok_or_else(|| {
+                            CodegenError::Unsupported(format!(
+                                "path call `{}` returns no value but is used \
+                                 in expression position",
+                                segs.join("::")
+                            ))
+                        });
+                    }
+                }
                 // If the first segment is a known stdlib namespace
                 // root (used without the `std::` prefix), surface
                 // the typo directly. Saves the agent a debug round-
@@ -25433,6 +26140,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 ret: fd.ret.clone(),
                             })
                         }
+                        // B11 / G25: external `g.bulk(...)` /
+                        // `g.harmonic(...)` / `g.resolution(...)`
+                        // dispatches into a `mode <kind> { ... }`
+                        // member. Modes register as user_methods
+                        // keyed by their kind name (see
+                        // declare_locus_methods), so the func
+                        // lookup above already succeeds — the
+                        // signature lookup just needs to walk
+                        // ModeKind too. Same shape as the self-
+                        // method-call arm above.
+                        LocusMember::Mode(md) => {
+                            let n = match md.kind {
+                                ModeKind::Bulk => "bulk",
+                                ModeKind::Harmonic => "harmonic",
+                                ModeKind::Resolution => "resolution",
+                            };
+                            if n == method_name {
+                                Some(MethodSig {
+                                    params: md.params.clone(),
+                                    ret: md.ret.clone(),
+                                })
+                            } else {
+                                None
+                            }
+                        }
                         _ => None,
                     }),
                 _ => None,
@@ -25786,13 +26518,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 let (arg_val, arg_ty) =
                     self.lower_expr(&args[0], scope)?;
-                if arg_ty != slot.elem_ty {
+                // A10 (G20): if the cell type is an interface and
+                // the arg is a concrete locus that satisfies it,
+                // coerce locus → interface here the same way
+                // `lower_user_fn_call` does. The cell stores the
+                // 8-byte ptr to the fat-pointer struct (data +
+                // vtable), arena-allocated.
+                let arg_val = if let (
+                    CodegenTy::Interface(iface),
+                    CodegenTy::LocusRef(l),
+                ) = (&slot.elem_ty, &arg_ty)
+                {
+                    self.coerce_to_interface(
+                        arg_val.into_pointer_value(),
+                        l,
+                        iface,
+                    )?
+                    .into()
+                } else if arg_ty != slot.elem_ty {
                     return Err(CodegenError::Unsupported(format!(
                         "@form(vec) `{}`.push arg type mismatch: \
                          expected {:?}, got {:?}",
                         locus_name, slot.elem_ty, arg_ty
                     )));
-                }
+                } else {
+                    arg_val
+                };
                 // Materialize the arg in an alloca so we can hand
                 // its address to lotus_vec_push. The runtime
                 // memcpys elem_size bytes from this address.
@@ -28565,6 +29316,60 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("ClosureViolation declared at startup");
         let ptr_t = self.context.ptr_type(AddressSpace::default());
         let viol_ptr = val.into_pointer_value();
+        // B15: defensive null check. If a cascade of on_failure
+        // handlers all re-bubble the same violation and the
+        // parent has dissolved (so its arena slot was reclaimed),
+        // the err pointer can be stale. Fall back to a generic
+        // diagnostic and exit non-zero rather than segfaulting on
+        // the GEP+load below.
+        let cur_fn = self.current_fn.expect("bubble inside a fn body");
+        let null_bb = self.context.append_basic_block(cur_fn, "bubble.null");
+        let live_bb = self.context.append_basic_block(cur_fn, "bubble.live");
+        let is_null = self
+            .builder
+            .build_is_null(viol_ptr, "bubble.viol.null")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(is_null, null_bb, live_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // null_bb: stale violation. Emit a generic diagnostic +
+        // exit so a runaway cascade lands at exit(1) instead of
+        // SIGSEGV. Keeps the existing pond/trade/risk failure
+        // mode visible but non-cryptic.
+        self.builder.position_at_end(null_bb);
+        let null_fmt = self.global_string(
+            "runtime error: ClosureViolation: bubbled past all on_failure handlers \
+             (payload reclaimed; see prior diagnostics)\n",
+        );
+        let dprintf_fn0 = self
+            .module
+            .get_function("dprintf")
+            .expect("dprintf declared");
+        let i32_t0 = self.context.i32_type();
+        self.builder
+            .build_call(
+                dprintf_fn0,
+                &[i32_t0.const_int(2, false).into(), null_fmt.into()],
+                "bubble.null.dprintf",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let exit_fn0 = self
+            .module
+            .get_function("exit")
+            .expect("exit declared");
+        self.builder
+            .build_call(
+                exit_fn0,
+                &[i32_t0.const_int(1, false).into()],
+                "bubble.null.exit",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // live_bb: continue with the standard format-and-exit
+        // path.
+        self.builder.position_at_end(live_bb);
         let locus_field = self
             .builder
             .build_struct_gep(
@@ -28961,6 +29766,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 _ => expr,
             };
             let (val, val_ty) = self.lower_expr(expr_to_lower, scope)?;
+            // B13 / G30: F.23 Int → Float widening in user-type
+            // field-init position. Matches the call-site Int→Float
+            // coercion in `lower_user_fn_call`.
+            let (val, val_ty) =
+                if declared_ty == CodegenTy::Float && val_ty == CodegenTy::Int {
+                    let w = self.coerce_to_float(
+                        val,
+                        &val_ty,
+                        &format!("type `{}` field `{}`", type_name, fname),
+                    )?;
+                    (w.into(), CodegenTy::Float)
+                } else {
+                    (val, val_ty)
+                };
             if val_ty != declared_ty {
                 return Err(CodegenError::Unsupported(format!(
                     "type `{}` field `{}` type mismatch: declared {:?}, \
@@ -28989,6 +29808,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .builder
             .build_global_string_ptr(s, "s")
             .expect("build_global_string_ptr");
+        g.as_pointer_value()
+    }
+
+    /// B2 / G5: emit a global constant array of i8 holding the
+    /// given bytes (NUL-safe — for use with `lotus_bytes_from_buf`
+    /// where the length is passed alongside the pointer). Unlike
+    /// `global_string` this does NOT NUL-terminate and does NOT
+    /// stop at embedded NULs.
+    fn global_bytes(&mut self, bytes: &[u8]) -> PointerValue<'ctx> {
+        let i8_t = self.context.i8_type();
+        let const_vals: Vec<inkwell::values::IntValue<'ctx>> = bytes
+            .iter()
+            .map(|b| i8_t.const_int(*b as u64, false))
+            .collect();
+        let arr = i8_t.const_array(&const_vals);
+        let arr_ty = i8_t.array_type(bytes.len() as u32);
+        let g = self.module.add_global(arr_ty, None, "bytes.lit");
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(inkwell::module::Linkage::Private);
         g.as_pointer_value()
     }
 

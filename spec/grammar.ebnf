@@ -197,8 +197,12 @@ bus_member        = bus_subscribe
                   ;
 (* The subject is either a literal string (legacy form, requires
    `of type T`) or a named topic decl (no `of type T` allowed —
-   the topic carries the payload type). *)
-bus_subject       = STRING_LIT | IDENTIFIER ;
+   the topic carries the payload type). A7 (G16) admits a
+   qualified name (`alias::TopicName`) for cross-seed
+   subscribe/publish over an imported lib's topic decl; the
+   codegen pre-pass at `build_executable_with_imports` resolves
+   the alias chain through the per-build path-rename table. *)
+bus_subject       = STRING_LIT | qualified_name ;
 bus_subscribe     = "subscribe" , bus_subject , "as" , IDENTIFIER ,
                     [ "of" , "type" , type_expr ] , ";" ;
 bus_publish       = "publish" , bus_subject ,
@@ -598,12 +602,21 @@ assignment_expr   = or_disposition_expr , [ assign_op , assignment_expr ] ;
    type, identical at each level. *)
 or_disposition_expr
                   = logical_or_expr , [ or_clause ] ;
-or_clause         = "or" , ( "raise" | "discard" | or_disposition_expr ) ;
+or_clause         = "or" , ( "raise" | "discard"
+                            | "fail" , expr
+                            | or_disposition_expr ) ;
 (* `or discard` (added 2026-05-16) swallows the error and
    substitutes Unit. Typechecker rejects it on calls whose
    success type is non-Unit and points the user at
    `or <default>` / `or raise`. Sugar for the previously-
-   idiomatic `or noop(err)` pattern with a no-op handler fn. *)
+   idiomatic `or noop(err)` pattern with a no-op handler fn.
+
+   `or fail X` (B3 / G6) is symmetric to `or raise` but the
+   caller picks a fresh payload of the enclosing fallible fn's
+   declared error type. Lets a caller translate one error
+   shape into another without bouncing through a helper fn.
+   Same divergence rule as `or raise`: chain value type
+   collapses to the inner success type. *)
 
 logical_or_expr   = logical_and_expr , { "||" , logical_and_expr } ;
 
