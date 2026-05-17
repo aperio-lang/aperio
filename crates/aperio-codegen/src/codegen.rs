@@ -2824,6 +2824,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let sha1_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_crypto_sha1", sha1_ty, None);
+        // C3 (pond follow-up): SHA-256 + HMAC-SHA256.
+        // declare ptr @lotus_crypto_sha256(ptr bytes)
+        let sha256_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_crypto_sha256", sha256_ty, None);
+        // declare ptr @lotus_crypto_hmac_sha256(ptr key, ptr msg)
+        let hmac_sha256_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_crypto_hmac_sha256", hmac_sha256_ty, None);
         // declare ptr @lotus_text_base64_encode(ptr bytes)
         let b64_encode_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module
@@ -20253,6 +20263,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_crypto_sha1(args, scope)?;
                 Ok(())
             }
+            ["std", "crypto", "sha256"] => {
+                let _ = self.lower_std_crypto_sha256(args, scope)?;
+                Ok(())
+            }
+            ["std", "crypto", "hmac_sha256"] => {
+                let _ = self.lower_std_crypto_hmac_sha256(args, scope)?;
+                Ok(())
+            }
             ["std", "text", "base64", "encode"] => {
                 let _ = self.lower_std_text_base64_encode(args, scope)?;
                 Ok(())
@@ -20760,6 +20778,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "crypto", "sha1"] => {
                 self.lower_std_crypto_sha1(args, scope)
+            }
+            ["std", "crypto", "sha256"] => {
+                self.lower_std_crypto_sha256(args, scope)
+            }
+            ["std", "crypto", "hmac_sha256"] => {
+                self.lower_std_crypto_hmac_sha256(args, scope)
             }
             ["std", "text", "base64", "encode"] => {
                 self.lower_std_text_base64_encode(args, scope)
@@ -23744,6 +23768,93 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let call = self
             .builder
             .build_call(f, &[b_val.into()], "sha1.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// C3 (pond follow-up): lower
+    /// `std::crypto::sha256(b: Bytes) -> Bytes`. Returns a 32-byte
+    /// digest per FIPS 180-4. Stand-alone implementation in the
+    /// C runtime — no libcrypto dependency. Anchored in the
+    /// program-lifetime payload arena. Drops pond/crypto's
+    /// ~140-line pure-Aperio O(N²) sha256.ap.
+    fn lower_std_crypto_sha256(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::sha256 takes 1 arg (b), got {}",
+                args.len()
+            )));
+        }
+        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
+        if b_ty != CodegenTy::Bytes {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::sha256: b must be Bytes, got {:?}",
+                b_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_crypto_sha256")
+            .expect("lotus_crypto_sha256 declared");
+        let call = self
+            .builder
+            .build_call(f, &[b_val.into()], "sha256.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// C3 (pond follow-up): lower
+    /// `std::crypto::hmac_sha256(key: Bytes, msg: Bytes) -> Bytes`.
+    /// Returns the 32-byte HMAC tag per RFC 2104. Anchored in
+    /// the payload arena. Drops pond/crypto's hmac.ap wrapper.
+    fn lower_std_crypto_hmac_sha256(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::hmac_sha256 takes 2 args (key, msg), got {}",
+                args.len()
+            )));
+        }
+        let (key_val, key_ty) = self.lower_expr(&args[0], scope)?;
+        if key_ty != CodegenTy::Bytes {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::hmac_sha256: key must be Bytes, got {:?}",
+                key_ty
+            )));
+        }
+        let (msg_val, msg_ty) = self.lower_expr(&args[1], scope)?;
+        if msg_ty != CodegenTy::Bytes {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::hmac_sha256: msg must be Bytes, got {:?}",
+                msg_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_crypto_hmac_sha256")
+            .expect("lotus_crypto_hmac_sha256 declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[key_val.into(), msg_val.into()],
+                "hmac_sha256.ret",
+            )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let ptr = call
             .try_as_basic_value()
