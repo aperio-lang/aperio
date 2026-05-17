@@ -1045,11 +1045,17 @@ for-loop vars, pattern bindings, generic params) shadow
 top-level names per ordinary lexical scope; the mangler's
 scope-aware walker leaves shadowed references unrewritten.
 
-**Strict barrier.** Imports declared inside imported library
-files are not followed by the resolver. Library A importing
-library B does NOT make B visible to A's importers; each
-importer declares its own dependencies. See `spec/projects.md`
-for the rationale.
+**Per-importer scoped imports (A4, 2026-05-17).** Imports
+declared inside imported library files **are** followed
+transitively by the resolver, but each library's imports land
+under that library's own alias namespace — they do not become
+visible to the top-level program. So library A importing
+library B exposes A's surface to the importer; B is reachable
+only through A's API surface (or by the importer re-declaring
+its own `import "lib/B" as ...;`). This replaces the prior
+strict barrier (which rejected transitive imports outright) and
+unblocks composition without leaking dependency identity. See
+`spec/projects.md` for the rationale and per-alias scoping rules.
 
 **`aperio run` interaction.** The interpreter path consumes the
 merged program but ignores the per-build path-rename table —

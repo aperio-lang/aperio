@@ -419,7 +419,10 @@ build on.
   implicit because the call is inside the locus body.
 - **Cross-locus method calls** (`other.method(arg)`) work on
   typed locus references. Methods resolve by the locus's declared
-  name.
+  name. Modes are callable the same way (`g.bulk()`,
+  `g.harmonic()`, `g.resolution()`); the receiver expression
+  must evaluate to a LocusRef of the mode-declaring locus.
+  Lifted from self-only dispatch in B11 / G25 (2026-05-17).
 - **Let-bound locus literals** defer dissolve to scope-exit per
   the m82 dissolve-timing rule. Use when the locus's lifecycle
   should match a fn body's duration.

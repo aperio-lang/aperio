@@ -1331,6 +1331,12 @@ The typechecker recognizes `k_max` on every locus type as
 `Ty::Float`; the runtime errors cleanly on missing params or
 zero denominator rather than producing NaN or infinity.
 
+Read shape is uniform across receivers (B14 / G31, 2026-05-17):
+`self.k_max` inside a locus method and `g.k_max` on a borrowed
+LocusRef `g` lower to the same arithmetic — codegen extracts the
+field-load helper so non-self receivers reach the same path.
+Same rule applies to the F.27 synthetic `draining` flag.
+
 This makes the framework's signature equation an executable
 language primitive. A closure can audit against it directly:
 
@@ -1742,9 +1748,10 @@ the spec; implementation tasks are tracked at the friction
 plan level (`crates/aperio-codegen/runtime/lotus_arena.c`
 gets Pool + Heap primitives first; codegen surface follows).
 
-### F.23 Int → Float widening at let/arg sites (Phase 2c, 2026-05-11)
+### F.23 Int → Float widening at let/arg sites (Phase 2c, 2026-05-11; broadened B13 / G30, 2026-05-17)
 
-Codegen inserts an implicit `sitofp` widening at two surfaces:
+Codegen inserts an implicit `sitofp` widening at the following
+surfaces:
 
 - **let-binding type ascription** — `let nf: Float = self.n;`
   with `self.n: Int` succeeds. The ascription tells the lowerer
@@ -1754,6 +1761,18 @@ Codegen inserts an implicit `sitofp` widening at two surfaces:
   the call site. Same rule applies to user-declared fns and to
   stdlib path-calls (`std::math::sqrt(n)` with `n: Int` works
   without `2.0` literals).
+- **binary-op promotion** (B13 / G30, 2026-05-17) — when
+  exactly one side of an arithmetic or comparison binop is
+  `Int` and the other is `Float`, the `Int` side widens and the
+  op produces `Float` (or `Bool` for comparisons). Symmetric:
+  either side can be the one that widens. Lets `0.5 + n`,
+  `i < 0.5`, `3 * 1.5` typecheck without sprinkling `to_float`
+  helpers at every mixed call site.
+- **user-type field init** (B13 / G30, 2026-05-17) — assigning
+  an `Int` value into a `Float`-typed struct field at literal-
+  init time widens at the store. Lets a config bundle declare
+  `timeout: Float` and accept an `Int` from the caller without
+  per-field casts.
 
 **Strictly one-way.** `Float → Int` narrowing remains explicit;
 `Decimal` never participates in implicit cross-type conversion;

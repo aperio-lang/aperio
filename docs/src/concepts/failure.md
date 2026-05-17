@@ -121,12 +121,15 @@ call result:
 let id = parse_player_id(input);     // ERROR: "error not addressed"
 ```
 
-You address it with an **`or` clause**, in one of three motions:
+You address it with an **`or` clause**, in one of the motions
+below:
 
 ```aperio
 let id = parse_player_id(input) or raise;          // propagate up
 let id = parse_player_id(input) or default_id();   // substitute
 let id = parse_player_id(input) or handle(err);    // hand off
+let id = parse_player_id(input)
+    or fail GameErr { reason: "bad-id" };          // translate
 mkdir(path) or discard;                            // swallow (Unit only)
 ```
 
@@ -140,6 +143,12 @@ mkdir(path) or discard;                            // swallow (Unit only)
   inside the fallback expression. The fallback can be a
   literal (`or 0`), an expression (`or default_id()`), or a
   call (`or handle(err)`).
+- **`or fail <payload>`** — symmetric to `or raise`, but you
+  build a fresh payload of the *enclosing* fn's declared error
+  type instead of forwarding the inner call's verbatim. Use
+  when your library has its own error vocabulary and you don't
+  want to leak the inner one through it. Enclosing fn must be
+  `fallible(T)`; same divergence rule as `or raise`.
 - **`or discard`** — swallow the error. Only valid when the
   underlying call's success type is Unit (e.g.
   `std::io::fs::mkdir`, `@form(vec).set`). Sugar for "I know

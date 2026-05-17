@@ -31,7 +31,7 @@ Namespaces with path-call shape:
 | `std::env` | `args_count()`, `arg(i)`, `arg_or(i, default)`, `var(name)`, `var_exists(name)` |
 | `std::time` | `monotonic()` → Duration, `sleep(d)` |
 | `std::str` | `parse_int(s) -> Int fallible(ParseError)`, `parse_float(s) -> Float fallible(ParseError)` (`ParseError { kind, input }`), `can_parse_int`, `can_parse_float` (non-fallible predicates), `index_of`, `lower` / `upper`, `trim`, `substring(s, lo, hi)`, `replace`, `repeat`, `pad_left` / `pad_right`, `from_bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` |
-| `std::bytes` | `at(b, i) -> Int fallible(IndexError)`, `slice(b, lo, hi)`, `from_string(s)` |
+| `std::bytes` | `at(b, i) -> Int fallible(IndexError)`, `slice(b, lo, hi)`, `from_string(s)`, `from_int(b)`, `concat(a, b)`. Literal syntax: `b"..."` (added 2026-05-17) — same escapes as String, `\xNN` accepts full 0x00..0xFF; NUL-safe; length carried alongside the buffer. |
 | `std::text` | byte-class predicates `is_alpha`, `is_digit`, `is_alnum`, `is_whitespace`, `is_word_char` (`fn(Int) -> Bool`); `tokenize_words_into(s, target_vec)` populates a `@form(vec) of String` with lowercased word tokens |
 | `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `mkdir`, `list_dir_count`, `list_dir_at` — all return `fallible(IoError)` (`kind: String`, `errno: Int`, `path: String`). `file_exists(path) -> Bool` is the only non-fallible predicate. Iterate directories via the index API (`for i in 0..count { let name = at(i); ... }`); the older newline-joined `list_dir(path) -> String` was removed 2026-05-16. |
 | `std::io::stdin` | `read_line() -> String`, `read_line_status() -> Int` |

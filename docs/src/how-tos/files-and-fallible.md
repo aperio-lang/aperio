@@ -28,7 +28,7 @@ the surface and the four addressing motions.
 - `errno: Int` — raw platform errno.
 - `path: String` — the file path the call was made against.
 
-## The four addressing motions
+## The five addressing motions
 
 Pick the disposition that matches your intent — the
 typechecker rejects an unaddressed fallible call.
@@ -100,6 +100,29 @@ std::io::fs::mkdir("/tmp/cache") or discard;     // ok if it already exists
 `or discard` is rejected on value-bearing calls — the
 typechecker tells you "this returns `String`, can't discard"
 and suggests `or ""` or `or raise`.
+
+### `or fail <payload>` — translate to your error type
+
+Symmetric to `or raise`, but you supply a fresh payload of the
+enclosing fallible fn's declared error type instead of
+forwarding the inner call's `IoError` verbatim. Useful when
+your library has its own error vocabulary and you don't want
+to leak `IoError` through it.
+
+```aperio
+type ConfigErr { reason: String; path: String; }
+
+fn load_config(p: String) -> Config fallible(ConfigErr) {
+    let body = std::io::fs::read_file(p)
+        or fail ConfigErr { reason: "read failed", path: p };
+    return parse(body) or fail ConfigErr { reason: "parse", path: p };
+}
+```
+
+The enclosing fn must itself be `fallible(T)`; outside one,
+the typechecker rejects with a hint to use `or raise` or
+`or <fallback>`. Diverges like `or raise` — the chain value
+collapses to the inner call's success type.
 
 ## A worked example: copy + count
 

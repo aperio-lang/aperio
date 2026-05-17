@@ -174,7 +174,8 @@ Exception: contract-graded subtyping (next section).
 
 ### Numeric coercion: Int → Float (Phase 2c)
 
-A single documented one-way widening fires at two surfaces:
+A single documented one-way widening fires at the following
+surfaces:
 
 - **let-binding type ascription:** `let nf: Float = self.n;`
   where `self.n: Int` widens `n` to a Float at the binding
@@ -184,6 +185,17 @@ A single documented one-way widening fires at two surfaces:
   at the call site. Same rule applies to user-declared fns
   and to stdlib path-calls (`std::math::sqrt(n)` with `n: Int`
   works without `2.0` literals).
+- **binary-op promotion** (B13 / G30, 2026-05-17): when exactly
+  one side of a numeric binop is `Int` and the other `Float`,
+  the `Int` side widens to `Float` and the op produces `Float`.
+  Same rule covers comparison ops (`<`, `>=`, `==`) so
+  `i < 0.5` typechecks. Symmetric — either side can be the
+  one that widens.
+- **user-type field init:** assigning an `Int` value into a
+  `Float`-typed struct field at literal-init time widens at the
+  store, mirroring fn-arg coercion. Lets a config bundle
+  declare `timeout: Float` and accept an `Int` from the caller
+  without sprinkling `Float(n)` casts.
 
 The widening is **strictly one-way**. `Float → Int` narrowing
 remains explicit (round + cast). `Decimal` never participates
@@ -302,8 +314,29 @@ Three init shapes (2026-05-16):
   error. Use for fields where no sensible default exists (e.g.
   `Server { handler: ... }` where the handler is the whole
   reason the locus exists).
+
+  **Exception (B7 / G19, 2026-05-17):** if `T` is a user-defined
+  `type` (struct) and every field of `T` has a declared default,
+  the compiler synthesizes `T { }` as the param's default. So
+  `params { cfg: Cfg; }` against `type Cfg { host: String =
+  "localhost"; port: Int = 8080; }` works without `= Cfg { }`
+  spelled out. Required-shape is preserved when any field on
+  `T` lacks a default.
 - `name: T : inferred;` — F.3 inference path; compiler /
   runtime determines the value.
+
+**T may be another locus (B10 / G24, 2026-05-17).** A param
+typed as a locus name (`params { db: DB; }`) stores a `LocusRef`
+— a single-pointer borrow. The param-holding locus does **not**
+own the referenced locus; the caller keeps it alive. Cross-decl
+declaration order doesn't matter: a forward reference
+(`User { db: DB; }` declared above `locus DB { ... }`) resolves
+via the codegen-side `pending_locus_names` pre-pass.
+
+Reading through the borrow (`self.db.name`, `self.db.draining`)
+goes through the same field-access lowering as any other
+LocusRef receiver. Synthetic fields (`self.db.k_max`,
+`self.db.draining`) work on non-self receivers too (B14 / G31).
 
 ## `inferred` params
 

@@ -427,7 +427,20 @@ annotations are not in v1.
 
 ### Bytes literals
 
-- `b"..."` for byte-string literals; same escapes as strings.
+- `b"..."` — byte-string literal. Same escape table as `STRING_LIT`
+  (`\n`, `\t`, `\r`, `\\`, `\"`, `\0`, `\xNN`), but the body is
+  raw bytes — **no UTF-8 promotion**, so `\xNN` accepts the full
+  `0x00..0xFF` range (unlike the string literal which clamps at
+  `\x7f`). Embedded NULs are preserved; the value's length is
+  carried alongside the byte buffer, so `len(b)` and
+  `std::bytes::at(b, i)` work over the entire literal. Codegen
+  lowers via `lotus_bytes_from_buf(arena, src, len)`, which
+  copies the source bytes into the caller's arena.
+
+  Use cases: binary protocol headers / framing, magic bytes,
+  embedded fixtures. Earlier code reached for
+  `std::bytes::from_string("...")`, which only worked for ASCII;
+  the `b"..."` form replaces that workaround end-to-end.
 
 ## Built-in identifiers (not keywords)
 

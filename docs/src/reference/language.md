@@ -40,8 +40,10 @@ with the spec, the spec wins.
   projection-class types, locus types, perspective types,
   structural interfaces, fallible typing.
 - Numeric coercion: Int → Float widening at let-binding type
-  ascriptions and fn-arg sites (one-way; Decimal never
-  participates). See `types.md` § "Numeric coercion".
+  ascriptions, fn-arg sites, mixed-type binary ops (`0.5 + n`,
+  `i < 0.5`), and user-type field-init positions. Strictly
+  one-way; Decimal never participates. See `types.md` §
+  "Numeric coercion".
 
 ## Storage and memory
 
