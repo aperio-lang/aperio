@@ -702,6 +702,12 @@ pub fn resolve_path(segments: &[&str]) -> Option<Value> {
             name: "std::io::fs::mktemp",
             func: Rc::new(std_io_fs_mktemp),
         })),
+        // C4 (pond/crypto): CSPRNG bytes via getrandom(2) +
+        // /dev/urandom fallback. Returns Bytes fallible(IoError).
+        ["std", "os", "getrandom"] => Some(Value::Builtin(BuiltinRef {
+            name: "std::os::getrandom",
+            func: Rc::new(std_os_getrandom),
+        })),
         // str — the parse_int family (used in CLI argument
         // parsing).
         ["std", "str", "parse_int"] => Some(Value::Builtin(BuiltinRef {
@@ -1955,6 +1961,102 @@ fn std_io_fs_mktemp(args: &[Value]) -> Result<Value, String> {
         }
     };
     Ok(Value::String(path))
+}
+
+// C4 (pond/crypto): cryptographically-strong random bytes.
+// Mirrors the codegen C primitive `lotus_os_getrandom`:
+//   - n <= 0       → empty Bytes, no error.
+//   - n > 8192     → IoError(kind="invalid") (per-call cap).
+//   - getrandom(2) syscall on Linux; falls back to /dev/urandom
+//     on ENOSYS (older kernels) or non-Linux platforms.
+const STD_OS_GETRANDOM_PER_CALL_MAX: i64 = 8192;
+const STD_OS_GETRANDOM_LABEL: &str = "std::os::getrandom";
+
+fn std_os_getrandom(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "std::os::getrandom takes 1 arg (n), got {}",
+            args.len()
+        ));
+    }
+    let n = match &args[0] {
+        Value::Int(i) => *i,
+        other => {
+            return Err(format!(
+                "std::os::getrandom: n must be Int, got {}",
+                other.type_name()
+            ))
+        }
+    };
+    if n <= 0 {
+        return Ok(Value::Bytes(Vec::new()));
+    }
+    if n > STD_OS_GETRANDOM_PER_CALL_MAX {
+        let e = std::io::Error::from_raw_os_error(libc::EINVAL);
+        return Ok(Value::FallibleErr(Box::new(io_error_from_std(
+            &e,
+            STD_OS_GETRANDOM_LABEL,
+        ))));
+    }
+    let mut buf = vec![0u8; n as usize];
+
+    // Step 1: try getrandom(2) directly via syscall. Loop on
+    // EINTR + short reads. ENOSYS → fall through to urandom.
+    #[cfg(target_os = "linux")]
+    {
+        let mut filled = 0usize;
+        let mut syscall_unavailable = false;
+        while filled < buf.len() {
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_getrandom,
+                    buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                    (buf.len() - filled) as libc::size_t,
+                    0u32 as libc::c_uint,
+                )
+            };
+            if r >= 0 {
+                filled += r as usize;
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::ENOSYS) {
+                // Kernel too old (pre-3.17). Reset and try urandom.
+                syscall_unavailable = true;
+                break;
+            }
+            return Ok(Value::FallibleErr(Box::new(io_error_from_std(
+                &err,
+                STD_OS_GETRANDOM_LABEL,
+            ))));
+        }
+        if !syscall_unavailable {
+            return Ok(Value::Bytes(buf));
+        }
+    }
+
+    // Step 2: /dev/urandom fallback. Used on non-Linux platforms
+    // and on Linux kernels too old to expose getrandom(2).
+    use std::io::Read;
+    let mut f = match std::fs::File::open("/dev/urandom") {
+        Ok(f) => f,
+        Err(e) => {
+            return Ok(Value::FallibleErr(Box::new(io_error_from_std(
+                &e,
+                STD_OS_GETRANDOM_LABEL,
+            ))))
+        }
+    };
+    if let Err(e) = f.read_exact(&mut buf) {
+        return Ok(Value::FallibleErr(Box::new(io_error_from_std(
+            &e,
+            STD_OS_GETRANDOM_LABEL,
+        ))));
+    }
+    Ok(Value::Bytes(buf))
 }
 
 // === str parsing =============================================

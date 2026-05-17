@@ -48,6 +48,13 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <math.h>
+/* C4: getrandom(2). Glibc 2.25+ exposes the declaration via
+ * <sys/random.h>; we still gate the call site on a feature
+ * macro so platforms that lack the syscall fall through to
+ * the /dev/urandom path cleanly. */
+#if defined(__linux__) || defined(__GLIBC__)
+#include <sys/random.h>
+#endif
 
 /* Default chunk size: 64KB. Big enough that most loci fit in
  * one chunk, small enough that a leaf locus that allocates a
@@ -4095,6 +4102,114 @@ void *lotus_fs_read_bytes_global(const char *path) {
     void *result = lotus_fs_read_bytes(g_bus_payload_arena, path);
     pthread_mutex_unlock(&g_bus_payload_arena_mutex);
     return result;
+}
+
+/*
+ * C4 (pond/crypto follow-up): cryptographically-strong random
+ * bytes. Returns a fresh Bytes blob of length `n` anchored in
+ * the bus payload arena, mirroring `lotus_fs_read_bytes_global`'s
+ * lifetime story.
+ *
+ * Implementation order (Linux):
+ *   1. `getrandom(buf, n, 0)` — modern syscall, retries on EINTR,
+ *      handles short returns by looping.
+ *   2. If `getrandom` is unavailable (ENOSYS) or `<sys/random.h>`
+ *      isn't visible at build time, fall through to reading
+ *      `/dev/urandom` until `n` bytes are filled.
+ *
+ * Argument shape:
+ *   - `n <= 0`         → returns a length-0 Bytes blob, no error.
+ *   - `n > GETRANDOM_MAX (8192)` → sets errno=EINVAL and returns
+ *     NULL so the codegen-side wrapper synthesizes an IoError
+ *     with kind="invalid". The cap is a per-call ergonomic
+ *     limit, not the kernel's GRND_MAX (33,554,431) — agents
+ *     pulling more than 8 KiB at once are almost certainly
+ *     doing something wrong (key material is 16-64 bytes;
+ *     session tokens are 16-32). They can loop if they really
+ *     want more.
+ *   - Any read error from the underlying source surfaces as
+ *     NULL + errno from the failing call.
+ */
+#define LOTUS_GETRANDOM_PER_CALL_MAX 8192
+
+void *lotus_os_getrandom(int64_t n) {
+    pthread_mutex_lock(&g_bus_payload_arena_mutex);
+    if (!g_bus_payload_arena) {
+        g_bus_payload_arena = lotus_arena_create();
+        if (!g_bus_payload_arena) {
+            pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    /* n <= 0 → caller wants empty (no error). */
+    if (n <= 0) {
+        void *empty = lotus_bytes_create(g_bus_payload_arena, 0);
+        pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+        return empty;
+    }
+    if (n > LOTUS_GETRANDOM_PER_CALL_MAX) {
+        pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+        errno = EINVAL;
+        return NULL;
+    }
+    void *blob = lotus_bytes_create(g_bus_payload_arena, n);
+    pthread_mutex_unlock(&g_bus_payload_arena_mutex);
+    if (!blob) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    unsigned char *body = (unsigned char *)lotus_bytes_data(blob);
+    size_t left = (size_t)n;
+    unsigned char *p = body;
+
+    /* Step 1: try getrandom(2). On ENOSYS, fall through. */
+#if defined(__linux__) || defined(__GLIBC__)
+    while (left > 0) {
+        ssize_t r = getrandom(p, left, 0);
+        if (r > 0) {
+            p    += (size_t)r;
+            left -= (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && errno == ENOSYS) {
+            /* Kernel too old (pre-3.17). Reset progress so the
+             * urandom fallback rewrites the entire buffer. */
+            p    = body;
+            left = (size_t)n;
+            break;
+        }
+        /* Any other error: surface it. */
+        return NULL;
+    }
+    if (left == 0) {
+        return blob;
+    }
+#endif
+
+    /* Step 2: /dev/urandom fallback. Used on platforms without
+     * the syscall and on Linux kernels too old to expose it. */
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return NULL;
+    }
+    while (left > 0) {
+        ssize_t r = read(fd, p, left);
+        if (r > 0) {
+            p    += (size_t)r;
+            left -= (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        /* r == 0 from /dev/urandom is "impossible" but treat as
+         * EIO so the caller sees a useful kind. */
+        if (r == 0) errno = EIO;
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+    return blob;
 }
 
 /*

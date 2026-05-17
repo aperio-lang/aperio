@@ -2400,6 +2400,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             None,
         );
 
+        // C4 (pond/crypto follow-up): CSPRNG random bytes via
+        // `getrandom(2)` with `/dev/urandom` fallback. Returns a
+        // Bytes pointer in the bus payload arena (NULL on error,
+        // length-0 blob when caller asks for n <= 0).
+        // declare ptr @lotus_os_getrandom(i64 n)
+        let os_getrandom_ty = ptr_t.fn_type(&[i64_t.into()], false);
+        self.module
+            .add_function("lotus_os_getrandom", os_getrandom_ty, None);
+
         // m48: render a Decimal (i128 mantissa, implicit scale 9)
         // into a NUL-terminated string buffer.
         // declare void @lotus_decimal_to_string(i64 hi, i64 lo, ptr buf)
@@ -11668,6 +11677,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "str", "parse_float"] => Ok(Some(
                 self.lower_std_str_parse_float_fallible(args, scope)?,
             )),
+            // C4 (pond/crypto follow-up): CSPRNG getrandom.
+            ["std", "os", "getrandom"] => Ok(Some(
+                self.lower_std_os_getrandom_fallible(args, scope)?,
+            )),
             // Known stdlib paths that AREN'T fallible — surface a
             // focused diagnostic instead of "unknown path call".
             // Each name here is a path-call that returns a value
@@ -12378,6 +12391,78 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             path_val,
             Some((bytes_ptr.into(), CodegenTy::Bytes)),
             "fs.read_bytes",
+        )
+    }
+
+    /// C4 (pond/crypto follow-up):
+    /// `std::os::getrandom(n: Int) -> Bytes fallible(IoError)`.
+    ///
+    /// Calls into `lotus_os_getrandom`, which routes through the
+    /// `getrandom(2)` syscall and falls back to `/dev/urandom`
+    /// when the syscall is unavailable. NULL pointer → error
+    /// (same convention as `read_bytes`); the `IoError.path`
+    /// slot carries the static label `"std::os::getrandom"` so
+    /// the agent sees which surface failed (there isn't a
+    /// caller-supplied path to anchor on).
+    fn lower_std_os_getrandom_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::os::getrandom takes 1 arg (n), got {}",
+                args.len()
+            )));
+        }
+        let (n_val, n_ty) = self.lower_expr(&args[0], scope)?;
+        if n_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::os::getrandom: n must be Int, got {:?}",
+                n_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_os_getrandom")
+            .expect("lotus_os_getrandom declared");
+        let bytes_ptr = self
+            .builder
+            .build_call(f, &[n_val.into()], "os.getrandom.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_os_getrandom returns ptr")
+            .into_pointer_value();
+        // NULL => error (errno is set by the runtime).
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                self.builder
+                    .build_ptr_to_int(
+                        bytes_ptr,
+                        self.context.i64_type(),
+                        "os.getrandom.as_int",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?,
+                self.context.i64_type().const_zero(),
+                "os.getrandom.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Anchor the diagnostic path on the surface name — no
+        // caller-supplied path here, but the agent still benefits
+        // from seeing *which* fallible primitive raised.
+        let path_label = self
+            .builder
+            .build_global_string_ptr("std::os::getrandom", "os.getrandom.label")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
+        self.complete_io_fallible_call(
+            is_err,
+            path_label.into(),
+            Some((bytes_ptr.into(), CodegenTy::Bytes)),
+            "os.getrandom",
         )
     }
 
@@ -20600,11 +20685,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "text", "tokenize_words_into"] => {
                 self.lower_std_text_tokenize_words_into(args, scope)
             }
-            // C9: new fallible-only fs surfaces. Same "use `or`"
-            // diagnostic shape as the parse_int family.
+            // C9: new fallible-only fs surfaces + C4: getrandom.
+            // Same "use `or`" diagnostic shape as the parse_int family.
             ["std", "io", "fs", "rename"]
             | ["std", "io", "fs", "unlink"]
-            | ["std", "io", "fs", "mktemp"] => {
+            | ["std", "io", "fs", "mktemp"]
+            | ["std", "os", "getrandom"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",
@@ -21146,20 +21232,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // forgets the `or` clause. (Other fallible-flipped
             // paths like fs::read_file still have a non-fallible
             // expression-dispatch sibling for legacy reasons —
-            // this arm doesn't shadow them.)
-            ["std", "str", "parse_int"] | ["std", "str", "parse_float"] => {
-                Err(CodegenError::Unsupported(format!(
-                    "`{}` returns a fallible value — address the error with \
-                     `or raise`, `or <substitute>`, or `or self.handle(err)`",
-                    segs.join("::")
-                )))
-            }
-            // C9: new fallible-only fs surfaces. No legacy non-
-            // fallible sibling, so the diagnostic is the friendly
-            // "use `or`" reminder — same shape as parse_int above.
-            ["std", "io", "fs", "rename"]
+            // this arm doesn't shadow them.) C9 added the fs
+            // surfaces; C4 added getrandom.
+            ["std", "str", "parse_int"]
+            | ["std", "str", "parse_float"]
+            | ["std", "io", "fs", "rename"]
             | ["std", "io", "fs", "unlink"]
-            | ["std", "io", "fs", "mktemp"] => {
+            | ["std", "io", "fs", "mktemp"]
+            | ["std", "os", "getrandom"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",

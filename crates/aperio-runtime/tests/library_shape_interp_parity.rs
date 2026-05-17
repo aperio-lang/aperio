@@ -129,3 +129,41 @@ fn fs_mktemp_rename_unlink_roundtrip_interp() {
     "#;
     assert_eq!(run(src), 0);
 }
+
+// C4 — interpreter parity for std::os::getrandom. Same shape as
+// the codegen test: 32-byte happy path, n=0 → empty, two draws
+// differ, n=-1 → empty, n>8192 → kind="invalid".
+#[test]
+fn os_getrandom_happy_path_interp() {
+    let src = r#"
+        fn main() {
+            let b = std::os::getrandom(32) or raise;
+            if len(b) != 32 { std::process::exit(1); }
+            let z = std::os::getrandom(0) or raise;
+            if len(z) != 0 { std::process::exit(1); }
+            let neg = std::os::getrandom(-1) or raise;
+            if len(neg) != 0 { std::process::exit(1); }
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
+
+// "Two draws differ" is exercised on the codegen side
+// (crates/aperio-codegen/tests/os_getrandom.rs); it requires
+// std::bytes::at which the interpreter doesn't yet have parity
+// for. The interp-side parity here covers length + error-shape;
+// the entropy-source distinction lives in the codegen test.
+
+#[test]
+fn os_getrandom_too_large_invalid_interp() {
+    let src = r#"
+        fn report(e: IoError) -> Bytes {
+            if e.kind != "invalid" { std::process::exit(1); }
+            return std::os::getrandom(0) or raise;
+        }
+        fn main() {
+            let _b = std::os::getrandom(9000) or report(err);
+        }
+    "#;
+    assert_eq!(run(src), 0);
+}
