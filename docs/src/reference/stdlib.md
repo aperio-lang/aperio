@@ -27,7 +27,7 @@ Namespaces with path-call shape:
 
 | Namespace | Surface |
 |---|---|
-| `std::process` | `pid()`, `exit(code)` |
+| `std::process` | `pid()`, `exit(code)`, `run(argv: String) -> ProcessOutput fallible(IoError)` — synchronous fork/exec; `argv` is newline-separated (e.g. `"git\nstatus\n"`), output captured up to 16 MiB/stream, exec failures surface as IoError (`kind="not_found"` / `"permission_denied"` / `"invalid"`). Lifecycle-bound subprocess uses the `Child` namespace lotus (see below). |
 | `std::env` | `args_count()`, `arg(i)`, `arg_or(i, default)`, `var(name)`, `var_exists(name)` |
 | `std::time` | `monotonic()` → Duration, `sleep(d)`, `now() -> Int` (wall-clock seconds since the Unix epoch — observation only, not for scheduling; backed by `clock_gettime(CLOCK_REALTIME)`) |
 | `std::str` | `parse_int(s) -> Int fallible(ParseError)`, `parse_float(s) -> Float fallible(ParseError)` (`ParseError { kind, input }`), `can_parse_int`, `can_parse_float` (non-fallible predicates), `index_of`, `lower` / `upper`, `trim`, `substring(s, lo, hi)`, `replace`, `repeat`, `pad_left` / `pad_right`, `from_bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` |
@@ -67,6 +67,7 @@ Namespaces with namespace-lotus shape:
 | Namespace | Loci / interfaces shipped |
 |---|---|
 | `std::io::tcp` | `Listener` (multi-accept loop, dispatch via `on_connection: fn(Stream)`), `Stream` (per-connection handle with `send` / `send_bytes` / `recv` / `recv_bytes` methods) |
+| `std::process` | `Child` (async subprocess handle obtained via `spawn(argv: String) -> Child fallible(IoError)`); methods `wait(c)` (blocking), `kill(c)` (SIGTERM → 100ms grace → SIGKILL → reap), `write_stdin(c, s)`, `read_stdout(c)`, `read_stderr(c)` (non-blocking 64 KiB; empty String on EAGAIN or EOF — disambiguate via `wait`). Every spawned child gets its own process group (`setpgid(0,0)` post-fork); SIGPIPE is globally ignored at runtime init so writes to closed pipes surface as IoError EPIPE. `Child.dissolve()` closes pipes and kill-escalates idempotently to prevent zombies on scope exit. |
 | `std::http` | `Request` and `Response` types (`Response.content_type` defaults to `"text/plain"`; `Response.headers: String = ""` carries CRLF-joined user-supplied headers — no trailing CRLF — for Set-Cookie / CORS / custom-header use; emitted on the wire after the fixed Content-Type / Content-Length / Connection-close lines), `parse_request`, `write_response`, case-insensitive symmetric `header(receiver, name)` lookup that works on both Request and Response receivers, `Handler` interface (`fn handle(req: Request) -> Response`), `Server` locus (wraps accept-recv-parse-dispatch-write; `handler:` is a required field typed by `Handler`, takes any locus with a `handle` method — state lives in the handler-locus's params) |
 | `std::text` | `md_to_html`, `base64::encode` / `decode`, `Sink` interface with `StdoutSink` / `StringSink` / `FileSink` implementations (note: the byte-class predicates + `tokenize_words_into` are path-call surface, listed in the previous table) |
 | `std::cli` | `Resolver` for argv parsing |
