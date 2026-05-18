@@ -529,6 +529,26 @@ is used only inside one locus and has no binding.
 - **Signal handling.** SIGINT / SIGTERM trigger `drain` →
   `dissolve` on the root locus. Stdlib provides finer-grained
   control if needed.
+- **SIGPIPE globally ignored** (added 2026-05-17, C2). The
+  prelude installs `signal(SIGPIPE, SIG_IGN)` once at
+  `lotus_io_init` so writes to a closed pipe (subprocess stdin,
+  closed TCP socket, etc.) surface as `EPIPE` through the
+  IoError channel instead of synchronously killing the parent.
+  Applies process-wide — no opt-out.
+- **Subprocess lifecycle** (added 2026-05-17, C2 — see
+  [`spec/stdlib.md` § std::process](stdlib.md) for the API
+  surface). Every spawned child gets its own process group via
+  `setpgid(0, 0)` in the post-fork prelude. Chosen over
+  `prctl(PR_SET_PDEATHSIG, SIGKILL)` for POSIX portability
+  (macOS / BSD parity); a controlled `Child.dissolve()` covers
+  the orderly-shutdown path. `Child.dissolve()` closes the
+  three pipe fds and kill-escalates idempotently (SIGTERM →
+  100 ms grace → SIGKILL → waitpid; `ESRCH` / `ECHILD` count
+  as success) so an unwaited child doesn't leak zombies on
+  scope exit. The `std::process::run` synchronous form drains
+  stdout + stderr via interleaved `poll()` so the child can
+  write to either stream without deadlocking; 16 MiB cap per
+  stream.
 
 ### stdout buffering (2026-05-17)
 
