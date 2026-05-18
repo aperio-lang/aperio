@@ -37,15 +37,8 @@ locus Registry {
 
 ## v1 deviations
 
-Three deviations land in this implementation; see `FRICTION.md`
-for the full audit. Brief summary:
+One deviation remains; see `FRICTION.md` for the full audit.
 
-- **`register(t: Tool)` is split into `register(e: Entry)` plus
-  convenience free fns `register_tool` / `register_fns`.**
-  Interface values can't sit in `@form(vec)` cells at v1
-  (spec/types.md § F.20 Phase B; `KNOWN_GOTCHAS.md` § G20). The
-  fn-pointer-shadow approach matches what `pond/router` and
-  `pond/jobs` already shipped for the same gap.
 - **`dispatch(call) -> ToolResult fallible(ToolError)` is split
   into `Registry.dispatch_call(call) -> ToolResult` (non-fallible
   method, returns an `is_error` ToolResult on miss) plus a
@@ -53,85 +46,73 @@ for the full audit. Brief summary:
   fallible(ToolError)`.** Per the two-channel rule
   (`KNOWN_GOTCHAS.md` § G4), user-declared locus methods may not
   declare `fallible(E)`. Both paths share the same lookup kernel.
-- **Cross-seed consumers must use `Registry` methods, not the
-  convenience free fns.** Per `KNOWN_GOTCHAS.md` § G11, calls
-  like `tools::register_tool(reg, ...)` from a consumer seed
-  don't lower at v1. The free fns stay declared in `registry.ap`
-  for in-seed callers and as the unblock-day surface; consumer
-  code uses `reg.register(tools::Entry { spec, invoke_fn })` and
-  `reg.dispatch_call(call)` instead.
+
+The previous fn-pointer/`Entry`-wrapper deviation is gone:
+F.20 Phase B (G20) shipped interface values in `@form(vec)`
+cells, and the Registry now stores `Tool` directly. Cross-seed
+consumers register via the free fn `tools::register(reg, t)`
+(user-declared locus method arg coercion `LocusRef → Interface`
+isn't yet wired across seeds; the free-fn arg site is the wired
+coercion path).
 
 ## Writing a Tool
 
-A Tool is any locus exposing the two interface methods (for
-forward compatibility once F.20 Phase B unblocks) plus a pair
-of top-level free-fn shadows for the v1 fn-pointer storage path.
+A Tool is any locus whose method set structurally satisfies the
+`Tool` interface — declare `spec()` and `invoke()` directly on
+the locus; no fn-pointer shadow needed.
 
 ```aperio
 import "vendor/pond/agent/tools" as tools;
 
-// Free fns are the v1 registry-facing surface; the locus
-// methods stay in-shape with the Tool interface for the
-// Phase-B-unblock future.
-fn calc_spec() -> tools::ToolSpec {
-    return tools::ToolSpec {
-        name:        "calculator",
-        description: "Evaluate a simple arithmetic expression.",
-        input_schema:
-            "{\"type\":\"object\","
-            + "\"properties\":{"
-            + "\"op\":{\"type\":\"string\"},"
-            + "\"a\":{\"type\":\"number\"},"
-            + "\"b\":{\"type\":\"number\"}},"
-            + "\"required\":[\"op\",\"a\",\"b\"]}"
-    };
-}
-
-fn calc_invoke(call: tools::ToolCall) -> tools::ToolResult {
-    let op = std::json::find_string_field(call.args_json, "op");
-    let a  = std::json::find_int_field(call.args_json, "a");
-    let b  = std::json::find_int_field(call.args_json, "b");
-    let mut out = "";
-    let mut err = false;
-    if op == "add"      { out = to_string(a + b); }
-    else if op == "sub" { out = to_string(a - b); }
-    else if op == "mul" { out = to_string(a * b); }
-    else if op == "div" {
-        if b == 0 { out = "division by zero"; err = true; }
-        else      { out = to_string(a / b);                }
-    }
-    else { out = "unknown op: " + op; err = true; }
-    return tools::ToolResult {
-        call_id:  call.call_id,
-        content:  out,
-        is_error: err
-    };
-}
-
-// Tool-interface-shaped locus. The methods aren't called by the
-// Registry at v1 (the fn-pointer pair above is what gets stored
-// + dispatched), but consumers writing code against the `Tool`
-// interface in fn signatures will pick this up structurally.
 locus Calculator {
     params { }
-    fn spec()   -> tools::ToolSpec { return calc_spec(); }
+
+    fn spec() -> tools::ToolSpec {
+        return tools::ToolSpec {
+            name:        "calculator",
+            description: "Evaluate a simple arithmetic expression.",
+            input_schema:
+                "{\"type\":\"object\","
+                + "\"properties\":{"
+                + "\"op\":{\"type\":\"string\"},"
+                + "\"a\":{\"type\":\"number\"},"
+                + "\"b\":{\"type\":\"number\"}},"
+                + "\"required\":[\"op\",\"a\",\"b\"]}"
+        };
+    }
+
     fn invoke(call: tools::ToolCall) -> tools::ToolResult {
-        return calc_invoke(call);
+        let op = std::json::find_string_field(call.args_json, "op");
+        let a  = std::json::find_int_field(call.args_json, "a");
+        let b  = std::json::find_int_field(call.args_json, "b");
+        let mut out = "";
+        let mut err = false;
+        if op == "add"      { out = to_string(a + b); }
+        else if op == "sub" { out = to_string(a - b); }
+        else if op == "mul" { out = to_string(a * b); }
+        else if op == "div" {
+            if b == 0 { out = "division by zero"; err = true; }
+            else      { out = to_string(a / b);                }
+        }
+        else { out = "unknown op: " + op; err = true; }
+        return tools::ToolResult {
+            call_id:  call.call_id,
+            content:  out,
+            is_error: err
+        };
     }
 }
 ```
 
-Register and dispatch (cross-seed-consumer v1 shape):
+Register and dispatch (cross-seed consumer shape):
 
 ```aperio
-let reg = tools::Registry { };
+let reg  = tools::Registry { };
+let calc = Calculator { };
 
-// Build the Entry literal at the call site (cross-seed free-fn
-// path calls don't lower at v1 — KNOWN_GOTCHAS.md § G11).
-reg.register(tools::Entry {
-    spec:      calc_spec(),
-    invoke_fn: calc_invoke
-});
+// Free-fn arg site coerces Calculator → Tool; the Registry's
+// @form(vec) of Tool stores the fat-pointer directly.
+tools::register(reg, calc);
 
 let call = tools::ToolCall {
     name:      "calculator",
@@ -150,32 +131,32 @@ let specs_json = reg.list();
 ```
 
 The fallible-channel free fn `tools::dispatch(reg, call) or
-raise` is callable cross-seed (works through the fallible-`or`
-codegen path):
+raise` is the value-channel surface:
 
 ```aperio
 let result = tools::dispatch(reg, call) or raise;
 ```
 
-The non-fallible `tools::register_tool(reg, spec, invoke_fn)`
-compiles but currently segfaults at runtime when called
-cross-seed (see `FRICTION.md` `cross-seed-locus-arg-segv`); use
-`reg.register(tools::Entry { ... })` until the upstream gap
-closes.
+In-seed callers can also use the locus-method form
+`reg.register(calc)` directly. Cross-seed consumers should
+prefer `tools::register(reg, calc)` because user-declared
+locus-method arg coercion `LocusRef → Interface` isn't yet
+wired across seeds (the free-fn arg site is wired).
 
 ## Pattern catalog mapping
 
 - `Registry`     — pattern 3 (service locus). Implicit lifecycle;
-  the `EntryList` child storage births / dissolves with it.
-- `EntryList`    — pattern 3 backing storage (`@form(vec)` child).
-- `Tool`         — F.20 interface (forward-compat).
-- `Entry`        — pattern 5 (shape type). Internal storage cell.
+  the `ToolList` child storage births / dissolves with it.
+- `ToolList`     — pattern 3 backing storage (`@form(vec)` child,
+  cells of `Tool` interface).
+- `Tool`         — F.20 interface. The storage cell type as well
+  as the public registration surface.
 - `ToolSpec / ToolCall / ToolResult / ToolError` — pattern 5
   shape types; the public wire surface.
-- `dispatch / register_tool / register_fns` — pattern 6 free fns.
-  Free because lifecycle methods can't declare `fallible(E)`
-  (two-channel rule) and because fn-pointer registration is
-  naturally a non-method shape.
+- `dispatch / register` — pattern 6 free fns. Free because
+  lifecycle methods can't declare `fallible(E)` (two-channel
+  rule) and because cross-seed locus-method arg coercion
+  `LocusRef → Interface` isn't yet wired (free-fn arg site is).
 
 ## Cross-lib pairings
 
@@ -188,7 +169,8 @@ closes.
   into the conversation history as the next turn's content.
 - **`pond/agent/sandbox`** is a natural `Tool` (its
   `run_code(code)` shape maps to `invoke({"code": "..."})`).
-  Wrap with a free-fn pair the way Calculator does.
+  Declare `spec()` / `invoke()` on the sandbox locus the way
+  Calculator does and pass it through `tools::register`.
 
 ## Example
 

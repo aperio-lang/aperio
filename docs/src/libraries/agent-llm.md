@@ -8,43 +8,35 @@ Suggested import alias: **`llm`**
 import "vendor/pond/agent/llm" as llm;
 ```
 
-## Status (2026-05-16)
+## Status (2026-05-18)
 
 The library builds clean and the public surface matches
-`pond/CONTRACTS.md § pond/agent/llm/`. There are TWO load-bearing
-caveats consumers must understand before reaching for it; both
-are documented in `FRICTION.md` with the full design rationale.
+`pond/CONTRACTS.md § pond/agent/llm/`. One load-bearing caveat
+remains (eager-buffering on the streaming path); the prior TLS
+gap closed 2026-05-18 with `std::io::tls::*` shipping upstream
+and the source-level wire-up landing in this commit.
 
-### 1. No TLS — `api.anthropic.com` over HTTPS won't dial
+### TLS — `api.anthropic.com` over HTTPS now dials directly
 
-The Aperio stdlib (`std::io::tcp::*`) does not currently expose
-a TLS implementation. Both clients will happily build
-`POST /v1/messages` wire-format requests with the right headers
-(`x-api-key`, `anthropic-version`, `Authorization: Bearer ...`,
-`Content-Type: application/json`, etc.), but they can only ship
-those requests over plaintext TCP. Pointing `base_url` at
-`https://api.anthropic.com` (or `https://api.openai.com`) will
-fail with `kind: "unsupported_scheme"` from `parse_url`.
+`base_url` accepts both `http://` and `https://` schemes; the
+URL parser routes the right scheme into the right substrate
+(`std::io::tls::connect` for `https`, `std::io::tcp::connect`
+for `http`). No config flag — just point at the real endpoint:
 
-**Workarounds** (any one of the three is fine):
+```aperio
+let client = llm::AnthropicClient {
+    api_key:  std::env::var("ANTHROPIC_API_KEY"),
+    base_url: "https://api.anthropic.com"    // default — TLS by scheme
+};
+```
 
-- **Local LLM-API-compatible endpoint** — point `base_url` at a
-  local server speaking the OpenAI or Anthropic wire format.
-  Examples: [LM Studio](https://lmstudio.ai)'s OpenAI-compatible
-  server (default `http://localhost:1234`), `llama.cpp`'s
-  built-in OpenAI server, [Ollama](https://ollama.ai) with
-  `--openai-host`. The demo defaults to
-  `http://localhost:1234`, matching LM Studio's out-of-the-box
-  setup.
-- **HTTP proxy with upstream TLS termination** — run a tiny
-  reverse proxy (nginx, Caddy, `socat`, `mitmproxy`,
-  `cloudflared`) that listens on plain HTTP locally and
-  terminates TLS upstream against the vendor's API.
-- **Wait for stdlib TLS** — once `std::io::tls::*` ships
-  (substrate roadmap, no firm date) the `unsupported_scheme`
-  guard flips off and the same code dials the real endpoint.
+The TLS handshake uses SNI + system trust store (TLS 1.2+,
+`SSL_VERIFY_PEER`). Build-time link drags in `-lssl -lcrypto`
+automatically — no extra steps. Local HTTP-only endpoints
+(LM Studio, llama.cpp, Ollama) still work as before; point
+`base_url` at `http://localhost:1234` to dial plaintext.
 
-### 2. Eager-buffering on the streaming path
+### Eager-buffering on the streaming path
 
 The streaming surface (`AnthropicClient.stream` /
 `OpenAiClient.stream`) drains the entire HTTP response off the
@@ -123,23 +115,27 @@ same pattern across pond):
 
 ### Bus subjects
 
-Both clients publish on **literal-subject** wire-format strings
-(`"agent.llm.chunk"` / `"agent.llm.done"`) — see `FRICTION.md
-§ topic-rename-asymmetry` for the workaround driving this.
-Subscribers wire up by literal subject + explicit payload type:
+Both clients publish on the **topic-ident** form (canonical
+per spec/semantics.md § Topic declarations):
+`topic LlmChunk { payload: LlmChunkMsg; subject:
+"agent.llm.chunk"; }` and `topic LlmDone { payload: LlmDoneMsg;
+subject: "agent.llm.done"; }`. The bus requires a user-defined
+type at every publish site, so each topic wraps its payload in
+a thin `*Msg` struct.
+
+Subscribers wire up by topic ident (no `of type T` — the
+topic carries the payload type):
 
 ```aperio
 locus Listener {
     bus {
-        subscribe "agent.llm.chunk" as on_chunk
-            of type llm::LlmChunk;
-        subscribe "agent.llm.done"  as on_done
-            of type llm::LlmDone;
+        subscribe llm::LlmChunk as on_chunk;
+        subscribe llm::LlmDone  as on_done;
     }
-    fn on_chunk(c: llm::LlmChunk) {
+    fn on_chunk(c: llm::LlmChunkMsg) {
         print(c.payload);
     }
-    fn on_done(d: llm::LlmDone) {
+    fn on_done(d: llm::LlmDoneMsg) {
         println("[stop=", d.payload.stop_reason, "]");
     }
 }
@@ -189,7 +185,7 @@ use for the same reason).
 | `wire.ap`         | JSON body builders + response parsers          |
 | `anthropic.ap`    | `AnthropicClient` locus + free-fn kernels      |
 | `openai.ap`       | `OpenAiClient` locus + free-fn kernels         |
-| `wire_topics.ap`  | `LlmChunk` / `LlmDone` payload types          |
+| `wire_topics.ap`  | `LlmChunk` / `LlmDone` topic decls + `LlmChunkMsg` / `LlmDoneMsg` payload wrappers |
 
 ## Demo
 
