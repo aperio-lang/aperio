@@ -47,7 +47,26 @@ examples/*/main
 # match per example directory the way apps/ does.
 examples/14-projection-classes/14-projection-classes
 
+# Codegen test fixtures build binaries next to their .ap sources
+# (same `aperio build` shape as apps/ and examples/). Match the
+# per-fixture-dir output: either `<dirname>/main` (single-file
+# fixtures) or `<dirname>/<dirname>` (multi-file fixtures).
+crates/aperio-codegen/tests/fixtures/**/main
+crates/aperio-codegen/tests/fixtures/examples/05-bus/05-bus
+crates/aperio-codegen/tests/fixtures/import-fallible-consumer/import-fallible-consumer
+
 # Ferryman recognition output. Lands in <repo>/.ferryman/ wherever
 # ferryman is pointed; the apps/operational-graph/fixture path
 # is the in-repo smoke-test target.
 .ferryman/
+
+# experiments/token-efficiency lives on its own branch
+# (experiments/token-efficiency). When that branch isn't checked
+# out the dir still sits on disk; ignore its generated state so
+# main's `git status` stays clean. Source files (briefs, tasks,
+# harness, judges) are tracked on the branch, not here.
+experiments/token-efficiency/.venv/
+experiments/token-efficiency/workdirs/
+experiments/token-efficiency/harness/runs.db
+experiments/token-efficiency/.todo_storage*
+**/__pycache__/
