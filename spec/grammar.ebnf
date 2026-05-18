@@ -136,20 +136,16 @@ locus_member      = params_block
 
 (* Phase 2: per-topic transport binding. Only legal inside a
    `main` locus. The same library can be deployed differently in
-   different binaries — `bindings` is the deployment seam. Empty
-   bindings means "everything is in-process via the cooperative
-   queue" (the default). `bindings` is a contextual keyword
-   recognized in locus-member position only. *)
+   different binaries — `bindings` is the deployment seam.
+   Absence-of-entry means "this topic is delivered same-process
+   via the cooperative queue" (the runtime default). v1.x ships a
+   single substrate-provided transport (`unix`); user-supplied
+   protocol-layer adapters land in Wave B. *)
 bindings_block    = "bindings" , "{" , { binding_entry } , "}" ;
 binding_entry     = IDENTIFIER , ":" , transport_spec , ";" ;
-transport_spec    = "in_memory"
-                  | "unix" , "(" , STRING_LIT , ")" , ":" , transport_role
-                  | "tcp" , "(" , STRING_LIT , "," , INT_LIT , ")" ,
-                    ":" , transport_role
-                  | "nats" , "(" , STRING_LIT , { "," , nats_kwarg } , ")"
-                  ;
+transport_spec    = "unix" , "(" , STRING_LIT , { "," , unix_kwarg } , ")" ;
+unix_kwarg        = "role" , ":" , transport_role ;
 transport_role    = "listen" | "connect" ;
-nats_kwarg        = IDENTIFIER , "=" , expression ;
 
 
 (* === 3. Params block =========================================== *)

@@ -278,48 +278,40 @@ pub struct BindingsBlock {
 pub struct BindingEntry {
     /// Topic name being bound — must reference a declared topic.
     pub topic: Ident,
-    /// Transport constructor — `in_memory`, `unix(...)`, etc.
+    /// Transport constructor — currently `unix(...)` only; future
+    /// `Adapter(LocusLiteral)` variant lands in Wave B of the
+    /// bus-transport redesign. Absence-of-binding means same-
+    /// process via the cooperative queue (no variant needed).
     pub transport: TransportSpec,
     pub span: Span,
 }
 
-/// Phase 2: closed set of compiler-recognized transport
-/// constructors. Phase 3 will replace this with a polymorphic
-/// dispatch through stdlib's `interface Transport` once user-
-/// defined adapters are supported.
+/// Bus transport constructors. v1.x ships exactly one substrate-
+/// provided variant (`Unix`); a future Wave B adds `Adapter(locus)`
+/// for user-supplied protocol-layer transports (NATS, MQTT, TCP-
+/// with-framing, etc.) once interface-value storage (G20 / F.20
+/// Phase B) lands. In-memory delivery is "absence of binding
+/// entry," not a variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransportSpec {
-    /// `in_memory` — single-process, no transport. Equivalent to
-    /// not binding at all; appears explicitly so test mains can
-    /// assert "this topic must NOT cross processes."
-    InMemory { span: Span },
-    /// `unix("/path/to/sock") : connect|listen` — AF_UNIX domain
-    /// socket. Wired to today's `lotus_transport_*` substrate.
+    /// `unix("/path/to/sock")` or `unix("/path", role: listen)`
+    /// — AF_UNIX domain socket. Substrate-provided: the runtime's
+    /// `lotus_transport_*` owns the delivery contract directly,
+    /// no protocol layer involved. Role is optional at the syntax
+    /// level; the typechecker fills it in from the bus block when
+    /// unambiguous (`publish`-only → connect, `subscribe`-only →
+    /// listen). When both publish and subscribe touch the same
+    /// topic, role must be explicit.
     Unix {
         path: String,
-        role: TransportRole,
-        span: Span,
-    },
-    /// `tcp("host", port) : connect|listen` — TCP socket. Parsed
-    /// in Phase 2; backend not yet implemented (build error).
-    Tcp {
-        host: String,
-        port: i64,
-        role: TransportRole,
-        span: Span,
-    },
-    /// `nats("nats://...", subject = "...", queue_group = "...")`
-    /// — broker. Parsed in Phase 2; backend not yet implemented
-    /// (build error).
-    Nats {
-        url: String,
-        kwargs: Vec<(Ident, Expr)>,
+        role: Option<TransportRole>,
         span: Span,
     },
 }
 
-/// Role suffix for point-to-point transports (unix, tcp).
-/// Brokers (nats) don't take a role.
+/// Direction-of-traffic for point-to-point substrate transports.
+/// Broker-shaped or user-supplied adapters carry direction in
+/// their own params blocks, not at the binding-spec level.
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum TransportRole {
     Connect,

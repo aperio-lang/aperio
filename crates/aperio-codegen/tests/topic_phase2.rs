@@ -6,7 +6,7 @@
 //!   topic Events { payload: Event; subject: "events"; }
 //!   topic Login : Events { payload: Login; subject: "login"; }
 //!   main locus App {
-//!     bindings { Login: unix("/tmp/x.sock") : listen; }
+//!     bindings { Login: unix("/tmp/x.sock"); }
 //!   }
 //!
 //! Wire subject for `Login` is `events.login` (parent.own).
@@ -173,9 +173,10 @@ fn main_locus_modifier_parses() {
         type T { n: Int; }
         topic Foo { payload: T; }
         main locus App {
-            bindings { Foo: in_memory; }
+            bindings { Foo: unix("/tmp/x.sock"); }
         }
-        fn main() { App { }; }
+        locus Pub { bus { publish Foo; } birth() { Foo <- T { n: 0 }; } }
+        fn main() { App { }; Pub { }; }
     "#;
     let p = parse(src);
     let app = p.items.iter().find_map(|it| match it {
@@ -192,7 +193,7 @@ fn bindings_in_non_main_locus_rejected_at_parse() {
         type T { n: Int; }
         topic Foo { payload: T; }
         locus Other {
-            bindings { Foo: in_memory; }
+            bindings { Foo: unix("/tmp/x.sock"); }
         }
         fn main() { Other { }; }
     "#;
@@ -210,7 +211,7 @@ fn binding_to_unknown_topic_errors() {
     let src = r#"
         type T { n: Int; }
         main locus App {
-            bindings { NoSuch: in_memory; }
+            bindings { NoSuch: unix("/tmp/x.sock"); }
         }
         fn main() { App { }; }
     "#;
@@ -229,16 +230,65 @@ fn duplicate_binding_for_same_topic_errors() {
         topic Foo { payload: T; }
         main locus App {
             bindings {
-                Foo: in_memory;
-                Foo: unix("/tmp/x.sock") : listen;
+                Foo: unix("/tmp/a.sock");
+                Foo: unix("/tmp/b.sock");
             }
         }
-        fn main() { App { }; }
+        locus Pub { bus { publish Foo; } birth() { Foo <- T { n: 0 }; } }
+        fn main() { App { }; Pub { }; }
     "#;
     let diags = typecheck_diags(src);
     assert!(
         diags.iter().any(|m| m.contains("already bound")),
         "expected dup-binding diag; got: {:?}",
+        diags,
+    );
+}
+
+#[test]
+fn binding_without_publisher_or_subscriber_errors() {
+    // After the v1.x bus-transport refactor: a bindings entry
+    // with no publisher AND no subscriber for the topic in the
+    // bundle has no role to infer, so the typechecker emits a
+    // diagnostic rather than silently producing dead code.
+    let src = r#"
+        type T { n: Int; }
+        topic Foo { payload: T; }
+        main locus App {
+            bindings { Foo: unix("/tmp/x.sock"); }
+        }
+        fn main() { App { }; }
+    "#;
+    let diags = typecheck_diags(src);
+    assert!(
+        diags.iter().any(|m| m.contains("no publisher or subscriber")),
+        "expected role-uninferable diag; got: {:?}",
+        diags,
+    );
+}
+
+#[test]
+fn binding_with_both_pub_and_sub_without_explicit_role_errors() {
+    // Ambiguous case: some locus publishes Foo AND some locus
+    // subscribes Foo, but the binding doesn't specify a role.
+    // Compile error pointing to the explicit-role override.
+    let src = r#"
+        type T { n: Int; }
+        topic Foo { payload: T; }
+        locus P { bus { publish Foo; } birth() { Foo <- T { n: 1 }; } }
+        locus S {
+            bus { subscribe Foo as on_foo; }
+            fn on_foo(t: T) { }
+        }
+        main locus App {
+            bindings { Foo: unix("/tmp/x.sock"); }
+        }
+        fn main() { App { }; P { }; S { }; }
+    "#;
+    let diags = typecheck_diags(src);
+    assert!(
+        diags.iter().any(|m| m.contains("ambiguous") && m.contains("role:")),
+        "expected ambiguous-role diag; got: {:?}",
         diags,
     );
 }
@@ -353,7 +403,7 @@ fn intra_locus_optimization_skipped_when_topic_is_bound() {
             birth() { Beat <- Tick { n: 1 }; }
         }
         main locus App {
-            bindings { Beat: unix("/tmp/x.sock") : listen; }
+            bindings { Beat: unix("/tmp/x.sock"); }
         }
         fn main() { App { }; Loop { }; }
     "#);

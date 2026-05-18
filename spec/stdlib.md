@@ -395,6 +395,7 @@ tree. Quick reference grouped by `std::*` namespace prefix:
 | `std::math` | `sqrt`, `exp`, `log`, `floor`, `ceil`, `pow`, `tanh`, `nan`, `is_nan`, `inf` | path-call dispatch into libm (`nan` / `inf` / `is_nan` are IEEE 754 sentinels / classification) |
 | `std::crypto` | `sha1(b) -> Bytes` (20-byte), `sha256(b) -> Bytes` (32-byte), `hmac_sha256(key, msg) -> Bytes` (32-byte). All non-fallible; results anchored in the bus payload arena. | `lotus_crypto_*` C runtime primitives (stand-alone — no libcrypto / OpenSSL link dep) |
 | `std::os` | `getrandom(n: Int) -> Bytes fallible(IoError)` (CSPRNG; `getrandom(2)` with `/dev/urandom` fallback) | `lotus_os_getrandom` C runtime primitive |
+| `std::bus` | `Adapter` interface (contract for user-supplied bus transports). No concrete adapter implementations ship in std — protocol-layer transports (NATS, MQTT, raw-TCP-with-framing) live in user code or downstream packages. The binding-site wiring (`bindings { T: MyAdapter { ... }; }`) lands in Wave B of the bus-transport redesign, gated on F.20 Phase B interface storage. | `runtime/stdlib/bus.ap` |
 
 Aperio doesn't use parametric stdlib collection types (`Map<K,
 V>`, `Vec<T>`, `Set<T>`, etc.). Storage is locus-shaped via the

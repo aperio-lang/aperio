@@ -363,9 +363,12 @@ and modes; specific transports come from stdlib (`std::bus::*`).
 top-level `topic Foo { payload: T; subject: "..."; }` decls
 (with optional `: Parent` for hierarchical wire subjects);
 deployment-time bindings live in the `main` locus's
-`bindings { Topic: <transport>; }` block (`in_memory`,
-`unix(...)`, and `tcp(...)` wired in v1.x; `nats(...)` parses
-but unimplemented). See `spec/semantics.md` "Topic declarations →
+`bindings { Topic: <transport>; }` block. The only transport
+variant in v1.x is substrate-provided `unix("/path", role: ...)`
+— in-memory delivery is absence-of-entry, and protocol-layer
+transports (NATS, MQTT, TCP-with-framing) land in Wave B as
+user-supplied loci satisfying `interface std::bus::Adapter`.
+See `spec/semantics.md` "Topic declarations →
 Phase 2" for the full surface, including the closed-world
 intra-locus optimization that elides bus dispatch when a topic
 is used only inside one locus and has no binding.

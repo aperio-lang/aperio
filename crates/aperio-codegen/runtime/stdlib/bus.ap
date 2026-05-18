@@ -1,0 +1,52 @@
+// std::bus — bus-adapter contract.
+//
+// The Adapter interface defines what a user-supplied protocol-
+// layer transport must provide so the bus router can drive its
+// lifecycle and ship payloads through it. Concrete adapters
+// (NATS, MQTT, raw-TCP-with-framing, custom JSON-over-WebSocket)
+// live in user code or downstream packages — they are NOT
+// shipped in std. std offers the contract only; raw networking
+// primitives are in std::io::tcp / std::io::udp.
+//
+// Each adapter is an ordinary locus whose params block carries
+// whatever configuration the protocol needs (broker URL, host,
+// port, role for point-to-point shapes, credentials, timeouts).
+// The bus runtime binds an Adapter instance per bindings entry
+// of the form:
+//
+//   bindings {
+//       RemoteEvt: MyNatsAdapter { url: "nats://..." };
+//   }
+//
+// (The Adapter binding variant of TransportSpec ships in Wave B
+// of the bus-transport redesign, gated on F.20 Phase B interface
+// storage. The interface itself is declared here so user code
+// can author adapters against a stable contract ahead of Wave B
+// runtime wiring.)
+//
+// Contract semantics:
+//
+//   birth():  open the connection / bind the socket / register
+//             with the broker. Errors raise via fallible.
+//   send:     ship a single message for a wire-subject. Must
+//             deliver atomically (one whole message; framing,
+//             retry, ordering are the adapter's concern).
+//   run:      background recv loop. The adapter pulls inbound
+//             messages off its transport and hands each to the
+//             bus router via __bus_local_dispatch (m105 will
+//             open this primitive; until then, run() bodies
+//             that need to dispatch require the Wave B runtime).
+//   dissolve: tear down the transport. Drain in-flight if the
+//             adapter cares about that; the router has already
+//             stopped publishing by the time dissolve fires.
+//
+// Bytes/String semantics: payloads are serialized to wire bytes
+// by the bus's per-payload-type codec before reaching send();
+// the adapter sees opaque bytes + a wire-subject string and
+// must preserve message boundaries end-to-end. The receive path
+// is symmetric: recv'd bytes go back to the router which
+// deserializes per the subscribing handler's payload type.
+
+interface __StdBusAdapter {
+    fn send(subject: String, bytes: Bytes);
+}

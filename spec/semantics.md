@@ -15,12 +15,12 @@ not blocked on full formalization.
 1. The runtime initializes:
    - Region allocator, schedulers (one per CPU core; cooperative
      within each), bus router, lifecycle dispatcher.
-   - Reads deployment config (e.g., `deployment.yaml`) for
-     transport bindings.
    - Establishes the **runtime root locus** as the implicit
      parent of `main`'s implicit locus.
-2. Bus channels declared in the program are wired to transport
-   adapters per deployment config.
+2. Bus topics with `bindings { Topic: ...; }` entries in the
+   `main` locus are registered against their declared transports.
+   Topics without a binding stay same-process via the cooperative
+   queue.
 3. `fn main()` is invoked.
 
 ## Function call
@@ -498,30 +498,37 @@ different binaries by varying the main locus.
 ```aperio
 main locus App {
     bindings {
-        Beat: in_memory;                              // default; can be omitted
-        Login: unix("/tmp/login.sock") : listen;      // AF_UNIX server side
-        Events: unix("/tmp/events.sock") : connect;   // AF_UNIX client side
+        // Beat: not bound — same-binary cooperative queue (default).
+        Login:  unix("/tmp/login.sock");                  // role inferred
+        Events: unix("/tmp/events.sock", role: listen);   // explicit override
     }
 }
 ```
 
-Transport surface (Phase 2):
+Transport surface (v1.x):
 
-- `in_memory` — same-binary cooperative queue; emits no
-  `lotus_bus_register_remote` call (this is the runtime default).
-- `unix("/path") : listen|connect` — AF_UNIX framed-byte transport;
-  `listen` spawns a reader thread that fans recv'd payloads into
-  the local handler set, `connect` opens a write-side transport
-  that publish-site dispatch sends to.
-- `tcp("host", port) : listen|connect` — AF_INET stream transport;
-  routed through the `lotus_tcp_*` substrate with an 8-byte LE
-  length-prefix framer that preserves message boundaries across
-  the TCP byte stream. `listen` spawns a reader thread (same
-  cooperative-dispatch shape as the `unix` listener); `connect`
-  opens a write-side transport. The codegen-emitted URL form is
-  `tcp://host:port`.
-- `nats("nats://...", subject = "...", ...)` — parsed but
-  unimplemented in Phase 2.
+- `unix("/path")` or `unix("/path", role: connect|listen)` —
+  AF_UNIX framed-byte transport. Substrate-provided: the
+  runtime's `lotus_transport_*` owns the delivery contract
+  directly. `role: listen` spawns a reader thread that fans
+  recv'd payloads into the local handler set; `role: connect`
+  opens a write-side transport that publish-site dispatch sends
+  to. When `role:` is omitted, the typechecker infers it from
+  the bus block (`publish` only → connect, `subscribe` only →
+  listen); if both publish and subscribe touch the topic, the
+  binding is rejected with a "specify `role:`" diagnostic.
+
+- (User-supplied adapters via the `Adapter(...)` variant land in
+  Wave B, gated on interface-value storage. Once shipped,
+  protocol-layer transports — NATS, MQTT, TCP-with-framing,
+  custom JSON-over-WebSocket — will be ordinary loci that
+  satisfy `interface std::bus::Adapter` and live in user code
+  or downstream packages, not in `std::` itself.)
+
+**In-memory delivery is absence-of-entry.** A topic with no
+binding entry is delivered same-process via the cooperative
+queue. There is no `in_memory` variant — the runtime default
+covers the case and explicit syntax would be ceremony.
 
 Bundle-wide rules:
 
@@ -531,12 +538,15 @@ Bundle-wide rules:
 3. A topic may appear at most once across all bindings.
 4. Bindings only legal in a `main`-modified locus. The parser
    rejects them in any other locus position.
+5. Every binding's role must be either explicit (`role:`
+   kwarg) or unambiguously inferable from the bus block.
 
 Codegen emits one `lotus_bus_register_remote(subject, url, role)`
-call per non-`in_memory` binding entry into `fn main`'s prelude,
-right after the bus queue is published. Subjects use the
-desugared wire form (so a binding for hierarchical `Login`
-registers as `"events.login"`).
+call per binding entry into `fn main`'s prelude, right after the
+bus queue is published. Subjects use the desugared wire form (so
+a binding for hierarchical `Login` registers as `"events.login"`).
+Topics with no binding entry get no register call and stay
+same-process via the cooperative queue.
 
 **3. Closed-world topology optimization.** When a topic has no
 binding and the publisher / subscriber relationship is statically

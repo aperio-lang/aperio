@@ -57,6 +57,109 @@ pub fn desugar_topics(program: &mut Program) {
     let mut topics: BTreeMap<String, TopicEntry> = BTreeMap::new();
     collect_topics(&program.items, &mut topics);
     rewrite_items(&mut program.items, &topics);
+    desugar_binding_roles(program);
+}
+
+/// Fill in `TransportSpec::Unix { role: None, .. }` with the
+/// role inferred from the bus block's publish/subscribe
+/// declarations on the topic. Typecheck already emitted a diag
+/// for the ambiguous case (both pub + sub with no explicit
+/// role); here we just fill in the unambiguous cases. Anything
+/// still `None` after this pass is either an error path
+/// (typecheck diag fired) or an empty-binding (no pub or sub),
+/// which we leave as `None` and let codegen sort out.
+fn desugar_binding_roles(program: &mut Program) {
+    let pubs = collect_topic_publishers(&program.items);
+    let subs = collect_topic_subscribers(&program.items);
+    fill_roles_in_items(&mut program.items, &pubs, &subs);
+}
+
+fn collect_topic_publishers(items: &[TopDecl]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    fn walk(items: &[TopDecl], out: &mut std::collections::BTreeSet<String>) {
+        for item in items {
+            match item {
+                TopDecl::Locus(l) => {
+                    for member in &l.members {
+                        if let LocusMember::Bus(bb) = member {
+                            for bm in &bb.members {
+                                if let BusMember::Publish { subject, .. } = bm {
+                                    if let BusSubject::Topic(id) = subject {
+                                        out.insert(id.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                TopDecl::Module(m) => walk(&m.items, out),
+                _ => {}
+            }
+        }
+    }
+    walk(items, &mut out);
+    out
+}
+
+fn collect_topic_subscribers(items: &[TopDecl]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    fn walk(items: &[TopDecl], out: &mut std::collections::BTreeSet<String>) {
+        for item in items {
+            match item {
+                TopDecl::Locus(l) => {
+                    for member in &l.members {
+                        if let LocusMember::Bus(bb) = member {
+                            for bm in &bb.members {
+                                if let BusMember::Subscribe { subject, .. } = bm {
+                                    if let BusSubject::Topic(id) = subject {
+                                        out.insert(id.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                TopDecl::Module(m) => walk(&m.items, out),
+                _ => {}
+            }
+        }
+    }
+    walk(items, &mut out);
+    out
+}
+
+fn fill_roles_in_items(
+    items: &mut [TopDecl],
+    pubs: &std::collections::BTreeSet<String>,
+    subs: &std::collections::BTreeSet<String>,
+) {
+    for item in items {
+        match item {
+            TopDecl::Locus(l) => {
+                for member in &mut l.members {
+                    if let LocusMember::Bindings(bb) = member {
+                        for entry in &mut bb.entries {
+                            let TransportSpec::Unix { role, .. } = &mut entry.transport;
+                            if role.is_none() {
+                                let p = pubs.contains(&entry.topic.name);
+                                let s = subs.contains(&entry.topic.name);
+                                // Typecheck emits a diag for (p && s)
+                                // and (!p && !s); here we only fill in
+                                // the unambiguous cases.
+                                if p && !s {
+                                    *role = Some(TransportRole::Connect);
+                                } else if s && !p {
+                                    *role = Some(TransportRole::Listen);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            TopDecl::Module(m) => fill_roles_in_items(&mut m.items, pubs, subs),
+            _ => {}
+        }
+    }
 }
 
 fn collect_topics(items: &[TopDecl], topics: &mut BTreeMap<String, TopicEntry>) {

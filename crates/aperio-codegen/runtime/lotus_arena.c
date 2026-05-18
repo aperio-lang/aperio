@@ -3809,26 +3809,14 @@ int lotus_str_can_parse_float(const char *s) {
  * per peer) is m60.
  */
 
-/* Transport kind tag — distinguishes which adapter owns an entry's
- * transport pointer. v0.1 added `unix://` only; m105 grows the
- * second branch for `tcp://host:port` URLs by routing through the
- * already-shipped lotus_tcp_* substrate. New kinds (TLS, QUIC, ...)
- * slot in by adding a constant + filling the dispatch arms in
- * register_remote / fanout / destroy_all. */
-#define LOTUS_BUS_REMOTE_KIND_UNIX 0
-#define LOTUS_BUS_REMOTE_KIND_TCP  1
-
 typedef struct lotus_bus_remote_entry {
     char              *subject;       /* owned (strdup'd at register) */
-    int                kind;          /* LOTUS_BUS_REMOTE_KIND_* */
-    /* Exactly one of `transport` / `tcp` is non-NULL based on kind.
-     * Set in main for CONNECT, in reader-thread for LISTEN. */
-    lotus_transport_t *transport;     /* kind == UNIX */
-    lotus_tcp_t       *tcp;           /* kind == TCP */
+    lotus_transport_t *transport;     /* set in main for CONNECT,
+                                         in reader-thread for LISTEN */
     int                role;
     /* m59: per-subject reader thread for LISTEN role. Set when the
-     * pthread is spawned at register time; the thread loops on the
-     * kind-appropriate recv and dispatches to local subscribers via
+     * pthread is spawned at register time; the thread loops on
+     * lotus_transport_recv and dispatches to local subscribers via
      * lotus_bus_local_dispatch. CONNECT-role entries leave both
      * fields zero (no thread, transport opened on the main path). */
     pthread_t          reader_thread;
@@ -3857,21 +3845,12 @@ void lotus_bus_set_queue(lotus_bus_queue_t *queue) {
     g_bus_queue_for_remote = queue;
 }
 
-/* m59: reader-thread args. Owns the path/host string so the
- * thread can outlive the lotus_bus_register_remote call. The
- * entry back-reference lets the thread publish its transport ptr
- * to the entry so lotus_bus_remote_destroy_all can find it.
- *
- * m105 added the `tcp` arm: `kind` selects which fields are
- * meaningful. UNIX kind uses `path` (full socket file path); TCP
- * kind uses `host` + `port`. Exactly one of `path` / `host` is
- * non-NULL per entry; both ownership-flags are wired so the
- * thread-cleanup path frees the right buffer. */
+/* m59: reader-thread args. Owns the path string so the thread
+ * can outlive the lotus_bus_register_remote call. The entry
+ * back-reference lets the thread publish its transport ptr to
+ * the entry so lotus_bus_remote_destroy_all can find it. */
 typedef struct lotus_bus_reader_args {
-    int                       kind;       /* LOTUS_BUS_REMOTE_KIND_* */
-    char                     *path;       /* UNIX kind; owned by the thread */
-    char                     *host;       /* TCP kind; owned by the thread */
-    uint16_t                  port;       /* TCP kind */
+    char                     *path;       /* owned by the thread */
     lotus_bus_remote_entry_t *entry;
 } lotus_bus_reader_args_t;
 
@@ -3883,44 +3862,27 @@ static void *lotus_bus_reader_thread_main(void *arg) {
      * meant a subscriber binary would hang at startup until the
      * publisher connected; m59 defers the accept off the boot
      * path so main proceeds and any local-subscribe registration
-     * can complete before we wait for a peer.
-     *
-     * m105: the same defer-off-boot pattern applies to the TCP
-     * adapter — lotus_tcp_create's LISTEN branch also blocks on
-     * accept(), so it lives here too. */
-    lotus_transport_t *t_unix = NULL;
-    lotus_tcp_t       *t_tcp  = NULL;
-    if (args->kind == LOTUS_BUS_REMOTE_KIND_TCP) {
-        t_tcp = lotus_tcp_create(args->host, args->port, LOTUS_TCP_LISTEN);
-        if (!t_tcp) {
-            free(args->host);
-            free(args);
-            return NULL;
-        }
-        args->entry->tcp = t_tcp;
-    } else {
-        t_unix = lotus_transport_create(args->path, LOTUS_TRANSPORT_LISTEN);
-        if (!t_unix) {
-            free(args->path);
-            free(args);
-            return NULL;
-        }
-        /* Publish the transport pointer back to the entry so
-         * lotus_bus_remote_destroy_all can shutdown(2) the
-         * connection if a clean teardown is needed. (Race:
-         * between accept returning and this store, destroy_all
-         * sees NULL and skips the shutdown — that's fine because
-         * in well-formed test scenarios destroy_all runs after
-         * the peer has closed, which already drives recv to EOF.) */
-        args->entry->transport = t_unix;
+     * can complete before we wait for a peer. */
+    lotus_transport_t *t = lotus_transport_create(
+        args->path, LOTUS_TRANSPORT_LISTEN);
+    if (!t) {
+        free(args->path);
+        free(args);
+        return NULL;
     }
+    /* Publish the transport pointer back to the entry so
+     * lotus_bus_remote_destroy_all can shutdown(2) the connection
+     * if a clean teardown is needed. (Race: between accept
+     * returning and this store, destroy_all sees NULL and skips
+     * the shutdown — that's fine because in well-formed test
+     * scenarios destroy_all runs after the peer has closed,
+     * which already drives recv to EOF.) */
+    args->entry->transport = t;
 
     char wire_buf[LOTUS_PAYLOAD_MAX];
     char struct_buf[LOTUS_PAYLOAD_MAX];
     while (1) {
-        ssize_t n = (args->kind == LOTUS_BUS_REMOTE_KIND_TCP)
-            ? lotus_tcp_recv(t_tcp, wire_buf, sizeof(wire_buf))
-            : lotus_transport_recv(t_unix, wire_buf, sizeof(wire_buf));
+        ssize_t n = lotus_transport_recv(t, wire_buf, sizeof(wire_buf));
         if (n <= 0) break;     /* peer closed (0) or error (-1) */
 
         /* m60: deserialize wire bytes into struct-layout bytes
@@ -3955,53 +3917,11 @@ static void *lotus_bus_reader_thread_main(void *arg) {
                                  struct_buf, (size_t)struct_size);
     }
 
-    if (args->kind == LOTUS_BUS_REMOTE_KIND_TCP) {
-        lotus_tcp_destroy(t_tcp);
-        args->entry->tcp = NULL;
-        free(args->host);
-    } else {
-        lotus_transport_destroy(t_unix);
-        args->entry->transport = NULL;
-        free(args->path);
-    }
+    lotus_transport_destroy(t);
+    args->entry->transport = NULL;     /* prevent double-destroy */
+    free(args->path);
     free(args);
     return NULL;
-}
-
-/* Parse `tcp://host:port` into host (heap-owned, must be freed by
- * caller) and port. Returns 0 on success, -1 on malformed input
- * (and the caller's *out_host stays NULL). The `body` arg is the
- * portion of the URL after `tcp://`. */
-static int lotus__bus_parse_tcp_authority(const char *body,
-                                          char **out_host,
-                                          uint16_t *out_port) {
-    *out_host = NULL;
-    *out_port = 0;
-    if (!body || *body == '\0') return -1;
-    /* IPv4 + hostnames: split on the LAST ':'. (IPv6 literals
-     * would need a `[host]:port` shape; m105 doesn't ship that.) */
-    const char *colon = strrchr(body, ':');
-    if (!colon || colon == body) return -1;
-    size_t host_len = (size_t)(colon - body);
-    char  *host = (char *)malloc(host_len + 1);
-    if (!host) return -1;
-    memcpy(host, body, host_len);
-    host[host_len] = '\0';
-
-    const char *port_str = colon + 1;
-    if (*port_str == '\0') {
-        free(host);
-        return -1;
-    }
-    char     *endp = NULL;
-    long      val  = strtol(port_str, &endp, 10);
-    if (!endp || *endp != '\0' || val < 0 || val > 65535) {
-        free(host);
-        return -1;
-    }
-    *out_host = host;
-    *out_port = (uint16_t)val;
-    return 0;
 }
 
 void lotus_bus_register_remote(const char *subject,
@@ -4012,44 +3932,23 @@ void lotus_bus_register_remote(const char *subject,
                 "lotus_bus_register_remote: null subject or url\n");
         return;
     }
-    /* URL schemes recognized at this milestone: `unix://`
-     * (AF_UNIX SEQPACKET — m58) and `tcp://host:port` (m105,
-     * routed through the lotus_tcp_* substrate with length-
-     * prefix framing matching project_tcp_framing). Future
-     * schemes (TLS, QUIC, NATS) grow into the same dispatch. */
+    /* v1.x recognizes the `unix://` scheme only. User-supplied
+     * adapters (NATS, TCP-with-framing, etc.) await Wave B of
+     * the bus-transport redesign — see [[bus-transport-redesign]]
+     * in the dev memory. */
     static const char unix_scheme[] = "unix://";
-    static const char tcp_scheme[]  = "tcp://";
-    size_t unix_len = sizeof(unix_scheme) - 1;
-    size_t tcp_len  = sizeof(tcp_scheme)  - 1;
-
-    int   kind     = -1;
-    const char *unix_path = NULL;
-    char       *tcp_host  = NULL;     /* heap-owned on success */
-    uint16_t    tcp_port  = 0;
-
-    if (strncmp(url, unix_scheme, unix_len) == 0) {
-        kind      = LOTUS_BUS_REMOTE_KIND_UNIX;
-        unix_path = url + unix_len;
-        if (*unix_path == '\0') {
-            fprintf(stderr,
-                    "lotus_bus_register_remote: empty path in %s\n",
-                    url);
-            return;
-        }
-    } else if (strncmp(url, tcp_scheme, tcp_len) == 0) {
-        kind = LOTUS_BUS_REMOTE_KIND_TCP;
-        if (lotus__bus_parse_tcp_authority(url + tcp_len,
-                                           &tcp_host, &tcp_port) != 0) {
-            fprintf(stderr,
-                    "lotus_bus_register_remote: malformed tcp URL "
-                    "(want tcp://host:port): %s\n", url);
-            return;
-        }
-    } else {
+    size_t scheme_len = sizeof(unix_scheme) - 1;
+    if (strncmp(url, unix_scheme, scheme_len) != 0) {
         fprintf(stderr,
                 "lotus_bus_register_remote: unsupported URL scheme "
-                "(want unix:// or tcp://host:port): %s\n",
+                "(only unix:// in v1.x): %s\n",
                 url);
+        return;
+    }
+    const char *path = url + scheme_len;
+    if (*path == '\0') {
+        fprintf(stderr,
+                "lotus_bus_register_remote: empty path in %s\n", url);
         return;
     }
 
@@ -4063,26 +3962,18 @@ void lotus_bus_register_remote(const char *subject,
         lotus_bus_remote_entry_t *grown = (lotus_bus_remote_entry_t *)
             realloc(g_bus_remote_entries,
                     new_cap * sizeof(lotus_bus_remote_entry_t));
-        if (!grown) {
-            free(tcp_host);
-            return;
-        }
+        if (!grown) return;
         g_bus_remote_entries = grown;
         g_bus_remote_cap     = new_cap;
     }
 
     char *subject_copy = strdup(subject);
-    if (!subject_copy) {
-        free(tcp_host);
-        return;
-    }
+    if (!subject_copy) return;
 
     lotus_bus_remote_entry_t *e =
         &g_bus_remote_entries[g_bus_remote_count++];
     e->subject           = subject_copy;
-    e->kind              = kind;
     e->transport         = NULL;
-    e->tcp               = NULL;
     e->role              = role;
     e->has_reader_thread = 0;
 
@@ -4090,31 +3981,20 @@ void lotus_bus_register_remote(const char *subject,
         /* m59: spawn a reader thread that owns this subject's
          * recv loop. The thread opens the LISTEN transport on
          * its own stack so accept() doesn't block the main
-         * thread. m105 routes args by kind. */
+         * thread. */
         lotus_bus_reader_args_t *args =
-            (lotus_bus_reader_args_t *)calloc(1, sizeof(*args));
-        if (!args) {
-            free(tcp_host);
-            return;
-        }
-        args->kind  = kind;
+            (lotus_bus_reader_args_t *)malloc(sizeof(*args));
+        if (!args) return;
+        args->path  = strdup(path);
         args->entry = e;
-        if (kind == LOTUS_BUS_REMOTE_KIND_TCP) {
-            args->host = tcp_host;     /* ownership transferred */
-            args->port = tcp_port;
-            tcp_host = NULL;
-        } else {
-            args->path = strdup(unix_path);
-            if (!args->path) {
-                free(args);
-                return;
-            }
+        if (!args->path) {
+            free(args);
+            return;
         }
         if (pthread_create(&e->reader_thread, NULL,
                            lotus_bus_reader_thread_main, args) != 0) {
             perror("lotus_bus_register_remote: pthread_create");
             free(args->path);
-            free(args->host);
             free(args);
             return;
         }
@@ -4123,18 +4003,11 @@ void lotus_bus_register_remote(const char *subject,
         /* CONNECT: open inline so the connect-with-retry happens
          * on the boot path. The first publish on this subject
          * fans out through the resulting transport. */
-        if (kind == LOTUS_BUS_REMOTE_KIND_TCP) {
-            e->tcp = lotus_tcp_create(tcp_host, tcp_port, LOTUS_TCP_CONNECT);
-            free(tcp_host);
-            tcp_host = NULL;
-        } else {
-            e->transport = lotus_transport_create(unix_path, role);
-        }
-        /* On failure lotus_*_create already perror'd; the entry
-         * stays in the table with transport/tcp=NULL so fanout
+        e->transport = lotus_transport_create(path, role);
+        /* On failure lotus_transport_create already perror'd; the
+         * entry stays in the table with transport=NULL so fanout
          * skips it and destroy_all is a no-op for this slot. */
     }
-    if (tcp_host) free(tcp_host);
 }
 
 /* Trim leading + trailing whitespace in-place. Returns a pointer
@@ -4223,25 +4096,16 @@ void lotus_bus_remote_fanout(const char *subject,
     if (!subject) return;
     for (size_t i = 0; i < g_bus_remote_count; i++) {
         lotus_bus_remote_entry_t *e = &g_bus_remote_entries[i];
-        if (!e->subject) continue;
+        if (!e->subject || !e->transport) continue;
         if (strcmp(e->subject, subject) != 0) continue;
         /* CONNECT role only fans out at this milestone. LISTEN
          * role transports exist on the receive side and are
          * driven by the (future) reader thread, not by publish-
          * site dispatch. */
         if (e->role != LOTUS_TRANSPORT_CONNECT) continue;
-        /* Dispatch by kind. Exactly one of transport/tcp is
-         * non-NULL when create() succeeded; both are NULL when
-         * create() failed (we keep the slot but skip it here). */
-        if (e->kind == LOTUS_BUS_REMOTE_KIND_TCP) {
-            if (!e->tcp) continue;
-            (void)lotus_tcp_send(e->tcp, payload, payload_size);
-        } else {
-            if (!e->transport) continue;
-            (void)lotus_transport_send(e->transport, payload, payload_size);
-        }
-        /* Errors are logged inside lotus_*_send; we don't abort
-         * dispatch on transport failure — local subscribers
+        (void)lotus_transport_send(e->transport, payload, payload_size);
+        /* Errors are logged inside lotus_transport_send; we don't
+         * abort dispatch on transport failure — local subscribers
          * already received their copy. */
     }
 }
@@ -5951,40 +5815,24 @@ void lotus_bus_remote_destroy_all(void) {
          * transport's lifecycle. Best-effort shutdown(conn_fd)
          * to unblock recv if the peer hasn't closed yet, then
          * join. The thread destroys the transport itself before
-         * exiting, so we don't double-destroy here.
-         *
-         * m105: same pattern for the TCP adapter — the conn_fd
-         * field lives at the same offset in lotus_tcp_t. */
+         * exiting, so we don't double-destroy here. */
         if (e->has_reader_thread) {
-            int conn_fd = -1;
-            if (e->kind == LOTUS_BUS_REMOTE_KIND_TCP) {
-                if (e->tcp && e->tcp->conn_fd >= 0) {
-                    conn_fd = e->tcp->conn_fd;
-                }
-            } else {
-                if (e->transport && e->transport->conn_fd >= 0) {
-                    conn_fd = e->transport->conn_fd;
-                }
-            }
-            if (conn_fd >= 0) {
+            if (e->transport && e->transport->conn_fd >= 0) {
                 /* SHUT_RDWR turns subsequent recvs into
                  * immediate EOF. Ignore errors — if the peer has
                  * already closed (the common case in a clean
                  * teardown), the fd may already be half-shut. */
-                shutdown(conn_fd, SHUT_RDWR);
+                shutdown(e->transport->conn_fd, SHUT_RDWR);
             }
             pthread_join(e->reader_thread, NULL);
-            /* Reader thread has already nulled e->transport / e->tcp
-             * on its way out, but if it failed before storing
-             * (create returned NULL), the field is already NULL —
-             * so the CONNECT-style destroy below is a no-op for
-             * this slot. */
+            /* Reader thread has already nulled e->transport on
+             * its way out, but if it failed before storing
+             * (transport_create returned NULL), the field is
+             * already NULL — so the CONNECT-style destroy below
+             * is a no-op for this slot. */
         }
         if (e->transport) {
             lotus_transport_destroy(e->transport);
-        }
-        if (e->tcp) {
-            lotus_tcp_destroy(e->tcp);
         }
         if (e->subject) {
             free(e->subject);

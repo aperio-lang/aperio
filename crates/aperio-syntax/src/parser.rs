@@ -920,11 +920,13 @@ impl Parser {
         })
     }
 
-    /// Transport constructor — closed set in Phase 2:
-    /// `in_memory`
-    /// `unix("/path") : connect|listen`
-    /// `tcp("host", port) : connect|listen`
-    /// `nats("nats://...", subject = "...", queue_group = "...")`
+    /// Transport constructor.
+    /// `unix("/path/to/sock")` or `unix("/path", role: listen)` —
+    /// the only substrate-provided transport in v1.x. The optional
+    /// `role:` kwarg overrides the typechecker's role inference
+    /// from the bus block. No other transport keywords are
+    /// recognized; user-supplied adapters land via Wave B (gated
+    /// on G20).
     fn parse_transport_spec(&mut self) -> Result<TransportSpec, Diag> {
         let head_tok = self.peek_token().clone();
         let head_name = match &head_tok.kind {
@@ -933,8 +935,7 @@ impl Parser {
                 return Err(Diag::parse(
                     head_tok.span,
                     format!(
-                        "expected transport constructor name (`in_memory`, \
-                         `unix`, `tcp`, `nats`), got {:?}",
+                        "expected transport constructor `unix`, got {:?}",
                         other
                     ),
                 ));
@@ -942,88 +943,71 @@ impl Parser {
         };
         self.bump();
         match head_name.as_str() {
-            "in_memory" => Ok(TransportSpec::InMemory { span: head_tok.span }),
             "unix" => {
                 self.expect(TokenKind::LParen, "(")?;
                 let path = self.expect_string_literal("unix path")?;
+                let mut role: Option<TransportRole> = None;
+                while self.eat(&TokenKind::Comma) {
+                    let key = self.expect_ident("unix kwarg name")?;
+                    self.expect(TokenKind::Colon, ":")?;
+                    match key.name.as_str() {
+                        "role" => {
+                            let tok = self.peek_token().clone();
+                            let role_name = match &tok.kind {
+                                TokenKind::Ident(s) => s.clone(),
+                                other => {
+                                    return Err(Diag::parse(
+                                        tok.span,
+                                        format!(
+                                            "expected `connect` or `listen` for `role:`, \
+                                             got {:?}",
+                                            other
+                                        ),
+                                    ));
+                                }
+                            };
+                            self.bump();
+                            role = Some(match role_name.as_str() {
+                                "connect" => TransportRole::Connect,
+                                "listen" => TransportRole::Listen,
+                                other => {
+                                    return Err(Diag::parse(
+                                        tok.span,
+                                        format!(
+                                            "expected `connect` or `listen` for `role:`, \
+                                             got `{}`",
+                                            other
+                                        ),
+                                    ));
+                                }
+                            });
+                        }
+                        other => {
+                            return Err(Diag::parse(
+                                key.span,
+                                format!(
+                                    "unknown `unix` kwarg `{}` (recognized: `role`)",
+                                    other
+                                ),
+                            ));
+                        }
+                    }
+                }
                 let close = self.expect(TokenKind::RParen, ")")?;
-                let role = self.parse_transport_role("unix")?;
                 Ok(TransportSpec::Unix {
                     path,
                     role,
                     span: head_tok.span.merge(close.span),
                 })
             }
-            "tcp" => {
-                self.expect(TokenKind::LParen, "(")?;
-                let host = self.expect_string_literal("tcp host")?;
-                self.expect(TokenKind::Comma, ",")?;
-                let port = self.expect_int_literal("tcp port")?;
-                let close = self.expect(TokenKind::RParen, ")")?;
-                let role = self.parse_transport_role("tcp")?;
-                Ok(TransportSpec::Tcp {
-                    host,
-                    port,
-                    role,
-                    span: head_tok.span.merge(close.span),
-                })
-            }
-            "nats" => {
-                self.expect(TokenKind::LParen, "(")?;
-                let url = self.expect_string_literal("nats url")?;
-                let mut kwargs = Vec::new();
-                while self.eat(&TokenKind::Comma) {
-                    let key = self.expect_ident("nats kwarg name")?;
-                    self.expect(TokenKind::Eq, "=")?;
-                    let value = self.parse_expr()?;
-                    kwargs.push((key, value));
-                }
-                let close = self.expect(TokenKind::RParen, ")")?;
-                Ok(TransportSpec::Nats {
-                    url,
-                    kwargs,
-                    span: head_tok.span.merge(close.span),
-                })
-            }
             other => Err(Diag::parse(
                 head_tok.span,
                 format!(
-                    "unknown transport constructor `{}` (recognized: \
-                     `in_memory`, `unix`, `tcp`, `nats`)",
+                    "unknown transport constructor `{}` (only `unix` is supported \
+                     in v1.x; in-memory delivery is absence-of-entry; user-supplied \
+                     adapters await Wave B)",
                     other
                 ),
-            )),
-        }
-    }
-
-    fn parse_transport_role(&mut self, transport: &str) -> Result<TransportRole, Diag> {
-        if !self.eat(&TokenKind::Colon) {
-            return Err(Diag::parse(
-                self.peek_token().span,
-                format!(
-                    "transport `{}` requires `: connect` or `: listen` role suffix",
-                    transport
-                ),
-            ));
-        }
-        let tok = self.peek_token().clone();
-        let role_name = match &tok.kind {
-            TokenKind::Ident(s) => s.clone(),
-            // `connect` shares no token; both lex as Ident.
-            other => {
-                return Err(Diag::parse(
-                    tok.span,
-                    format!("expected `connect` or `listen`, got {:?}", other),
-                ));
-            }
-        };
-        self.bump();
-        match role_name.as_str() {
-            "connect" => Ok(TransportRole::Connect),
-            "listen" => Ok(TransportRole::Listen),
-            other => Err(Diag::parse(
-                tok.span,
-                format!("expected `connect` or `listen`, got `{}`", other),
             )),
         }
     }
@@ -1038,20 +1022,6 @@ impl Parser {
             _ => Err(Diag::parse(
                 tok.span,
                 format!("expected string literal for {}", ctx),
-            )),
-        }
-    }
-
-    fn expect_int_literal(&mut self, ctx: &str) -> Result<i64, Diag> {
-        let tok = self.peek_token().clone();
-        match tok.kind {
-            TokenKind::IntLit(n) => {
-                self.bump();
-                Ok(n)
-            }
-            _ => Err(Diag::parse(
-                tok.span,
-                format!("expected integer literal for {}", ctx),
             )),
         }
     }

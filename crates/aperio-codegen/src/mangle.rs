@@ -266,14 +266,12 @@ impl<'a> Mangler<'a> {
             LocusMember::Bindings(bb) => {
                 // Topic idents resolve against top-level topic decls;
                 // current substitution scope (locus generic params)
-                // never collides. Walk transport kwargs for safety.
+                // never collides. v1.x's only TransportSpec variant
+                // (`Unix`) carries a literal path string with no
+                // expressions inside it, so nothing to walk past
+                // the topic ident.
                 for entry in &mut bb.entries {
                     self.rewrite_ident(&mut entry.topic.name);
-                    if let TransportSpec::Nats { kwargs, .. } = &mut entry.transport {
-                        for (_, e) in kwargs {
-                            self.walk_expr(e);
-                        }
-                    }
                 }
             }
         }

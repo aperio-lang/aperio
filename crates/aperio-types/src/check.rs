@@ -184,6 +184,11 @@ pub fn check_bundle(bundle: &Bundle<'_>, top: &TopScope) -> Vec<Diag> {
 ///   - Each `bindings { Topic: <transport>; }` entry must name a
 ///     declared `topic`.
 ///   - A topic may appear at most once across all bindings.
+///   - For `unix(...)` bindings without an explicit `role:` kwarg,
+///     the role must be inferable from the bus block's
+///     publish/subscribe declarations on this topic. Pub-only →
+///     connect, sub-only → listen, both → compile error
+///     ("specify `role:`").
 fn check_main_and_bindings(
     bundle: &Bundle<'_>,
     top: &TopScope,
@@ -191,6 +196,12 @@ fn check_main_and_bindings(
 ) {
     let mut mains: Vec<(String, Span)> = Vec::new();
     let mut bound: BTreeMap<String, Span> = BTreeMap::new();
+
+    // For role inference: gather, per wire-subject, whether ANY
+    // locus in the bundle publishes / subscribes to it. Bindings
+    // reference topic-name, so map name → (publishes, subscribes).
+    let (topic_publishes, topic_subscribes) = collect_topic_pub_sub(bundle);
+
     for program in bundle.programs.values() {
         for item in &program.items {
             if let TopDecl::Locus(l) = item {
@@ -226,6 +237,43 @@ fn check_main_and_bindings(
                             } else {
                                 bound.insert(entry.topic.name.clone(), entry.topic.span);
                             }
+
+                            // Role inference validation. Only one
+                            // TransportSpec variant ships in v1.x;
+                            // future variants (Adapter, etc.) won't
+                            // need this same check.
+                            let TransportSpec::Unix { role, .. } = &entry.transport;
+                            if role.is_none() {
+                                let pubs = topic_publishes
+                                    .contains(&entry.topic.name);
+                                let subs = topic_subscribes
+                                    .contains(&entry.topic.name);
+                                if pubs && subs {
+                                    diags.push(Diag::ty(
+                                        entry.topic.span,
+                                        format!(
+                                            "binding for topic `{}` is ambiguous: \
+                                             some locus publishes it AND some locus \
+                                             subscribes to it; specify `role:` \
+                                             (e.g. `unix(\"/path\", role: listen)`)",
+                                            entry.topic.name
+                                        ),
+                                    ));
+                                } else if !pubs && !subs {
+                                    diags.push(Diag::ty(
+                                        entry.topic.span,
+                                        format!(
+                                            "binding for topic `{}` has no publisher \
+                                             or subscriber in the bundle; nothing to \
+                                             route. Add a `bus {{ publish | subscribe }}` \
+                                             or remove the binding",
+                                            entry.topic.name
+                                        ),
+                                    ));
+                                }
+                                // Otherwise (exactly one of pubs/subs):
+                                // role is inferable; desugar fills it in.
+                            }
                         }
                     }
                 }
@@ -244,6 +292,56 @@ fn check_main_and_bindings(
             ));
         }
     }
+}
+
+/// Walk the bundle and collect, per topic name (the binding-side
+/// identifier), the set of topics that have at least one publisher
+/// and the set that have at least one subscriber across all loci.
+/// Used by role-inference validation in `check_main_and_bindings`.
+fn collect_topic_pub_sub(
+    bundle: &Bundle<'_>,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut pubs = std::collections::BTreeSet::new();
+    let mut subs = std::collections::BTreeSet::new();
+    fn walk(
+        items: &[TopDecl],
+        pubs: &mut std::collections::BTreeSet<String>,
+        subs: &mut std::collections::BTreeSet<String>,
+    ) {
+        for item in items {
+            match item {
+                TopDecl::Locus(l) => {
+                    for member in &l.members {
+                        if let LocusMember::Bus(bb) = member {
+                            for bm in &bb.members {
+                                match bm {
+                                    BusMember::Publish { subject, .. } => {
+                                        if let BusSubject::Topic(id) = subject {
+                                            pubs.insert(id.name.clone());
+                                        }
+                                    }
+                                    BusMember::Subscribe { subject, .. } => {
+                                        if let BusSubject::Topic(id) = subject {
+                                            subs.insert(id.name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                TopDecl::Module(m) => walk(&m.items, pubs, subs),
+                _ => {}
+            }
+        }
+    }
+    for program in bundle.programs.values() {
+        walk(&program.items, &mut pubs, &mut subs);
+    }
+    (pubs, subs)
 }
 
 fn collect_known_names(top: &TopScope) -> BTreeMap<String, Span> {

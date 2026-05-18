@@ -528,6 +528,14 @@ const STDLIB_AP_SOURCE: &str = concat!(
     // near the top of this concat) must precede it. Independent
     // of other stdlib files otherwise.
     include_str!("../runtime/stdlib/process.ap"),
+    "\n",
+    // std::bus::Adapter interface contract for user-supplied
+    // protocol-layer transports. No concrete impls live in std;
+    // the runtime side of the binding variant lands in Wave B
+    // of the bus-transport redesign (gated on F.20 Phase B
+    // interface-value storage). Standalone — references only
+    // Bytes and String, both core types.
+    include_str!("../runtime/stdlib/bus.ap"),
 );
 
 /// Maps each user-facing stdlib path (locus OR type) to the
@@ -540,6 +548,7 @@ const STDLIB_AP_SOURCE: &str = concat!(
 /// is just the path → name mapping. Keep sorted by path for
 /// review.
 const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
+    (&["std", "bus", "Adapter"], "__StdBusAdapter"),
     (&["std", "cli", "Resolver"], "__StdCliResolver"),
     (&["std", "http", "Handler"], "__StdHttpHandler"),
     (&["std", "http", "Request"], "__StdHttpRequest"),
@@ -5729,36 +5738,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
                 // Build URL + role from the transport spec.
                 let (url, role) = match &entry.transport {
-                    TransportSpec::InMemory { .. } => {
-                        // No remote transport — same-binary cooperative
-                        // queue is the default. Skip emission entirely.
-                        continue;
-                    }
                     TransportSpec::Unix { path, role, .. } => {
+                        // Role inference filled this in during desugar
+                        // (publish-only → connect, subscribe-only →
+                        // listen). Typecheck emitted a diag if the
+                        // binding was ambiguous or unused; in that
+                        // path role stays None and we fall through to
+                        // the error arm below.
                         let r = match role {
-                            TransportRole::Listen => 0_i64,
-                            TransportRole::Connect => 1_i64,
+                            Some(TransportRole::Listen) => 0_i64,
+                            Some(TransportRole::Connect) => 1_i64,
+                            None => {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "binding for topic `{}`: role could not be \
+                                     inferred (no publisher or subscriber declared \
+                                     in this bundle, or both); add `role:` kwarg \
+                                     to `unix(...)`",
+                                    entry.topic.name
+                                )));
+                            }
                         };
                         (format!("unix://{}", path), r)
-                    }
-                    TransportSpec::Tcp { host, port, role, .. } => {
-                        let r = match role {
-                            TransportRole::Listen => 0_i64,
-                            TransportRole::Connect => 1_i64,
-                        };
-                        // Runtime parses `tcp://host:port` and routes
-                        // through the lotus_tcp_* substrate. The same
-                        // url-string mechanism the unix path uses keeps
-                        // lotus_bus_register_remote's signature stable.
-                        (format!("tcp://{}:{}", host, port), r)
-                    }
-                    TransportSpec::Nats { .. } => {
-                        return Err(CodegenError::Unsupported(
-                            "binding transport `nats(...)` is not yet \
-                             implemented (only `unix(...)` and \
-                             `in_memory` are wired in v1.x Phase 2)"
-                                .to_string(),
-                        ));
                     }
                 };
 
