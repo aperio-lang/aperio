@@ -35,6 +35,54 @@
 - [Language reference](./reference/language.md)
 - [Standard library](./reference/stdlib.md)
 
+# Libraries (pond)
+
+- [Overview](./libraries/index.md)
+
+## Convention
+
+- [tower](./libraries/tower.md)
+
+## Tier 0 — Infrastructure
+
+- [http/client](./libraries/http-client.md)
+- [crypto](./libraries/crypto.md)
+- [subprocess](./libraries/subprocess.md)
+- [math/matrix](./libraries/math-matrix.md)
+- [math/stats](./libraries/math-stats.md)
+
+## Tier 1 — Architecture + web stack
+
+- [sqlite](./libraries/sqlite.md)
+- [router](./libraries/router.md)
+- [sessions](./libraries/sessions.md)
+- [jobs](./libraries/jobs.md)
+- [migrations](./libraries/migrations.md)
+
+## Tier 2 — Observability + supervision
+
+- [logfmt](./libraries/logfmt.md)
+- [metrics](./libraries/metrics.md)
+- [supervisor](./libraries/supervisor.md)
+- [tracing](./libraries/tracing.md)
+
+## Tier 4 — Trading kit
+
+- [trade/orderbook](./libraries/trade-orderbook.md)
+- [trade/marketdata](./libraries/trade-marketdata.md)
+- [trade/strategy](./libraries/trade-strategy.md)
+- [trade/risk](./libraries/trade-risk.md)
+- [trade/backtest](./libraries/trade-backtest.md)
+
+## Tier 5 — AI / agent
+
+- [agent/llm](./libraries/agent-llm.md)
+- [agent/tools](./libraries/agent-tools.md)
+- [agent/conversation](./libraries/agent-conversation.md)
+- [agent/sandbox](./libraries/agent-sandbox.md)
+- [agent/embeddings](./libraries/agent-embeddings.md)
+- [ml/neural](./libraries/ml-neural.md)
+
 ---
 
 [Contributing](./contributing.md)
