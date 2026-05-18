@@ -215,6 +215,29 @@ impl Parser {
             if self.eat(&TokenKind::Semi) {
                 continue;
             }
+            // An `import` keyword here means imports were mis-ordered:
+            // the grammar (spec/grammar.ebnf) requires every import to
+            // precede every top-level decl. Emit a typed error and
+            // consume the bad import so the parser can recover instead
+            // of looping on the same token (recover_to_top_level used
+            // to list `Import` as a stop token and never advanced past
+            // it — that produced an unbounded-allocation infinite loop
+            // surfaced as a multi-GB OOM on real source).
+            if matches!(self.peek(), TokenKind::Import) {
+                let span = self.peek_token().span;
+                self.diags.push(Diag::parse(
+                    span,
+                    "`import` statements must appear before any top-level \
+                     declaration (per spec/grammar.ebnf `program = \
+                     { import_decl } , { top_decl }`); move this import \
+                     to the top of the file."
+                        .to_string(),
+                ));
+                // Consume the offending `import "..." [as <ident>];`
+                // shape so parsing makes forward progress.
+                let _ = self.parse_import();
+                continue;
+            }
             match self.parse_top_decl() {
                 Ok(item) => items.push(item),
                 Err(d) => {
@@ -236,7 +259,16 @@ impl Parser {
     }
 
     fn recover_to_top_level(&mut self) {
-        // Skip until we find a likely top-level start.
+        // Skip until we find a likely top-level start. `Import` is
+        // intentionally NOT in this set: imports are only valid at
+        // the top of the file, so an `import` keyword encountered
+        // during recovery is itself a mis-ordering error, not a
+        // valid resume point. Including it caused an infinite-loop
+        // OOM when a parse error landed in front of a mis-ordered
+        // import (the second `parse_program` loop kept failing on
+        // the same import token and recovery kept stopping at it).
+        // The mis-ordered case is now caught explicitly in
+        // `parse_program`.
         while !matches!(
             self.peek(),
             TokenKind::Eof
@@ -246,7 +278,6 @@ impl Parser {
                 | TokenKind::Const
                 | TokenKind::Fn
                 | TokenKind::Module
-                | TokenKind::Import
         ) {
             self.bump();
         }
@@ -3867,6 +3898,33 @@ fn main() { }
         assert!(
             msg.contains("import alias"),
             "diag should mention the missing alias identifier, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_import_after_top_decl_errors_and_terminates() {
+        // Regression: an `import` placed after any top-level decl
+        // used to wedge the parser in an unbounded-allocation loop
+        // (recover_to_top_level treated `Import` as a stop token,
+        // so the second `parse_program` loop kept failing on the
+        // same import token and pushing a Diag forever — surfaced
+        // as a ~27 GB OOM on real-world source).
+        let src = r#"
+type Foo { x: Int; }
+import "lib/foo" as foo;
+
+fn main() { }
+"#;
+        let diags = parse_str(src)
+            .expect_err("import after top decl must reject");
+        let msg = diags
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            msg.contains("must appear before any top-level declaration"),
+            "diag should explain the ordering rule, got: {msg}"
         );
     }
 

@@ -290,6 +290,49 @@ fn resolve_imports(
     merged_items: &mut Vec<aperio_syntax::ast::TopDecl>,
     renames: &mut ImportRenames,
 ) -> Result<(), ()> {
+    // Defensive guards + env-gated tracing. The guards bound the
+    // resolver's accumulators so a future bug (or pathological
+    // input) can't OOM the machine — pond surfaced a 27 GB freeze
+    // 2026-05-17 when an upstream parser bug looped on mis-ordered
+    // imports; that's fixed in aperio-syntax now, but the caps stay
+    // as a generic backstop. Real workloads sit ~1000x below the
+    // ceilings (pond's largest demo: visited=14, renames=51).
+    // APERIO_IMPORT_DEBUG=1 enables per-call tracing for future
+    // import-resolution debugging.
+    if std::env::var("APERIO_IMPORT_DEBUG").is_ok() {
+        eprintln!(
+            "[import] entry: dir={} imports={} visited={} renames={} merged_items={}",
+            importer_dir.display(),
+            imports.len(),
+            visited.len(),
+            renames.len(),
+            merged_items.len(),
+        );
+    }
+    if visited.len() > 2000 {
+        eprintln!(
+            "[import] ABORT: visited > 2000 ({}); recursion runaway, importer={}",
+            visited.len(),
+            importer_dir.display(),
+        );
+        std::process::exit(99);
+    }
+    if renames.len() > 200_000 {
+        eprintln!(
+            "[import] ABORT: renames > 200k ({}); rename-table runaway, importer={}",
+            renames.len(),
+            importer_dir.display(),
+        );
+        std::process::exit(99);
+    }
+    if merged_items.len() > 200_000 {
+        eprintln!(
+            "[import] ABORT: merged_items > 200k ({}); item-merge runaway, importer={}",
+            merged_items.len(),
+            importer_dir.display(),
+        );
+        std::process::exit(99);
+    }
     for imp in imports {
         // `import "std" as ...;` would be malformed at the spec
         // level — std is the bundled namespace, not a vendored
@@ -352,6 +395,10 @@ fn resolve_imports(
                     return Err(());
                 }
             };
+            let trace = std::env::var("APERIO_IMPORT_DEBUG").is_ok();
+            if trace {
+                eprintln!("[import]     parse start: {}", file.display());
+            }
             let program = match aperio_syntax::parse_source(&source) {
                 Ok(p) => p,
                 Err(diags) => {
@@ -362,6 +409,14 @@ fn resolve_imports(
                     continue;
                 }
             };
+            if trace {
+                eprintln!(
+                    "[import]     parse done : {} (items={} imports={})",
+                    file.display(),
+                    program.items.len(),
+                    program.imports.len(),
+                );
+            }
             let stem = file
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -386,15 +441,40 @@ fn resolve_imports(
             .iter()
             .map(|f| (f.stem.clone(), &f.program))
             .collect();
+        let trace = std::env::var("APERIO_IMPORT_DEBUG").is_ok();
+        if trace {
+            eprintln!("[import]     build_seed_renames start (n_files={})", parsed_files.len());
+        }
         let seed_renames =
             aperio_codegen::mangle::build_seed_renames(&stem_prog_refs, &alias);
+        if trace {
+            eprintln!("[import]     build_seed_renames done (n={})", seed_renames.len());
+        }
         // Mangle each file's program with the shared map.
         for pf in parsed_files.iter_mut() {
+            if trace {
+                eprintln!("[import]     mangle start: {}", pf.path.display());
+            }
             aperio_codegen::mangle::mangle_with_renames(&mut pf.program, &seed_renames);
+            if trace {
+                eprintln!("[import]     mangle done : {}", pf.path.display());
+            }
         }
         // Populate the per-build path-rename table.
         for (name, mangled) in &seed_renames {
             renames.push((vec![alias.clone(), name.clone()], mangled.clone()));
+        }
+        if trace {
+            eprintln!(
+                "[import]   resolved '{}' as {}: +{} files, seed_renames={}, \
+                 visited now {}, renames now {}",
+                imp.path,
+                alias,
+                parsed_files.len(),
+                seed_renames.len(),
+                visited.len(),
+                renames.len(),
+            );
         }
         // A4 (G34): lift the v1 strict barrier — follow each
         // imported lib's own `import "..." as ...;` directives,
