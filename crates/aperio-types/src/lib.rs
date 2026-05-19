@@ -1656,4 +1656,36 @@ mod tests {
             diags
         );
     }
+
+    #[test]
+    fn ok_send_via_cross_seed_qualified_topic() {
+        // Bug 1 regression. The parser admits `alias::Topic` as a
+        // bus subject in `subscribe`, `publish`, and `<-` positions.
+        // The codegen-side pre-pass resolves the qualified path
+        // through the import path-rename table. The typechecker
+        // doesn't see the merged + mangled program, so it must
+        // accept `Expr::Path(alias::Topic) <- payload;` directly
+        // using the leaf segment as the subject — mirroring how
+        // resolve_bus_subject treats QualifiedTopic in subscribe /
+        // publish declarations (leaf name + Ty::Unknown payload).
+        //
+        // Before the fix, the send-statement LHS fell through to
+        // "computed subject" and errored with "wildcard publish
+        // required".
+        let src = r#"
+            locus Pub {
+                bus { publish src::Heartbeat; }
+                run() {
+                    src::Heartbeat <- src::Beat { n: 42 };
+                }
+            }
+            fn main() { Pub { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected cross-seed send to typecheck cleanly; got: {:?}",
+            diags
+        );
+    }
 }

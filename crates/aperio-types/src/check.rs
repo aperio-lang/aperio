@@ -1887,6 +1887,19 @@ impl<'a> Checker<'a> {
                 Some(TopSymbol::Topic(_)) => Some(id.name.clone()),
                 _ => None,
             },
+            // A7 (G16): cross-seed `alias::Topic <- payload;`. The
+            // typechecker can't resolve cross-seed names directly
+            // (mangling happens at the codegen-side pre-pass), so
+            // we use the leaf segment as the subject — mirroring
+            // resolve_bus_subject's handling of QualifiedTopic in
+            // subscribe/publish declarations, which also stores the
+            // leaf name. The locus's bus_publishes entry for this
+            // topic has payload=Unknown, so the assignability check
+            // below is permissive; the codegen-side mangle resolves
+            // the full path and binds the wire subject.
+            Expr::Path(qn) if qn.segments.len() > 1 => {
+                qn.segments.last().map(|s| s.name.clone())
+            }
             _ => None,
         };
         let locus = match self.current_locus {
