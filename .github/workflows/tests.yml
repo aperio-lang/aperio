@@ -54,6 +54,21 @@ jobs:
             llvm-18-dev libpolly-18-dev libzstd-dev \
             clang-18 libclang-18-dev zlib1g-dev
 
+      - name: cargo build --release --workspace
+        # Build ALL workspace members first so `libaperio_ts_shim.a`
+        # lands at `target/release/` before any test that links
+        # against it runs. `aperio-cli` and `aperio-codegen` tests
+        # invoke clang to link compiled .ap fixtures — codegen
+        # appends the staticlib by path-probe (no cargo dep edge
+        # forces it), so a fresh checkout that goes straight to
+        # `cargo test` misses the artifact and fails with
+        # `undefined reference to lotus_ts_*`.
+        env:
+          LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+        run: |
+          set -eux
+          cargo build --release --workspace
+
       - name: cargo test --release --workspace
         env:
           LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
