@@ -542,26 +542,43 @@ bytes for a bound subject) can use this too.
   buffer. N appends are amortized O(N). `finish()` copies into
   the bus payload arena (program-lifetime) and frees the
   builder.
-- `lotus_bytes_builder_new()` / `_append(b, chunk)` /
-  `_len(b) -> i64` / `_finish(b) -> Bytes*` — C10. Binary-safe
-  sibling of the str-builder family. Shares the underlying
-  `lotus_str_builder_t` struct (cap / len / buf); the split is
-  in append/finish semantics (reads the chunk's `[i64 len]`
-  prefix instead of `strlen`; finish emits a length-prefixed
-  Bytes blob with no trailing NUL).
-- `lotus_bytes_builder_shift_front(b, n)` /
-  `lotus_bytes_builder_clear(b)` /
-  `lotus_bytes_builder_snapshot(b) -> Bytes*` /
-  `lotus_bytes_builder_free(b)` — 2026-05-19 (Phase 0,
-  pond/websocket follow-up). In-place ops for long-lived
-  recv-loop accumulators. `shift_front` memmoves the tail to
-  the head and drops n bytes (capacity preserved). `clear`
-  sets len=0 (capacity preserved). `snapshot` copies the
-  current `[0..len)` into a fresh Bytes blob in the bus
-  payload arena, builder unchanged. `free` disposes the
-  malloc-backed buffer without materializing a final blob —
-  closes the "leak unless finish" hazard for holders that
-  never call `finish`.
+- `lotus_bytes_builder_new(i64 initial_cap) -> ptr` /
+  `_append(ptr handle, ptr chunk) -> i64 status` /
+  `_len(ptr handle) -> i64` /
+  `_finish(ptr handle) -> Bytes*` /
+  `_shift_front(ptr handle, i64 n)` /
+  `_clear(ptr handle)` /
+  `_snapshot(ptr handle) -> Bytes*` /
+  `_free(ptr handle)` — C10 / Phase 0 (2026-05-19,
+  pond/websocket follow-up). Binary-safe sibling of the
+  str-builder family. Shares the underlying
+  `lotus_str_builder_t` struct (`{cap, len, buf*}`); the
+  split is in append/finish semantics (reads the chunk's
+  `[i64 len]` prefix instead of `strlen`; finish emits a
+  length-prefixed Bytes blob with no trailing NUL).
+  In-place ops: `shift_front` memmoves the tail to the head
+  and drops n bytes (capacity preserved). `clear` sets len=0
+  (capacity preserved). `snapshot` copies the current
+  `[0..len)` into a fresh Bytes blob in the bus payload
+  arena, builder unchanged. `free` disposes the malloc-backed
+  buffer without materializing a final blob.
+
+  These primitives are no longer the user-facing surface;
+  they're the C externs called by the
+  `std::bytes::BytesBuilder` stdlib locus
+  (`crates/aperio-codegen/runtime/stdlib/bytes_builder.ap`).
+  See `spec/design-rationale.md` § F.28 for the rationale
+  and the locus's method shape. The locus-side calls reach
+  these via internal `std::bytes::builder::__*` path-call
+  dispatch.
+
+  **ABI notes (2026-05-19).** `_new` takes `int64_t
+  initial_cap` (previously zero-arg, hardcoded 64) — values
+  `<= 0` are treated as the legacy default. `_append`
+  returns `int64_t status` (1=ok, 0=fail on realloc-NULL
+  or null-handle) — previously void; the status return is
+  what the locus's `append` method checks before routing
+  through `violate alloc_failed` per F.27.
 
   **Builder handles are NOT layout-compatible with regular
   Bytes blobs.** The struct shape is
@@ -569,8 +586,11 @@ bytes for a bound subject) can use this too.
   Bytes blobs are `[int64_t len][u8 data[]]`. So
   `lotus_bytes_at(builder, i)` / `lotus_bytes_len(builder)`
   read the wrong slots if a builder handle is passed as a
-  Bytes value. Use `snapshot` to materialize a Bytes view or
-  `builder_len` for the running length.
+  Bytes value. The Aperio-level enforcement (`BytesBuilder`
+  as its own locus type) makes that mistake impossible to
+  express; this note is the C-side mirror — anyone calling
+  these primitives directly from C / Rust must keep the
+  distinction.
 - `lotus_tcp_recv_into(fd, builder, max_bytes) -> i64` /
   `lotus_tls_recv_into(handle, builder, max_bytes) -> i64` /
   `lotus_udp_recv_into(fd, builder, max_bytes) -> i64` —
