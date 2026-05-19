@@ -2339,6 +2339,31 @@ The grammar in v0 does **not** specify:
   more sophisticated pattern logic awaits a future version.
 - **First-class modules.** `module IDENTIFIER { ... }` is in the
   grammar but module loading semantics are not specified.
+- **Locus-typed fields with lifecycle cascade.** Today a locus
+  param can carry `Int`, `String`, `Bytes`, and other types, but
+  not another locus (or stdlib locus). Declaring `rx_buf:
+  std::bytes::BytesBuilder;` as a param on a user locus produces
+  `codegen error: ... declared LocusRef(...), got Bytes`. The
+  canonical workaround is the caller-owns-the-allocation pattern
+  — let-bind the locus in the owning method's body and thread it
+  through call sites — which is the recv-loop pattern documented
+  in `spec/stdlib.md` § _Builders vs Bytes_. The shape that v0
+  doesn't support is "locus B is owned by locus A's params,
+  birth-cascades on A's birth, dissolve-cascades on A's
+  dissolve, lives across method calls without explicit
+  threading." This is Phase-2 (2) of the pond/websocket recv-
+  loop closure — the "vertical contract / DMA" idiom for
+  zero-copy producer/consumer over F.14. Three design
+  candidates are sketched in the fathom Phase-2 handoff: field
+  annotation (`@inplace`), storage-class heuristic, or
+  contract-side `expose ... @reuse`. The implementation crosses
+  multiple codegen subsystems (locus struct layout, birth /
+  dissolve cascade, field-access through the parent's struct
+  GEP path) — substantial enough to warrant its own design
+  pass. Phase-2 (1) `BytesBuilder.view()` covers the largest
+  recv-loop residual without needing this; Phase-2 (2) is the
+  load-bearing zero-copy idiom for the broader vertical-
+  contract surface.
 
 Each of these is a known extension point. Closing them off in v0
 keeps the spec tractable; opening them later is a non-breaking
