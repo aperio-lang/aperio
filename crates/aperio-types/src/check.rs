@@ -27,7 +27,7 @@ use aperio_syntax::{Diag, Span};
 
 use crate::resolve::{resolve_type_expr, TopScope};
 use crate::symbol::*;
-use crate::ty::Ty;
+use crate::ty::{is_flat_shapeable, Ty};
 
 fn method_to_fn_ty(m: &MethodInfo) -> Ty {
     Ty::Function {
@@ -263,6 +263,171 @@ fn check_satisfies_bus_adapter(
     Ok(())
 }
 
+/// Form K4a (2026-05-20): validate the operational constraints
+/// declared via the `where ...` clause on a binding entry.
+///
+/// Three classes of check:
+///   1. **Intra-constraint consistency** — at most one scope
+///      keyword per binding; `zero_copy` + `cross_machine` is a
+///      contradiction.
+///   2. **Transport-constraint compatibility** — does the
+///      named transport satisfy each declared constraint? `unix`
+///      is intra-machine, NOT zero-copy; `Adapter` is trusted
+///      for scope (user-supplied transport), NOT zero-copy.
+///   3. **Payload-shape compatibility** — `zero_copy` requires
+///      the topic's payload to satisfy `is_flat_shapeable`.
+///
+/// Diagnostics are pushed to `diags`; the function returns
+/// nothing (zero-or-more errors per binding).
+fn check_binding_constraints(
+    entry: &BindingEntry,
+    top: &TopScope,
+    diags: &mut Vec<Diag>,
+) {
+    if entry.constraints.is_empty() {
+        return;
+    }
+
+    // (1) intra-constraint consistency.
+    let scope_constraints: Vec<&SpannedBindingConstraint> = entry
+        .constraints
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.kind,
+                BindingConstraint::IntraProcess
+                    | BindingConstraint::IntraMachine
+                    | BindingConstraint::CrossMachine
+            )
+        })
+        .collect();
+    if scope_constraints.len() > 1 {
+        // Diagnostic cites the second one; the first is the
+        // surviving "declared" scope. Pick whichever the user
+        // sees first in source order; the parser preserves
+        // declaration order.
+        diags.push(Diag::ty(
+            scope_constraints[1].span,
+            format!(
+                "binding for topic `{}` has multiple scope constraints \
+                 (`{}` and `{}`); pick one",
+                entry.topic.name,
+                scope_constraints[0].kind.name(),
+                scope_constraints[1].kind.name(),
+            ),
+        ));
+    }
+
+    let has_zero_copy = entry
+        .constraints
+        .iter()
+        .any(|c| matches!(c.kind, BindingConstraint::ZeroCopy));
+    let has_cross_machine = entry
+        .constraints
+        .iter()
+        .any(|c| matches!(c.kind, BindingConstraint::CrossMachine));
+    if has_zero_copy && has_cross_machine {
+        // Find the zero_copy span for the diagnostic location.
+        let span = entry
+            .constraints
+            .iter()
+            .find(|c| matches!(c.kind, BindingConstraint::ZeroCopy))
+            .map(|c| c.span)
+            .unwrap_or(entry.span);
+        diags.push(Diag::ty(
+            span,
+            format!(
+                "binding for topic `{}`: `zero_copy` and `cross_machine` \
+                 contradict — network transports require serialization",
+                entry.topic.name
+            ),
+        ));
+    }
+
+    // (2) transport-constraint compatibility.
+    for c in &entry.constraints {
+        if let Some(msg) = transport_satisfies(&entry.transport, c.kind) {
+            diags.push(Diag::ty(
+                c.span,
+                format!("binding for topic `{}`: {}", entry.topic.name, msg),
+            ));
+        }
+    }
+
+    // (3) payload-shape compatibility — `zero_copy` requires
+    //     `is_flat_shapeable`. Look the topic's payload up
+    //     through the resolved top scope; skip silently if the
+    //     topic isn't registered (a separate diagnostic upstream
+    //     will catch the missing topic).
+    if has_zero_copy {
+        if let Some(TopSymbol::Topic(topic)) =
+            top.lookup(&entry.topic.name)
+        {
+            if !is_flat_shapeable(&topic.payload, top) {
+                let span = entry
+                    .constraints
+                    .iter()
+                    .find(|c| matches!(c.kind, BindingConstraint::ZeroCopy))
+                    .map(|c| c.span)
+                    .unwrap_or(entry.span);
+                diags.push(Diag::ty(
+                    span,
+                    format!(
+                        "binding for topic `{}` requires `zero_copy` but \
+                         payload type `{}` is not flat-shapeable (contains \
+                         String, Bytes, or other variable-size fields)",
+                        entry.topic.name,
+                        topic.payload.display()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Returns `Some(reason)` if `transport` cannot satisfy
+/// `constraint`. Returns `None` when the transport satisfies it
+/// (or when the satisfaction can't be determined and trust
+/// defaults to "OK" — adapter loci for scope constraints).
+fn transport_satisfies(
+    transport: &TransportSpec,
+    constraint: BindingConstraint,
+) -> Option<String> {
+    use BindingConstraint::*;
+    match (transport, constraint) {
+        // unix: intra-machine substrate, kernel-memcpy at the
+        // socket boundary.
+        (TransportSpec::Unix { .. }, IntraProcess) => Some(
+            "`unix` transport crosses OS process boundaries; cannot \
+             satisfy `intra_process`"
+                .into(),
+        ),
+        (TransportSpec::Unix { .. }, IntraMachine) => None,
+        (TransportSpec::Unix { .. }, CrossMachine) => Some(
+            "`unix` transport is host-local (AF_UNIX); cannot satisfy \
+             `cross_machine`"
+                .into(),
+        ),
+        (TransportSpec::Unix { .. }, ZeroCopy) => Some(
+            "`unix` transport memcpys at the kernel boundary; cannot \
+             satisfy `zero_copy`"
+                .into(),
+        ),
+
+        // Adapter: user-supplied. Trust for scope constraints
+        // (the adapter body knows where it routes). Reject
+        // zero_copy — the Adapter contract (`fn send(subject: \
+        // String, bytes: Bytes)`) requires serialization.
+        (TransportSpec::Adapter { .. }, ZeroCopy) => Some(
+            "`Adapter` transports cannot satisfy `zero_copy` — the \
+             Adapter contract (`fn send(subject, bytes)`) requires \
+             serialization to Bytes"
+                .into(),
+        ),
+        (TransportSpec::Adapter { .. }, _) => None,
+    }
+}
+
 fn check_main_and_bindings(
     bundle: &Bundle<'_>,
     top: &TopScope,
@@ -401,6 +566,17 @@ fn check_main_and_bindings(
                                     }
                                 }
                             }
+
+                            // Form K4a (2026-05-20): operational-
+                            // constraint validity. The `where ...`
+                            // clause asserts properties of the
+                            // route; the typechecker validates
+                            // intra-constraint consistency,
+                            // transport compatibility, and
+                            // payload-shape compatibility.
+                            check_binding_constraints(
+                                entry, top, diags,
+                            );
                         }
                     }
                 }

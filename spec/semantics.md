@@ -561,13 +561,40 @@ Constraints split into two orthogonal axes:
 - **Behavior** — `zero_copy` (no memcpy at locus boundary;
   requires the payload type to satisfy `is_flat_shapeable`).
 
-The parser accepts the clause and the AST records the
-constraints. Semantic enforcement (compile errors on
-contradictions like `zero_copy` + `cross_machine`, payload-
-shape rejection for `zero_copy` + variadic field) lands with
-Form K's route-selection codegen pass; until then the clause
-is reserved syntax. Existing bindings without a `where`
-clause continue to work unchanged.
+The typechecker validates three classes of constraint issue
+(Form K4a, 2026-05-20):
+
+1. **Intra-constraint consistency.** At most one scope
+   keyword per binding (`intra_machine` + `intra_process` is
+   rejected as ambiguous). `zero_copy` + `cross_machine` is
+   rejected as a contradiction — network transports require
+   serialization.
+
+2. **Transport-constraint compatibility.** Each declared
+   constraint is checked against the binding's transport
+   variant:
+   - `unix(...)` satisfies `intra_machine`. Rejects
+     `intra_process` (sockets cross processes),
+     `cross_machine` (AF_UNIX is host-local), and `zero_copy`
+     (kernel memcpy at the socket boundary).
+   - Adapter loci: trusted for scope constraints (the adapter
+     body knows where its protocol routes). Rejected for
+     `zero_copy` — the Adapter contract
+     (`fn send(subject, bytes)`) requires serialization.
+
+3. **Payload-shape compatibility.** `zero_copy` requires the
+   topic's payload to satisfy `is_flat_shapeable` — every
+   leaf must be a fixed-layout primitive, fixed-size array of
+   flat-shapeable, or struct whose fields are all
+   flat-shapeable. String, Bytes, BytesView, StringView, and
+   unbounded arrays are variadic and fail the predicate.
+
+Slot-locus codegen and the `shm_ring(...)` transport variant
+that actually satisfies `zero_copy` land in subsequent K
+sub-tasks. Until then, asserting `zero_copy` on any binding
+produces a clear diagnostic naming the transport limitation.
+Existing bindings without a `where` clause continue to work
+unchanged.
 
 Bundle-wide rules:
 

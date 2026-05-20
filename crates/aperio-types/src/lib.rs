@@ -228,6 +228,258 @@ mod flat_shapeable_tests {
 }
 
 #[cfg(test)]
+mod binding_constraint_tests {
+    //! Form K4a (2026-05-20): typecheck-time validity matrix
+    //! for the `where ...` clause on binding entries.
+
+    use super::*;
+    use aperio_syntax::parse_source;
+
+    fn check(src: &str) -> Vec<Diag> {
+        let p = parse_source(src).expect("parses");
+        check_program(&p)
+    }
+
+    #[test]
+    fn unix_with_intra_machine_is_clean() {
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where intra_machine;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("`where`")
+                || d.message.contains("intra_machine")
+                || d.message.contains("zero_copy")),
+            "unix + intra_machine should be clean, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn unix_with_zero_copy_rejected() {
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where zero_copy;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("`unix` transport memcpys")
+                && d.message.contains("zero_copy")),
+            "expected unix + zero_copy rejection, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn unix_with_cross_machine_rejected() {
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where cross_machine;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("host-local")
+                && d.message.contains("cross_machine")),
+            "expected unix + cross_machine rejection, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn unix_with_intra_process_rejected() {
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where intra_process;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("crosses OS process")
+                && d.message.contains("intra_process")),
+            "expected unix + intra_process rejection, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn zero_copy_plus_cross_machine_rejected() {
+        // Internal contradiction, fires before transport-
+        // specific checks.
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where zero_copy, cross_machine;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("contradict")
+                && d.message.contains("zero_copy")
+                && d.message.contains("cross_machine")),
+            "expected zero_copy + cross_machine contradiction diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn multiple_scope_constraints_rejected() {
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where intra_machine, intra_process;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("multiple scope constraints")),
+            "expected multiple-scope diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn zero_copy_with_non_flat_payload_rejected() {
+        // Payload contains a String field — variadic, not flat.
+        // Even without considering the transport, the constraint
+        // is unsatisfiable.
+        let src = r#"
+            type Note { code: Int; text: String; }
+            topic Evt { payload: Note; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock") where zero_copy;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("not flat-shapeable")
+                && d.message.contains("Note")),
+            "expected non-flat-payload diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn adapter_with_zero_copy_rejected() {
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            locus MyAdapter {
+                params { }
+                fn send(subject: String, bytes: Bytes) { }
+            }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: MyAdapter { } where zero_copy;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Adapter")
+                && d.message.contains("zero_copy")
+                && d.message.contains("serialization")),
+            "expected adapter + zero_copy rejection, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn adapter_with_scope_constraint_is_trusted() {
+        // Adapter's actual scope can't be known from the type
+        // alone; trust the user's assertion.
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            locus MyAdapter {
+                params { }
+                fn send(subject: String, bytes: Bytes) { }
+            }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: MyAdapter { } where cross_machine;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("cross_machine")),
+            "adapter + cross_machine should be trusted, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn binding_without_where_clause_unaffected() {
+        // Regression guard: bindings without a `where` clause
+        // continue to typecheck cleanly.
+        let src = r#"
+            type Ping { n: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: unix("/tmp/evt.sock");
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("where")
+                || d.message.contains("constraint")),
+            "no-constraint binding should be unaffected, got: {:?}",
+            diags
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aperio_syntax::parse_source;
