@@ -537,18 +537,30 @@ Transport surface:
   awaits the `__bus_local_dispatch` opening (deferred).
 
 - `shm_ring("/name", slot_count: N)` — POSIX SHM ring
-  substrate (Form K4b, 2026-05-20) backing the zero-copy
-  route. Name is the shm_open object name; slot_count
-  defaults to 128 when not specified. Satisfies
-  `intra_machine` and `zero_copy` constraints intrinsically.
-  Slot size is derived at codegen from the topic's payload
-  type (which must satisfy `is_flat_shapeable` — variadic
-  fields rejected). Substrate-provided: the runtime's
-  `lotus_shm_ring_*` primitives in `runtime/lotus_shm_ring.c`
-  own the lifecycle. Slot-locus codegen + claim/commit
-  lowering land in K4c+d; until then the parser/typecheck
-  accept the syntax but codegen emits a "not yet wired"
-  diagnostic at link time.
+  substrate backing the zero-copy route. Name is the
+  shm_open object name; slot_count defaults to 128 when not
+  specified. Satisfies `intra_machine` and `zero_copy`
+  constraints intrinsically. Slot size is derived at codegen
+  from the topic's payload type (which must satisfy
+  `is_flat_shapeable` — variadic fields rejected).
+  Substrate-provided: the runtime's `lotus_shm_ring_*`
+  primitives in `runtime/lotus_shm_ring.c` own the lifecycle.
+
+  At codegen, each shm_ring binding emits a
+  `lotus_bus_register_shm_ring(subject, slot_size,
+  slot_count, name)` call into main's prelude (alongside
+  the existing `lotus_bus_register_remote` for unix
+  bindings). Subsequent `Topic <- value` (Send) statements
+  on the bound topic short-circuit to
+  `lotus_bus_publish_shm_ring(subject, &value, sizeof(value))`
+  — the C runtime owns claim + memcpy + commit. This is the
+  one-memcpy path: 1.6x faster than the m28b two-memcpy
+  baseline per `experiments/k2-zero-copy/bench.c`.
+
+  Explicit `let slot = topic.claim(); slot.field = ...;
+  slot.commit();` surface (the slot-as-locus design in
+  [[slot-locus-design]]) for the zero-memcpy path is
+  post-v1; the implicit `<-` path covers the common case.
 
 **In-memory delivery is absence-of-entry.** A topic with no
 binding entry is delivered same-process via the cooperative

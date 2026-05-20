@@ -309,6 +309,7 @@ pub fn build_executable_with_imports(
             .map(|(segs, mangled)| (segs.clone(), mangled.clone()))
             .collect(),
         bus_state: None,
+        shm_ring_subjects: std::collections::BTreeSet::new(),
         deferred_dissolves: Vec::new(),
         in_main: false,
         current_arena_override: None,
@@ -937,6 +938,15 @@ struct Cx<'ctx, 'p> {
     /// (m45-followup); this is just a presence flag so a `<-` send
     /// in a program without subscribers errors clearly.
     bus_state: Option<BusState>,
+    /// Form K4c (2026-05-20): set of wire-subject names whose
+    /// binding is a `shm_ring(...)` transport. Populated when
+    /// `emit_bindings_prelude` walks the main locus's bindings;
+    /// `lower_send` checks membership to decide whether to route
+    /// through `lotus_bus_publish_shm_ring` (zero-copy path) or
+    /// the normal `lotus_bus_dispatch` path. Empty when no
+    /// shm_ring bindings exist; lookups on an empty set are
+    /// O(1) so the per-Send branch cost is negligible.
+    shm_ring_subjects: std::collections::BTreeSet<String>,
     /// Stack of "deferred-dissolve" frames: each enclosing fn
     /// body / lifecycle method body opens one. Long-lived loci
     /// (any locus with a `bus subscribe` declaration) instantiated
@@ -2953,6 +2963,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_bus_register_remote_adapter",
             bus_register_adapter_ty,
+            None,
+        );
+
+        // Form K4c (2026-05-20): shm_ring binding registration +
+        // publish-side dispatch. The registration call (emitted in
+        // emit_bindings_prelude for each ShmRing binding) opens the
+        // SHM ring and adds it to a per-subject registry. The
+        // publish call (emitted in lower_send when the target
+        // topic is shm_ring-bound) looks up the ring and routes
+        // through claim + memcpy + commit.
+        // declare void @lotus_bus_register_shm_ring(ptr subject, i64 slot_size, i64 slot_count, ptr shm_name)
+        let bus_register_shm_ring_ty = void_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bus_register_shm_ring",
+            bus_register_shm_ring_ty,
+            None,
+        );
+        // declare i32 @lotus_bus_publish_shm_ring(ptr subject, ptr value, i64 value_size)
+        let bus_publish_shm_ring_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bus_publish_shm_ring",
+            bus_publish_shm_ring_ty,
             None,
         );
 
@@ -5972,6 +6010,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
         }
 
+        // Form K4c (2026-05-20): pre-pass over main locus's
+        // bindings to collect shm_ring-bound wire subjects. Runs
+        // BEFORE any user-code lowering so `lower_send` can
+        // consult the set when it sees `"<subject>" <- value`
+        // sends. The actual `lotus_bus_register_shm_ring` IR
+        // calls are emitted later by `emit_bindings_prelude` in
+        // main's prelude.
+        self.collect_shm_ring_subjects();
+
         // Pass A0: declare every user-defined `type` so locus
         // params, fn signatures, and struct literals can reference
         // them by name regardless of source order. Plain data
@@ -6603,6 +6650,38 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// `TransportSpec`. Phase-2 covers `unix(...)`; `tcp` and
     /// `nats` parse but error here so authors get a useful diag
     /// before linking.
+    /// Form K4c (2026-05-20): walk the main locus's bindings
+    /// before any user-code lowering and populate
+    /// `shm_ring_subjects` with the wire subjects of each
+    /// shm_ring-bound topic. `lower_send` checks the set on
+    /// every Send-stmt; the set must be populated before user
+    /// fn bodies are lowered, otherwise the short-circuit
+    /// misses and Sends fall through to the normal dispatch
+    /// path (which fails at codegen time for publisher-only
+    /// programs).
+    fn collect_shm_ring_subjects(&mut self) {
+        let mut wire_subjects: BTreeMap<String, String> = BTreeMap::new();
+        Self::collect_topic_wire_subjects(&self.program.items, &mut wire_subjects);
+        let main_locus = self.program.items.iter().find_map(|item| match item {
+            TopDecl::Locus(l) if l.is_main => Some(l),
+            _ => None,
+        });
+        let Some(l) = main_locus else { return };
+        for m in &l.members {
+            if let LocusMember::Bindings(b) = m {
+                for entry in &b.entries {
+                    if matches!(entry.transport, TransportSpec::ShmRing { .. }) {
+                        let subj = wire_subjects
+                            .get(&entry.topic.name)
+                            .cloned()
+                            .unwrap_or_else(|| entry.topic.name.clone());
+                        self.shm_ring_subjects.insert(subj);
+                    }
+                }
+            }
+        }
+    }
+
     fn emit_bindings_prelude(&mut self) -> Result<(), CodegenError> {
         // Build a name → wire_subject map for declared topics so
         // each binding entry can resolve its topic ref. Topic-graph
@@ -6682,23 +6761,102 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         )?;
                         continue;
                     }
-                    TransportSpec::ShmRing { .. } => {
-                        // Form K4b (2026-05-20): the parser/AST/
-                        // typecheck accept `shm_ring(...)`, but the
-                        // codegen path (slot-locus synthesis +
-                        // claim/commit lowering) lands in K4c+d.
-                        // Until then, surface a clean "not yet
-                        // wired" diagnostic so users who write the
-                        // syntax get an actionable message.
-                        return Err(CodegenError::Unsupported(format!(
-                            "binding for topic `{}`: `shm_ring(...)` codegen \
-                             not yet wired — the parser and typecheck accept \
-                             the syntax (Form K4b) but slot-locus synthesis \
-                             + claim/commit/publish lowering land in K4c. \
-                             Use `unix(...)` or omit the binding for in-process \
-                             delivery until the full zero-copy path ships.",
+                    TransportSpec::ShmRing { name, slot_count, .. } => {
+                        // Form K4c (2026-05-20): emit the
+                        // shm_ring registration + record the
+                        // subject for lower_send's publish-side
+                        // routing branch.
+                        //
+                        // Look up the topic's payload type to
+                        // derive slot_size. v1 requires a
+                        // struct-typed payload (single-segment
+                        // TypeExpr::Path resolving in user_types).
+                        // Primitive-typed shm_ring payloads are
+                        // post-v1.
+                        let topic_decl = self.program.items.iter().find_map(|it| match it {
+                            TopDecl::Topic(t) if t.name.name == entry.topic.name => Some(t),
+                            _ => None,
+                        }).ok_or_else(|| CodegenError::Unsupported(format!(
+                            "binding for topic `{}`: topic decl not found in \
+                             this bundle (typecheck should have caught this)",
                             entry.topic.name
-                        )));
+                        )))?;
+                        let payload_ty_name = match &topic_decl.payload {
+                            TypeExpr::Named { path, generic_args, .. }
+                                if path.segments.len() == 1
+                                    && generic_args.is_empty() =>
+                            {
+                                path.segments[0].name.clone()
+                            }
+                            other => {
+                                return Err(CodegenError::Unsupported(format!(
+                                    "shm_ring binding for topic `{}`: only \
+                                     single-segment struct payloads are \
+                                     supported in v1; got payload type {:?}",
+                                    entry.topic.name, other
+                                )));
+                            }
+                        };
+                        let payload_info = self
+                            .user_types
+                            .get(&payload_ty_name)
+                            .cloned()
+                            .ok_or_else(|| CodegenError::Unsupported(format!(
+                                "shm_ring binding for topic `{}`: payload type \
+                                 `{}` not a user-declared struct (primitives \
+                                 are post-v1)",
+                                entry.topic.name, payload_ty_name
+                            )))?;
+                        let slot_size = payload_info
+                            .struct_ty
+                            .size_of()
+                            .expect("flat struct has compile-time size");
+                        let slot_count_val =
+                            self.context.i64_type().const_int(*slot_count, false);
+                        let subj_ptr = self
+                            .builder
+                            .build_global_string_ptr(
+                                &subject,
+                                &format!(
+                                    "lotus.shm_ring.subject.{}",
+                                    entry.topic.name
+                                ),
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                            .as_pointer_value();
+                        let name_ptr = self
+                            .builder
+                            .build_global_string_ptr(
+                                name,
+                                &format!(
+                                    "lotus.shm_ring.name.{}",
+                                    entry.topic.name
+                                ),
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                            .as_pointer_value();
+                        let register_shm_ring_fn = self
+                            .module
+                            .get_function("lotus_bus_register_shm_ring")
+                            .expect("lotus_bus_register_shm_ring declared");
+                        self.builder
+                            .build_call(
+                                register_shm_ring_fn,
+                                &[
+                                    subj_ptr.into(),
+                                    slot_size.into(),
+                                    slot_count_val.into(),
+                                    name_ptr.into(),
+                                ],
+                                "lotus.shm_ring.register",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        // Track this subject so lower_send routes
+                        // its publishes through
+                        // lotus_bus_publish_shm_ring instead of
+                        // the normal dispatch path.
+                        self.shm_ring_subjects.insert(subject.clone());
+                        continue;
                     }
                 };
 
@@ -34928,6 +35086,29 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         value: &Expr,
         scope: &Scope<'ctx>,
     ) -> Result<(), CodegenError> {
+        // Form K4c (2026-05-20): shm_ring short-circuit. If the
+        // subject is a compile-time-constant string that matches
+        // a registered shm_ring binding, route through
+        // lotus_bus_publish_shm_ring (claim + memcpy + commit)
+        // and skip the rest of the dispatch machinery — including
+        // the bus_state check, since an shm_ring publisher
+        // doesn't need a same-binary subscriber (subscribers may
+        // be in another process attached to the same SHM
+        // object).
+        let shm_subject_const: Option<String> = match subject {
+            Expr::Literal(Literal::String(s), _) => {
+                if self.shm_ring_subjects.contains(s) {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(subj_str) = shm_subject_const {
+            return self.lower_send_shm_ring(&subj_str, value, scope);
+        }
+
         let _ = self.bus_state.ok_or_else(|| {
             CodegenError::Unsupported(
                 "bus send `<-` used but no `bus subscribe` declared in \
@@ -35111,6 +35292,132 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     ser_fn.as_global_value().as_pointer_value().into(),
                 ],
                 "bus.dispatch.call",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Form K4c (2026-05-20): lower a Send statement whose
+    /// subject is bound to a `shm_ring(...)` transport. Routes
+    /// through `lotus_bus_publish_shm_ring(subject, &value,
+    /// sizeof(value))` — the C runtime owns claim + memcpy +
+    /// commit.
+    ///
+    /// Payload must be a struct literal or a struct-typed
+    /// expression that lowers to a pointer + size we can pass
+    /// directly to memcpy. The stack-alloca fast path (same as
+    /// the normal Send lowering) is used when the payload is a
+    /// bare struct literal — the publisher's local storage is
+    /// dead after publish, so no arena allocation is needed.
+    fn lower_send_shm_ring(
+        &mut self,
+        subject: &str,
+        value: &Expr,
+        scope: &Scope<'ctx>,
+    ) -> Result<(), CodegenError> {
+        // Stack-alloca fast path for bare struct literals
+        // (mirrors the normal lower_send shape).
+        let stack_payload: Option<(PointerValue<'ctx>, String)> = match value {
+            Expr::Struct { path, inits, .. } => {
+                let mangled: Option<String> = if path.segments.len() == 1 {
+                    let name = path.segments[0].name.clone();
+                    if self.user_types.contains_key(&name) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                } else {
+                    let segs: Vec<&str> = path
+                        .segments
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    self.mangled_for_path(&segs).and_then(|m| {
+                        if self.user_types.contains_key(&m) {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(mname) = mangled {
+                    let info = self
+                        .user_types
+                        .get(&mname)
+                        .cloned()
+                        .expect("checked above");
+                    let slot = self.alloca_in_entry(
+                        info.struct_ty.into(),
+                        &format!("{}.shm.send.payload", mname),
+                    )?;
+                    self.populate_user_type_fields(
+                        &mname, &info, inits, slot, scope,
+                    )?;
+                    Some((slot, mname))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let (payload_val, payload_struct_name): (PointerValue<'ctx>, String) =
+            if let Some((slot, mname)) = stack_payload {
+                (slot, mname)
+            } else {
+                // Non-literal expressions: lower normally,
+                // require a struct-typed result whose pointer we
+                // can pass to memcpy.
+                let (v, ty) = self.lower_expr(value, scope)?;
+                match (&v, &ty) {
+                    (BasicValueEnum::PointerValue(p), CodegenTy::TypeRef(n)) => {
+                        (*p, n.clone())
+                    }
+                    _ => {
+                        return Err(CodegenError::Unsupported(format!(
+                            "shm_ring send for subject `{}`: payload must be \
+                             a struct-typed value (struct literal or \
+                             struct-shaped expression); got {:?}",
+                            subject, ty
+                        )));
+                    }
+                }
+            };
+        let info = self
+            .user_types
+            .get(&payload_struct_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "shm_ring send for subject `{}`: payload type `{}` not \
+                     registered in user_types",
+                    subject, payload_struct_name
+                ))
+            })?;
+        let payload_size_iv = info
+            .struct_ty
+            .size_of()
+            .expect("flat struct has compile-time size");
+        let subj_ptr = self
+            .builder
+            .build_global_string_ptr(
+                subject,
+                &format!("lotus.shm_ring.send.subject.{}", subject),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
+        let publish_fn = self
+            .module
+            .get_function("lotus_bus_publish_shm_ring")
+            .expect("lotus_bus_publish_shm_ring declared");
+        self.builder
+            .build_call(
+                publish_fn,
+                &[
+                    subj_ptr.into(),
+                    payload_val.into(),
+                    payload_size_iv.into(),
+                ],
+                "bus.shm_ring.publish.call",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(())

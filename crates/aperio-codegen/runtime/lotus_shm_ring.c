@@ -252,3 +252,108 @@ void *lotus_shm_ring_read_slot(lotus_shm_ring_t *ring, uint64_t seqno) {
     uint64_t idx = seqno % ring->header->slot_count;
     return (char *)ring->slots_base + idx * ring->header->slot_size;
 }
+
+/* === Form K4c (2026-05-20) — bus router integration ====================
+ *
+ * Per-process subject->ring registry. Aperio's codegen emits a
+ * register call per shm_ring binding into main's prelude, and
+ * routes `Topic <- value` (Send stmt) publishes through the
+ * registry. Single producer model: one binding per subject, one
+ * ring per binding.
+ *
+ * Lookup is linear over the entry array. v1 expects a handful of
+ * shm_ring bindings per binary (most apps have one or two
+ * high-rate topics on shared rings); a small array beats hash
+ * overhead at this scale.
+ */
+
+#define LOTUS_SHM_RING_MAX_BINDINGS 64
+
+typedef struct {
+    char subject[64];           /* matches lotus_bus_remote_entry's shape */
+    lotus_shm_ring_t *ring;
+    uint64_t slot_size;         /* mirrored from ring->header for memcpy */
+} shm_ring_binding_t;
+
+static shm_ring_binding_t g_shm_ring_bindings[LOTUS_SHM_RING_MAX_BINDINGS];
+static int g_shm_ring_binding_count = 0;
+
+/* Codegen emits one call per shm_ring binding in main's prelude.
+ * Idempotent across the process — registering the same subject
+ * twice is a programmer bug (the typechecker catches duplicate
+ * topic bindings); the runtime asserts on collision. */
+void lotus_bus_register_shm_ring(const char *subject,
+                                 uint64_t slot_size,
+                                 uint64_t slot_count,
+                                 const char *shm_name) {
+    if (g_shm_ring_binding_count >= LOTUS_SHM_RING_MAX_BINDINGS) {
+        fprintf(stderr,
+                "lotus_bus_register_shm_ring: exceeded "
+                "LOTUS_SHM_RING_MAX_BINDINGS (%d) — bump the cap "
+                "or split into multiple binaries\n",
+                LOTUS_SHM_RING_MAX_BINDINGS);
+        _exit(1);
+    }
+    /* Reject duplicate subjects — should be caught by the
+     * typechecker upstream (Form K4a + the existing "topic may
+     * appear at most once across all bindings" rule), but runtime
+     * assert is a defence-in-depth. */
+    for (int i = 0; i < g_shm_ring_binding_count; i++) {
+        if (strcmp(g_shm_ring_bindings[i].subject, subject) == 0) {
+            fprintf(stderr,
+                    "lotus_bus_register_shm_ring: duplicate "
+                    "registration for subject `%s`\n",
+                    subject);
+            _exit(1);
+        }
+    }
+    lotus_shm_ring_t *ring =
+        lotus_shm_ring_open(shm_name, slot_size, slot_count);
+    if (!ring) {
+        fprintf(stderr,
+                "lotus_bus_register_shm_ring(`%s`, %s): open failed: %s\n",
+                subject, shm_name, strerror(errno));
+        _exit(1);
+    }
+    shm_ring_binding_t *b = &g_shm_ring_bindings[g_shm_ring_binding_count++];
+    strncpy(b->subject, subject, sizeof(b->subject) - 1);
+    b->subject[sizeof(b->subject) - 1] = '\0';
+    b->ring = ring;
+    b->slot_size = slot_size;
+}
+
+/* Publish-side dispatch. Called from Aperio-codegen's lower_send
+ * when the target topic is shm_ring-bound. The implicit one-
+ * memcpy path: claim the next slot, copy the payload bytes into
+ * it, commit. K2's bench measured this at ~7.3 ns/op.
+ *
+ * Returns 0 on success, -1 if the subject isn't registered
+ * (programmer bug — codegen should never emit this call for an
+ * unregistered subject, but defence-in-depth). */
+int lotus_bus_publish_shm_ring(const char *subject,
+                               const void *value,
+                               uint64_t value_size) {
+    for (int i = 0; i < g_shm_ring_binding_count; i++) {
+        shm_ring_binding_t *b = &g_shm_ring_bindings[i];
+        if (strcmp(b->subject, subject) != 0) continue;
+        if (value_size != b->slot_size) {
+            fprintf(stderr,
+                    "lotus_bus_publish_shm_ring(`%s`): payload size %llu "
+                    "doesn't match registered slot_size %llu — payload "
+                    "type changed between codegen and link?\n",
+                    subject,
+                    (unsigned long long)value_size,
+                    (unsigned long long)b->slot_size);
+            _exit(1);
+        }
+        void *slot = lotus_shm_ring_claim(b->ring);
+        memcpy(slot, value, value_size);
+        lotus_shm_ring_commit(b->ring);
+        return 0;
+    }
+    fprintf(stderr,
+            "lotus_bus_publish_shm_ring(`%s`): no registration for "
+            "this subject\n",
+            subject);
+    return -1;
+}
