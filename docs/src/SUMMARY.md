@@ -67,15 +67,7 @@
 - [supervisor](./libraries/supervisor.md)
 - [tracing](./libraries/tracing.md)
 
-## Tier 4 — Trading kit
-
-- [trade/orderbook](./libraries/trade-orderbook.md)
-- [trade/marketdata](./libraries/trade-marketdata.md)
-- [trade/strategy](./libraries/trade-strategy.md)
-- [trade/risk](./libraries/trade-risk.md)
-- [trade/backtest](./libraries/trade-backtest.md)
-
-## Tier 5 — AI / agent
+## Tier 3 — AI / agent
 
 - [agent/llm](./libraries/agent-llm.md)
 - [agent/tools](./libraries/agent-tools.md)

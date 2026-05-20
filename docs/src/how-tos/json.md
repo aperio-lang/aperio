@@ -30,6 +30,28 @@ ints, `false` for bools. There's no fallible variant; if you
 need to distinguish "missing" from "present-and-empty," you
 need a richer parser.
 
+## Descending into nested objects
+
+For payloads where the real fields live inside a wrapper object
+(`"result":{...}`, `"data":[{...}]` channel state),
+`find_field_raw` returns the raw value-token substring:
+
+```aperio
+let s = "{\"result\":{\"channel\":\"book\",\"symbol\":\"XBT/USD\"}}";
+let inner = std::json::find_field_raw(s, "result");
+// inner == `{"channel":"book","symbol":"XBT/USD"}`
+let channel = std::json::find_string_field(inner, "channel");
+let symbol  = std::json::find_string_field(inner, "symbol");
+```
+
+The walker is bracket-balanced over `{...}` and `[...]` (respects
+embedded string contents), so the returned substring covers the
+whole nested object. Strings come back with their surrounding
+quotes preserved (`"alice"` returns `"\"alice\""`); numeric /
+boolean / null tokens come back verbatim. Recursive descent: re-
+feed the returned substring into any of `find_string_field` /
+`find_int_field` / `find_bool_field` / `find_field_raw`.
+
 ## Walking top-level arrays
 
 For a top-level JSON array of objects, use `array_first` +

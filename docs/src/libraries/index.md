@@ -23,7 +23,6 @@ aperio fetch
 // in your .ap files
 import "libraries/sqlite" as db;
 import "libraries/router" as router;
-import "libraries/trade/orderbook" as book;
 import "libraries/agent/llm" as llm;
 ```
 
@@ -77,17 +76,7 @@ codegen limitation that constrains where they're usable.
 | `supervisor/` | Erlang-style restart strategies on `on_failure` | `sup` |
 | `tracing/` | Span tree mirroring the locus tower | `trace` |
 
-### Tier 4 — Trading kit
-
-| Path | What it is | Suggested alias |
-|------|------------|------|
-| `trade/orderbook/` | Order book with rich/chunked/recognition projections | `book` |
-| `trade/marketdata/` | ITCH/FIX/synthetic feed parsers | `md` |
-| `trade/strategy/` | Strategy harness with PnL attribution closure | `strat` |
-| `trade/risk/` | Risk gate (k_max bounds on position/DD/gross) | `risk` |
-| `trade/backtest/` | Replay harness over recorded feed | `bt` |
-
-### Tier 5 — AI / agent orchestration
+### Tier 3 — AI / agent orchestration
 
 | Path | What it is | Suggested alias |
 |------|------------|------|
@@ -98,7 +87,7 @@ codegen limitation that constrains where they're usable.
 | `agent/embeddings/` | Vector store with top-k search | `emb` |
 | `ml/neural/` | Tiny NN trainer (MNIST-class problems) | `nn` |
 
-### Tier 3, 6, 7, 8 — backlog (not yet built)
+### Tier 4+ — backlog (not yet built)
 
 Realtime/messaging (`realtime/websocket`, `realtime/pubsub`,
 `realtime/nats`, `realtime/cron`); game/sim (`game/ecs`,

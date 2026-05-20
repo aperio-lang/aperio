@@ -21,7 +21,7 @@ Every parser combines three primitives:
 | Length                     | `len(b)` polymorphic over `Bytes` / `String` / `@form(vec)` cells                    |
 | Substrings                 | `s[lo..hi]` slice (no copy semantics in v1; treat as read-only view)                 |
 | Index search               | `std::str::index_of(s: String, needle: String) -> Int` (returns -1 if absent)        |
-| Parse a number             | `std::str::parse_int(s) or substitute(err)` / `std::str::parse_float(s) or ...`      |
+| Parse a number             | `std::str::parse_int(s) or substitute(err)` / `std::str::parse_float(s) or ...` / `std::str::parse_decimal(s) or ...` (scale-9 i128 — right shape for venue book qtys + money values where IEEE 754 doubles would round trailing zeros) |
 
 For most wire formats you'll wrap `std::bytes::at` in a
 one-liner that swallows the out-of-bounds error so a "default
@@ -35,8 +35,7 @@ fn byte_at(b: Bytes, i: Int) -> Int {
 
 The guard rail then lives in your explicit length checks
 (`if off + N > total { fail BadFrame { ... } }`), not in the
-read itself. Same shape `pond/trade/marketdata/itch.ap` uses
-for its ITCH 5.0 parser; reach there for a worked-out example.
+read itself.
 
 ## Pattern 1 — Line-delimited records
 
@@ -67,9 +66,10 @@ fn drive_lines(body: String, sink: SinkLocus) {
 }
 ```
 
-`pond/trade/backtest/feed.ap` is a worked example: it loads a CSV
-file with `std::io::fs::read_file`, scans newlines once into an
-offsets table, then `row_at(i)` does an O(1) slice + parse.
+The shape: load the body once with `std::io::fs::read_file`,
+scan newlines into an offsets table on first touch, then
+`row_at(i)` does an O(1) slice + parse against the stable
+offset.
 
 ## Pattern 2 — Length-prefix framing
 
@@ -211,7 +211,6 @@ of length-prefix framing, RFC 4180 (CSV) has corner cases around
 embedded quotes that a naive line scanner misses. The pond contrib
 catalog already ships parsers for:
 
-- **ITCH 5.0 market-data**: `pond/trade/marketdata` (`ItchParser`)
 - **HTTP/1.1**: `pond/http/client` (request builder + response
   reader)
 - **ANSI SQL**: `pond/sqlite` (round-tripped through libsqlite,
