@@ -131,6 +131,93 @@ fn cascade_fires_inner_dissolve_on_outer_scope_exit() {
 }
 
 #[test]
+fn drain_cascades_depth_first_before_outer_drain() {
+    // Phase-2 (3): per spec/runtime.md "drain() cascades depth-
+    // first; children first, then self." For locus-typed param
+    // fields the same vertical-edge rule applies — outer's drain
+    // mediates child drains because siblings can't talk laterally.
+    //
+    // Expected ordering for two Inner fields on Outer (drain step
+    // only):
+    //   Inner.drain tag=1     ← cascade in field-index order
+    //   Inner.drain tag=2
+    //   Outer.drain           ← outer's own drain AFTER children
+    // followed by the existing dissolve cascade:
+    //   Outer.dissolve
+    //   Inner.dissolve tag=1
+    //   Inner.dissolve tag=2
+    let src = r#"
+        locus Inner {
+            params { tag: Int = 0; }
+            drain() {
+                println("Inner.drain tag=", self.tag);
+            }
+            dissolve() {
+                println("Inner.dissolve tag=", self.tag);
+            }
+        }
+        locus Outer {
+            params {
+                a: Inner = Inner { tag: 1 };
+                b: Inner = Inner { tag: 2 };
+            }
+            drain() {
+                println("Outer.drain");
+            }
+            dissolve() {
+                println("Outer.dissolve");
+            }
+        }
+        fn use_outer() {
+            let o = Outer { };
+        }
+        fn main() {
+            use_outer();
+        }
+    "#;
+    let (stdout, status) = build_and_run("drain_cascade", src);
+    assert!(status.success(), "non-zero: {:?}", status);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("missing {:?} in:\n{}", needle, stdout))
+    };
+    let inner1_drain = pos("Inner.drain tag=1");
+    let inner2_drain = pos("Inner.drain tag=2");
+    let outer_drain = pos("Outer.drain");
+    let outer_diss = pos("Outer.dissolve");
+    let inner1_diss = pos("Inner.dissolve tag=1");
+    let inner2_diss = pos("Inner.dissolve tag=2");
+    assert!(
+        inner1_drain < inner2_drain,
+        "children drain in field order: {}",
+        stdout
+    );
+    assert!(
+        inner2_drain < outer_drain,
+        "children drain BEFORE outer drain (depth-first): {}",
+        stdout
+    );
+    assert!(
+        outer_drain < outer_diss,
+        "outer drain BEFORE outer dissolve: {}",
+        stdout
+    );
+    assert!(
+        outer_diss < inner1_diss,
+        "outer dissolve body BEFORE child dissolve cascade: {}",
+        stdout
+    );
+    assert!(
+        inner1_diss < inner2_diss,
+        "dissolve cascade in field order: {}",
+        stdout
+    );
+}
+
+#[test]
 fn many_iterations_dont_blow_memory() {
     // Without the cascade dissolve, each Holder leaks one
     // malloc-backed BytesBuilder header + buffer per iteration.

@@ -68,21 +68,23 @@
 // drain / bubble); a violation that bubbles past `main` exits the
 // process non-zero with the violation report on stderr.
 //
-// `birth()` can also hit a malloc failure (lotus_bytes_builder_new
-// returning NULL → self.handle = 0). The codegen restricts
-// `violate` to fn-bodies — it's not legal inside lifecycle blocks
-// — so a birth-time failure is detected lazily at the first
-// `append()` call: __append returns 0 for a null handle, which
-// the violate path catches. Other methods (`len`, `shift_front`,
-// `clear`, `snapshot`, `finish`) gracefully degrade on a null
-// handle (the C primitives all check NULL up front).
+// `birth()` routes lotus_bytes_builder_new returning NULL through
+// `violate alloc_failed` at construction (2026-05-19). Pre-fix,
+// F.27 codegen rejected `violate` inside lifecycle blocks, so
+// birth-fail surfaced lazily at the next `append() / snapshot() /
+// finish()` call via the C primitives' null-handle checks. The
+// codegen extension treats lifecycle bodies as void-returning
+// user-fn contexts, so the same divergent-return machinery as
+// method-body violate fires; the parent's on_failure handler
+// runs at construction instead of waiting for a method call.
 //
-// `snapshot()` and `finish()` can also hit a payload-arena alloc
-// failure — at v1 those return an empty Bytes blob silently
-// (matching the prior surface); lifting them into violations is
-// a follow-up that needs the C primitives to distinguish
-// "empty-on-success" from "empty-on-fail" (their returns alias
-// today).
+// `snapshot()` and `finish()` route payload-arena alloc failures
+// through `violate alloc_failed` per F.27 (2026-05-19). The C
+// primitives use a dedicated alloc-fail sentinel pointer on
+// every failure path — success paths always emit a fresh
+// arena-allocated blob (even for len=0), so the sentinel is
+// unambiguous and the locus method body checks via
+// `std::bytes::__is_alloc_fail(out)` before returning.
 
 locus __StdBytesBytesBuilder {
     params {
@@ -108,12 +110,16 @@ locus __StdBytesBytesBuilder {
     // dead locus's storage.
     closure alloc_failed { captures: initial_cap; epoch inline; }
     birth() {
-        // Malloc fail leaves self.handle = 0; the next append()
-        // catches it via __append's null-handle return and routes
-        // through `violate alloc_failed`. (Lifecycle bodies can't
-        // host `violate` directly — F.27 restricts it to fn-
-        // bodies.)
+        // lotus_bytes_builder_new returns NULL → __new yields 0.
+        // F.27 violate at birth surfaces the failure at
+        // construction (2026-05-19; previously deferred to first
+        // method call). The parent's on_failure handler runs
+        // immediately; without one, the process exits non-zero
+        // with the violation payload on stderr.
         self.handle = std::bytes::builder::__new(self.initial_cap);
+        if self.handle == 0 {
+            violate alloc_failed;
+        }
     }
     dissolve() {
         std::bytes::builder::__free(self.handle);
@@ -128,7 +134,11 @@ locus __StdBytesBytesBuilder {
         return std::bytes::builder::__len(self.handle);
     }
     fn snapshot() -> Bytes {
-        return std::bytes::builder::__snapshot(self.handle);
+        let out = std::bytes::builder::__snapshot(self.handle);
+        if std::bytes::__is_alloc_fail(out) == 1 {
+            violate alloc_failed;
+        }
+        return out;
     }
     // Phase-2 (1): zero-copy view. Returns a non-owning Bytes
     // pointer aliasing the builder's `[i64 len][u8 data]` region —
@@ -155,6 +165,9 @@ locus __StdBytesBytesBuilder {
         // double-free that would otherwise fire at scope exit.
         let out = std::bytes::builder::__finish(self.handle);
         self.handle = 0;
+        if std::bytes::__is_alloc_fail(out) == 1 {
+            violate alloc_failed;
+        }
         return out;
     }
 }

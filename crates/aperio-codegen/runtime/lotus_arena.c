@@ -5456,7 +5456,10 @@ const char *lotus_fs_extension_global(const char *path) {
  * payload arena. Used as the "empty / error" return shape for
  * recv_bytes and the bytes_* helpers so callers always get a
  * well-formed blob (length=0 visible via lotus_bytes_len) rather
- * than NULL.
+ * than NULL. Each call allocates fresh — callers downstream may
+ * write to the buffer (lotus_bytes_data + 0 is in-bounds for
+ * len-0 blobs but only via subsequent grow paths), and aliasing
+ * via a singleton would surface mutation across unrelated callers.
  */
 static void *lotus_bytes_empty_global(void) {
     pthread_mutex_lock(&g_bus_payload_arena_mutex);
@@ -5470,6 +5473,25 @@ static void *lotus_bytes_empty_global(void) {
     void *empty = lotus_bytes_create(g_bus_payload_arena, 0);
     pthread_mutex_unlock(&g_bus_payload_arena_mutex);
     return empty;
+}
+
+/* F.27 alloc-fail sentinel for BytesBuilder snapshot()/finish()
+ * (2026-05-19). Stable static pointer with `[i64 0][i64 0]`
+ * layout — eight bytes of length-prefix (read as 0 by
+ * lotus_bytes_len) plus padding so lotus_bytes_data's `+8`
+ * derive lands in valid memory. Returned from the C primitives
+ * failure paths instead of lotus_bytes_empty_global, so the
+ * locus method body's lotus_bytes_is_alloc_fail check
+ * discriminates fail-empty from success-empty (the latter still
+ * allocates fresh via lotus_bytes_create even for len=0). */
+static const int64_t g_bytes_alloc_fail_sentinel[2] = { 0, 0 };
+
+static void *lotus_bytes_alloc_fail_sentinel(void) {
+    return (void *)g_bytes_alloc_fail_sentinel;
+}
+
+int64_t lotus_bytes_is_alloc_fail(const void *blob) {
+    return blob == (const void *)g_bytes_alloc_fail_sentinel ? 1 : 0;
 }
 
 /*
@@ -6939,7 +6961,7 @@ void *lotus_bytes_builder_view(void *handle) {
 }
 
 void *lotus_bytes_builder_finish(void *handle) {
-    if (!handle) return lotus_bytes_empty_global();
+    if (!handle) return lotus_bytes_alloc_fail_sentinel();
     lotus_bytes_builder_t *b = (lotus_bytes_builder_t *)handle;
     int64_t cur_len = lotus_bb_len(b);
     pthread_mutex_lock(&g_bus_payload_arena_mutex);
@@ -6949,7 +6971,7 @@ void *lotus_bytes_builder_finish(void *handle) {
             pthread_mutex_unlock(&g_bus_payload_arena_mutex);
             free(b->buf - sizeof(int64_t));
             free(b);
-            return NULL;
+            return lotus_bytes_alloc_fail_sentinel();
         }
     }
     /* Emit a `[i64 len][u8 data[len]]` blob in the bus payload
@@ -6959,7 +6981,7 @@ void *lotus_bytes_builder_finish(void *handle) {
     if (!blob) {
         free(b->buf - sizeof(int64_t));
         free(b);
-        return lotus_bytes_empty_global();
+        return lotus_bytes_alloc_fail_sentinel();
     }
     if (cur_len > 0) {
         memcpy(lotus_bytes_data(blob), b->buf, (size_t)cur_len);
@@ -7012,7 +7034,7 @@ void lotus_bytes_builder_clear(void *handle) {
 }
 
 void *lotus_bytes_builder_snapshot(void *handle) {
-    if (!handle) return lotus_bytes_empty_global();
+    if (!handle) return lotus_bytes_alloc_fail_sentinel();
     lotus_bytes_builder_t *b = (lotus_bytes_builder_t *)handle;
     int64_t cur_len = lotus_bb_len(b);
     pthread_mutex_lock(&g_bus_payload_arena_mutex);
@@ -7020,13 +7042,13 @@ void *lotus_bytes_builder_snapshot(void *handle) {
         g_bus_payload_arena = lotus_arena_create();
         if (!g_bus_payload_arena) {
             pthread_mutex_unlock(&g_bus_payload_arena_mutex);
-            return lotus_bytes_empty_global();
+            return lotus_bytes_alloc_fail_sentinel();
         }
     }
     void *blob = lotus_bytes_create(g_bus_payload_arena, cur_len);
     pthread_mutex_unlock(&g_bus_payload_arena_mutex);
     if (!blob) {
-        return lotus_bytes_empty_global();
+        return lotus_bytes_alloc_fail_sentinel();
     }
     if (cur_len > 0) {
         memcpy(lotus_bytes_data(blob), b->buf, (size_t)cur_len);

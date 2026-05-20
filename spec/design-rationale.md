@@ -2237,22 +2237,35 @@ through `violate` on 0. Owners of the BytesBuilder bind an
 exits the process non-zero with the captured payload on
 stderr.
 
+**F.27 extension (2026-05-19): `violate` in lifecycle bodies.**
+The codegen restriction on `violate` was lifted for lifecycle
+blocks (birth / drain / dissolve / accept / run); they now
+participate in the same divergent-return + parent-on_failure
+routing as regular method bodies. The original spec rationale
+("only fn-bodies can violate") was an implementation
+simplification, not a structural requirement — lifecycle bodies
+are void-returning fn contexts at the codegen level, and the
+violate machinery's `build_return(None)` path handles them
+identically once `current_user_fn_ret` is set to `Some(None)` at
+lifecycle entry. Birth-time allocation failures (BytesBuilder's
+prior null-handle-with-lazy-surface caveat) now fire at
+construction; the parent's on_failure handler runs immediately,
+or — with no handler — the process exits non-zero with the
+violation payload on stderr. The accepted-child dissolve trade-
+off (`parent_accepts_us` skips dissolve bodies entirely) is
+unchanged; dissolve violate is observable only along the F.29
+locus-field cascade path where `emit_locus_field_dissolves` does
+fire the inner's dissolve.
+
 **Caveats at v1.**
 
-- `birth()` cannot `violate` directly — F.27 restricts the
-  statement to fn-bodies, not lifecycle blocks. A birth-time
-  malloc failure leaves `self.handle = 0`; the next
-  `append()` catches it (the C primitive returns 0 for a
-  null handle) and routes through `violate alloc_failed`.
-  Methods other than `append` gracefully degrade on a null
-  handle (the C primitives all check NULL up front and
-  no-op), so the worst case between birth-fail and
-  first-append is "the builder is silently inert."
-- `snapshot()` and `finish()` payload-arena alloc failures
-  silently return an empty Bytes blob today (matching the
-  prior surface). Lifting them into violations needs the C
-  primitives to distinguish "empty-on-success" from "empty-
-  on-fail" — their returns alias right now. Follow-up.
+- `snapshot()` / `finish()` payload-arena alloc failures route
+  through `violate alloc_failed` per the snapshot/finish
+  follow-up (2026-05-19). The C primitives use a dedicated
+  alloc-fail sentinel pointer on every failure path; the locus
+  method body discriminates via `std::bytes::__is_alloc_fail`
+  before returning. The previous "empty-on-success aliases
+  empty-on-fail" hazard is closed.
 
 **Implementation entry points.**
 

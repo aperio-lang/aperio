@@ -663,6 +663,41 @@ m20 deliberately keeps free fns + main on the program-wide arena
 class — chunked-class per-coordinatee sub-regions land in m22,
 the recognition-class fixed pool in m23.
 
+**Phase-2 (4) `g_bus_payload_arena` reclaim investigation
+(2026-05-19; finding: NOT reclaimable under current semantics).**
+The handoff posed: "should `lotus_bus_dispatch_wire`'s
+`g_bus_payload_arena` deposit reclaim per dispatch since m20
+memcpy's into subscriber arena anyway?" The answer is no, and
+the reason exposes a load-bearing constraint.
+
+m20's `memcpy(copy, payload, size)` is a flat struct copy: the
+publisher's payload bytes (size = compile-time-known struct size)
+land in the subscriber's arena. The struct's String / Bytes /
+TypeRef fields are POINTERS inside that struct; the memcpy copies
+the pointers, not the pointed-to bytes. For cross-process wire
+dispatch (`lotus_bus_dispatch_wire` → deserialize → struct_buf →
+`lotus_bus_local_dispatch`), the deserialized String / Bytes data
+lives in `g_bus_payload_arena`. After m20's struct memcpy, the
+subscriber's copy still aliases that arena.
+
+Handler-side assignment (`self.foo = payload.string_field`) is a
+pointer store — `lotus_str_clone` is invoked only at *free-fn
+return* boundaries, not at struct-field assignment. So if the
+handler retains payload fields on its own struct, the retention
+extends the `g_bus_payload_arena` deposit's lifetime to the
+subscriber's entire lifetime. Reclaiming per dispatch would dangle
+the subscriber's retained pointers.
+
+Enabling per-dispatch reclaim requires changing handler-side
+String / Bytes assignment to clone-on-store from payload, OR
+introducing a per-dispatch arena that's reset only after every
+subscriber's handler has run — neither is a small change. For
+v1 the arena grows unbounded for high-message-rate cross-process
+subscribers; bounding it is forward work, not a follow-up to F.28
+/ F.29 / F.27. Documented here so the next surface that asks
+"can we reclaim per dispatch?" finds the previously-investigated
+answer.
+
 **m49 closes the free-fn gap.** Every non-main free fn takes
 an implicit `__caller_arena: ptr` first param at the LLVM ABI.
 `main` keeps the program-wide `arena.global` it always had —

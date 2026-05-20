@@ -94,7 +94,15 @@ the model: runtime is automatic; stdlib is explicit.
   waits for them, then drains itself. SIGINT triggers `drain()`
   on the runtime root, cascading through the whole process
   tree. No separate cascade syntax — `drain()` is always
-  cascading.
+  cascading. For locus-typed param fields specifically
+  (F.29), the codegen walks `LocusRef` fields in declaration
+  order at the cascade-teardown sites (ephemeral scope-exit
+  and deferred-flush) and calls each child's drain BEFORE the
+  outer locus's own drain. The subsequent dissolve cascade
+  runs the outer's `closures → dissolve` body next, then per
+  child `closures → dissolve → arena_destroy`, then outer's
+  arena_destroy. Pinned-thread tail and `parent_accepts_us`
+  still skip the cascade per the v1 trade-off.
 - **Recovery primitives.** `restart`, `restart_in_place`,
   `quarantine`, `reorganize`, `bubble`, `dissolve`, `drain` —
   all language keywords; runtime implements the actual

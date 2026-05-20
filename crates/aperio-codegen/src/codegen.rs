@@ -3563,6 +3563,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             bb_view_ty,
             None,
         );
+        // declare i64 @lotus_bytes_is_alloc_fail(ptr blob)
+        // F.27 discriminator: 1 iff blob is the alloc-fail
+        // sentinel returned from BytesBuilder snapshot()/finish()
+        // failure paths. Used by the locus method bodies to detect
+        // payload-arena alloc failure and route through
+        // `violate alloc_failed` before returning. Success paths
+        // always emit a fresh arena-allocated blob (even for
+        // len=0) via lotus_bytes_create, so the sentinel is
+        // unambiguous.
+        let bb_is_alloc_fail_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_is_alloc_fail",
+            bb_is_alloc_fail_ty,
+            None,
+        );
 
         // m96: tree-sitter substrate. extern "C" symbols defined
         // in `runtime/lotus_treesitter.rs` (compiled into the
@@ -3997,6 +4012,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
             }
             if !is_pinned_entry {
+                // Phase-2 (3): cascade child-field drains depth-first
+                // BEFORE outer's drain, per spec/runtime.md "drain()
+                // cascades depth-first; children first, then self."
+                self.emit_locus_field_drains(&info, self_ptr, &locus_name)?;
                 // Cooperative long-lived: drain → __closures →
                 // dissolve, mirroring the ephemeral-locus ordering.
                 // The cascade itself ran each descendant's closures
@@ -9543,7 +9562,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .expect("self_ptr param")
                     .into_pointer_value();
                 self.current_fn = Some(func);
-                self.current_user_fn_ret = None;
+                // F.27 extension (2026-05-19): lifecycle bodies are
+                // void-returning user-fn contexts from the violate
+                // codegen's perspective. Marking the ret as
+                // `Some(None)` (a "user fn returning void" frame)
+                // lets `violate NAME;` inside birth / drain /
+                // dissolve / accept / run route through the parent's
+                // on_failure handler just like a regular method
+                // body would, instead of erroring at codegen with
+                // `"violate" outside a user fn`. Birth-time
+                // allocation failures (BytesBuilder's prior
+                // birth-fail leaves-handle-zero-and-waits caveat)
+                // now route at construction. The divergent return
+                // is `build_return(None)` for the void shape.
+                self.current_user_fn_ret = Some(None);
                 self.current_self = Some(SelfCx {
                     locus_name: l.name.name.clone(),
                     struct_ty: info.struct_ty,
@@ -12381,6 +12413,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "bytes", "builder", "__snapshot"]
             | ["std", "bytes", "builder", "__free"]
             | ["std", "bytes", "builder", "__view"]
+            | ["std", "bytes", "__is_alloc_fail"]
             | ["std", "math", "sqrt"]
             | ["std", "math", "exp"]
             | ["std", "math", "log"]
@@ -22367,6 +22400,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_bytes_builder_view(args, scope)?;
                 Ok(())
             }
+            ["std", "bytes", "__is_alloc_fail"] => {
+                let _ = self.lower_std_bytes_is_alloc_fail(args, scope)?;
+                Ok(())
+            }
             // m84: parse_request also reachable in statement
             // position (rare — usually you keep the result), but
             // wire it for completeness so `std::http::parse_request(raw);`
@@ -22925,6 +22962,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "bytes", "builder", "__view"] => {
                 self.lower_std_bytes_builder_view(args, scope)
+            }
+            ["std", "bytes", "__is_alloc_fail"] => {
+                self.lower_std_bytes_is_alloc_fail(args, scope)
             }
             // m84: std::http::parse_request(raw: String) -> Request.
             // Implementation lives in stdlib.ap as the bare-name
@@ -24685,6 +24725,47 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("returns ptr");
         Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// F.27 discriminator: lower `std::bytes::__is_alloc_fail(b:
+    /// Bytes) -> Int`. Returns 1 iff `b` is the alloc-fail
+    /// sentinel returned by BytesBuilder snapshot()/finish() on
+    /// payload-arena alloc failure. Success paths always allocate
+    /// a fresh blob via lotus_bytes_create (even for len=0), so
+    /// the sentinel is unambiguous. Used inside the BytesBuilder
+    /// locus method bodies to gate the `violate alloc_failed`
+    /// route.
+    fn lower_std_bytes_is_alloc_fail(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::__is_alloc_fail takes 1 arg (b), got {}",
+                args.len()
+            )));
+        }
+        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
+        if b_ty != CodegenTy::Bytes {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::__is_alloc_fail: b must be Bytes, got {:?}",
+                b_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_bytes_is_alloc_fail")
+            .expect("lotus_bytes_is_alloc_fail declared");
+        let call = self
+            .builder
+            .build_call(f, &[b_val.into()], "bb.is_alloc_fail.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let status = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((status, CodegenTy::Int))
     }
 
     /// v1.x-16: `std::str::can_parse_float(s: String) -> Bool`.
@@ -29235,6 +29316,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             || parent_accepts_us
             || parent_owns_via_field;
         if !defer {
+            // Phase-2 (3): cascade child-field drains depth-first
+            // BEFORE outer's drain, per spec/runtime.md "drain()
+            // cascades depth-first; children first, then self."
+            self.emit_locus_field_drains(&info, self_ptr, locus_name)?;
             // drain → __dissolve_closures → dissolve. Mirrors the
             // interpreter ordering in eval.rs::dissolve_locus:
             // drain body fires first, then dissolve-epoch closures
@@ -34337,12 +34422,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// std::bytes::BytesBuilder { ... };`) leak their malloc-backed
     /// state at the outer's dissolve.
     ///
-    /// Cascade ordering: outer's `drain → closures → dissolve` runs
-    /// first, then this cascade fires per child, then outer's
+    /// Cascade ordering: outer's `field_drains → drain → closures →
+    /// dissolve` runs first, then this cascade fires per child's
+    /// `closures → dissolve → arena_destroy`, then outer's
     /// arena_destroy. The choice matches "outer's user dissolve
     /// body may still legitimately touch its inner field" — the
     /// inner is alive through outer's dissolve body and only torn
-    /// down after.
+    /// down after. The child's drain step itself ran earlier via
+    /// `emit_locus_field_drains` so that drain cascades depth-first
+    /// per spec/runtime.md "drain() cascades depth-first; children
+    /// first, then self."
     fn emit_locus_field_dissolves(
         &mut self,
         info: &LocusInfo<'ctx>,
@@ -34386,18 +34475,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
                 .into_pointer_value();
-            // drain → __dissolve_closures → dissolve. Skip empties.
-            if let Some(drain_fn) = inner_info.methods.get("drain") {
-                if !inner_info.empty_lifecycle.contains("drain") {
-                    self.builder
-                        .build_call(
-                            *drain_fn,
-                            &[inner_ptr.into()],
-                            &format!("{}.cascade.drain", inner_name),
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                }
-            }
+            // __dissolve_closures → dissolve → arena_destroy. The
+            // drain step ran earlier via `emit_locus_field_drains`
+            // (depth-first before outer's drain) so this teardown
+            // half can assume children have already drained.
             if let Some(closures_fn) = inner_info.dissolve_closures_fn {
                 let (parent_self, handler_ptr) =
                     self.resolve_failure_route(&inner_name);
@@ -34428,6 +34509,69 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // nothing in its arena, the slot was created at birth
             // and must be destroyed for symmetry.
             self.emit_locus_arena_destroy(&inner_info, inner_ptr, &inner_name)?;
+        }
+        Ok(())
+    }
+
+    /// Phase-2 (3) drain cascade. Per spec/runtime.md: "drain()
+    /// cascades depth-first; children first, then self." Walks
+    /// LocusRef-typed param fields in declaration order and calls
+    /// each child's drain method, expected to be invoked BEFORE
+    /// the outer locus's own drain at every cascade-teardown site.
+    /// The companion `emit_locus_field_dissolves` runs the second
+    /// half (closures → dissolve → arena_destroy) AFTER outer's
+    /// dissolve body.
+    fn emit_locus_field_drains(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+    ) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let mut field_entries: Vec<(String, u32, CodegenTy)> = info
+            .fields
+            .iter()
+            .map(|(n, (idx, ty))| (n.clone(), *idx, ty.clone()))
+            .collect();
+        field_entries.sort_by_key(|(_, idx, _)| *idx);
+        for (fname, field_idx, field_ty) in field_entries {
+            let inner_name = match field_ty {
+                CodegenTy::LocusRef(n) => n,
+                _ => continue,
+            };
+            let inner_info = match self.user_loci.get(&inner_name).cloned() {
+                Some(i) => i,
+                None => continue,
+            };
+            let drain_fn = match inner_info.methods.get("drain") {
+                Some(f) if !inner_info.empty_lifecycle.contains("drain") => *f,
+                _ => continue,
+            };
+            let field_slot_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    field_idx,
+                    &format!("{}.{}.drain.gep", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let inner_ptr = self
+                .builder
+                .build_load(
+                    ptr_t,
+                    field_slot_ptr,
+                    &format!("{}.{}.drain.load", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_pointer_value();
+            self.builder
+                .build_call(
+                    drain_fn,
+                    &[inner_ptr.into()],
+                    &format!("{}.cascade.drain", inner_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
         Ok(())
     }
