@@ -1,8 +1,10 @@
 name: tests
 
-# Runs the full workspace test suite on every push to main and on
-# every pull request targeting main. Linux-only at v1 — the
-# release workflow exercises macOS coverage at tag time.
+# Runs the full workspace test suite on every push (to any branch)
+# and on every pull request targeting main. Pushing a feature
+# branch is enough to delegate a full test run — no PR required.
+# Linux-only at v1; the release workflow exercises macOS coverage
+# at tag time.
 #
 # Uses cargo-nextest (drop-in replacement for `cargo test`) for
 # smarter scheduling: each test runs in its own process, so the
@@ -12,7 +14,7 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
   workflow_dispatch:

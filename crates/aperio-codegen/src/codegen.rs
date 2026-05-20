@@ -65,6 +65,16 @@ enum CodegenTy {
     /// Length is read by dereferencing the prefix; the data
     /// pointer is the blob plus 8 bytes.
     Bytes,
+    /// F.30 (2026-05-20): non-owning view over a BytesBuilder's
+    /// buffer. Runtime layout identical to `Bytes` (same single-
+    /// pointer ABI, same `[i64 len][u8 data]` derefed at the
+    /// same offsets); typecheck-distinct so the read-vs-store
+    /// axis is visible. Returned only by `BytesBuilder.view()`.
+    BytesView,
+    /// F.30 companion: non-owning view over a BytesBuilder's
+    /// NUL-terminated buffer. Runtime layout identical to
+    /// `String`. Returned only by `BytesBuilder.text_view()`.
+    StringView,
     /// Pointer to a locus's struct. The string carries the locus
     /// name; the layout + field map live in `Cx.user_loci`. Used
     /// for the child param of `accept(g: ChildLocus)`.
@@ -312,6 +322,7 @@ pub fn build_executable_with_imports(
         generic_fn_templates: BTreeMap::new(),
         generic_locus_templates: BTreeMap::new(),
         defer_next_locus_dissolve: false,
+        instantiating_for_parent_field: false,
         vtables: BTreeMap::new(),
     };
 
@@ -577,6 +588,16 @@ const STDLIB_AP_SOURCE: &str = concat!(
     // per the m82 deferred-dissolve mechanism. Returned String
     // data lives in the bus payload arena (program-lifetime).
     include_str!("../runtime/stdlib/file.ap"),
+    "\n",
+    // std::bytes::BytesBuilder — long-lived growing-byte-buffer
+    // locus. Replaces the prior `std::bytes::builder_*` free-fn
+    // surface so the typechecker can distinguish builder handles
+    // from regular Bytes blobs (the two have incompatible runtime
+    // ABIs). Lifecycle (birth/dissolve) wraps malloc /free of the
+    // underlying lotus_str_builder_t header + buffer. References
+    // only path-call primitives (`std::bytes::builder::__*`) that
+    // resolve at codegen time; independent of order.
+    include_str!("../runtime/stdlib/bytes_builder.ap"),
 );
 
 /// Maps each user-facing stdlib path (locus OR type) to the
@@ -590,6 +611,7 @@ const STDLIB_AP_SOURCE: &str = concat!(
 /// review.
 const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "bus", "Adapter"], "__StdBusAdapter"),
+    (&["std", "bytes", "BytesBuilder"], "__StdBytesBytesBuilder"),
     (&["std", "cli", "Resolver"], "__StdCliResolver"),
     (&["std", "http", "Handler"], "__StdHttpHandler"),
     (&["std", "http", "Request"], "__StdHttpRequest"),
@@ -989,6 +1011,19 @@ struct Cx<'ctx, 'p> {
     /// literals (`Stream { ... };`) are unaffected — the flag
     /// only fires from `Stmt::Let`.
     defer_next_locus_dissolve: bool,
+    /// Phase-2 (2): set by `lower_locus_instantiation` around the
+    /// param-init loop when evaluating a child locus literal as a
+    /// field default / override. The child must NOT dissolve
+    /// eagerly — the parent owns it and needs it alive past the
+    /// instantiation expression. The parent's dissolve sequence
+    /// cascades into the child later. Without this flag, the
+    /// child runs its full birth → dissolve cycle inside the
+    /// expression evaluation, freeing its malloc-backed buffer
+    /// before the parent ever stores the dangling pointer. Same
+    /// `mem::take` discipline as `defer_next_locus_dissolve`:
+    /// outermost instantiation owns the flag, nested ones see
+    /// false.
+    instantiating_for_parent_field: bool,
     /// F.20 Phase B: per-(locus, interface) vtable globals.
     /// Synthesized lazily by `ensure_vtable` the first time a
     /// given locus is coerced to a given interface. Layout is
@@ -1319,6 +1354,26 @@ fn expr_definitely_non_allocating(e: &Expr) -> bool {
 /// acquired. RecpoolFixed/RecpoolSlab children stay on the
 /// original path (recpool slots have their own pre-allocated
 /// lifecycle).
+/// F.30 (2026-05-20): implicit coercion gate at fn-argument
+/// READ positions. A `BytesView` flows into a `Bytes`-typed
+/// param (and `StringView` into `String`) as a no-op at
+/// runtime — same pointer ABI, same data layout — so existing
+/// stdlib readers (`std::bytes::at`, `len`, `std::str::*`)
+/// accept views without per-signature changes. Storage sites
+/// (let-binding type ascription, struct/locus field init,
+/// return-value to a different declared type) deliberately do
+/// NOT use this coercion: callers wanting owned storage must
+/// `std::bytes::clone(view)` / `std::str::clone(view)` to
+/// deep-copy explicitly, which is what makes the read-vs-store
+/// axis legible in the type signature.
+fn view_coerces_to(from: &CodegenTy, to: &CodegenTy) -> bool {
+    matches!(
+        (from, to),
+        (CodegenTy::BytesView, CodegenTy::Bytes)
+            | (CodegenTy::StringView, CodegenTy::String)
+    )
+}
+
 fn locus_arena_elidable(l: &LocusDecl) -> bool {
     // Structural disqualifiers — these consume arena at
     // instantiation regardless of method-body content.
@@ -1706,6 +1761,23 @@ struct LocusInfo<'ctx> {
     /// the time the parent's slot-destroy runs). Cap of 64 slots
     /// per locus is well above the v1 ceiling.
     slot_borrowed_mask_field_idx: u32,
+    /// F.29 follow-up: index of the synthetic
+    /// `__locus_ref_owned_mask: i64` field. Bit N (LSB = the Nth
+    /// LocusRef-typed param field in declaration order, per
+    /// `locus_ref_bit_per_field`) is set iff that field was
+    /// initialized via a locus literal at instantiation
+    /// (parent-owned). Zero means externally provided (variable
+    /// reference override, etc.) — the cascade skips it.
+    locus_ref_owned_mask_field_idx: u32,
+    /// F.29 follow-up: bit-index map for LocusRef-typed param
+    /// fields. Keys are the field names; values are the bit
+    /// position within `__locus_ref_owned_mask`. Built in
+    /// declaration order over the locus's params (filtering on
+    /// `CodegenTy::LocusRef`). Used by the cascade emitters to
+    /// branch on ownership and by the field-init loop to set the
+    /// bit when the initializing expression produced a parent-
+    /// owned locus literal.
+    locus_ref_bit_per_field: BTreeMap<String, u32>,
     /// v1.x-3: index of the synthetic `__recpool: ptr` field —
     /// the parent-side handle into a recognition pool. Set at
     /// instantiation iff this locus's projection class is
@@ -2392,6 +2464,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function("lotus_str_clone", str_clone_ty, None);
+        // F.30: deep-copy Bytes blob (length-prefixed) into a
+        // destination arena. Companion to lotus_str_clone for
+        // BytesView → Bytes upgrades via `std::bytes::clone`.
+        // declare ptr @lotus_bytes_clone(ptr arena, ptr src)
+        let bytes_clone_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function("lotus_bytes_clone", bytes_clone_ty, None);
         let i32_t_local = self.context.i32_type();
         let str_eq_ty =
             i32_t_local.fn_type(&[ptr_t.into(), ptr_t.into()], false);
@@ -3083,6 +3163,29 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ptr_t.fn_type(&[i32_t.into(), i32_t.into()], false);
         self.module
             .add_function("lotus_tcp_recv_bytes", tcp_recv_bytes_ty, None);
+        // Phase 1: caller-provided destination — recv into a
+        // builder, zero allocation in g_bus_payload_arena.
+        // declare i64 @lotus_tcp_recv_into(i32 fd, ptr builder, i64 max_bytes)
+        let tcp_recv_into_ty = i64_t.fn_type(
+            &[i32_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_tcp_recv_into", tcp_recv_into_ty, None);
+        // declare i64 @lotus_tls_recv_into(i32 handle, ptr builder, i64 max_bytes)
+        let tls_recv_into_ty = i64_t.fn_type(
+            &[i32_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_tls_recv_into", tls_recv_into_ty, None);
+        // declare i64 @lotus_udp_recv_into(i32 fd, ptr builder, i64 max_bytes)
+        let udp_recv_into_ty = i64_t.fn_type(
+            &[i32_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_udp_recv_into", udp_recv_into_ty, None);
         // Phase 2g: cross-shape converters anchored in the global
         // payload arena so the result outlives the call site.
         // declare ptr @lotus_str_from_bytes(ptr bytes)
@@ -3443,14 +3546,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // and finish() returns a Bytes blob (no trailing NUL).
         // Handle stays a `ptr` carried as Bytes in the Aperio
         // surface, matching the str-builder ergonomic.
-        // declare ptr @lotus_bytes_builder_new(void)
-        let bb_new_ty = ptr_t.fn_type(&[], false);
+        // declare ptr @lotus_bytes_builder_new(i64 initial_cap)
+        let bb_new_ty = ptr_t.fn_type(&[i64_t.into()], false);
         self.module
             .add_function("lotus_bytes_builder_new", bb_new_ty, None);
-        // declare void @lotus_bytes_builder_append(ptr handle, ptr chunk)
-        let bb_append_ty = self
-            .context
-            .void_type()
+        // declare i64 @lotus_bytes_builder_append(ptr handle, ptr chunk)
+        // 2026-05-19: was `void` — now returns 1=ok / 0=fail so the
+        // BytesBuilder locus's `append` method can `violate
+        // alloc_failed` on realloc-NULL (F.27 routing).
+        let bb_append_ty = i64_t
             .fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.module.add_function(
             "lotus_bytes_builder_append",
@@ -3466,6 +3570,115 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_bytes_builder_finish",
             bb_finish_ty,
+            None,
+        );
+        // Phase-0 in-place ops for long-lived recv-loop accumulators
+        // (pond/websocket per-frame Bytes-allocation leak).
+        // declare void @lotus_bytes_builder_shift_front(ptr handle, i64 n)
+        let bb_shift_ty = self
+            .context
+            .void_type()
+            .fn_type(&[ptr_t.into(), i64_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_builder_shift_front",
+            bb_shift_ty,
+            None,
+        );
+        // declare void @lotus_bytes_builder_clear(ptr handle)
+        let bb_clear_ty =
+            self.context.void_type().fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_builder_clear",
+            bb_clear_ty,
+            None,
+        );
+        // declare ptr @lotus_bytes_builder_snapshot(ptr handle)
+        let bb_snap_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_builder_snapshot",
+            bb_snap_ty,
+            None,
+        );
+        // declare void @lotus_bytes_builder_free(ptr handle)
+        let bb_free_ty =
+            self.context.void_type().fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_builder_free",
+            bb_free_ty,
+            None,
+        );
+        // declare ptr @lotus_bytes_builder_view(ptr handle)
+        // Phase-2 (1): zero-copy non-owning Bytes view aliasing the
+        // builder's inline `[i64 len][u8 data]` region. Lifetime
+        // tied to "no mutation of the source builder while view is
+        // in use" — documented-and-trusted at v1.
+        let bb_view_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_builder_view",
+            bb_view_ty,
+            None,
+        );
+        // declare ptr @lotus_bytes_builder_text_view(ptr handle)
+        // Phase-3 Site 2 (2026-05-19): non-owning String view
+        // aliasing the builder's buffer. Returns a C-string
+        // pointer that's NUL-terminated at `buf[len]` (invariant
+        // maintained by every mutation). Lifetime tied to "no
+        // mutation of the source builder while view is in use".
+        // Kills the per-text-frame lotus_str_from_bytes alloc.
+        let bb_text_view_ty = ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_builder_text_view",
+            bb_text_view_ty,
+            None,
+        );
+        // declare i64 @lotus_bytes_builder_append_slice(ptr handle, ptr src_blob, i64 lo, i64 hi)
+        // Phase-3 Site 1 (2026-05-19): copy src[lo..hi) directly
+        // into the builder's tail. Returns 1=ok / 0=fail (null
+        // handle, out-of-range, realloc NULL). Aperio-side
+        // wrapper routes 0 through `violate alloc_failed` per
+        // F.27. Eliminates the slice+append pair's intermediate
+        // Bytes wrapper that otherwise lands in g_bus_payload_arena.
+        let bb_append_slice_ty = i64_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i64_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bytes_builder_append_slice",
+            bb_append_slice_ty,
+            None,
+        );
+        // declare void @lotus_set_caller_arena(ptr arena)
+        // Phase-3 (2026-05-19) __caller_arena threading: stdlib
+        // primitives that previously allocated into the program-
+        // lifetime g_bus_payload_arena now read a thread-local
+        // arena pointer instead. The codegen emits a setter call
+        // before each user-callable primitive invocation, passing
+        // `current_arena_ptr()` from the calling context (locus
+        // method's self arena / free fn's __caller_arena /
+        // main's program arena). Primitives fall back to the
+        // capped g_bus_payload_arena when TLS is null (interpreter
+        // or non-Aperio C entry). See lotus_arena.c
+        // lotus_caller_arena_or_global for the read side.
+        let void_t = self.context.void_type();
+        let set_caller_arena_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_set_caller_arena",
+            set_caller_arena_ty,
+            None,
+        );
+        // declare i64 @lotus_bytes_is_alloc_fail(ptr blob)
+        // F.27 discriminator: 1 iff blob is the alloc-fail
+        // sentinel returned from BytesBuilder snapshot()/finish()
+        // failure paths. Used by the locus method bodies to detect
+        // payload-arena alloc failure and route through
+        // `violate alloc_failed` before returning. Success paths
+        // always emit a fresh arena-allocated blob (even for
+        // len=0) via lotus_bytes_create, so the sentinel is
+        // unambiguous.
+        let bb_is_alloc_fail_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_bytes_is_alloc_fail",
+            bb_is_alloc_fail_ty,
             None,
         );
 
@@ -3902,6 +4115,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
             }
             if !is_pinned_entry {
+                // Phase-2 (3): cascade child-field drains depth-first
+                // BEFORE outer's drain, per spec/runtime.md "drain()
+                // cascades depth-first; children first, then self."
+                self.emit_locus_field_drains(&info, self_ptr, &locus_name)?;
                 // Cooperative long-lived: drain → __closures →
                 // dissolve, mirroring the ephemeral-locus ordering.
                 // The cascade itself ran each descendant's closures
@@ -3948,6 +4165,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     }
                 }
             }
+            // Phase-2 (2): cascade dissolve for parent-owned child
+            // loci. Mirrors the ephemeral path's ordering.
+            self.emit_locus_field_dissolves(&info, self_ptr, &locus_name)?;
             // Arena released at scope exit, after the pinned thread
             // is joined or after the cooperative drain/dissolve has
             // run. Symmetric with the ephemeral path in
@@ -6227,6 +6447,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 PrimType::Decimal => Ok(CodegenTy::Decimal),
                 PrimType::Time => Ok(CodegenTy::Time),
                 PrimType::Bytes => Ok(CodegenTy::Bytes),
+                PrimType::BytesView => Ok(CodegenTy::BytesView),
+                PrimType::StringView => Ok(CodegenTy::StringView),
                 other => Err(CodegenError::Unsupported(format!(
                     "type primitive `{:?}` in signature",
                     other
@@ -7773,7 +7995,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | LocusMember::Failure(_)
             | LocusMember::Closure(_)
             | LocusMember::Type(_)
-            | LocusMember::Bindings(_) => {}
+            | LocusMember::Bindings(_)
+            | LocusMember::BirthCheck(_) => {}
             LocusMember::Capacity(_) => {
                 // F.22 slot cell types are concrete in v1; no
                 // generic-template use sites. Future generic Pool/
@@ -8346,6 +8569,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let slot_borrowed_mask_field_idx = idx;
         llvm_field_tys.push(i64_t_struct.into());
         idx += 1;
+        // F.29 follow-up (2026-05-19): synthetic
+        // __locus_ref_owned_mask — bit N is set iff the Nth
+        // LocusRef-typed param field (in declaration order) was
+        // initialized via a locus literal at this instantiation
+        // (parent-owned), vs. an external override or non-locus
+        // expression (parent does not own). The cascade helpers
+        // `emit_locus_field_drains` / `emit_locus_field_dissolves`
+        // branch on the bit and skip externally-provided children,
+        // closing the double-dissolve regression where
+        // `Pub { sub: external_s }` would otherwise have the
+        // cascade tear down `external_s` while its real owner is
+        // still alive. Cap of 64 LocusRef fields per locus is well
+        // above any practical ceiling. Always present so the
+        // cascade emission stays uniform.
+        let locus_ref_owned_mask_field_idx = idx;
+        llvm_field_tys.push(i64_t_struct.into());
+        idx += 1;
         // v1.x-3: synthetic `__recpool: ptr` — parent-side recpool
         // handle (set only when this locus is Recognition class
         // with fixed_cell or shared_slab sub-mode; zero otherwise).
@@ -8699,6 +8939,36 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .opaque_struct_type(&format!("locus.{}", l.name.name));
         struct_ty.set_body(&llvm_field_tys, false);
 
+        // F.29 follow-up: assign bit positions for LocusRef-typed
+        // param fields in declaration order. The cascade emitters
+        // use these bits to discriminate parent-owned children
+        // (default-init OR locus-literal override) from externally
+        // provided ones (variable-ref override) — the latter
+        // are skipped by the cascade so they don't get
+        // double-dissolved by the parent's teardown alongside
+        // their real owner's teardown. `defaults` is in
+        // declaration order; we filter for fields whose codegen
+        // type is `LocusRef`.
+        let mut locus_ref_bit_per_field: BTreeMap<String, u32> =
+            BTreeMap::new();
+        let mut next_bit: u32 = 0;
+        for (fname, _) in defaults.iter() {
+            if let Some((_, ty)) = fields.get(fname) {
+                if matches!(ty, CodegenTy::LocusRef(_)) {
+                    locus_ref_bit_per_field.insert(fname.clone(), next_bit);
+                    next_bit += 1;
+                }
+            }
+        }
+        if next_bit > 64 {
+            return Err(CodegenError::Unsupported(format!(
+                "locus `{}` declares more than 64 LocusRef-typed \
+                 param fields ({}); the `__locus_ref_owned_mask` \
+                 bitmask only carries 64 bits",
+                l.name.name, next_bit
+            )));
+        }
+
         self.user_loci.insert(
             l.name.name.clone(),
             LocusInfo {
@@ -8729,6 +8999,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 restart_in_place_pending_field_idx,
                 drain_requested_field_idx,
                 slot_borrowed_mask_field_idx,
+                locus_ref_owned_mask_field_idx,
+                locus_ref_bit_per_field,
                 recpool_field_idx,
                 recpool_release_pool_field_idx,
                 recpool_release_kind_field_idx,
@@ -8808,9 +9080,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     // Params handled in pass A1; contracts are a
                     // typecheck-only feature with no codegen ABI.
                 }
-                LocusMember::Bindings(_) => {
-                    // Bindings emitted by main-locus prelude pass; no
-                    // method-table contribution.
+                LocusMember::Bindings(_) | LocusMember::BirthCheck(_) => {
+                    // Bindings emitted by main-locus prelude pass;
+                    // birth_check clauses are emitted inline at
+                    // instantiation (see lower_locus_instantiation's
+                    // F.27 v2 block). Neither contributes to the
+                    // method table.
                 }
                 LocusMember::Lifecycle(lc) => {
                     if lc.ret.is_some() {
@@ -9049,6 +9324,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 }
                                 CodegenTy::String
                                 | CodegenTy::Bytes
+                                | CodegenTy::BytesView
+                                | CodegenTy::StringView
                                 | CodegenTy::Time
                                 | CodegenTy::LocusRef(_)
                                 | CodegenTy::TypeRef(_)
@@ -9227,6 +9504,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 }
                                 CodegenTy::String
                                 | CodegenTy::Bytes
+                                | CodegenTy::BytesView
+                                | CodegenTy::StringView
                                 | CodegenTy::Time
                                 | CodegenTy::LocusRef(_)
                                 | CodegenTy::TypeRef(_)
@@ -9445,7 +9724,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .expect("self_ptr param")
                     .into_pointer_value();
                 self.current_fn = Some(func);
-                self.current_user_fn_ret = None;
+                // F.27 extension (2026-05-19): lifecycle bodies are
+                // void-returning user-fn contexts from the violate
+                // codegen's perspective. Marking the ret as
+                // `Some(None)` (a "user fn returning void" frame)
+                // lets `violate NAME;` inside birth / drain /
+                // dissolve / accept / run route through the parent's
+                // on_failure handler just like a regular method
+                // body would, instead of erroring at codegen with
+                // `"violate" outside a user fn`. Birth-time
+                // allocation failures (BytesBuilder's prior
+                // birth-fail leaves-handle-zero-and-waits caveat)
+                // now route at construction. The divergent return
+                // is `build_return(None)` for the void shape.
+                self.current_user_fn_ret = Some(None);
                 self.current_self = Some(SelfCx {
                     locus_name: l.name.name.clone(),
                     struct_ty: info.struct_ty,
@@ -10344,6 +10636,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 }
                 Some(CodegenTy::String)
                 | Some(CodegenTy::Bytes)
+                | Some(CodegenTy::BytesView)
+                | Some(CodegenTy::StringView)
                 | Some(CodegenTy::Time)
                 | Some(CodegenTy::LocusRef(_))
                 | Some(CodegenTy::TypeRef(_))
@@ -10949,6 +11243,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 // primitive that copies len + body into
                 // dest_arena, for callers that genuinely want
                 // the payload moved.
+                Ok(value)
+            }
+            CodegenTy::BytesView | CodegenTy::StringView => {
+                // F.30: a view returned from a fn keeps aliasing
+                // whatever buffer the source builder owned. The
+                // caller is responsible for treating it as a view
+                // (lifetime tied to the source builder); no
+                // deep-copy here. If the caller wants owned
+                // storage they must explicitly clone via
+                // `std::bytes::clone(v)` / `std::str::clone(v)`
+                // (see F.30 spec for the surface).
                 Ok(value)
             }
             CodegenTy::Tuple(elem_tys) => {
@@ -11688,6 +11993,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("fn `{}` arg {}", name, i),
                 )?;
                 widened.into()
+            } else if view_coerces_to(&ty, &sig.params[i]) {
+                // F.30: BytesView → Bytes / StringView → String at
+                // read-position fn-arg sites. Runtime no-op
+                // (identical pointer layout); the typecheck
+                // approval is the load-bearing piece.
+                v
             } else if ty != sig.params[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "fn `{}` arg {} type mismatch: expected {:?}, got {:?}",
@@ -12274,10 +12585,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "str", "builder_append"]
             | ["std", "str", "builder_len"]
             | ["std", "str", "builder_finish"]
-            | ["std", "bytes", "builder_new"]
-            | ["std", "bytes", "builder_append"]
-            | ["std", "bytes", "builder_len"]
-            | ["std", "bytes", "builder_finish"]
+            | ["std", "bytes", "builder", "__new"]
+            | ["std", "bytes", "builder", "__append"]
+            | ["std", "bytes", "builder", "__len"]
+            | ["std", "bytes", "builder", "__finish"]
+            | ["std", "bytes", "builder", "__shift_front"]
+            | ["std", "bytes", "builder", "__clear"]
+            | ["std", "bytes", "builder", "__snapshot"]
+            | ["std", "bytes", "builder", "__free"]
+            | ["std", "bytes", "builder", "__view"]
+            | ["std", "bytes", "builder", "__text_view"]
+            | ["std", "bytes", "builder", "__append_slice"]
+            | ["std", "bytes", "__is_alloc_fail"]
+            | ["std", "bytes", "clone"]
+            | ["std", "str", "clone"]
             | ["std", "math", "sqrt"]
             | ["std", "math", "exp"]
             | ["std", "math", "log"]
@@ -12330,7 +12651,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bytes::at: b must be Bytes, got {:?}. To read \
                  a byte from a String, convert first via \
@@ -12674,7 +12995,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::parse_int: s must be String, got {:?}",
                 s_ty
@@ -12735,7 +13056,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::parse_float: s must be String, got {:?}",
                 s_ty
@@ -12798,7 +13119,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::read_file: path must be String, got {:?}",
                 path_ty
@@ -12918,7 +13239,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::read_bytes: path must be String, got {:?}",
                 path_ty
@@ -13068,7 +13389,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (argv_val, argv_ty) = self.lower_expr(&args[0], scope)?;
-        if argv_ty != CodegenTy::String {
+        if !matches!(argv_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::process::run: argv must be String (newline-\
                  separated), got {:?}",
@@ -13207,7 +13528,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (argv_val, argv_ty) = self.lower_expr(&args[0], scope)?;
-        if argv_ty != CodegenTy::String {
+        if !matches!(argv_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::process::__spawn: argv must be String, got {:?}",
                 argv_ty
@@ -13542,7 +13863,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[1], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::process::__pipe_write: s must be String, got {:?}",
                 s_ty
@@ -13660,14 +13981,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "{}: path must be String, got {:?}",
                 c_fn_name, path_ty
             )));
         }
         let (content_val, content_ty) = self.lower_expr(&args[1], scope)?;
-        if content_ty != CodegenTy::String {
+        if !matches!(content_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "{}: content must be String, got {:?}",
                 c_fn_name, content_ty
@@ -13725,7 +14046,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::file_size: path must be String, got {:?}",
                 path_ty
@@ -13776,7 +14097,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::udp::__bind: host must be String, got {:?}",
                 host_ty
@@ -13852,7 +14173,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[1], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::udp::__send: host must be String, got {:?}", host_ty
             )));
@@ -13864,7 +14185,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (msg_val, msg_ty) = self.lower_expr(&args[3], scope)?;
-        if msg_ty != CodegenTy::String {
+        if !matches!(msg_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::udp::__send: msg must be String, got {:?}", msg_ty
             )));
@@ -13996,14 +14317,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::file::__open: path must be String, got {:?}",
                 path_ty
             )));
         }
         let (mode_val, mode_ty) = self.lower_expr(&args[1], scope)?;
-        if mode_ty != CodegenTy::String {
+        if !matches!(mode_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::file::__open: mode must be String, got {:?}",
                 mode_ty
@@ -14067,7 +14388,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (bytes_val, bytes_ty) = self.lower_expr(&args[1], scope)?;
-        if bytes_ty != CodegenTy::Bytes {
+        if !matches!(bytes_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::file::__write_bytes: bytes must be Bytes, got {:?}",
                 bytes_ty
@@ -14217,7 +14538,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::mkdir: path must be String, got {:?}",
                 path_ty
@@ -14264,14 +14585,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (src_val, src_ty) = self.lower_expr(&args[0], scope)?;
-        if src_ty != CodegenTy::String {
+        if !matches!(src_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::rename: src must be String, got {:?}",
                 src_ty
             )));
         }
         let (dst_val, dst_ty) = self.lower_expr(&args[1], scope)?;
-        if dst_ty != CodegenTy::String {
+        if !matches!(dst_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::rename: dst must be String, got {:?}",
                 dst_ty
@@ -14319,7 +14640,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::unlink: path must be String, got {:?}",
                 path_ty
@@ -14366,14 +14687,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (prefix_val, prefix_ty) = self.lower_expr(&args[0], scope)?;
-        if prefix_ty != CodegenTy::String {
+        if !matches!(prefix_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::mktemp: prefix must be String, got {:?}",
                 prefix_ty
             )));
         }
         let (suffix_val, suffix_ty) = self.lower_expr(&args[1], scope)?;
-        if suffix_ty != CodegenTy::String {
+        if !matches!(suffix_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::mktemp: suffix must be String, got {:?}",
                 suffix_ty
@@ -14472,7 +14793,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::list_dir_count: path must be String, got {:?}",
                 path_ty
@@ -14531,7 +14852,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::list_dir_at: path must be String, got {:?}",
                 path_ty
@@ -14598,7 +14919,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tcp::listen_socket: host must be String, got {:?}",
                 host_ty
@@ -14673,7 +14994,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tcp::connect: host must be String, got {:?}",
                 host_ty
@@ -16451,6 +16772,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             )?;
                             val = widened.into();
                             ty = CodegenTy::Float;
+                        } else if asc_ty != ty
+                            && matches!(
+                                (&ty, &asc_ty),
+                                (CodegenTy::BytesView, CodegenTy::Bytes)
+                                    | (CodegenTy::StringView, CodegenTy::String)
+                            )
+                        {
+                            // F.30: storage-site rejection. `let
+                            // stored: Bytes = b.view();` is the
+                            // exact footgun BytesView exists to
+                            // catch — the rhs is non-owning but
+                            // the declared type signals owned
+                            // storage. Reject with a pointer at
+                            // the explicit clone path.
+                            return Err(CodegenError::Unsupported(format!(
+                                "let `{}`: declared `{:?}` but RHS is `{:?}` \
+                                 (a non-owning view of a BytesBuilder). \
+                                 Use `let {}: {:?} = ...;` to keep the \
+                                 view's non-owning semantic, or wrap the \
+                                 RHS in `std::bytes::clone(view)` / \
+                                 `std::str::clone(view)` to deep-copy the \
+                                 contents into the caller's arena (F.30).",
+                                name.name, asc_ty, ty, name.name, ty
+                            )));
                         }
                     }
                 }
@@ -17399,7 +17744,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
         let (v, ty) = self.lower_expr(&args[0], scope)?;
         match ty {
-            CodegenTy::String => {
+            CodegenTy::String | CodegenTy::StringView => {
                 let len_fn = self
                     .module
                     .get_function("lotus_str_len")
@@ -17417,7 +17762,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .expect("lotus_str_len returns i64");
                 Ok((val, CodegenTy::Int))
             }
-            CodegenTy::Bytes => {
+            CodegenTy::Bytes | CodegenTy::BytesView => {
                 // m89: Bytes carries an explicit length prefix —
                 // not strlen, since binary data may have embedded
                 // NULs. lotus_bytes_len reads the i64 at offset 0.
@@ -19387,6 +19732,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             CodegenTy::String
             | CodegenTy::Bytes
+            | CodegenTy::BytesView
+            | CodegenTy::StringView
             | CodegenTy::Time
             | CodegenTy::LocusRef(_)
             | CodegenTy::TypeRef(_)
@@ -20625,6 +20972,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             CodegenTy::String
             | CodegenTy::Bytes
+            | CodegenTy::BytesView
+            | CodegenTy::StringView
             | CodegenTy::Time
             | CodegenTy::LocusRef(_)
             | CodegenTy::TypeRef(_)
@@ -21342,7 +21691,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         chosen.into_pointer_value(),
                     ));
                 }
-                CodegenTy::String | CodegenTy::Time => {
+                CodegenTy::String | CodegenTy::Time | CodegenTy::StringView => {
                     format.push_str("%s");
                     printf_args.push(BasicMetadataValueEnum::PointerValue(
                         val.into_pointer_value(),
@@ -21388,8 +21737,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                          values have no surface representation".into(),
                     ));
                 }
-                CodegenTy::Bytes => {
-                    // m89: print Bytes as `<bytes len=N>` so it's
+                CodegenTy::Bytes | CodegenTy::BytesView => {
+                    // m89 / F.30: print Bytes (and BytesView, same
+                    // runtime layout) as `<bytes len=N>` so it's
                     // identifiable in logs without dumping
                     // potentially-binary content. Users who want the
                     // body should write a hex / base64 helper —
@@ -22014,6 +22364,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_tcp_recv_bytes(args, scope)?;
                 Ok(())
             }
+            // Phase 1: caller-provided destination recv_into.
+            // Returns Int: > 0 bytes appended, 0 peer closed,
+            // -1 error. Non-fallible — error surfaces via the
+            // return value (mirrors POSIX read semantics).
+            ["std", "io", "tcp", "recv_into"] => {
+                let _ = self.lower_std_io_tcp_recv_into(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "tls", "recv_into"] => {
+                let _ = self.lower_std_io_tls_recv_into(args, scope)?;
+                Ok(())
+            }
+            ["std", "io", "udp", "recv_into"] => {
+                let _ = self.lower_std_io_udp_recv_into(args, scope)?;
+                Ok(())
+            }
             // TLS substrate — same statement-position wiring as tcp.
             ["std", "io", "tls", "send_bytes"] => {
                 let _ = self.lower_std_io_tls_send_bytes(args, scope)?;
@@ -22206,21 +22572,66 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_builder_finish(args, scope)?;
                 Ok(())
             }
-            // C10 (pond follow-up): binary-safe builder.
-            ["std", "bytes", "builder_new"] => {
-                let _ = self.lower_std_bytes_builder_new(args)?;
+            // Internal C-primitive bridges for the BytesBuilder
+            // locus (runtime/stdlib/bytes_builder.ap). The `__`
+            // prefix marks these as not-for-user-code: user code
+            // constructs `std::bytes::BytesBuilder { }` and calls
+            // `.append() / .len() / .snapshot()` etc.; the locus's
+            // method bodies route through here.
+            ["std", "bytes", "builder", "__new"] => {
+                let _ = self.lower_std_bytes_builder_new(args, scope)?;
                 Ok(())
             }
-            ["std", "bytes", "builder_append"] => {
+            ["std", "bytes", "builder", "__append"] => {
                 let _ = self.lower_std_bytes_builder_append(args, scope)?;
                 Ok(())
             }
-            ["std", "bytes", "builder_len"] => {
+            ["std", "bytes", "builder", "__len"] => {
                 let _ = self.lower_std_bytes_builder_len(args, scope)?;
                 Ok(())
             }
-            ["std", "bytes", "builder_finish"] => {
+            ["std", "bytes", "builder", "__finish"] => {
                 let _ = self.lower_std_bytes_builder_finish(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__shift_front"] => {
+                let _ = self.lower_std_bytes_builder_shift_front(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__clear"] => {
+                let _ = self.lower_std_bytes_builder_clear(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__snapshot"] => {
+                let _ = self.lower_std_bytes_builder_snapshot(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__free"] => {
+                let _ = self.lower_std_bytes_builder_free(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__view"] => {
+                let _ = self.lower_std_bytes_builder_view(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__append_slice"] => {
+                let _ = self.lower_std_bytes_builder_append_slice(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "builder", "__text_view"] => {
+                let _ = self.lower_std_bytes_builder_text_view(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "__is_alloc_fail"] => {
+                let _ = self.lower_std_bytes_is_alloc_fail(args, scope)?;
+                Ok(())
+            }
+            ["std", "bytes", "clone"] => {
+                let _ = self.lower_std_bytes_clone(args, scope)?;
+                Ok(())
+            }
+            ["std", "str", "clone"] => {
+                let _ = self.lower_std_str_clone(args, scope)?;
                 Ok(())
             }
             // m84: parse_request also reachable in statement
@@ -22620,6 +23031,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "tls", "close"] => {
                 self.lower_std_io_tls_close(args, scope)
             }
+            ["std", "io", "tcp", "recv_into"] => {
+                self.lower_std_io_tcp_recv_into(args, scope)
+            }
+            ["std", "io", "tls", "recv_into"] => {
+                self.lower_std_io_tls_recv_into(args, scope)
+            }
+            ["std", "io", "udp", "recv_into"] => {
+                self.lower_std_io_udp_recv_into(args, scope)
+            }
             ["std", "bus", "__local_dispatch"] => {
                 self.lower_std_bus_local_dispatch(args, scope)
             }
@@ -22742,18 +23162,51 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "str", "builder_finish"] => {
                 self.lower_std_str_builder_finish(args, scope)
             }
-            // C10 (pond follow-up): binary-safe builder.
-            ["std", "bytes", "builder_new"] => {
-                self.lower_std_bytes_builder_new(args)
+            // Internal C-primitive bridges for the BytesBuilder
+            // locus (runtime/stdlib/bytes_builder.ap). See the
+            // statement-position dispatch above for the routing
+            // rationale.
+            ["std", "bytes", "builder", "__new"] => {
+                self.lower_std_bytes_builder_new(args, scope)
             }
-            ["std", "bytes", "builder_append"] => {
+            ["std", "bytes", "builder", "__append"] => {
                 self.lower_std_bytes_builder_append(args, scope)
             }
-            ["std", "bytes", "builder_len"] => {
+            ["std", "bytes", "builder", "__len"] => {
                 self.lower_std_bytes_builder_len(args, scope)
             }
-            ["std", "bytes", "builder_finish"] => {
+            ["std", "bytes", "builder", "__finish"] => {
                 self.lower_std_bytes_builder_finish(args, scope)
+            }
+            ["std", "bytes", "builder", "__shift_front"] => {
+                self.lower_std_bytes_builder_shift_front(args, scope)
+            }
+            ["std", "bytes", "builder", "__clear"] => {
+                self.lower_std_bytes_builder_clear(args, scope)
+            }
+            ["std", "bytes", "builder", "__snapshot"] => {
+                self.lower_std_bytes_builder_snapshot(args, scope)
+            }
+            ["std", "bytes", "builder", "__free"] => {
+                self.lower_std_bytes_builder_free(args, scope)
+            }
+            ["std", "bytes", "builder", "__view"] => {
+                self.lower_std_bytes_builder_view(args, scope)
+            }
+            ["std", "bytes", "builder", "__append_slice"] => {
+                self.lower_std_bytes_builder_append_slice(args, scope)
+            }
+            ["std", "bytes", "builder", "__text_view"] => {
+                self.lower_std_bytes_builder_text_view(args, scope)
+            }
+            ["std", "bytes", "__is_alloc_fail"] => {
+                self.lower_std_bytes_is_alloc_fail(args, scope)
+            }
+            ["std", "bytes", "clone"] => {
+                self.lower_std_bytes_clone(args, scope)
+            }
+            ["std", "str", "clone"] => {
+                self.lower_std_str_clone(args, scope)
             }
             // m84: std::http::parse_request(raw: String) -> Request.
             // Implementation lives in stdlib.ap as the bare-name
@@ -23511,7 +23964,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tcp::__listen_socket: host must be String, got {:?}",
                 host_ty
@@ -23564,7 +24017,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tcp::__connect: host must be String, got {:?}",
                 host_ty
@@ -23672,14 +24125,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::index_of: s must be String, got {:?}",
                 s_ty
             )));
         }
         let (sub_val, sub_ty) = self.lower_expr(&args[1], scope)?;
-        if sub_ty != CodegenTy::String {
+        if !matches!(sub_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::index_of: sub must be String, got {:?}",
                 sub_ty
@@ -23717,7 +24170,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::can_parse_int: s must be String, got {:?}",
                 s_ty
@@ -23767,7 +24220,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             let hint = if matches!(s_ty, CodegenTy::Bytes) {
                 " — use `std::str::from_bytes(b)` to convert"
             } else {
@@ -23788,6 +24241,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function(extern_name)
             .expect("string fold/strip extern declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[s_val.into()], &format!("str.{}.ret", which))
@@ -23817,7 +24271,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::substring: s must be String, got {:?}",
                 s_ty
@@ -23841,6 +24295,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_substring")
             .expect("lotus_str_substring declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -23867,7 +24322,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::repeat: s must be String, got {:?}",
                 s_ty
@@ -23884,6 +24339,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_repeat")
             .expect("lotus_str_repeat declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[s_val.into(), n_val.into()], "str.repeat.ret")
@@ -23911,7 +24367,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
         let (w_val, w_ty) = self.lower_expr(&args[1], scope)?;
         let (p_val, p_ty) = self.lower_expr(&args[2], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::{}: s must be String, got {:?}",
                 which, s_ty
@@ -23923,7 +24379,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 which, w_ty
             )));
         }
-        if p_ty != CodegenTy::String {
+        if !matches!(p_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::{}: pad must be String, got {:?}",
                 which, p_ty
@@ -23938,6 +24394,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function(extern_name)
             .expect("pad extern declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -23984,6 +24441,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_replace")
             .expect("lotus_str_replace declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -24048,7 +24506,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::builder_append: builder must be Bytes \
                  (from builder_new), got {:?}",
@@ -24056,7 +24514,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[1], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::builder_append: s must be String, got {:?}",
                 s_ty
@@ -24086,7 +24544,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::builder_len: builder must be Bytes, got {:?}",
                 b_ty
@@ -24123,7 +24581,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::builder_finish: builder must be Bytes, got {:?}",
                 b_ty
@@ -24154,11 +24612,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     fn lower_std_bytes_builder_new(
         &mut self,
         args: &[Expr],
+        scope: &Scope<'ctx>,
     ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if !args.is_empty() {
+        if args.len() != 1 {
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_new takes 0 args, got {}",
+                "std::bytes::builder::__new takes 1 arg (initial_cap), got {}",
                 args.len()
+            )));
+        }
+        let (cap_val, cap_ty) = self.lower_expr(&args[0], scope)?;
+        if cap_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__new: initial_cap must be Int, got {:?}",
+                cap_ty
             )));
         }
         let f = self
@@ -24167,13 +24633,53 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .expect("lotus_bytes_builder_new declared");
         let call = self
             .builder
-            .build_call(f, &[], "bb.new.ret")
+            .build_call(f, &[cap_val.into()], "bb.new.ret")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let ptr = call
             .try_as_basic_value()
             .left()
-            .expect("returns ptr");
-        Ok((ptr, CodegenTy::Bytes))
+            .expect("returns ptr")
+            .into_pointer_value();
+        // Carry the ptr as Int (i64) so the BytesBuilder locus's
+        // `handle` param (typed Int) can hold it. The C primitive
+        // declared a `ptr` return; ptrtoint here, inttoptr at the
+        // matching consumer sites.
+        let i64_t = self.context.i64_type();
+        let as_int = self
+            .builder
+            .build_ptr_to_int(ptr, i64_t, "bb.new.handle.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((as_int.into(), CodegenTy::Int))
+    }
+
+    /// Helper: lower an `Int`-typed handle expression and emit
+    /// `inttoptr` so the C-primitive call boundary receives a
+    /// `ptr`. Returns the original `(IntValue, BasicValueEnum)`
+    /// pair — caller forwards the int as the lowering's result
+    /// (handles "return the handle unchanged" shapes) and uses
+    /// the ptr as the C call arg. Used by every internal
+    /// `std::bytes::builder::__*` lowering that consumes a
+    /// `handle: Int` arg.
+    fn lower_bytes_builder_handle_arg(
+        &mut self,
+        arg: &Expr,
+        scope: &Scope<'ctx>,
+        diag_name: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>), CodegenError> {
+        let (h_val, h_ty) = self.lower_expr(arg, scope)?;
+        if h_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: handle must be Int (the BytesBuilder locus's \
+                 internal handle field), got {:?}",
+                diag_name, h_ty
+            )));
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let ptr = self
+            .builder
+            .build_int_to_ptr(h_val.into_int_value(), ptr_t, "bb.handle.ptr")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((h_val, ptr.into()))
     }
 
     /// C10 (pond follow-up): `std::bytes::builder_append(b: Bytes,
@@ -24189,22 +24695,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
         if args.len() != 2 {
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_append takes 2 args (b, chunk), got {}",
+                "std::bytes::builder::__append takes 2 args (handle, chunk), got {}",
                 args.len()
             )));
         }
-        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
-            return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_append: builder must be Bytes \
-                 (from builder_new), got {:?}",
-                b_ty
-            )));
-        }
+        let (_h_int, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__append",
+        )?;
         let (chunk_val, chunk_ty) = self.lower_expr(&args[1], scope)?;
-        if chunk_ty != CodegenTy::Bytes {
+        if !matches!(chunk_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_append: chunk must be Bytes, got \
+                "std::bytes::builder::__append: chunk must be Bytes, got \
                  {:?} (use `std::bytes::from_string(s)` to convert)",
                 chunk_ty
             )));
@@ -24213,14 +24716,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_builder_append")
             .expect("lotus_bytes_builder_append declared");
-        self.builder
+        let call = self
+            .builder
             .build_call(
                 f,
-                &[b_val.into(), chunk_val.into()],
-                "bb.append",
+                &[handle_ptr.into(), chunk_val.into()],
+                "bb.append.ret",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        Ok((b_val, CodegenTy::Bytes))
+        // Returns i64 status: 1=ok, 0=fail (realloc NULL or null
+        // handle). The BytesBuilder locus's `append` method checks
+        // this and routes to `violate alloc_failed` on 0 per F.27.
+        let status = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64 status");
+        Ok((status, CodegenTy::Int))
     }
 
     /// C10 (pond follow-up): `std::bytes::builder_len(b: Bytes) ->
@@ -24233,24 +24744,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
         if args.len() != 1 {
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_len takes 1 arg (b), got {}",
+                "std::bytes::builder::__len takes 1 arg (handle), got {}",
                 args.len()
             )));
         }
-        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
-            return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_len: builder must be Bytes, got {:?}",
-                b_ty
-            )));
-        }
+        let (_, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__len",
+        )?;
         let f = self
             .module
             .get_function("lotus_bytes_builder_len")
             .expect("lotus_bytes_builder_len declared");
         let call = self
             .builder
-            .build_call(f, &[b_val.into()], "bb.len.ret")
+            .build_call(f, &[handle_ptr.into()], "bb.len.ret")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let v = call
             .try_as_basic_value()
@@ -24272,30 +24781,446 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
         if args.len() != 1 {
             return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_finish takes 1 arg (b), got {}",
+                "std::bytes::builder::__finish takes 1 arg (handle), got {}",
                 args.len()
             )));
         }
-        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
-            return Err(CodegenError::Unsupported(format!(
-                "std::bytes::builder_finish: builder must be Bytes, got {:?}",
-                b_ty
-            )));
-        }
+        let (_, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__finish",
+        )?;
         let f = self
             .module
             .get_function("lotus_bytes_builder_finish")
             .expect("lotus_bytes_builder_finish declared");
         let call = self
             .builder
-            .build_call(f, &[b_val.into()], "bb.finish.ret")
+            .build_call(f, &[handle_ptr.into()], "bb.finish.ret")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let ptr = call
             .try_as_basic_value()
             .left()
             .expect("returns ptr");
         Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// Phase 0: `std::bytes::builder_shift_front(b: Bytes, n: Int) -> Bytes`.
+    /// Drops the first n bytes in place via memmove; capacity
+    /// preserved. Returns the same builder pointer so call-site
+    /// `b = builder_shift_front(b, n)` and statement use both work.
+    fn lower_std_bytes_builder_shift_front(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__shift_front takes 2 args (handle, n), got {}",
+                args.len()
+            )));
+        }
+        let (h_int, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__shift_front",
+        )?;
+        let (n_val, n_ty) = self.lower_expr(&args[1], scope)?;
+        if n_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__shift_front: n must be Int, got {:?}",
+                n_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_shift_front")
+            .expect("lotus_bytes_builder_shift_front declared");
+        self.builder
+            .build_call(f, &[handle_ptr.into(), n_val.into()], "bb.shift")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((h_int, CodegenTy::Int))
+    }
+
+    /// Phase 0: `std::bytes::builder_clear(b: Bytes) -> Bytes`.
+    /// Sets len=0, capacity preserved.
+    fn lower_std_bytes_builder_clear(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__clear takes 1 arg (handle), got {}",
+                args.len()
+            )));
+        }
+        let (h_int, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__clear",
+        )?;
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_clear")
+            .expect("lotus_bytes_builder_clear declared");
+        self.builder
+            .build_call(f, &[handle_ptr.into()], "bb.clear")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((h_int, CodegenTy::Int))
+    }
+
+    /// Phase 0: `std::bytes::builder_snapshot(b: Bytes) -> Bytes`.
+    /// Copies the builder's current `[0..len)` into a fresh
+    /// length-prefixed Bytes blob in the bus payload arena.
+    /// Builder unchanged. The returned blob is a regular Bytes
+    /// value — `len()` / `at()` / `slice()` all work on it.
+    fn lower_std_bytes_builder_snapshot(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__snapshot takes 1 arg (handle), got {}",
+                args.len()
+            )));
+        }
+        let (_, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__snapshot",
+        )?;
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_snapshot")
+            .expect("lotus_bytes_builder_snapshot declared");
+        let call = self
+            .builder
+            .build_call(f, &[handle_ptr.into()], "bb.snapshot.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// Phase 0: `std::bytes::builder_free(b: Bytes)`. Dispose the
+    /// builder's malloc-backed buffer without materializing a
+    /// final Bytes blob. Pair with `builder_new()` in a long-lived
+    /// holder's `dissolve()` to close the recv-loop leak that
+    /// occurs when `finish()` is never called.
+    fn lower_std_bytes_builder_free(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__free takes 1 arg (handle), got {}",
+                args.len()
+            )));
+        }
+        let (h_int, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__free",
+        )?;
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_free")
+            .expect("lotus_bytes_builder_free declared");
+        self.builder
+            .build_call(f, &[handle_ptr.into()], "bb.free")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((h_int, CodegenTy::Int))
+    }
+
+    /// Phase-2 (1): lower `std::bytes::builder::__view(handle: Int)
+    /// -> Bytes`. Returns a non-owning Bytes pointer aliasing the
+    /// builder's `[i64 len][u8 data]` region — zero allocation,
+    /// zero copy. Lifetime is documented-and-trusted (no borrow
+    /// checker at v1): valid until the next mutation on the source
+    /// builder (append / shift_front / clear / finish).
+    fn lower_std_bytes_builder_view(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__view takes 1 arg (handle), got {}",
+                args.len()
+            )));
+        }
+        let (_, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__view",
+        )?;
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_view")
+            .expect("lotus_bytes_builder_view declared");
+        let call = self
+            .builder
+            .build_call(f, &[handle_ptr.into()], "bb.view.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        // F.30 (2026-05-20): the view bridge now mints `BytesView`,
+        // a typecheck-distinct non-owning shape. Runtime layout
+        // is identical to `Bytes` (same single-pointer ABI, same
+        // `[i64 len][u8 data]` deref); the type carries the
+        // "non-owning, valid until next mutation on the source
+        // builder" intent so storage sites can distinguish a view
+        // from an owned blob.
+        Ok((ptr, CodegenTy::BytesView))
+    }
+
+    /// Phase-3 Site 2: lower `std::bytes::builder::__text_view(
+    /// handle: Int) -> String`. Returns a non-owning String
+    /// pointer aliasing the builder's buffer; the builder
+    /// maintains `buf[len] == '\0'` after every mutation so the
+    /// returned C-string is well-formed for the lotus_str_*
+    /// surface. Lifetime: valid until the next mutation on the
+    /// source builder (documented-and-trusted at v1).
+    fn lower_std_bytes_builder_text_view(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__text_view takes 1 arg (handle), got {}",
+                args.len()
+            )));
+        }
+        let (_, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__text_view",
+        )?;
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_text_view")
+            .expect("lotus_bytes_builder_text_view declared");
+        let call = self
+            .builder
+            .build_call(f, &[handle_ptr.into()], "bb.text_view.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        // F.30: text_view bridge mints `StringView` — same runtime
+        // layout as `String` (NUL-terminated C-string), typecheck-
+        // distinct so the non-owning intent is visible.
+        Ok((ptr, CodegenTy::StringView))
+    }
+
+    /// Phase-3 Site 1: lower `std::bytes::builder::__append_slice(
+    /// handle: Int, src: Bytes, lo: Int, hi: Int) -> Int`. Copies
+    /// src[lo..hi) directly into the builder's tail. Returns 1=ok
+    /// / 0=fail (null handle, out-of-range, realloc NULL). The
+    /// stdlib wrapper routes 0 through `violate alloc_failed`.
+    /// Eliminates the slice+append pair's intermediate Bytes
+    /// wrapper that otherwise lands in g_bus_payload_arena.
+    fn lower_std_bytes_builder_append_slice(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 4 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__append_slice takes 4 args \
+                 (handle, src, lo, hi), got {}",
+                args.len()
+            )));
+        }
+        let (_, handle_ptr) = self.lower_bytes_builder_handle_arg(
+            &args[0],
+            scope,
+            "std::bytes::builder::__append_slice",
+        )?;
+        let (src_val, src_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(src_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__append_slice: src must be Bytes, \
+                 got {:?}",
+                src_ty
+            )));
+        }
+        let (lo_val, lo_ty) = self.lower_expr(&args[2], scope)?;
+        if lo_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__append_slice: lo must be Int, \
+                 got {:?}",
+                lo_ty
+            )));
+        }
+        let (hi_val, hi_ty) = self.lower_expr(&args[3], scope)?;
+        if hi_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::builder::__append_slice: hi must be Int, \
+                 got {:?}",
+                hi_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_bytes_builder_append_slice")
+            .expect("lotus_bytes_builder_append_slice declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[
+                    handle_ptr.into(),
+                    src_val.into(),
+                    lo_val.into(),
+                    hi_val.into(),
+                ],
+                "bb.append_slice.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let status = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64 status");
+        Ok((status, CodegenTy::Int))
+    }
+
+    /// F.27 discriminator: lower `std::bytes::__is_alloc_fail(b:
+    /// Bytes) -> Int`. Returns 1 iff `b` is the alloc-fail
+    /// sentinel returned by BytesBuilder snapshot()/finish() on
+    /// payload-arena alloc failure. Success paths always allocate
+    /// a fresh blob via lotus_bytes_create (even for len=0), so
+    /// the sentinel is unambiguous. Used inside the BytesBuilder
+    /// locus method bodies to gate the `violate alloc_failed`
+    /// route.
+    fn lower_std_bytes_is_alloc_fail(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::__is_alloc_fail takes 1 arg (b), got {}",
+                args.len()
+            )));
+        }
+        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::__is_alloc_fail: b must be Bytes, got {:?}",
+                b_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_bytes_is_alloc_fail")
+            .expect("lotus_bytes_is_alloc_fail declared");
+        let call = self
+            .builder
+            .build_call(f, &[b_val.into()], "bb.is_alloc_fail.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let status = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((status, CodegenTy::Int))
+    }
+
+    /// F.30 (2026-05-20): `std::bytes::clone(v: BytesView) -> Bytes`.
+    /// Deep-copies the view's contents into the caller's arena
+    /// (via Task 8's TLS routing), returning an owned Bytes
+    /// blob that outlives the source builder. This is the
+    /// explicit upgrade path BytesView signals when storage
+    /// sites reject the read-only coercion. Also accepts
+    /// `Bytes` as a no-op deep copy (useful for callers that
+    /// want to clone-from-a-borrowed-source generically).
+    fn lower_std_bytes_clone(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::clone takes 1 arg (view), got {}",
+                args.len()
+            )));
+        }
+        let (v_val, v_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(v_ty, CodegenTy::BytesView | CodegenTy::Bytes) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::bytes::clone: arg must be BytesView or Bytes, got {:?}",
+                v_ty
+            )));
+        }
+        let arena = self.current_arena_ptr()?;
+        let f = self
+            .module
+            .get_function("lotus_bytes_clone")
+            .expect("lotus_bytes_clone declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[arena.into(), v_val.into()],
+                "bytes.clone.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// F.30 companion: `std::str::clone(v: StringView) -> String`.
+    /// Reuses the existing m49 `lotus_str_clone` machinery — same
+    /// arena-arg shape — with the caller's current_arena as the
+    /// target. Also accepts `String` as a no-op clone.
+    fn lower_std_str_clone(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::clone takes 1 arg (view), got {}",
+                args.len()
+            )));
+        }
+        let (v_val, v_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(v_ty, CodegenTy::StringView | CodegenTy::String) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::clone: arg must be StringView or String, got {:?}",
+                v_ty
+            )));
+        }
+        let arena = self.current_arena_ptr()?;
+        let f = self
+            .module
+            .get_function("lotus_str_clone")
+            .expect("lotus_str_clone declared");
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[arena.into(), v_val.into()],
+                "str.clone.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ptr = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((ptr, CodegenTy::String))
     }
 
     /// v1.x-16: `std::str::can_parse_float(s: String) -> Bool`.
@@ -24311,7 +25236,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::can_parse_float: s must be String, got {:?}",
                 s_ty
@@ -24366,7 +25291,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (src_val, src_ty) = self.lower_expr(&args[0], scope)?;
-        if src_ty != CodegenTy::String {
+        if !matches!(src_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::ts::parse_go: src must be String, got {:?}",
                 src_ty
@@ -24683,7 +25608,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (name_val, name_ty) = self.lower_expr(&args[0], scope)?;
-        if name_ty != CodegenTy::String {
+        if !matches!(name_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::env::var: name must be String, got {:?}",
                 name_ty
@@ -24717,7 +25642,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (name_val, name_ty) = self.lower_expr(&args[0], scope)?;
-        if name_ty != CodegenTy::String {
+        if !matches!(name_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::env::var_exists: name must be String, got {:?}",
                 name_ty
@@ -24767,7 +25692,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::read_bytes: path must be String, got {:?}",
                 path_ty
@@ -24812,7 +25737,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[1], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tcp::__send_bytes: bytes must be Bytes, got {:?}",
                 b_ty
@@ -24870,7 +25795,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (host_val, host_ty) = self.lower_expr(&args[0], scope)?;
-        if host_ty != CodegenTy::String {
+        if !matches!(host_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tls::connect: host must be String, got {:?}",
                 host_ty
@@ -24949,7 +25874,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[1], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tls::send_bytes: bytes must be Bytes, got {:?}",
                 b_ty
@@ -25048,14 +25973,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (subj_val, subj_ty) = self.lower_expr(&args[0], scope)?;
-        if subj_ty != CodegenTy::String {
+        if !matches!(subj_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bus::__local_dispatch: subject must be String, got {:?}",
                 subj_ty
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[1], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bus::__local_dispatch: bytes must be Bytes, got {:?}",
                 b_ty
@@ -25169,7 +26094,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::read_file: path must be String, got {:?}",
                 path_ty
@@ -25300,14 +26225,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::write_file: path must be String, got {:?}",
                 path_ty
             )));
         }
         let (content_val, content_ty) = self.lower_expr(&args[1], scope)?;
-        if content_ty != CodegenTy::String {
+        if !matches!(content_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::write_file: content must be String, got {:?}",
                 content_ty
@@ -25371,14 +26296,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::write_file_append: path must be String, got {:?}",
                 path_ty
             )));
         }
         let (content_val, content_ty) = self.lower_expr(&args[1], scope)?;
-        if content_ty != CodegenTy::String {
+        if !matches!(content_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::write_file_append: content must be String, got {:?}",
                 content_ty
@@ -25439,7 +26364,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::mkdir: path must be String, got {:?}",
                 path_ty
@@ -25480,7 +26405,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::file_size: path must be String, got {:?}",
                 path_ty
@@ -25516,7 +26441,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::file_exists: path must be String, got {:?}",
                 path_ty
@@ -25568,7 +26493,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::extension: path must be String, got {:?}",
                 path_ty
@@ -25678,7 +26603,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (msg_val, msg_ty) = self.lower_expr(&args[1], scope)?;
-        if msg_ty != CodegenTy::String {
+        if !matches!(msg_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::tcp::__send: msg must be String, got {:?}",
                 msg_ty
@@ -25821,6 +26746,175 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok((ptr, CodegenTy::Bytes))
     }
 
+    /// Phase 1: lower `std::io::tcp::recv_into(fd: Int, buf: Bytes,
+    /// max_bytes: Int) -> Int`. `buf` is a builder handle (from
+    /// `std::bytes::builder_new`). Reads up to max_bytes into the
+    /// builder's tail; grows on insufficient headroom; bumps the
+    /// builder's len by the count read. Returns POSIX read(2)
+    /// semantics: > 0 bytes appended, 0 peer closed, -1 error.
+    /// Zero allocation in g_bus_payload_arena.
+    fn lower_std_io_tcp_recv_into(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        self.lower_recv_into_common(
+            args,
+            scope,
+            "lotus_tcp_recv_into",
+            "std::io::tcp::recv_into",
+        )
+    }
+
+    /// Phase 1: lower `std::io::tls::recv_into(handle: Int,
+    /// buf: Bytes, max_bytes: Int) -> Int`. SSL_read into the
+    /// builder's tail. Same return semantics as tcp_recv_into.
+    fn lower_std_io_tls_recv_into(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        self.lower_recv_into_common(
+            args,
+            scope,
+            "lotus_tls_recv_into",
+            "std::io::tls::recv_into",
+        )
+    }
+
+    /// Phase 1: lower `std::io::udp::recv_into(fd: Int, buf: Bytes,
+    /// max_bytes: Int) -> Int`. Single recvfrom into the builder's
+    /// tail (datagram boundaries preserved). Same return semantics
+    /// as tcp_recv_into.
+    fn lower_std_io_udp_recv_into(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        self.lower_recv_into_common(
+            args,
+            scope,
+            "lotus_udp_recv_into",
+            "std::io::udp::recv_into",
+        )
+    }
+
+    /// Shared lowering for the recv_into family. Validates arg
+    /// types, extracts the builder handle from the BytesBuilder
+    /// locus, truncates fd to i32, and emits the call.
+    fn lower_recv_into_common(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        extern_name: &str,
+        diag_name: &str,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "{} takes 3 args (fd, buf, max_bytes), got {}",
+                diag_name,
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: fd must be Int, got {:?}",
+                diag_name, fd_ty
+            )));
+        }
+        // `buf` must be a BytesBuilder locus (see
+        // runtime/stdlib/bytes_builder.ap). The locus is passed
+        // by pointer; we GEP+load the internal `handle` field to
+        // recover the underlying lotus_str_builder_t pointer that
+        // the C primitive expects as `void *builder`. Rejecting
+        // a raw Bytes here is the load-bearing typecheck — it's
+        // why BytesBuilder was lifted out of the Bytes type
+        // (incompatible runtime ABIs; passing the wrong one
+        // silently misreads).
+        let (buf_val, buf_ty) = self.lower_expr(&args[1], scope)?;
+        let buf_handle = match &buf_ty {
+            CodegenTy::LocusRef(n) if n == "__StdBytesBytesBuilder" => {
+                let info = self
+                    .user_loci
+                    .get(n)
+                    .cloned()
+                    .expect("BytesBuilder locus declared in stdlib seed");
+                let (idx, field_ty) = info
+                    .fields
+                    .get("handle")
+                    .cloned()
+                    .expect("BytesBuilder has a `handle` param");
+                let buf_ptr = buf_val.into_pointer_value();
+                let field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        buf_ptr,
+                        idx,
+                        "bb.handle.ptr",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let llvm_ty = self.llvm_basic_type(&field_ty);
+                let handle_int = self
+                    .builder
+                    .build_load(llvm_ty, field_ptr, "bb.handle")
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                // `handle` is Int (i64) — see bytes_builder.ap. The
+                // C primitive expects a ptr; inttoptr at the call
+                // boundary.
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                let as_ptr = self
+                    .builder
+                    .build_int_to_ptr(
+                        handle_int.into_int_value(),
+                        ptr_t,
+                        "bb.handle.ptr.recv",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let v: BasicValueEnum<'ctx> = as_ptr.into();
+                v
+            }
+            _ => {
+                return Err(CodegenError::Unsupported(format!(
+                    "{}: buf must be std::bytes::BytesBuilder (constructed \
+                     via `std::bytes::BytesBuilder {{ initial_cap: ... }}`), \
+                     got {:?}",
+                    diag_name, buf_ty
+                )));
+            }
+        };
+        let (max_val, max_ty) = self.lower_expr(&args[2], scope)?;
+        if max_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "{}: max_bytes must be Int, got {:?}",
+                diag_name, max_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "recv_into.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function(extern_name)
+            .unwrap_or_else(|| panic!("{} declared", extern_name));
+        let call = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), buf_handle.into(), max_val.into()],
+                "recv_into.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let v = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((v, CodegenTy::Int))
+    }
+
     /// Phase 2g: lower `std::str::from_bytes(b: Bytes) -> String`.
     /// Allocates a (len+1)-byte buffer in the global payload arena,
     /// memcpys the Bytes body, NUL-terminates. Embedded NULs in the
@@ -25839,7 +26933,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::str::from_bytes: b must be Bytes, got {:?}",
                 b_ty
@@ -25849,6 +26943,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_from_bytes")
             .expect("lotus_str_from_bytes declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[b_val.into()], "str_from_bytes.ret")
@@ -25876,7 +26971,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bytes::from_string: s must be String, got {:?}",
                 s_ty
@@ -25886,6 +26981,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_from_str")
             .expect("lotus_bytes_from_str declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[s_val.into()], "bytes_from_str.ret")
@@ -25914,7 +27010,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             let hint = if matches!(b_ty, CodegenTy::String) {
                 " — use `std::bytes::from_string(s)` to convert"
             } else {
@@ -25964,7 +27060,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bytes::slice: b must be Bytes, got {:?} \
                  (use `std::bytes::from_string(s)` to convert from String)",
@@ -25989,6 +27085,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_slice")
             .expect("lotus_bytes_slice declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -26033,6 +27130,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_from_int")
             .expect("lotus_bytes_from_int declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[v_val.into()], "bytes_from_int.ret")
@@ -26063,14 +27161,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (a_val, a_ty) = self.lower_expr(&args[0], scope)?;
-        if a_ty != CodegenTy::Bytes {
+        if !matches!(a_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bytes::concat: a must be Bytes, got {:?}",
                 a_ty
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[1], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::bytes::concat: b must be Bytes, got {:?}",
                 b_ty
@@ -26080,6 +27178,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_concat")
             .expect("lotus_bytes_concat declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -26112,7 +27211,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::crypto::sha1: b must be Bytes, got {:?}",
                 b_ty
@@ -26151,7 +27250,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::crypto::sha256: b must be Bytes, got {:?}",
                 b_ty
@@ -26188,14 +27287,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (key_val, key_ty) = self.lower_expr(&args[0], scope)?;
-        if key_ty != CodegenTy::Bytes {
+        if !matches!(key_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::crypto::hmac_sha256: key must be Bytes, got {:?}",
                 key_ty
             )));
         }
         let (msg_val, msg_ty) = self.lower_expr(&args[1], scope)?;
-        if msg_ty != CodegenTy::Bytes {
+        if !matches!(msg_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::crypto::hmac_sha256: msg must be Bytes, got {:?}",
                 msg_ty
@@ -26236,7 +27335,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
-        if b_ty != CodegenTy::Bytes {
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::text::base64::encode: b must be Bytes, got {:?}",
                 b_ty
@@ -26275,7 +27374,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
-        if s_ty != CodegenTy::String {
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::text::base64::decode: s must be String, got {:?}",
                 s_ty
@@ -26375,7 +27474,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::list_dir_count: path must be String, got {:?}",
                 path_ty
@@ -26412,7 +27511,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let (path_val, path_ty) = self.lower_expr(&args[0], scope)?;
-        if path_ty != CodegenTy::String {
+        if !matches!(path_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "std::io::fs::list_dir_at: path must be String, got {:?}",
                 path_ty
@@ -26743,6 +27842,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // eager dissolve. Outermost instantiation owns it; nested
         // ones see false.
         let defer_for_let = std::mem::take(&mut self.defer_next_locus_dissolve);
+        // Phase-2 (2): parent locus is constructing us as a field
+        // default / override. Suppress eager dissolve — the parent
+        // owns us and cascades dissolve from its own dispatch.
+        // See `instantiating_for_parent_field` doc on the Codegen
+        // struct. Same mem::take discipline as defer_for_let: only
+        // the outermost instantiation in the expression takes it.
+        let parent_owns_via_field =
+            std::mem::take(&mut self.instantiating_for_parent_field);
         let info = self
             .user_loci
             .get(locus_name)
@@ -27598,26 +28705,97 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // arena ptr; arena_alloc's lookup prefers an override over
         // both `current_self` (the parent, here) and the program
         // global.
+        // F.29 follow-up: zero-init __locus_ref_owned_mask BEFORE
+        // the field-init loop, so the OR-sets that fire when a
+        // LocusRef-typed field is initialized via a locus literal
+        // aren't clobbered by a later zero-init pass. The cascade
+        // emitters read this mask at teardown; bits set here
+        // survive past the loop to flag parent-owned children.
+        {
+            let i64_t_zero = self.context.i64_type();
+            let zero_mask = i64_t_zero.const_int(0, false);
+            let lrom_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    info.locus_ref_owned_mask_field_idx,
+                    &format!(
+                        "{}.__locus_ref_owned_mask.ptr", locus_name
+                    ),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(lrom_ptr, zero_mask)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
         let prev_arena_override = self.current_arena_override;
         self.current_arena_override = Some(new_arena.into_pointer_value());
         for (fname, default) in info.defaults.iter() {
-            let (val, val_ty) = if let Some(expr) = overrides.get(fname.as_str())
-            {
-                self.lower_expr(expr, scope)?
-            } else {
-                match default {
-                    DefaultInit::Const(pv) => self.const_param(pv),
-                    DefaultInit::Expr(e) => self.lower_expr(e, scope)?,
-                    DefaultInit::Required => {
-                        return Err(CodegenError::Unsupported(format!(
-                            "locus `{}` instantiation: param `{}` is \
-                             required (no default) — supply it as \
-                             `{} {{ {}: ... }}`",
-                            locus_name, fname, locus_name, fname
-                        )));
+            // Phase-2 (2): set the parent-field flag so a locus
+            // literal evaluated for this field doesn't run its
+            // eager dissolve. The flag is taken on entry to
+            // lower_locus_instantiation, so nested child literals
+            // beyond this one (e.g. defaults that themselves
+            // construct loci that themselves construct loci) see
+            // false — only the immediate child gets parent-owned
+            // semantics. Other expression shapes ignore the flag.
+            // Cleared after each lower_expr so it doesn't leak
+            // past this field's evaluation.
+            //
+            // F.29 follow-up (2026-05-19): after lower_expr, the
+            // flag's state tells us whether this field's value-
+            // expr produced a parent-owned locus literal:
+            // - `lower_locus_instantiation` consumes the flag via
+            //   `mem::take` when it enters the `parent_owns_via_field`
+            //   branch (true → false). So `owned_via_literal` is
+            //   `!self.instantiating_for_parent_field` after
+            //   lower_expr returns.
+            // - Non-literal exprs (variable ref, const, conditional
+            //   without a literal in the value-producing branch)
+            //   leave the flag at true, so `owned_via_literal` is
+            //   false. Const/Required don't invoke lower_expr at
+            //   all and short-circuit to false. We use this signal
+            //   to OR-set the matching bit in
+            //   `__locus_ref_owned_mask` below, so the cascade
+            //   knows which children to tear down at this parent's
+            //   dissolve vs. leave alone (they're owned by an
+            //   outer scope).
+            let prev_field_flag = self.instantiating_for_parent_field;
+            self.instantiating_for_parent_field = true;
+            let (val, val_ty, owned_via_literal) =
+                if let Some(expr) = overrides.get(fname.as_str()) {
+                    let r = self.lower_expr(expr, scope)?;
+                    let owned = !self.instantiating_for_parent_field;
+                    self.instantiating_for_parent_field = prev_field_flag;
+                    (r.0, r.1, owned)
+                } else {
+                    match default {
+                        DefaultInit::Const(pv) => {
+                            self.instantiating_for_parent_field =
+                                prev_field_flag;
+                            let r = self.const_param(pv);
+                            (r.0, r.1, false)
+                        }
+                        DefaultInit::Expr(e) => {
+                            let r = self.lower_expr(e, scope)?;
+                            let owned = !self.instantiating_for_parent_field;
+                            self.instantiating_for_parent_field =
+                                prev_field_flag;
+                            (r.0, r.1, owned)
+                        }
+                        DefaultInit::Required => {
+                            self.instantiating_for_parent_field =
+                                prev_field_flag;
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` instantiation: param `{}` is \
+                                 required (no default) — supply it as \
+                                 `{} {{ {}: ... }}`",
+                                locus_name, fname, locus_name, fname
+                            )));
+                        }
                     }
-                }
-            };
+                };
             let (slot_idx, declared_ty) = info
                 .fields
                 .get(fname)
@@ -27661,6 +28839,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.builder
                 .build_store(field_ptr, val)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // F.29 follow-up: OR the bit for this field into
+            // `__locus_ref_owned_mask` if the field is LocusRef-
+            // typed AND the value came from a parent-owned locus
+            // literal. Externally-provided overrides leave the
+            // bit clear so the cascade skips them — closes the
+            // double-dissolve regression where the cascade
+            // tore down loci it didn't own.
+            if owned_via_literal {
+                if let Some(&bit_pos) =
+                    info.locus_ref_bit_per_field.get(fname.as_str())
+                {
+                    let i64_t_local = self.context.i64_type();
+                    let mask_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            info.struct_ty,
+                            self_ptr,
+                            info.locus_ref_owned_mask_field_idx,
+                            &format!(
+                                "{}.__locus_ref_owned_mask.set.ptr",
+                                locus_name
+                            ),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let prev_mask = self
+                        .builder
+                        .build_load(
+                            i64_t_local,
+                            mask_ptr,
+                            &format!(
+                                "{}.__locus_ref_owned_mask.prev",
+                                locus_name
+                            ),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let bit = i64_t_local.const_int(1u64 << bit_pos, false);
+                    let new_mask = self
+                        .builder
+                        .build_or(
+                            prev_mask,
+                            bit,
+                            &format!(
+                                "{}.__locus_ref_owned_mask.or",
+                                locus_name
+                            ),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(mask_ptr, new_mask)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+            }
         }
         self.current_arena_override = prev_arena_override;
 
@@ -27750,6 +28981,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // Bits get OR'd in below during slot init when a parent
         // has `as_parent_for ThisLocus` for one of this child's
         // slots.
+        //
+        // NOTE: this zero-init runs AFTER slot init (line ~28018);
+        // a borrow that ORs a bit during slot init would be
+        // clobbered here. In practice no currently-exercised path
+        // combines borrow with this ordering, but the v1 layout
+        // ordering should be revisited.
         let sbm_ptr = self
             .builder
             .build_struct_gep(
@@ -27762,6 +28999,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder
             .build_store(sbm_ptr, zero)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // F.29 follow-up: __locus_ref_owned_mask is zero-init'd
+        // earlier — see the matching block right before the
+        // field-init loop. The bits OR'd in by the field-init
+        // loop must survive past it; doing the zero-init here
+        // would clobber them.
 
         // v1.x-3: init the three synthetic recpool fields.
         //
@@ -28506,6 +29748,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
+        // F.27 v2 (2026-05-20): birth_check synthesis hook. Each
+        // `birth_check { COND } -> violate NAME;` clause is
+        // evaluated AFTER birth() body + birth-epoch closures, at
+        // the well-defined point where every field has its
+        // declared post-birth value. The violate routing
+        // (set __drain_requested, indirect-call parent.on_failure
+        // or panic) is emitted INLINE here — we do not use the
+        // standard Stmt::Violate path because that path's
+        // divergent-return would return from the CALLER's LLVM
+        // function (e.g., Parent.run), not from the conceptual
+        // "construction step." Absorbed violations should leave
+        // the caller running normally after the failing
+        // instantiation expression; we branch to a continuation
+        // block instead of returning. Unhandled violations
+        // (parent_on_failure == null) still call exit(1) per the
+        // existing F.27 contract — same panic-with-diagnostic as
+        // a regular violate.
+        let birth_check_decls: Vec<BirthCheckDecl> = self
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TopDecl::Locus(l) if l.name.name == locus_name => {
+                    Some(
+                        l.members
+                            .iter()
+                            .filter_map(|m| match m {
+                                LocusMember::BirthCheck(bc) => Some(bc.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        if !birth_check_decls.is_empty() {
+            // We need current_self set for `self.X` reads in the
+            // cond expressions to resolve against the newly-
+            // constructed locus.
+            let prev_self = self.current_self.clone();
+            self.current_self = Some(SelfCx {
+                locus_name: locus_name.to_string(),
+                struct_ty: info.struct_ty,
+                self_ptr,
+                fields: info.fields.clone(),
+            });
+            let mut scope = Scope::default();
+            for bc in &birth_check_decls {
+                self.emit_birth_check(&bc, self_ptr, &info, &locus_name, &mut scope)?;
+            }
+            self.current_self = prev_self;
+        }
         // m41: gate run() on __quarantined. If a parent's
         // on_failure called quarantine(self) during the birth-
         // closure check above, the flag is now set and we skip
@@ -28644,8 +29939,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let defer = is_long_lived
             || defer_for_let
             || returns_this_locus
-            || parent_accepts_us;
+            || parent_accepts_us
+            || parent_owns_via_field;
         if !defer {
+            // Phase-2 (3): cascade child-field drains depth-first
+            // BEFORE outer's drain, per spec/runtime.md "drain()
+            // cascades depth-first; children first, then self."
+            self.emit_locus_field_drains(&info, self_ptr, locus_name)?;
             // drain → __dissolve_closures → dissolve. Mirrors the
             // interpreter ordering in eval.rs::dissolve_locus:
             // drain body fires first, then dissolve-epoch closures
@@ -28690,6 +29990,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
             }
+            // Phase-2 (2): cascade dissolve for parent-owned child
+            // loci held as `LocusRef`-typed param fields. Runs
+            // AFTER outer's user dissolve body so the body can
+            // still legitimately read its inner fields.
+            self.emit_locus_field_dissolves(&info, self_ptr, locus_name)?;
             // Wholesale-free the locus's arena. Per spec/memory.md:
             // "When the locus dissolves, the region is freed
             // wholesale." Anything allocated for this locus —
@@ -28705,6 +30010,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // when the parent itself dissolves. Drain/dissolve
             // bodies don't fire on the child — v1 trade-off,
             // matches `returns_this_locus`.
+        } else if parent_owns_via_field {
+            // Phase-2 (2): parent locus is initializing this child
+            // as a field default. The parent's dissolve dispatch
+            // cascades into this child below (cascade-locus-field
+            // path); skip eager dissolve here. Without the cascade
+            // wired up the child's dissolve body never fires —
+            // ok for Phase 1 (no segfault) but leaks the malloc-
+            // backed buffer for shapes like BytesBuilder. Phase 2
+            // wires the cascade through the parent's arena_destroy
+            // ordering.
         } else if let Some(top) = self.deferred_dissolves.last_mut() {
             top.push((self_ptr, locus_name.to_string(), None));
         } else {
@@ -32688,7 +34003,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )
         })?;
         let (subj_val, subj_ty) = self.lower_expr(subject, scope)?;
-        if subj_ty != CodegenTy::String {
+        if !matches!(subj_ty, CodegenTy::String | CodegenTy::StringView) {
             return Err(CodegenError::Unsupported(format!(
                 "bus send subject must be String; got {:?}",
                 subj_ty
@@ -33584,6 +34899,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(raw.into_pointer_value())
     }
 
+    /// Phase-3 (2026-05-19): emit a `lotus_set_caller_arena(arena)`
+    /// call passing the current arena pointer. Stdlib primitives
+    /// that return heap values (Bytes / String) read this TLS to
+    /// allocate the return value in the caller's arena instead of
+    /// the leaky program-lifetime g_bus_payload_arena. Call this
+    /// IMMEDIATELY BEFORE emitting the primitive's call instruction.
+    fn emit_set_caller_arena(&mut self) -> Result<(), CodegenError> {
+        let arena = self.current_arena_ptr()?;
+        let set_fn = self
+            .module
+            .get_function("lotus_set_caller_arena")
+            .expect("lotus_set_caller_arena declared");
+        self.builder
+            .build_call(set_fn, &[arena.into()], "set_caller_arena")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
     /// The arena pointer to allocate from at the current builder
     /// position. See `arena_alloc` for the priority order.
     fn current_arena_ptr(
@@ -33720,6 +35053,549 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// dissolve flush at body exit. Safe to call after the
     /// dissolve method body has run; the arena is the LAST piece
     /// of the locus's state to go.
+    /// Phase-2 (2): cascade dissolve for parent-owned child loci
+    /// stored in `LocusRef`-typed param fields. Called right before
+    /// the outer locus's own `arena_destroy` (both in the ephemeral
+    /// dispatch and in `flush_dissolve_frame`). For each field whose
+    /// declared type is `LocusRef(<inner>)`, this loads the inner's
+    /// self_ptr from the field slot and emits the same `drain →
+    /// __dissolve_closures → dissolve → arena_destroy` sequence
+    /// the inner would run under ephemeral semantics. Without this
+    /// cascade, locus literals constructed as field defaults
+    /// (Phase-2 (2)'s motivating shape — `rx_buf: BytesBuilder =
+    /// std::bytes::BytesBuilder { ... };`) leak their malloc-backed
+    /// state at the outer's dissolve.
+    ///
+    /// Cascade ordering: outer's `field_drains → drain → closures →
+    /// dissolve` runs first, then this cascade fires per child's
+    /// `closures → dissolve → arena_destroy`, then outer's
+    /// arena_destroy. The choice matches "outer's user dissolve
+    /// body may still legitimately touch its inner field" — the
+    /// inner is alive through outer's dissolve body and only torn
+    /// down after. The child's drain step itself ran earlier via
+    /// `emit_locus_field_drains` so that drain cascades depth-first
+    /// per spec/runtime.md "drain() cascades depth-first; children
+    /// first, then self."
+    fn emit_locus_field_dissolves(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+    ) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        // Sort field iteration by index so ordering is deterministic
+        // (BTreeMap iter is sorted by key — name; we want index).
+        let mut field_entries: Vec<(String, u32, CodegenTy)> = info
+            .fields
+            .iter()
+            .map(|(n, (idx, ty))| (n.clone(), *idx, ty.clone()))
+            .collect();
+        field_entries.sort_by_key(|(_, idx, _)| *idx);
+        for (fname, field_idx, field_ty) in field_entries {
+            let inner_name = match field_ty {
+                CodegenTy::LocusRef(n) => n,
+                _ => continue,
+            };
+            let inner_info = match self.user_loci.get(&inner_name).cloned() {
+                Some(i) => i,
+                None => continue, // shouldn't happen for a typed field
+            };
+            // F.29 follow-up: ownership branch. Wrap the cascade
+            // body in an `if (__locus_ref_owned_mask >> bit) & 1`
+            // check so externally-provided fields (variable-ref
+            // overrides) skip the per-child teardown — they're
+            // owned by an outer scope and will tear themselves
+            // down at THEIR scope exit. Without the gate, the
+            // parent's cascade would dissolve the external and
+            // its real owner's later teardown would hit freed
+            // memory.
+            let (owned_then_bb, owned_after_bb) = self
+                .emit_locus_field_owned_branch(
+                    info, self_ptr, locus_name, &fname,
+                    "cascade.dissolve",
+                )?;
+            let after_bb = match (owned_then_bb, owned_after_bb) {
+                (Some(then_bb), Some(after_bb)) => {
+                    self.builder.position_at_end(then_bb);
+                    Some(after_bb)
+                }
+                _ => None,
+            };
+            // GEP the field slot, load the inner self_ptr.
+            let field_slot_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    field_idx,
+                    &format!("{}.{}.cascade.gep", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let inner_ptr = self
+                .builder
+                .build_load(
+                    ptr_t,
+                    field_slot_ptr,
+                    &format!("{}.{}.cascade.load", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_pointer_value();
+            // __dissolve_closures → dissolve → arena_destroy. The
+            // drain step ran earlier via `emit_locus_field_drains`
+            // (depth-first before outer's drain) so this teardown
+            // half can assume children have already drained.
+            if let Some(closures_fn) = inner_info.dissolve_closures_fn {
+                let (parent_self, handler_ptr) =
+                    self.resolve_failure_route(&inner_name);
+                self.builder
+                    .build_call(
+                        closures_fn,
+                        &[
+                            inner_ptr.into(),
+                            parent_self.into(),
+                            handler_ptr.into(),
+                        ],
+                        &format!("{}.cascade.closures", inner_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            }
+            if let Some(dissolve_fn) = inner_info.methods.get("dissolve") {
+                if !inner_info.empty_lifecycle.contains("dissolve") {
+                    self.builder
+                        .build_call(
+                            *dissolve_fn,
+                            &[inner_ptr.into()],
+                            &format!("{}.cascade.dissolve", inner_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+            }
+            // Inner's arena_destroy. Even when inner allocates
+            // nothing in its arena, the slot was created at birth
+            // and must be destroyed for symmetry.
+            self.emit_locus_arena_destroy(&inner_info, inner_ptr, &inner_name)?;
+            // Close the owned-branch (if one was emitted): jump to
+            // the after-bb and position the builder there so the
+            // next field's emission begins in the correct block.
+            if let Some(after_bb) = after_bb {
+                self.builder
+                    .build_unconditional_branch(after_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(after_bb);
+            }
+        }
+        Ok(())
+    }
+
+    /// F.29 follow-up: emit the `owned-bit gate` around a
+    /// per-field cascade body. Returns `(Some(then_bb), Some(after_bb))`
+    /// when the field is LocusRef-typed and the locus has a
+    /// non-empty ownership-mask layout — caller positions the
+    /// builder at `then_bb`, emits the cascade body, then must
+    /// branch to `after_bb` and position there at the end.
+    /// Returns `(None, None)` for non-LocusRef fields (caller
+    /// continues emission in-line as before). The cascade body
+    /// stays linear in that no-gate case.
+    fn emit_locus_field_owned_branch(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+        fname: &str,
+        tag: &str,
+    ) -> Result<
+        (
+            Option<inkwell::basic_block::BasicBlock<'ctx>>,
+            Option<inkwell::basic_block::BasicBlock<'ctx>>,
+        ),
+        CodegenError,
+    > {
+        let bit_pos = match info.locus_ref_bit_per_field.get(fname) {
+            Some(&b) => b,
+            None => return Ok((None, None)),
+        };
+        let func = self.current_fn.expect("current_fn set");
+        let then_bb = self
+            .context
+            .append_basic_block(func, &format!("{}.{}.owned.then", tag, fname));
+        let after_bb = self
+            .context
+            .append_basic_block(func, &format!("{}.{}.owned.after", tag, fname));
+        let i64_t_local = self.context.i64_type();
+        let mask_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.locus_ref_owned_mask_field_idx,
+                &format!(
+                    "{}.{}.{}.mask.ptr", locus_name, tag, fname
+                ),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let mask = self
+            .builder
+            .build_load(
+                i64_t_local,
+                mask_ptr,
+                &format!("{}.{}.{}.mask", locus_name, tag, fname),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let bit = i64_t_local.const_int(1u64 << bit_pos, false);
+        let anded = self
+            .builder
+            .build_and(
+                mask,
+                bit,
+                &format!("{}.{}.{}.anded", locus_name, tag, fname),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let owned = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                anded,
+                i64_t_local.const_zero(),
+                &format!("{}.{}.{}.owned", locus_name, tag, fname),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(owned, then_bb, after_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((Some(then_bb), Some(after_bb)))
+    }
+
+    /// Phase-2 (3) drain cascade. Per spec/runtime.md: "drain()
+    /// cascades depth-first; children first, then self." Walks
+    /// LocusRef-typed param fields in declaration order and calls
+    /// each child's drain method, expected to be invoked BEFORE
+    /// the outer locus's own drain at every cascade-teardown site.
+    /// The companion `emit_locus_field_dissolves` runs the second
+    /// half (closures → dissolve → arena_destroy) AFTER outer's
+    /// dissolve body.
+    fn emit_locus_field_drains(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+    ) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let mut field_entries: Vec<(String, u32, CodegenTy)> = info
+            .fields
+            .iter()
+            .map(|(n, (idx, ty))| (n.clone(), *idx, ty.clone()))
+            .collect();
+        field_entries.sort_by_key(|(_, idx, _)| *idx);
+        for (fname, field_idx, field_ty) in field_entries {
+            let inner_name = match field_ty {
+                CodegenTy::LocusRef(n) => n,
+                _ => continue,
+            };
+            let inner_info = match self.user_loci.get(&inner_name).cloned() {
+                Some(i) => i,
+                None => continue,
+            };
+            let drain_fn = match inner_info.methods.get("drain") {
+                Some(f) if !inner_info.empty_lifecycle.contains("drain") => *f,
+                _ => continue,
+            };
+            // F.29 follow-up: ownership branch (same gate as
+            // emit_locus_field_dissolves). Externally-provided
+            // fields skip the cascade — their real owner runs
+            // drain at THEIR scope exit.
+            let (owned_then_bb, owned_after_bb) = self
+                .emit_locus_field_owned_branch(
+                    info, self_ptr, locus_name, &fname,
+                    "cascade.drain",
+                )?;
+            let after_bb = match (owned_then_bb, owned_after_bb) {
+                (Some(then_bb), Some(after_bb)) => {
+                    self.builder.position_at_end(then_bb);
+                    Some(after_bb)
+                }
+                _ => None,
+            };
+            let field_slot_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    field_idx,
+                    &format!("{}.{}.drain.gep", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let inner_ptr = self
+                .builder
+                .build_load(
+                    ptr_t,
+                    field_slot_ptr,
+                    &format!("{}.{}.drain.load", locus_name, fname),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                .into_pointer_value();
+            self.builder
+                .build_call(
+                    drain_fn,
+                    &[inner_ptr.into()],
+                    &format!("{}.cascade.drain", inner_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            if let Some(after_bb) = after_bb {
+                self.builder
+                    .build_unconditional_branch(after_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(after_bb);
+            }
+        }
+        Ok(())
+    }
+
+    /// F.27 v2: emit one birth_check inline at the instantiation
+    /// site. Evaluates the cond expression; if true, routes
+    /// through the violate machinery (sets __drain_requested,
+    /// indirect-calls parent.on_failure, OR panics with diagnostic
+    /// when no handler), then BRANCHES to a continuation block
+    /// instead of returning from the caller's LLVM function —
+    /// which is the key difference from the regular Stmt::Violate
+    /// codegen. After this routine returns, the builder is
+    /// positioned at the "after this birth_check" block; a
+    /// subsequent birth_check can be emitted onto that. The
+    /// caller (e.g., Parent.run) keeps running normally after
+    /// the instantiation when a parent handler absorbs the
+    /// violation; the panic branch is the unabsorbed case and
+    /// terminates the process per F.27's contract.
+    ///
+    /// Pre: `current_self` must be set to the newly-constructed
+    /// locus so cond's `self.X` reads resolve against its
+    /// fields.
+    fn emit_birth_check(
+        &mut self,
+        bc: &BirthCheckDecl,
+        self_ptr: PointerValue<'ctx>,
+        info: &LocusInfo<'ctx>,
+        locus_name: &str,
+        scope: &mut Scope<'ctx>,
+    ) -> Result<(), CodegenError> {
+        // 1. Lower cond → i1.
+        let (cond_v, cond_ty) = self.lower_expr(&bc.cond, scope)?;
+        if cond_ty != CodegenTy::Bool {
+            return Err(CodegenError::Unsupported(format!(
+                "birth_check cond must be Bool, got {:?}",
+                cond_ty
+            )));
+        }
+        let func = self.current_fn.expect("current_fn set");
+        let route_bb = self
+            .context
+            .append_basic_block(func, "bcheck.route");
+        let after_bb = self
+            .context
+            .append_basic_block(func, "bcheck.after");
+        self.builder
+            .build_conditional_branch(
+                cond_v.into_int_value(),
+                route_bb,
+                after_bb,
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // 2. route_bb: violate machinery — copy of Stmt::Violate's
+        // body (lines ~17065+), trimmed to the routing + ALWAYS
+        // branching to after_bb at the end (instead of returning).
+        self.builder.position_at_end(route_bb);
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let void_t = self.context.void_type();
+
+        // Set __drain_requested = 1.
+        let one = i64_t.const_int(1, false);
+        let dr_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.drain_requested_field_idx,
+                "bcheck.dr.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(dr_ptr, one)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // Read parent_self + parent_on_failure from the locus
+        // struct (set at instantiation via resolve_failure_route).
+        let ps_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.parent_self_field_idx,
+                "bcheck.parent_self.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let parent_self = self
+            .builder
+            .build_load(ptr_t, ps_ptr, "bcheck.parent_self")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let poh_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.parent_on_failure_field_idx,
+                "bcheck.parent_on_failure.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let parent_on_failure = self
+            .builder
+            .build_load(ptr_t, poh_ptr, "bcheck.parent_on_failure")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+
+        // Allocate + fill ClosureViolation.
+        let viol_info = self
+            .user_types
+            .get("ClosureViolation")
+            .cloned()
+            .expect("ClosureViolation declared at startup");
+        let size = viol_info
+            .struct_ty
+            .size_of()
+            .expect("violation struct has known size");
+        let viol_ptr = self.arena_alloc(size, "bcheck.viol.alloc")?;
+        let locus_str = self.global_string(locus_name);
+        let closure_str = self.global_string(&bc.closure_name.name);
+        let f0 = self
+            .builder
+            .build_struct_gep(
+                viol_info.struct_ty,
+                viol_ptr,
+                0,
+                "bcheck.viol.locus.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(f0, locus_str)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f1 = self
+            .builder
+            .build_struct_gep(
+                viol_info.struct_ty,
+                viol_ptr,
+                1,
+                "bcheck.viol.closure.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(f1, closure_str)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f2 = self
+            .builder
+            .build_struct_gep(
+                viol_info.struct_ty,
+                viol_ptr,
+                2,
+                "bcheck.viol.diff.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(f2, i64_t.const_zero())
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // Branch on parent_on_failure null.
+        let route_then = self
+            .context
+            .append_basic_block(func, "bcheck.handler");
+        let route_bare = self
+            .context
+            .append_basic_block(func, "bcheck.bare");
+        let null_check = self
+            .builder
+            .build_is_not_null(parent_on_failure, "bcheck.has.handler")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(null_check, route_then, route_bare)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // route_then: indirect-call parent.on_failure(parent_self,
+        // self_ptr, viol_ptr), then branch to after_bb.
+        self.builder.position_at_end(route_then);
+        let handler_callee_ty = void_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.builder
+            .build_indirect_call(
+                handler_callee_ty,
+                parent_on_failure,
+                &[
+                    parent_self.into(),
+                    self_ptr.into(),
+                    viol_ptr.into(),
+                ],
+                "bcheck.on_failure.call",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unconditional_branch(after_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // route_bare: dprintf + exit(1) — unabsorbed violation.
+        self.builder.position_at_end(route_bare);
+        let fflush_fn = self
+            .module
+            .get_function("fflush")
+            .expect("fflush declared");
+        self.builder
+            .build_call(
+                fflush_fn,
+                &[ptr_t.const_null().into()],
+                "bcheck.fflush",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let fmt = self.global_string(
+            "runtime error: ClosureViolation: locus `%s` closure `%s` (birth_check, no parent handler)\n",
+        );
+        let dprintf_fn = self
+            .module
+            .get_function("dprintf")
+            .expect("dprintf declared");
+        self.builder
+            .build_call(
+                dprintf_fn,
+                &[
+                    i32_t.const_int(2, false).into(),
+                    fmt.into(),
+                    locus_str.into(),
+                    closure_str.into(),
+                ],
+                "bcheck.dprintf",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let exit_fn = self
+            .module
+            .get_function("exit")
+            .expect("exit declared");
+        self.builder
+            .build_call(
+                exit_fn,
+                &[i32_t.const_int(1, false).into()],
+                "bcheck.exit",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // 3. Position at after_bb so subsequent birth_check
+        // clauses (and the rest of instantiation) emit there.
+        self.builder.position_at_end(after_bb);
+        Ok(())
+    }
+
     fn emit_locus_arena_destroy(
         &mut self,
         info: &LocusInfo<'ctx>,

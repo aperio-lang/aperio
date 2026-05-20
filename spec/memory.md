@@ -663,6 +663,114 @@ m20 deliberately keeps free fns + main on the program-wide arena
 class — chunked-class per-coordinatee sub-regions land in m22,
 the recognition-class fixed pool in m23.
 
+**Phase-3 hard byte-cap on `g_bus_payload_arena` (2026-05-19;
+safety net).** The arena now refuses to grow past
+`LOTUS_BUS_PAYLOAD_ARENA_CAP` (default 64 MiB, env-overridable
+for capacity-planning experiments). When the cap fires
+`lotus_arena_alloc` returns NULL; one diagnostic line goes to
+stderr identifying the cap event and the arena's name; subsequent
+allocations against the capped arena keep returning NULL.
+Existing callers — BytesBuilder `snapshot()` / `finish()` via the
+alloc-fail sentinel + violate routing, recv_bytes returning
+empty Bytes, `lotus_bytes_create` returning NULL through
+`empty_global` — already surface NULL as degraded service, so the
+cap converts a slow OOM into structural failure that surfaces
+through the F.27 channel. This is the floor for a long-running
+program leaking into the payload arena, not the fix; the fix is
+per-subscriber arena routing for m70 + `__caller_arena` threading
+for the stdlib primitives that land here.
+
+**Phase-3 Task 11 intra-process bus per-subscriber routing
+(2026-05-20).** Extends Task 9's per-sub arena pattern to the
+intra-process `<-` path. Previously `lotus_bus_dispatch` enqueued
+the publisher's struct bytes verbatim into each subscriber's
+queue cell — payload String / Bytes pointers stayed aliased to
+the publisher's locus arena. For long-running publishers (mdgw
+normalizer class) that meant an unbounded leak in the publisher's
+locus arena (the per-arena cap from Task 10 doesn't apply to
+locus-owned arenas), bounded only by the publisher's eventual
+dissolve — which for a daemon's root locus never happens.
+
+The fix: when the codegen has synthesized a wire codec for the
+payload type (the common case — every `<-` payload type gets
+one), the dispatcher serializes the publisher's struct to wire
+bytes once, then routes through `lotus_bus_dispatch_wire`. The
+wire path's per-subscriber TLS routing rebuilds the struct in
+each subscriber's own `__arena`; payload pointers end up bounded
+by the subscriber's lifecycle. Cost: one serialize + N
+deserializes per publish (N = matching subscribers). For
+cooperative-only programs with no remote subs, the
+previously-skipped serialize work is now paid on every publish.
+For programs with both local and remote subs, the serialize cost
+is amortized (same wire_buf feeds both).
+
+A payload-typeless subject (no codegen-synthesized wire codec —
+the `serialize_fn` arg is NULL) falls back to the legacy
+verbatim enqueue, preserving the pre-Task-11 v1 behavior. This
+escape hatch is intentional: it lets a hot-path subject opt out
+of the round-trip cost when the publisher controls all
+subscribers and can guarantee the payload's pointer-aliasing
+discipline.
+
+**Phase-3 Task 9 m70 per-subscriber arena routing (2026-05-20).**
+`lotus_bus_dispatch_wire` no longer parks deserialized String /
+Bytes pointers in the program-lifetime g_bus_payload_arena.
+Instead it iterates the matching subscribers, sets the TLS
+caller-arena (Task 8 indirection) to each subscriber's own
+`__arena` (via the m20 fixed-offset slot-0 GEP), and deserializes
+the wire bytes per-subscriber into that arena. The payload
+pointers in the enqueued struct_buf now alias the subscriber's
+own arena, bounded by the subscriber's lifecycle — no
+program-lifetime deposit, no eventual OOM.
+
+Cost: deserialize is invoked once per matching subscriber rather
+than once total. Acceptable for typical fan-out (1–3 subs per
+subject); high-fan-out subjects pay a real bill that could be
+optimized via deserialize-once-then-clone-per-sub if a workload
+demands it.
+
+Closes the original Phase-2 (4) investigation's finding ("not
+reclaimable under current semantics"): the answer was never to
+reclaim the global arena but to skip it entirely — the m20 spec
+("each subscriber's arena outlives the payload pointer") now
+holds by construction because the deserialize-time allocator IS
+the subscriber's arena.
+
+**Phase-2 (4) `g_bus_payload_arena` reclaim investigation
+(2026-05-19; superseded by Phase-3 Task 9).**
+The handoff posed: "should `lotus_bus_dispatch_wire`'s
+`g_bus_payload_arena` deposit reclaim per dispatch since m20
+memcpy's into subscriber arena anyway?" The answer is no, and
+the reason exposes a load-bearing constraint.
+
+m20's `memcpy(copy, payload, size)` is a flat struct copy: the
+publisher's payload bytes (size = compile-time-known struct size)
+land in the subscriber's arena. The struct's String / Bytes /
+TypeRef fields are POINTERS inside that struct; the memcpy copies
+the pointers, not the pointed-to bytes. For cross-process wire
+dispatch (`lotus_bus_dispatch_wire` → deserialize → struct_buf →
+`lotus_bus_local_dispatch`), the deserialized String / Bytes data
+lives in `g_bus_payload_arena`. After m20's struct memcpy, the
+subscriber's copy still aliases that arena.
+
+Handler-side assignment (`self.foo = payload.string_field`) is a
+pointer store — `lotus_str_clone` is invoked only at *free-fn
+return* boundaries, not at struct-field assignment. So if the
+handler retains payload fields on its own struct, the retention
+extends the `g_bus_payload_arena` deposit's lifetime to the
+subscriber's entire lifetime. Reclaiming per dispatch would dangle
+the subscriber's retained pointers.
+
+Enabling per-dispatch reclaim requires changing handler-side
+String / Bytes assignment to clone-on-store from payload, OR
+introducing a per-dispatch arena that's reset only after every
+subscriber's handler has run — neither is a small change. For
+v1 the arena grows unbounded for high-message-rate cross-process
+subscribers; bounding it is forward work, not a follow-up to F.28
+/ F.29 / F.27. Documented here so the next surface that asks
+"can we reclaim per dispatch?" finds the previously-investigated
+answer.
+
 **m49 closes the free-fn gap.** Every non-main free fn takes
 an implicit `__caller_arena: ptr` first param at the LLVM ABI.
 `main` keeps the program-wide `arena.global` it always had —

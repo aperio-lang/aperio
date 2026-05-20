@@ -2150,6 +2150,433 @@ declarative instead of folded into a free-form `Error` payload.
 - `crates/aperio-runtime/` — interpreter parity for the new
   statement and assertion-less closures.
 
+### F.28 BytesBuilder is a locus, not a primitive type (2026-05-19)
+
+**Commitment.** The bytes-accumulator surface
+(`std::bytes::builder_*`) is no longer a family of free
+functions over an opaque `Bytes` handle. It's now a stdlib
+locus, `std::bytes::BytesBuilder`, with method dispatch
+(`b.append`, `b.len`, `b.snapshot`, `b.shift_front`, `b.clear`,
+`b.finish`) and lifecycle (birth allocates the underlying
+malloc-backed buffer; dissolve frees it at scope exit). The
+prior free-fn surface is removed; the C primitives stay as
+the locus's method-body externs.
+
+**The bug being closed.** The builder header
+(`lotus_str_builder_t { cap, len, buf* }` — a separately-
+malloc'd buffer behind an internal pointer) and a `Bytes` blob
+(`[i64 len][u8 data]` — single contiguous allocation) are
+genuinely incompatible ABIs that cannot be unified without
+giving up stable handles (the body has to be relocatable; the
+Bytes blob layout forbids that). The original surface returned
+a builder as `Bytes` — the only Aperio type wide enough to
+carry a pointer — under the convention "you should treat it as
+opaque." When that convention slipped (a builder passed to
+`std::bytes::at(b, i)` reading the cap field as the length),
+the runtime silently misread and ran off the heap. Fathom hit
+this with RSS exploding 2.6 GB in 5 seconds. The mechanical
+fix is to make builder and Bytes statically distinct.
+
+**Why a locus, not a parallel primitive type.** Aperio's
+foundational axiom says types are pure data (no flow); loci
+are flow with invariants. The bytes builder is textbook flow
+— allocate → append (auto-grow) → snapshot → free — with
+invariants (`cap >= len`, `buf` is a valid malloc region,
+`len` is the count of valid bytes). It belongs on a locus.
+Introducing it as a primitive type would have closed the
+typecheck footgun, but would also have added a magic
+non-locus thing with lifecycle to the language — a special
+case that contradicts I4 (every named structural thing is in
+exactly one locus tower). The locus shape is the principled
+answer; the type-discrimination win is a free byproduct.
+
+**What the user sees.**
+
+```aperio
+fn pump_frames(sock: Int) {
+    let buf = std::bytes::BytesBuilder { initial_cap: 4096 };
+    loop {
+        let n = std::io::tcp::recv_into(sock, buf, 4096);
+        if n <= 0 { break; }
+        // ... peel via buf.len() / buf.shift_front(consumed)
+    }
+    // buf dissolves here → malloc freed, no explicit cleanup
+}
+```
+
+The typechecker rejects `std::bytes::at(buf, 0)` inside that
+loop — `at` takes `Bytes`, `buf` is a `__StdBytesBytesBuilder`
+locus reference. Same for `len(buf)`, `slice(buf, ...)`,
+anywhere a `Bytes` is expected. The discipline is mechanical.
+
+**Discarded alternatives.**
+
+- *Keep the free-fn surface and add a runtime tag bit to
+  `lotus_bytes_*` for transparent dispatch on builder
+  handles.* Rejected: every `Bytes` access pays a branch
+  forever, and the static type still doesn't distinguish the
+  two — readers have to consult runtime tags. Worse for
+  correctness *and* worse for perf.
+- *Keep the free-fn surface and add a parallel
+  `lotus_bytes_builder_*` accessor family that consumers must
+  use deliberately.* Rejected: discipline-only enforcement;
+  same class of footgun every time a new author touches the
+  code. The whole point is mechanical safety.
+- *Make `BytesBuilder` a parametric type, not a locus.*
+  Rejected per the foundational axiom — flow doesn't live on
+  types.
+
+**Failure routing (F.27).** `append()` routes realloc-NULL
+failure through `violate alloc_failed`. The locus declares
+`closure alloc_failed { captures: initial_cap; epoch inline; }`;
+`append` checks the C primitive's status return (now `int64_t`
+where it was `void` pre-2026-05-19; 1=ok, 0=fail), and routes
+through `violate` on 0. Owners of the BytesBuilder bind an
+`on_failure` policy to handle the violation (restart / drain
+/ bubble); an unhandled violation bubbles past `main` and
+exits the process non-zero with the captured payload on
+stderr.
+
+**F.27 v2 (2026-05-20): `birth_check` synthesis hook.** A
+declarative invariant check that runs AFTER the locus's birth()
+body completes (and after birth-epoch closures fire), at the
+well-defined point where every field has its declared
+post-birth value:
+
+    locus L {
+        params { x: Int = 0; }
+        closure invariant_broken { captures: x; epoch inline; }
+        birth() { /* set up state */ }
+        birth_check { self.x < 0 } -> violate invariant_broken;
+    }
+
+If the boolean cond evaluates to true, the named closure
+violates with the locus's fully-constructed state. Multiple
+birth_check clauses on a locus evaluate in declaration order;
+the first to fire short-circuits the rest (subsequent checks
+sit in unreachable basic blocks after the violate's
+terminator).
+
+Why a synthesis hook and not just `violate` inside birth(): the
+v1 form (2026-05-19) lifted the codegen restriction on
+`violate` in lifecycle bodies, but `violate alloc_failed` fired
+mid-birth leaves the locus PARTIALLY CONSTRUCTED — some fields
+set, others at defaults — when the on_failure handler reads
+the closure's captures. For BytesBuilder that worked by luck
+(only `initial_cap` is captured, and it's set before birth
+runs), but for any locus with multi-step birth and field
+inter-dependencies the partial-construction case produces
+undefined intermediate state in the violation payload. The
+birth_check form sidesteps this: the body runs to completion,
+the check fires at a well-defined point, the violation's
+captures read coherent state.
+
+Codegen. `emit_birth_check` (see `crates/aperio-codegen/src/codegen.rs`)
+emits the cond + violate routing INLINE at the instantiation
+site — NOT through the standard Stmt::Violate codegen. Standard
+violate's divergent return targets the CALLER's LLVM function
+(e.g. Parent.run), which is wrong for birth_check: an absorbed
+violation should let the caller keep running after the failing
+instantiation expression, not return from the caller's whole
+fn body. The inline emission writes `__drain_requested = 1`,
+allocates the ClosureViolation, branches on parent_on_failure
+(indirect-call vs dprintf+exit), then unconditionally branches
+to a continuation block so the caller proceeds normally.
+
+BytesBuilder migrated. `std::bytes::BytesBuilder` now uses the
+birth_check form for the null-handle case
+(`birth_check { self.handle == 0 } -> violate alloc_failed`),
+replacing the earlier inline `if self.handle == 0 { violate
+alloc_failed; }` in birth body.
+
+**F.27 extension (2026-05-19, superseded by F.27 v2): `violate`
+in lifecycle bodies.** The codegen restriction on `violate` was
+lifted for lifecycle blocks (birth / drain / dissolve / accept
+/ run); they now participate in the same divergent-return +
+parent-on_failure routing as regular method bodies. The
+original spec rationale ("only fn-bodies can violate") was an
+implementation simplification, not a structural requirement —
+lifecycle bodies are void-returning fn contexts at the codegen
+level, and the violate machinery's `build_return(None)` path
+handles them identically once `current_user_fn_ret` is set to
+`Some(None)` at lifecycle entry. Both forms remain supported in
+v1.x; new locus designs should prefer the birth_check synthesis
+hook for construction-time invariants (the partial-
+construction hazard described above). The accepted-child
+dissolve trade-off (`parent_accepts_us` skips dissolve bodies
+entirely) is unchanged; dissolve violate is observable only
+along the F.29 locus-field cascade path where
+`emit_locus_field_dissolves` does fire the inner's dissolve.
+
+**Caveats at v1.**
+
+- `snapshot()` / `finish()` payload-arena alloc failures route
+  through `violate alloc_failed` per the snapshot/finish
+  follow-up (2026-05-19). The C primitives use a dedicated
+  alloc-fail sentinel pointer on every failure path; the locus
+  method body discriminates via `std::bytes::__is_alloc_fail`
+  before returning. The previous "empty-on-success aliases
+  empty-on-fail" hazard is closed.
+
+**Implementation entry points.**
+
+- `crates/aperio-codegen/runtime/stdlib/bytes_builder.ap` —
+  the locus definition (params, birth, dissolve, methods).
+- `crates/aperio-codegen/src/codegen.rs` —
+  `STDLIB_PATH_RENAMES` rewrites `std::bytes::BytesBuilder` →
+  `__StdBytesBytesBuilder`; the C-primitive bridges live
+  behind `std::bytes::builder::__*` paths; `recv_into` family
+  extracts the locus's internal `handle` field via
+  struct-GEP + load + inttoptr at the C-call boundary.
+- `crates/aperio-codegen/runtime/lotus_arena.c` —
+  `lotus_bytes_builder_new` takes `int64_t initial_cap` (was
+  zero-arg); other primitives unchanged.
+- `crates/aperio-runtime/src/builtins.rs` — interpreter
+  parity moved to the `std::bytes::builder::__*` dispatch
+  paths; the `__new` impl accepts the new `initial_cap` arg
+  (currently ignored since the interpreter's `Vec` backing
+  auto-grows).
+
+**Phase-2 (1): zero-copy `view()` (2026-05-19).** Added
+`b.view() -> Bytes` returning a non-owning Bytes pointer that
+aliases the builder's buffer. Pond/websocket's recv loop had a
+residual leak after Phase 1 — `rx_buf.snapshot()` per peel
+attempt to materialize a Bytes value for `parse_frame` to read
+via `std::bytes::at` / `len`. `view()` is the same value without
+the allocation.
+
+**Memory layout (changed).** Prior layout was
+`{cap, len, buf*}` with the data area separately malloc'd.
+Reshaped to `{cap, buf}` where `buf` points at the data area
+of a single `[i64 len][u8 data[cap]]` malloc'd region — the
+8-byte length prefix lives inline immediately before the data.
+`view()` returns `buf - 8`, which IS a valid Bytes pointer:
+`lotus_bytes_len` / `lotus_bytes_at` / `lotus_bytes_data` all
+just work. Every mutation (`append`, `shift_front`, `clear`,
+`finish`) updates the inline prefix to match. The cost is one
+extra pointer dereference per len access (negligible at our
+scale); the win is true zero-copy view + zero-allocation peel.
+
+**Lifetime contract.** A `view()` Bytes is valid until the
+next mutation on the source builder. The aliasing property
+means a captured view sees stale len if the builder grew /
+shrank after capture, and a view captured after a mutation
+sees the new state. At v1 (no borrow checker) this is
+documented-and-trusted — same shape as the rest of Aperio's
+lifetime story. The canonical pattern is "view immediately,
+read immediately, don't store across mutations." The
+`snapshot()` path remains for cases that need a stable
+Bytes (consumer holds across producer mutations).
+
+This obviates Phase-2 ask (3a) — proposed `b.at(i)` /
+`b.slice(lo, hi)` methods on BytesBuilder. With `view()`,
+the existing `std::bytes::at(b.view(), i)` /
+`std::bytes::slice(b.view(), lo, hi)` work directly, no new
+method dispatch needed. The BytesBuilder surface stays
+minimal.
+
+Tests: `crates/aperio-codegen/tests/bytes_builder_view.rs` —
+5 cases covering current-contents read, aliasing across
+appends, slice composition, shift_front reflection, and
+clear-then-view.
+
+### F.29 Locus-typed param fields with lifecycle cascade (Phase-2 (2), 2026-05-19)
+
+**Commitment.** A locus's `params` block may declare a field
+whose type is another locus (user-defined or stdlib).
+Construction defaults via a locus literal:
+
+```aperio
+locus WsClient {
+    params {
+        sock: Int = -1;
+        rx_buf:   std::bytes::BytesBuilder
+                = std::bytes::BytesBuilder { initial_cap: 4096 };
+        last_msg: std::bytes::BytesBuilder
+                = std::bytes::BytesBuilder { initial_cap: 4096 };
+    }
+    fn run() {
+        // self.rx_buf is the held builder; method dispatch
+        // works through self.<field>.<method>(...) — same
+        // shape as any other locus field.
+    }
+}
+```
+
+The owning locus's lifecycle cascades into the child:
+- **Birth.** Default-init evaluates the child literal,
+  including running the child's `birth()` body. The child's
+  state lives past the construction expression — pre-2026-05-19,
+  the child dissolved eagerly at the end of its literal, leaving
+  the parent's slot dangling. The fix routes child instantiation
+  through a `parent_owns_via_field` path analogous to the
+  existing `parent_accepts_us` path.
+- **Dissolve.** The parent's dissolve dispatch fires the child's
+  full `drain → __dissolve_closures → dissolve → arena_destroy`
+  sequence per `LocusRef`-typed field, in field-declaration order,
+  **after** the parent's user dissolve body and **before** the
+  parent's `arena_destroy`. The "user body first" ordering means
+  the parent's dissolve body can still legitimately touch its
+  child fields. Mirrors the depth-first cascade discipline of
+  F.4 (drain) and F.9 (collapse vs explosion).
+
+**Motivation.** Fathom's Phase-2 ask (2) — "in-place storage for
+locus Bytes/String fields" — is what this commitment closes.
+Producer locus owns the storage (a `BytesBuilder` field, in
+practice); consumer reads zero-copy via the contract using
+`b.view()` (F.28 Phase-2 (1)); each frame the buffer is reused
+in place via `b.clear()` + `b.append(...)`. No per-message
+allocation against `g_bus_payload_arena`. The "vertical
+contract / DMA" idiom Aperio's F.14 design was reaching for.
+
+Equally important: this works for non-stdlib loci too. Any
+user-defined service locus can compose held sub-loci via param
+fields with cascade — `Cache`, `RetryPolicy`, `RateLimiter`,
+whatever the application carves up. The locus axiom (everything
+named and structural is a locus) gets a working composition
+story.
+
+**Discarded alternatives.**
+
+- *Field annotation `@inplace` on Bytes/String fields.*
+  Considered (one of three options in fathom's handoff). Rejected
+  because the underlying need is "a locus owns growing buffer
+  storage with its own lifecycle" — that's a locus, not an
+  annotation on a primitive. Plus annotations don't compose with
+  the rest of the locus story (no `@inplace BytesBuilder`).
+- *Storage-class heuristic.* Considered (option two). Rejected
+  for the same reason — silent magic where explicit composition
+  is available.
+- *Contract-side `expose ... @reuse`.* Considered (option three).
+  Rejected: the field-owner-vs-consumer split is real, but it's
+  cleanly modeled by the producer holding a `BytesBuilder` field
+  and the consumer reading through `b.view()` over F.14 — no new
+  contract annotation needed.
+
+**Caveats at v1.**
+
+- **Cascade only fires when parent dissolves through one of the
+  tracked paths** — the ephemeral dispatch in
+  `lower_locus_instantiation` or the `flush_dissolve_frame`
+  deferred path. Both cover normal control flow (statement
+  literals, let-binding scope exits, fn returns). Pinned and
+  `parent_accepts_us` paths inherit the existing "v1 trade-off:
+  child's dissolve body skipped" behavior; the new cascade
+  doesn't extend to those edges yet (matches the comment on
+  line 29183).
+- **Diamond / cycle composition is undefined.** A locus that
+  appears in two field slots of the same parent dissolves
+  twice. The locus literal model already forbids reuse (each
+  `Locus { }` evaluates to a fresh instance), so diamond shapes
+  are rare in practice; document-and-trust at v1.
+- **No depth-first drain cascade yet.** Drain still runs only
+  on the outer; inner field drains are not invoked separately.
+  Adding them is straightforward (mirror the dissolve cascade
+  in the drain phase) and warranted when a held sub-locus
+  declares its own drain — none of the stdlib loci do today.
+
+**Implementation entry points.**
+
+- `crates/aperio-codegen/src/codegen.rs`:
+  - `Codegen.instantiating_for_parent_field: bool` — flag set
+    by the param-init loop before each `lower_expr` call.
+  - `lower_locus_instantiation` consumes the flag via
+    `mem::take` and adds `parent_owns_via_field` to the
+    `defer` set; the dispatch branch suppresses eager
+    dissolve at the child's instantiation site.
+  - `emit_locus_field_dissolves` — new helper that iterates
+    `LocusRef`-typed param fields in declaration order,
+    loading each child pointer and running its
+    drain/closures/dissolve/arena_destroy sequence.
+  - Called from both the ephemeral dispatch in
+    `lower_locus_instantiation` and the deferred-flush path
+    in `flush_dissolve_frame_kind`.
+
+Tests: `crates/aperio-codegen/tests/locus_field_cascade.rs` —
+3 cases: method dispatch through a field-held `BytesBuilder`,
+ordering of the cascade (outer body → inner cascade → outer
+arena_destroy), and a 100k-iteration construct-destroy loop
+exercising the cascade path under load.
+
+### F.30 BytesView — non-owning view as a distinct type (2026-05-20)
+
+The Phase-2 `view()` / Phase-3 `text_view()` machinery hands back
+a non-owning pointer that's layout-compatible with `Bytes`. The
+ergonomic win is real (`std::bytes::at`, `len`, `slice` all just
+work) but the type system can't distinguish a fresh arena-owned
+`Bytes` blob from a non-owning view whose validity ends at the
+next mutation on the source builder. Fungible call sites,
+divergent lifetimes; a footgun symmetric to the pre-F.28
+"passing a builder where `Bytes` was expected" hazard the locus
+lift closed.
+
+**Design move:** introduce `BytesView` as a distinct type. It
+aliases `Bytes` at runtime (same `[i64 len][u8 data]` pointer
+shape, zero allocation) but carries different intent at
+typecheck:
+
+- `BytesBuilder.view() -> BytesView` (was `Bytes`).
+- `BytesBuilder.text_view() -> StringView` (was `String`) —
+  symmetric companion for the C-string-shaped case.
+- A `BytesView` coerces implicitly to `Bytes` ONLY at function-
+  argument positions where the parameter is declared `Bytes` —
+  i.e. read-only use sites (`std::bytes::at(v, i)`, `len(v)`,
+  pattern-matching, etc.). The coercion is a no-op at runtime
+  (same pointer) but the typechecker emits it as an explicit
+  cast so the read-vs-store axis is visible.
+- A `BytesView` does NOT coerce to `Bytes` at storage sites: a
+  field declared `bytes: Bytes` or a `let x: Bytes = …`
+  rejects a `BytesView` value. Callers wanting owned storage
+  must call `.clone_to_bytes()` explicitly, which deep-copies
+  into the caller's arena (via Task 8's TLS-routed allocator).
+- `BytesView` IS allowed at storage sites whose declared type
+  is `BytesView`. Fathom's pond/websocket pattern — storing a
+  view in `self.last_message.bytes` with a documented
+  "deferred clear" invariant — remains expressible; the type
+  signature now declares the lifetime intent, and any
+  maintainer reading the struct knows the field is non-owning.
+
+**What this catches:**
+
+- Accidental fungibility — a function whose param is declared
+  `Bytes` (signaling "you can keep this") now rejects a
+  `BytesView` value at the call site; the caller must
+  explicitly `clone_to_bytes()` to opt into the deep copy.
+- Field declarations carry lifetime intent. A struct with
+  `bytes: BytesView` is self-documenting about the non-owning
+  semantic; the type-vs-`Bytes` distinction is visible at
+  every read site of the struct.
+
+**What this DOES NOT catch (deferred to F.30b):**
+
+- Mutation of the source builder while a `BytesView` from it
+  is still observable. The "future maintainer adds
+  `frag_buf.append(...)` between `frag_buf.text_view()` and
+  the consumer's read" hazard requires either a borrow
+  checker (compile-time lifetime tracking) or a runtime
+  epoch guard (BytesBuilder bumps a `mutation_epoch` on
+  every mutating op; BytesView captures the epoch at
+  construction; reads through BytesView check the epoch
+  matches). The runtime guard is the cheaper v1.x partial fix
+  (~half day); the borrow checker is v2 territory.
+
+**Why distinct-type ships before the lifetime enforcement:**
+The Design lens (form-before-content): a distinct type is a
+SYNTAX-LEVEL commitment the rest of the system rests on. A
+runtime epoch guard works regardless of whether the type is
+distinct; a borrow checker is most useful when the type carries
+the lifetime annotation. Both lifetime-enforcement options sit
+ABOVE this depth. Settling the type first means whichever
+enforcement we ship later integrates without re-shaping the
+surface.
+
+**Codegen.** `BytesView` (and `StringView`) compile to the same
+LLVM pointer type as `Bytes` / `String`. The implicit
+read-site coercion is a typecheck-only no-op; the codegen path
+treats both types identically when emitting reads. The
+`.clone_to_bytes()` method lowers to `lotus_bytes_clone(caller_arena,
+src)` (analogous to the existing `lotus_str_clone`).
+
 ## 16. What's deferred
 
 The grammar in v0 does **not** specify:
@@ -2173,7 +2600,6 @@ The grammar in v0 does **not** specify:
   more sophisticated pattern logic awaits a future version.
 - **First-class modules.** `module IDENTIFIER { ... }` is in the
   grammar but module loading semantics are not specified.
-
 Each of these is a known extension point. Closing them off in v0
 keeps the spec tractable; opening them later is a non-breaking
 addition.

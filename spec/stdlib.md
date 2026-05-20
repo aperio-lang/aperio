@@ -160,13 +160,15 @@ surface.
 | Explicit Float → Int narrowing | v1.x-11 | `Int(f)` truncates toward zero (fptosi); `Int(n)` is the identity; other types rejected. No implicit narrowing. |
 | String-builder primitive | v1.x-15 | `std::str::builder_new() -> Bytes`, `builder_append(b, s)`, `builder_len(b) -> Int`, `builder_finish(b) -> String`. Doubling-realloc malloc buffer; N appends amortized O(N). Resolves reader-list_item-quadratic-concat. |
 | `parse_float` + `can_parse_float` | v1.x-16 | `std::str::parse_float(s) -> Float fallible(ParseError)` (flipped 2026-05-17 alongside parse_int). Paired bool predicate `can_parse_float(s)` stays non-fallible for predicate use. |
-| Bytes-builder (binary-safe sibling) | C10 (pond follow-up) | `std::bytes::builder_new() -> Bytes`, `builder_append(b, chunk)`, `builder_len(b) -> Int`, `builder_finish(b) -> Bytes`. Mirror of the v1.x-15 str-builder family with Bytes ABI on both ends: append reads the chunk's `[i64 len]` prefix (no strlen, embedded NULs survive); finish emits a fresh `[i64 len][u8 data[len]]` blob in the bus payload arena (no trailing NUL). Shares the underlying `lotus_str_builder_t` struct (cap / len / buf — identical layout, the only difference is the append/finish semantics). Drives `pond/http/client/wire.ap` + `pond/agent/llm/wire.ap` — both were accumulating message bodies through `std::str::builder_*` + `std::bytes::from_string`, lossy on chunks containing NUL. Interpreter parity in `aperio-runtime::builtins`. |
+| Bytes-builder (binary-safe sibling) | C10 (pond follow-up) | Originally shipped as a `std::bytes::builder_*` free-fn family — superseded 2026-05-19 by the `std::bytes::BytesBuilder` locus (see the BytesBuilder-locus row below). The free-fn surface is gone; the C primitives (`lotus_str_builder_t`-backed buffer, `[i64 len]`-prefixed binary-safe append, fresh-blob-in-payload-arena finish) remain as the locus methods' externs. Driver consumers (`pond/http/client/wire.ap`, `pond/agent/llm/wire.ap`) migrate to the locus form. Interpreter parity preserved in `aperio-runtime::builtins`. |
+| Bytes-builder in-place ops (Phase 0) | 2026-05-19 (pond/websocket follow-up) | Long-lived recv-loop accumulator ops: `shift_front(n)` (drop first n bytes via memmove, capacity preserved), `clear()` (len=0, capacity preserved), `snapshot() -> Bytes` (copy `[0..len)` into a fresh `[i64 len][u8 data[len]]` Bytes blob in the bus payload arena, builder unchanged). Released the per-iteration `concat`/`slice` churn that pond/websocket's recv loop hit; the buffer now stabilizes at max-frame-size. Originally shipped as free fns alongside the C10 family — folded into the `std::bytes::BytesBuilder` locus method surface on 2026-05-19. The "leak unless finish" hazard that motivated the original `builder_free` is closed by the locus's dissolve cascade — no explicit free is needed. |
+| recv_into family (Phase 1) | 2026-05-19 (pond/websocket follow-up) | `std::io::tcp::recv_into(fd: Int, buf: std::bytes::BytesBuilder, max_bytes: Int) -> Int` and tls / udp siblings. `buf` is a `BytesBuilder` locus instance; codegen extracts the internal `handle` slot at the call boundary and writes into the builder's tail, growing on insufficient headroom, bumping len by the count read. Returns POSIX read(2) semantics: `> 0` bytes appended, `= 0` peer closed cleanly (TCP) / zero-length datagram (UDP), `< 0` fatal error. Non-fallible — the return value carries error state, mirroring read(2). Eliminates the per-recv allocation in `g_bus_payload_arena` that the prior `recv_bytes` surfaces produce. The typecheck — `buf` must be a `BytesBuilder` locus, not a raw `Bytes` — is the load-bearing enforcement that closes the prior silent-misread footgun: with the builder lifted out of the `Bytes` type, calling `std::bytes::at(buf, i)` on a builder now fails at typecheck rather than reading the cap/len/buf header. The `recv_bytes` surfaces remain for one-shot reads. |
+| BytesBuilder locus (`std::bytes::BytesBuilder`) | 2026-05-19 | Lifts the entire `std::bytes::builder_*` family out of the free-fn surface and into a stdlib locus. Construction: `let b = std::bytes::BytesBuilder { initial_cap: N };` (defaults to 64 if elided). Method surface: `b.append(chunk: Bytes)`, `b.len() -> Int`, `b.snapshot() -> Bytes`, `b.shift_front(n: Int)`, `b.clear()`, `b.finish() -> Bytes`, `b.view() -> BytesView` (Phase-2 (1), 2026-05-19; return type promoted from `Bytes` to `BytesView` on 2026-05-20 per F.30 — non-owning view aliasing the builder's `[i64 len][u8 data]` region; zero allocation, zero copy; lifetime valid until the next mutation on the source builder; the load-bearing primitive for "parser reads via `std::bytes::at`/`len`/`slice` over an rx_buf accumulator without snapshotting per peel attempt" — the dominant residual leak source after Phase 1). Lifecycle: birth allocates the underlying `lotus_str_builder_t` header + buffer via `lotus_bytes_builder_new(initial_cap)`; dissolve frees on scope exit. **The motivation is type discrimination at design time.** The builder header (`{cap, len, buf*}` separately-malloc'd body) is NOT layout-compatible with a regular `Bytes` blob (`[i64 len][u8 data]` contiguous) — the prior surface conflated the two under the `Bytes` static type, so `std::bytes::at(builder, i)` silently misread the cap field as the length and ran off the end. With the builder typed as its own locus, that confusion fails at typecheck. The Aperio axiom (everything with lifecycle + invariants is a locus, types are pure data) makes this the principled shape — the prior free-fn surface was a workaround for not having a locus to anchor the buffer's flow. Internal C-primitive bridges live behind `std::bytes::builder::__*` paths (not for user code; the locus's method bodies are the only legitimate callers). Failure routing: `append()` routes realloc-NULL (and null-handle from a failed birth) through `violate alloc_failed` per F.27 — the locus declares `closure alloc_failed { captures: initial_cap; epoch inline; }` and `append` violates it on the failure path. Owners of the BytesBuilder bind an `on_failure` policy to handle (restart / drain / bubble); an unhandled violation bubbles past `main` and exits the process non-zero. **Phase-3 zero-alloc additions (2026-05-19):** `b.append_slice(src: Bytes, lo: Int, hi: Int)` copies `src[lo..hi)` directly into the builder's tail — eliminates the `slice + append` pair's intermediate Bytes wrapper that otherwise lands in g_bus_payload_arena. Routes alloc-fail (and out-of-range indices) through `violate alloc_failed` per F.27. `b.text_view() -> StringView` (return type promoted from `String` to `StringView` on 2026-05-20 per F.30) returns a non-owning view aliasing the builder's buffer; lifetime tied to "no mutation while view is in use" (same documented-and-trusted contract as `view()`). The builder's buffer reserves one trailing-NUL slot past `cap` and maintains `buf[len] == '\0'` after every mutation, so the returned C string is well-formed for the `lotus_str_*` surface — zero allocation, zero copy. Use case: a recv loop publishes a text-typed message field referencing the accumulator without per-message `lotus_str_from_bytes` allocation. **Birth-time violate (F.27 extension, 2026-05-19):** `birth()` now routes `lotus_bytes_builder_new(initial_cap) → NULL` (malloc fail) through `violate alloc_failed` at construction. The codegen restriction on lifecycle-body violate was lifted; the same divergent-return + parent-on_failure machinery fires from birth as from method bodies. Construction-time fail surfaces immediately rather than waiting for first method use. **`snapshot()` / `finish()` violate routing (2026-05-19):** payload-arena alloc failures (handle-NULL, arena create fail, lotus_bytes_create fail) now route through `violate alloc_failed` per F.27. The C primitives use a dedicated alloc-fail sentinel pointer on every failure path while success paths emit a fresh arena-allocated blob (even for len=0). The locus method body discriminates via `std::bytes::__is_alloc_fail(out)` before returning. The previous "empty-on-success aliases empty-on-fail" hazard is closed; the channels meet at the `violate` boundary, never as a silent zero-length blob. |
 | `base64::decode` | v1.x-16 | `std::text::base64::decode(s) -> Bytes`. Standard alphabet, whitespace tolerated, non-alphabet / wrong padding → empty Bytes. Inverse of `base64::encode`. |
 | `std::str::lower` / `std::str::upper` | (follow-up) | ASCII case folding. One-pass C-runtime primitives — non-ASCII bytes pass through. Used internally by `std::http::header` for RFC 7230 case-insensitive lookup; `apps/cli`'s `upper()` helper now delegates here too. |
 | `std::str::trim` / `std::str::replace` | (follow-up) | `trim(s)` strips ASCII whitespace (space / tab / CR / LF) from both ends. `replace(s, needle, replacement)` does greedy non-overlapping substring replace; empty needle is a no-op (avoids the infinite-replace footgun). Both C-runtime primitives; both anchor results in the bus payload arena. |
 | `std::str::repeat` / `pad_left` / `pad_right` | (follow-up) | `repeat(s, n)` returns n concatenated copies (n <= 0 → empty). `pad_left(s, width, pad)` and `pad_right(s, width, pad)` align to a target width using the first char of `pad` as the fill byte (empty pad → space). No truncation — if `len(s) >= width`, returns `s` unchanged. Common for separator lines, column-aligned table output, and right-aligned numeric formatting. |
 | F-string interpolation supports nested string literals | (follow-up) | The interpolation-capture loop tracks quote state via `\"` toggles, so `f"got: {func(\"abc\")}"` parses cleanly. `{` / `}` inside the interpolated string don't perturb depth counting. Limitation: a `"` inside the nested string can't be re-escaped (would need triple-backslash) — flagged in the lexer source. |
-<<<<<<< HEAD
 | `std::time::now() -> Int` wall-clock seconds | C7 (pond follow-up) | Wraps `clock_gettime(CLOCK_REALTIME, &ts)` via the new `lotus_time_now_seconds` C primitive; returns `ts.tv_sec` as `Int`. Drives `pond/sessions` cookie expiries that must survive a process restart (the monotonic origin resets, the wall-clock origin does not). Observation only — NTP slewing / leap seconds can warp the value, so `std::time::monotonic` stays the basis for scheduling. The `today` shape called out in the pond handoff was deferred until a consumer surfaces a concrete date-shape need. |
 | `std::math::{tanh, nan, is_nan, inf}` IEEE 754 surface | C8 (pond follow-up) | `tanh(Float) -> Float` is a direct LLVM extern into libm `tanh` (same shape as `sqrt` / `exp` / `log` / `floor` / `ceil` / `pow`). `nan() -> Float` / `inf() -> Float` are nullary and return platform-quiet-NaN / +infinity via `lotus_math_nan` / `lotus_math_inf` (backed by C's `NAN` / `INFINITY` macros, so they don't reference libm at link time — keeps the test helper binaries that compile `lotus_arena.c` without `-lm` happy). `is_nan(Float) -> Bool` is the canonical IEEE 754 `f != f` test via `lotus_math_is_nan` (returns C `int`, truncated to `i1` at the call site). All four are non-fallible — libm domain errors return NaN naturally, which is the caller's contract. Drives `pond/ml/neural` (was hand-rolling tanh from `exp`) and `pond/math/matrix` (was synthesizing `nan_sentinel()` as `0.0 / 0.0` and `is_nan(f)` as `f != f`). NaN-printing is platform-dependent (`nan` / `NaN` / `-nan` via printf %g); tests assert correctness via `is_nan(x)`, not by comparing the printed value of NaN itself. |
 | `std::io::fs::rename(src, dst) -> () fallible(IoError)` | C9 (pond follow-up) | POSIX `rename(2)`; atomic on the same filesystem (EXDEV cross-fs). Backs `pond/logfmt`'s log-rotation policy — the standard "shift `.N-1` → `.N`, overwrite oldest, truncate active" cycle was previously a `read_file → write_file` chain because no rename existed. `IoError.path` is anchored to `dst` (destination is more diagnostic on the common failure modes: target dir missing, target already a non-empty dir, cross-fs). |
@@ -260,6 +262,7 @@ resolves a specific friction-log entry.
 | Int → Float widening + `std::math::*` libm primitives | `lotus-harness` `float-surface-gaps` | Codegen widens Int → Float (via `sitofp`) at let-binding type ascriptions and fn-arg sites where the parameter is `Float`; one-way only, `Float → Int` and `Decimal` mixes still reject. `std::math::{sqrt, exp, log, floor, ceil}` (unary) + `std::math::pow` (binary) ship as path-call dispatches into libm. (Phase 2c) |
 | `[val; N]` array-literal repetition | `lotus-harness` `float-surface-gaps` (sub-bullet 3) | New `Expr::ArrayRepeat { val, count }`. `val` is evaluated once; the result is broadcast to N slots of an arena-allocated `[N x T]`. N is a non-negative Int literal at v0. (Phase 2d) |
 | Binary-safe TCP recv + Bytes/String surface | `apps/ws-echo` `tcp-recv-string-strlen-truncates-binary` | `Stream.recv_bytes(max) -> Bytes` (length-prefixed; embedded NULs survive) backed by `lotus_tcp_recv_bytes`. Companions: `std::bytes::from_string(s) -> Bytes`, `std::str::from_bytes(b) -> String`, `std::bytes::at(b, i) -> Int fallible(IndexError)` (flipped 2026-05-16; pre-flip returned -1 sentinel), `std::bytes::slice(b, lo, hi) -> Bytes`. All anchored in the global payload arena. Together they make a WebSocket frame parser straight-line Aperio. (Phase 2g) |
+| `std::bytes::clone(v) -> Bytes` and `std::str::clone(v) -> String` | F.30 follow-up (2026-05-20) | Deep-copy a `BytesView` / `StringView` into the caller's arena (via Task 8's TLS allocator), producing an owned blob that survives subsequent mutations on the source builder. The explicit upgrade path BytesView signals when storage sites reject the read-only coercion — `let owned: Bytes = std::bytes::clone(b.view());` is the canonical form. Both accept the matching owned type as a no-op same-type clone, so generic callers (e.g. "clone whatever was passed in") don't branch on view-ness. Backed by `lotus_bytes_clone` (new) and `lotus_str_clone` (existing m49). |
 | `list_dir` index API | `apps/ssg` `list_dir-newline-string` | `std::io::fs::list_dir_count(path) -> Int fallible(IoError)` + `std::io::fs::list_dir_at(path, i) -> String fallible(IoError)`. Both walk the same global-arena cache, so iteration becomes a 4-line `let n = count; while i < n { name = at(i); i = i + 1; }` — no manual newline-scanning. **2026-05-16 cleanup:** the older newline-joined `list_dir(path) -> String` shape was removed; the index API is the only iteration form. (Phase 2e) |
 | `read_file` errno status | `apps/ssg` `read_file-empty-vs-error` | The Phase-2f legacy companion `read_file_status(path) -> Int` was **removed 2026-05-16**. Use `read_file(path) -> String fallible(IoError)` and address the err path with `or raise` / `or substitute` / `or handler(err)`; the `IoError` payload carries errno + kind tag. Distinguishes empty-file vs missing-file via the err arm rather than a paired status call. |
 | Stale-CLI rebuild check | `apps/log-router` `stale-cli-silent-drops-subscribers` | `crates/aperio-cli/build.rs` hashes `codegen.rs`, `lotus_arena.c`, and every `runtime/stdlib/*.ap` file at CLI-build time, bakes the hash + crate path into the binary via `cargo:rustc-env`. On every `aperio build` invocation, `check_stale_cli()` in main.rs recomputes from disk and emits a four-line warning when they diverge — catches the "edit codegen, run cargo test, forget to rebuild CLI" footgun without forcing an automatic rebuild. Skipped silently for installed binaries or when `APERIO_SKIP_STALE_CHECK=1`. (Phase 2i) |
@@ -400,14 +403,14 @@ tree. Quick reference grouped by `std::*` namespace prefix:
 | `std::env` | `args_count()`, `arg(i)`, `arg_or(i, default)`, `var(name)`, `var_exists(name)` | path-call dispatch + main-prelude argv stash |
 | `std::time` | `monotonic() -> Duration`, `sleep(d: Duration)`, `now() -> Int` | `clock_gettime(CLOCK_MONOTONIC)` + EINTR-retrying `clock_nanosleep`; `now()` calls `clock_gettime(CLOCK_REALTIME)` via `lotus_time_now_seconds` |
 | `std::str` | `parse_int(s) -> Int fallible(ParseError)`, `parse_float(s) -> Float fallible(ParseError)`, `can_parse_int(s) -> Bool`, `can_parse_float(s) -> Bool`, `index_of`, `lower` / `upper`, `trim`, `substring(s, lo, hi)`, `replace`, `repeat`, `pad_left` / `pad_right`, `from_bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` | `lotus_str_*` C runtime primitives |
-| `std::bytes` | `at(b, i) -> Int fallible(IndexError)`, `slice(b, lo, hi) -> Bytes`, `from_string(s) -> Bytes`, `from_int(v) -> Bytes`, `concat(a, b) -> Bytes`, `builder_new` / `builder_append` / `builder_len` / `builder_finish` (binary-safe sibling of the `std::str::builder_*` family) | `lotus_bytes_*` C runtime primitives |
+| `std::bytes` | `at(b, i) -> Int fallible(IndexError)`, `slice(b, lo, hi) -> Bytes`, `from_string(s) -> Bytes`, `from_int(v) -> Bytes`, `concat(a, b) -> Bytes`. Growing-buffer accumulator surface lives on the `BytesBuilder` locus (`std::bytes::BytesBuilder` — see § _Builders vs Bytes_ below): `b.append`, `b.len`, `b.snapshot`, `b.view` (zero-copy alias; Phase-2 (1)), `b.shift_front`, `b.clear`, `b.finish`. The locus shape is what enforces builder/Bytes type discrimination — `std::bytes::at(b, i)` on a `BytesBuilder` fails at typecheck rather than misreading the runtime header. | `lotus_bytes_*` C runtime primitives |
 | `std::text` | `md_to_html(md) -> String`, `base64::encode` / `base64::decode`, `Sink` interface + `StdoutSink` / `StringSink` / `FileSink` loci, byte-class predicates `is_alpha` / `is_digit` / `is_alnum` / `is_whitespace` / `is_word_char`, `tokenize_words_into(s, target_vec)` | `runtime/stdlib/text.ap` + C runtime |
 | `std::io::fs` | `read_file`, `write_file`, `write_file_append`, `read_bytes`, `file_size`, `mkdir`, `rename`, `unlink`, `mktemp`, `list_dir`, `list_dir_count`, `list_dir_at` — all `fallible(IoError)`. `file_exists(path) -> Bool` (predicate, not failable). One-shot path-call surface: each call opens, does the op, closes. For held-open shapes use `std::io::file::File`. | `lotus_fs_*` C runtime primitives |
 | `std::io::file` | `File` locus (held-open fd with auto-dissolve close). `open(path, mode) -> File fallible(IoError)`; `read_line(f) -> String` (returns "" at EOF or read error — pair with `at_eof`); `at_eof(f) -> Bool`; `write_bytes(f, b)`, `write_line(f, s)`, `seek(f, offset)` all `fallible(IoError)`. Mode strings `"r"` / `"w"` / `"a"` / `"r+"` / `"w+"`. Returned Strings live in the bus payload arena (program-lifetime). | `lotus_file_*` C runtime primitives + `runtime/stdlib/file.ap` |
-| `std::io::udp` | Raw UDP networking primitives. `bind(host, port) -> Int fallible(IoError)` (creates SOCK_DGRAM bound to addr; host=""→INADDR_ANY); `send(fd, host, port, msg) -> () fallible(IoError)` (best-effort datagram send); `recv(fd, max_bytes) -> Bytes fallible(IoError)` (one datagram); `close(fd) -> Int`. Datagram boundaries preserved by the kernel — no framing needed at this layer. **NOT a bus transport**: UDP doesn't satisfy the bus's atomic-delivery contract. Cross-host bus over UDP would require a user-written adapter (Wave B) layering retry / framing on top. | `lotus_udp_*` C runtime primitives |
+| `std::io::udp` | Raw UDP networking primitives. `bind(host, port) -> Int fallible(IoError)` (creates SOCK_DGRAM bound to addr; host=""→INADDR_ANY); `send(fd, host, port, msg) -> () fallible(IoError)` (best-effort datagram send); `recv(fd, max_bytes) -> Bytes fallible(IoError)` (one datagram); `recv_into(fd, buf: Bytes, max_bytes) -> Int` (caller-provided builder destination — Phase 1; see feature table for return semantics); `close(fd) -> Int`. Datagram boundaries preserved by the kernel — no framing needed at this layer. **NOT a bus transport**: UDP doesn't satisfy the bus's atomic-delivery contract. Cross-host bus over UDP would require a user-written adapter (Wave B) layering retry / framing on top. | `lotus_udp_*` C runtime primitives |
 | `std::io::stdin` | `read_line() -> String`, `read_line_status() -> Int` | `lotus_stdin_*` C runtime primitives (POSIX `getline` + payload-arena copy) |
-| `std::io::tcp` | `Listener` locus, `Stream` locus, `send`, `send_bytes`, `recv_bytes`. Path-calls `listen_socket`, `connect`, `accept_one` are `fallible(IoError)`. `connect` accepts dotted-quad hosts directly and falls back to hostname resolution via `getaddrinfo` (AF_INET) when the host isn't numeric. | `lotus_tcp_*` C runtime primitives |
-| `std::io::tls` | Client-side TLS via system OpenSSL. `connect(host: String, port: Int) -> Int fallible(IoError)` opens a TCP connection, performs a TLS 1.2+ handshake with SNI + system-trust-store cert verification (`SSL_VERIFY_PEER` + `SSL_set1_host`), and returns an opaque handle. `send_bytes(handle, bytes: Bytes) -> Int` and `recv_bytes(handle, max: Int) -> Bytes` operate on the handshaked connection; both non-fallible at the language level (return 0/-1 or empty Bytes on error). `close(handle) -> Int` shuts the TLS layer down + closes the underlying socket. The `lotus_tls.c` translation unit is compiled separately so helper tests that link `lotus_arena.c` directly don't drag in libssl/libcrypto; the main `aperio build` link adds `-lssl -lcrypto`. | `lotus_tls_*` C runtime primitives in `runtime/lotus_tls.c` |
+| `std::io::tcp` | `Listener` locus, `Stream` locus, `send`, `send_bytes`, `recv_bytes`, `recv_into(fd, buf: Bytes, max_bytes) -> Int` (caller-provided builder destination — Phase 1). Path-calls `listen_socket`, `connect`, `accept_one` are `fallible(IoError)`. `connect` accepts dotted-quad hosts directly and falls back to hostname resolution via `getaddrinfo` (AF_INET) when the host isn't numeric. | `lotus_tcp_*` C runtime primitives |
+| `std::io::tls` | Client-side TLS via system OpenSSL. `connect(host: String, port: Int) -> Int fallible(IoError)` opens a TCP connection, performs a TLS 1.2+ handshake with SNI + system-trust-store cert verification (`SSL_VERIFY_PEER` + `SSL_set1_host`), and returns an opaque handle. `send_bytes(handle, bytes: Bytes) -> Int` and `recv_bytes(handle, max: Int) -> Bytes` operate on the handshaked connection; both non-fallible at the language level (return 0/-1 or empty Bytes on error). `recv_into(handle, buf: Bytes, max_bytes) -> Int` reads directly into a caller-provided builder (Phase 1; same return semantics as the tcp/udp siblings). `close(handle) -> Int` shuts the TLS layer down + closes the underlying socket. The `lotus_tls.c` translation unit is compiled separately so helper tests that link `lotus_arena.c` directly don't drag in libssl/libcrypto; the main `aperio build` link adds `-lssl -lcrypto`. | `lotus_tls_*` C runtime primitives in `runtime/lotus_tls.c` |
 | `std::http` | `Request` + `Response` types (`Response.content_type` defaults to `"text/plain"`; `Response.headers: String = ""` carries CRLF-joined user-supplied headers — no trailing CRLF — for Set-Cookie / CORS / custom-header use), `parse_request`, `write_response`, case-insensitive symmetric `header(receiver, name)` lookup that works on both Request and Response receivers, `Handler` interface (`fn handle(req: Request) -> Response`), `Server` locus (accept loop dispatches each request to a `Handler`-typed locus's `handle` method — state lives on the handler's params; `handler:` is a required field on `Server`, no default; optional `ready_signal: String = ""` prints a sync line to stdout after `listen()` succeeds) | `runtime/stdlib/http.ap` |
 | `std::json` | `Builder` locus (streaming output assembly: `begin_object` / `end_object` / `begin_array` / `end_array`, `field` / `string_field` / `int_field` / `bool_field` / `null_field`, `value` / `string_value` / `int_value` / `bool_value` / `null_value`, `begin_object_field` / `begin_array_field`, `result() -> String`), `escape_string` / `unescape_string` (RFC 8259 string escaping), `find_string_field` / `find_int_field` / `find_bool_field` (flat-object field lookup), `ArrayIter` + `array_first` / `array_next` (flat-array iteration). No nested-tree shape at v1. | `runtime/stdlib/json.ap` |
 | `std::test` | `assert(cond, msg)`, `assert_eq_int`, `assert_eq_str` | `runtime/stdlib/test.ap` |
@@ -423,6 +426,124 @@ V>`, `Vec<T>`, `Set<T>`, etc.). Storage is locus-shaped via the
 ships `@form(vec)` (contiguous-buffer; v1.x-FORM-2),
 `@form(hashmap)` (intrusive open-addressing; v1.x-FORM-4), and
 `@form(ring_buffer)` (fixed-capacity FIFO; v1.x-FORM-5).
+
+### Builders vs Bytes — the recv-loop pattern
+
+`Bytes` and `std::bytes::BytesBuilder` are deliberately
+distinct types because their runtime ABIs are **incompatible**:
+
+- **`Bytes` blob.** Single contiguous allocation: `[i64 len]
+  [u8 data[len]]`. The handle points at the length prefix.
+  `lotus_bytes_len(b)` reads `*(int64_t*)b`. `lotus_bytes_at(b, i)`
+  reads `((u8*)b)[8 + i]`. Stable across the value's lifetime.
+- **`BytesBuilder` locus.** Owns a `lotus_str_builder_t`
+  header `{ size_t cap; size_t len; char *buf; }` whose body
+  lives in a separately malloc'd region pointed to by `buf`
+  and can move on realloc (the header pointer is stable, the
+  body pointer is not). `cap` starts at the locus's
+  `initial_cap` param (default 64) and doubles on grow.
+
+The two ABIs cannot be unified without giving up stable handles
+(the body has to be relocatable; the Bytes blob layout doesn't
+tolerate that). They used to share a static type — `builder_*`
+free fns returned `Bytes`, so `std::bytes::at(builder, i)`
+silently read the cap field as the length and ran off the end
+of the heap. Lifting the builder into its own locus type
+turned that silent footgun into a typecheck error.
+
+The discipline that follows:
+
+1. **Pick one role per binding.** A binding is either a
+   `BytesBuilder` (long-lived growable buffer, methods
+   `append` / `len` / `shift_front` / `clear` / `snapshot` /
+   `finish`) or a `Bytes` (immutable length-prefixed blob,
+   functions `at` / `slice` / `len` / `concat`). The
+   typechecker enforces this — there's no implicit coercion.
+2. **Cross between roles via explicit calls.** `BytesBuilder
+   → Bytes` is either `b.snapshot()` (copies into the bus
+   payload arena — stable across mutations) or `b.view()` (no
+   copy, aliases the builder's buffer — valid until the next
+   mutation; the right choice for read-then-discard idioms
+   like parser passes). `Bytes → BytesBuilder` is `let b =
+   std::bytes::BytesBuilder { ... };` followed by
+   `b.append(bytes)` (copies). The Builder → Bytes direction
+   has a zero-cost path via `view()`; the reverse does not.
+3. **Long-lived accumulators live as locus state.** Either a
+   method-body `let`-binding (dissolves at scope exit) or a
+   param-typed field on the owning service locus (dissolves
+   via cascade at the parent's dissolve — see F.29). Method-
+   body `let` is simpler when the accumulator's lifetime fits
+   inside one method invocation; field-typed is needed when
+   the buffer must outlive a single method call (e.g., state
+   held across bus subscription callbacks).
+4. **Read syscalls write directly into the builder.** The
+   `recv_into` family takes a `BytesBuilder` as `buf` and
+   writes into its tail. Codegen extracts the internal handle
+   slot at the call boundary. Combined with `b.shift_front`
+   after each peeled frame (streaming case) or `b.clear()` at
+   message boundaries (per-message accumulator case), the
+   steady-state recv loop is zero-alloc against
+   `g_bus_payload_arena`.
+
+Canonical pattern, a held-open socket locus that accumulates
+inbound frames:
+
+```aperio
+locus FrameClient {
+  params { sock: Int = -1; recv_chunk: Int = 4096; }
+  run() {
+    let rx_buf = std::bytes::BytesBuilder {
+      initial_cap: 4096,
+    };
+    loop {
+      let got = std::io::tcp::recv_into(
+        self.sock, rx_buf, self.recv_chunk);
+      if got <= 0 { break; }
+      // peel complete frames off the front via rx_buf.len() /
+      // rx_buf.shift_front(consumed); for a per-frame snapshot
+      // use rx_buf.snapshot() only at the point of handoff to
+      // logic that needs a Bytes view (parsers that read via
+      // std::bytes::at / slice).
+    }
+    // rx_buf dissolves here → buffer freed, no explicit cleanup
+  }
+}
+```
+
+Try writing `std::bytes::at(rx_buf, 0)` inside that loop — it
+fails at typecheck (`at` expects `Bytes`, got
+`__StdBytesBytesBuilder`). The discipline is mechanical, not
+documentary.
+
+The same pattern with the builder held as locus state (per
+F.29), for cases where the accumulator must survive across
+multiple method calls (bus callbacks, message-state held
+between handler firings, etc.):
+
+```aperio
+locus WsClient {
+  params {
+    sock: Int = -1;
+    recv_chunk: Int = 4096;
+    rx_buf:   std::bytes::BytesBuilder
+            = std::bytes::BytesBuilder { initial_cap: 4096 };
+    last_msg: std::bytes::BytesBuilder
+            = std::bytes::BytesBuilder { initial_cap: 4096 };
+  }
+  fn read_one() {
+    let got = std::io::tcp::recv_into(
+      self.sock, self.rx_buf, self.recv_chunk);
+    // ... peel frames, append payload bytes into self.last_msg
+    // via self.last_msg.clear() + .append(...) between
+    // message boundaries — no per-frame allocation.
+  }
+  // No dissolve() needed for rx_buf / last_msg — the cascade
+  // fires their dissolve when WsClient itself dissolves.
+}
+```
+
+Consumer reads `self.last_msg` via a contract that exposes
+`b.view()` — zero-copy across the F.14 interface.
 
 ### ~~`std::panic`~~ — not a thing
 

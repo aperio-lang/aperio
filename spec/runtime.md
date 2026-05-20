@@ -94,7 +94,15 @@ the model: runtime is automatic; stdlib is explicit.
   waits for them, then drains itself. SIGINT triggers `drain()`
   on the runtime root, cascading through the whole process
   tree. No separate cascade syntax — `drain()` is always
-  cascading.
+  cascading. For locus-typed param fields specifically
+  (F.29), the codegen walks `LocusRef` fields in declaration
+  order at the cascade-teardown sites (ephemeral scope-exit
+  and deferred-flush) and calls each child's drain BEFORE the
+  outer locus's own drain. The subsequent dissolve cascade
+  runs the outer's `closures → dissolve` body next, then per
+  child `closures → dissolve → arena_destroy`, then outer's
+  arena_destroy. Pinned-thread tail and `parent_accepts_us`
+  still skip the cascade per the v1 trade-off.
 - **Recovery primitives.** `restart`, `restart_in_place`,
   `quarantine`, `reorganize`, `bubble`, `dissolve`, `drain` —
   all language keywords; runtime implements the actual
@@ -542,6 +550,108 @@ bytes for a bound subject) can use this too.
   buffer. N appends are amortized O(N). `finish()` copies into
   the bus payload arena (program-lifetime) and frees the
   builder.
+- `lotus_bytes_builder_new(i64 initial_cap) -> ptr` /
+  `_append(ptr handle, ptr chunk) -> i64 status` /
+  `_len(ptr handle) -> i64` /
+  `_finish(ptr handle) -> Bytes*` /
+  `_shift_front(ptr handle, i64 n)` /
+  `_clear(ptr handle)` /
+  `_snapshot(ptr handle) -> Bytes*` /
+  `_view(ptr handle) -> Bytes*` /
+  `_free(ptr handle)` — C10 / Phase 0 / Phase-2 (1)
+  (2026-05-19, pond/websocket follow-up). Binary-safe sibling
+  of the str-builder family. Append reads the chunk's
+  `[i64 len]` prefix instead of `strlen`; finish emits a
+  length-prefixed Bytes blob with no trailing NUL.
+  In-place ops: `shift_front` memmoves the tail to the head
+  and drops n bytes (capacity preserved). `clear` sets len=0
+  (capacity preserved). `snapshot` copies the current
+  `[0..len)` into a fresh Bytes blob in the bus payload
+  arena, builder unchanged. `view` returns a non-owning Bytes
+  pointer aliasing the builder's inline `[i64 len][u8 data]`
+  region — zero allocation, zero copy; lifetime valid until
+  the next mutation on the source builder. `free` disposes
+  the malloc-backed buffer.
+
+  **F.30 (2026-05-20) type promotion.** The runtime
+  `_view` / `_text_view` C primitives still return raw
+  pointers; the Aperio-visible method surface now returns
+  `BytesView` / `StringView` (typecheck-distinct from `Bytes`
+  / `String`, runtime-identical). The codegen lowering of
+  the bridge mints the view types; the locus method body's
+  declared return type matches. The view-to-owned upgrade
+  paths (`std::bytes::clone`, `std::str::clone`) are backed
+  by `lotus_bytes_clone(arena, src)` (new) and
+  `lotus_str_clone(arena, src)` (existing m49).
+
+  **Memory layout (Phase-2 (1)).** Diverges from
+  `lotus_str_builder_t` to support zero-copy `view()`. Header
+  is `{cap, buf}`; the data area is preceded inline by an
+  8-byte length prefix matching the Bytes ABI:
+
+  ```
+  malloc'd region: [int64_t len][u8 data[cap]]
+                                ^
+                                buf
+  ```
+
+  `view(b)` returns `b->buf - 8` — a pointer that
+  `lotus_bytes_len` / `lotus_bytes_at` / `lotus_bytes_data`
+  can dereference directly. Append / shift_front / clear /
+  finish all update the inline prefix in sync with the data
+  mutation. Cost: one extra pointer dereference per len
+  access vs the prior `{cap, len, buf*}` shape. Trade-off
+  taken in exchange for the substrate-enabled zero-alloc
+  read path. `lotus_str_builder_t` (for `std::str::*`) keeps
+  the prior layout — no view surface there yet.
+
+  These primitives are no longer the user-facing surface;
+  they're the C externs called by the
+  `std::bytes::BytesBuilder` stdlib locus
+  (`crates/aperio-codegen/runtime/stdlib/bytes_builder.ap`).
+  See `spec/design-rationale.md` § F.28 for the rationale
+  and the locus's method shape. The locus-side calls reach
+  these via internal `std::bytes::builder::__*` path-call
+  dispatch.
+
+  **ABI notes (2026-05-19).** `_new` takes `int64_t
+  initial_cap` (previously zero-arg, hardcoded 64) — values
+  `<= 0` are treated as the legacy default. `_append`
+  returns `int64_t status` (1=ok, 0=fail on realloc-NULL
+  or null-handle) — previously void; the status return is
+  what the locus's `append` method checks before routing
+  through `violate alloc_failed` per F.27.
+
+  **Builder handles are NOT layout-compatible with regular
+  Bytes blobs.** The struct shape is
+  `{ size_t cap; size_t len; char *buf; }` (24 bytes);
+  Bytes blobs are `[int64_t len][u8 data[]]`. So
+  `lotus_bytes_at(builder, i)` / `lotus_bytes_len(builder)`
+  read the wrong slots if a builder handle is passed as a
+  Bytes value. The Aperio-level enforcement (`BytesBuilder`
+  as its own locus type) makes that mistake impossible to
+  express; this note is the C-side mirror — anyone calling
+  these primitives directly from C / Rust must keep the
+  distinction.
+- `lotus_tcp_recv_into(fd, builder, max_bytes) -> i64` /
+  `lotus_tls_recv_into(handle, builder, max_bytes) -> i64` /
+  `lotus_udp_recv_into(fd, builder, max_bytes) -> i64` —
+  2026-05-19 (Phase 1, pond/websocket follow-up).
+  Caller-provided destination at the syscall layer. Reads
+  directly into the builder's tail; grows on insufficient
+  headroom; bumps the builder's len by the count read.
+  Return semantics mirror POSIX read(2): `> 0` bytes
+  appended, `= 0` peer closed cleanly (TCP) / zero-length
+  datagram (UDP), `< 0` fatal error. EINTR retried
+  internally. No allocation in `g_bus_payload_arena` —
+  closes the residual ~80% of the pond/websocket recv-loop
+  leak that Phase 0's in-place builder ops surfaced (the
+  syscall layer's own `[i64 len][body]` blob per call).
+  Helpers `lotus_bytes_builder_reserve(handle, n)` +
+  `lotus_bytes_builder_advance(handle, n)` factor the
+  grow + offset-bump so `lotus_tls.c` (separate translation
+  unit) can implement its recv_into without seeing the
+  builder struct layout.
 - `lotus_str_lower(s) -> char*` / `lotus_str_upper(s) -> char*`
   — ASCII case folding. One-pass byte-level fold; non-ASCII
   bytes pass through unchanged. Allocates in the bus payload
