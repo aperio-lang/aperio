@@ -688,6 +688,13 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "process", "wait"], "__std_process_wait"),
     (&["std", "process", "write_stdin"], "__std_process_write_stdin"),
     (&["std", "source", "Walk"], "__StdSourceWalk"),
+    // v1.x polish (2026-05-20): qualified `std::str::ParseError`
+    // resolves to the same bare ParseError the stdlib's parse_*
+    // fns inject. Lets users disambiguate explicitly in fn
+    // signatures and `or raise as e: std::str::ParseError`
+    // bindings — useful when a project also has its own
+    // local error types.
+    (&["std", "str", "ParseError"], "ParseError"),
     (&["std", "tagged", "Accumulator"], "__StdTaggedAccumulator"),
     (&["std", "text", "Sink"], "__StdTextSink"),
     (&["std", "text", "StdoutSink"], "__StdTextStdoutSink"),
@@ -13898,6 +13905,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
     /// Allocate a `ParseError { kind, input }` in the current
     /// arena, populate, return pointer.
+    ///
+    /// v1.x polish (2026-05-20): converts a user-declared
+    /// `type ParseError` that's missing the stdlib's expected
+    /// `kind: String` / `input: String` fields from a hard
+    /// runtime panic into a clean codegen-time diagnostic.
+    /// Users hitting this either rename their type or use the
+    /// `std::str::ParseError` path-rename for the stdlib's
+    /// shape.
     fn emit_parse_error_alloc(
         &mut self,
         input_str_ptr: BasicValueEnum<'ctx>,
@@ -13907,7 +13922,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .user_types
             .get("ParseError")
             .cloned()
-            .expect("ParseError declared by declare_builtin_parse_error_type");
+            .ok_or_else(|| {
+                CodegenError::Unsupported(
+                    "ParseError type missing — `declare_builtin_parse_error_type` \
+                     should have injected it; sequencing bug?".to_string(),
+                )
+            })?;
         let size = info
             .struct_ty
             .size_of()
@@ -13915,11 +13935,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let alloc_ptr = self.arena_alloc(size, "ParseError.alloc")?;
 
         let kind_ptr = self.global_string(kind_tag);
-        let (kind_idx, _) = info
-            .fields
-            .get("kind")
-            .cloned()
-            .expect("ParseError.kind field");
+        let (kind_idx, _) = info.fields.get("kind").cloned().ok_or_else(|| {
+            CodegenError::Unsupported(
+                "user-declared `type ParseError` is missing the stdlib's \
+                 expected `kind: String` field — std::str::parse_* fns need \
+                 to allocate `ParseError { kind, input }` on failure. \
+                 Either match the stdlib shape (`type ParseError { kind: \
+                 String; input: String; }`), rename your type (e.g. \
+                 `MyParseError`), or use the `std::str::ParseError` qualified \
+                 path where you need the stdlib's"
+                    .to_string(),
+            )
+        })?;
         let kind_field_ptr = self
             .builder
             .build_struct_gep(
@@ -13933,11 +13960,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_store(kind_field_ptr, kind_ptr)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
-        let (input_idx, _) = info
-            .fields
-            .get("input")
-            .cloned()
-            .expect("ParseError.input field");
+        let (input_idx, _) = info.fields.get("input").cloned().ok_or_else(|| {
+            CodegenError::Unsupported(
+                "user-declared `type ParseError` is missing the stdlib's \
+                 expected `input: String` field — see the `kind` field \
+                 diagnostic above for the fix options"
+                    .to_string(),
+            )
+        })?;
         let input_field_ptr = self
             .builder
             .build_struct_gep(

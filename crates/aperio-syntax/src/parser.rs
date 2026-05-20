@@ -3152,6 +3152,13 @@ impl Parser {
                     }
                     elems.push(first);
                     while self.eat(&TokenKind::Comma) {
+                        // Allow a trailing comma — the multi-line
+                        // form is idiomatic. Mirrors the same
+                        // shape adapter/struct_init blocks already
+                        // accept.
+                        if self.at(&TokenKind::RBracket) {
+                            break;
+                        }
                         elems.push(self.parse_expr()?);
                     }
                 }
@@ -4703,6 +4710,43 @@ main locus App {
             }
             other => panic!("expected ShmRing, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_array_literal_with_trailing_comma() {
+        // v1.x polish (2026-05-20): multi-line array literals
+        // with trailing commas now parse. Single-line form
+        // works too — same code path. Reported by fathom as a
+        // cosmetic friction; idiomatic Aperio mirrors Rust's
+        // trailing-comma allowance on collection literals.
+        let multi_line = r#"
+            type B { v: Int; }
+            fn main() {
+                let xs = [
+                    B { v: 1 },
+                    B { v: 2 },
+                ];
+            }
+        "#;
+        parse_str(multi_line).expect("multi-line array literal");
+
+        let single_line_trailing = r#"
+            type B { v: Int; }
+            fn main() {
+                let xs = [B { v: 1 }, B { v: 2 },];
+            }
+        "#;
+        parse_str(single_line_trailing).expect("single-line trailing comma");
+
+        // No-trailing-comma stays admissible (was the only
+        // shape that worked pre-fix).
+        let no_trailing = r#"
+            type B { v: Int; }
+            fn main() {
+                let xs = [B { v: 1 }, B { v: 2 }];
+            }
+        "#;
+        parse_str(no_trailing).expect("no trailing comma");
     }
 
     #[test]

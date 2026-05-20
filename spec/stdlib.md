@@ -699,6 +699,20 @@ Reach for the predicate sibling `can_parse_int(s) -> Bool` only
 when you genuinely want to branch *before* parsing rather than
 parse-and-substitute. In most cases `or` is shorter.
 
+**Qualified path (v1.x polish 2026-05-20).** The qualified form
+`std::str::ParseError` resolves to the same struct as bare
+`ParseError`. Useful in projects that also declare a local
+error type — write `fn handle(e: std::str::ParseError) { ... }`
+or `or raise as e: std::str::ParseError` to be explicit about
+which type you mean.
+
+When a user-declared `type ParseError` lacks the stdlib's
+expected `kind: String` / `input: String` fields, calls to
+`std::str::parse_*` produce a compile-time codegen diagnostic
+naming the fix paths (rename your type, match the stdlib
+shape, or use the qualified path). Previously this case
+panicked at codegen time.
+
 ### `Server.ready_signal` — synchronization for piped oracles (2026-05-17)
 
 `std::http::Server` accepts an optional `ready_signal: String = ""`
