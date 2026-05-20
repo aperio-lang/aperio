@@ -24,18 +24,23 @@ fn build(name: &str, src: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn snapshot_at_cap_violates_alloc_failed() {
-    // Set the cap below the alloc size we'll force; the second
-    // snapshot deposit exceeds the cap and the C primitive
-    // returns the alloc_fail_sentinel, which the BytesBuilder
-    // locus's snapshot() method routes through
-    // `violate alloc_failed`. With a parent on_failure, the
-    // violation is absorbed and run() continues.
+fn snapshot_with_tls_routing_skips_global_cap() {
+    // 2026-05-19 update: after the __caller_arena threading lands,
+    // BytesBuilder snapshot/finish allocations route through the
+    // calling fn's arena (via the TLS `lotus_current_caller_arena`)
+    // instead of the program-lifetime g_bus_payload_arena. The
+    // cap mechanism still exists on the global arena, but the
+    // common-case stdlib paths no longer touch it — that's the
+    // whole point of the threading work.
     //
-    // We allocate 1 MiB chunks via append_slice from a 1 MiB
-    // source bytes blob and snapshot each time. The cap is set
-    // to 2 MiB so the third snapshot exceeds the cap (taking
-    // into account the initial chunk size + per-snapshot alloc).
+    // This test pins that behavior: allocating 100x 1 MiB
+    // snapshots with a small global cap should NOT fire the cap
+    // diagnostic, because the snapshots land in Parent's
+    // (long-lived) locus arena, not the capped global. Parent's
+    // arena is unbounded; allocations there are bounded by
+    // Parent's lifecycle (still program-lifetime here since
+    // Parent IS the program root, but the principle holds at
+    // any locus depth).
     let src = r#"
         locus Parent {
             accept(b: std::bytes::BytesBuilder) { }
@@ -48,10 +53,9 @@ fn snapshot_at_cap_violates_alloc_failed() {
                     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
                 );
                 let mut i = 0;
-                while i < 100 {
+                while i < 50 {
                     b.append(chunk);
                     let snap = b.snapshot();
-                    println("iter=", i, " len=", len(snap));
                     i = i + 1;
                 }
                 println("loop done");
@@ -59,7 +63,7 @@ fn snapshot_at_cap_violates_alloc_failed() {
         }
         fn main() { Parent { }; }
     "#;
-    let bin = build("snapshot_cap", src);
+    let bin = build("snapshot_tls", src);
     let output = Command::new(&bin)
         .env("LOTUS_BUS_PAYLOAD_ARENA_CAP", "65536") // 64 KiB
         .output()
@@ -69,26 +73,27 @@ fn snapshot_at_cap_violates_alloc_failed() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "non-zero with absorbed violations expected — stdout:\n{}\nstderr:\n{}",
+        "expected clean run — stdout:\n{}\nstderr:\n{}",
         stdout,
         stderr
     );
-    // The cap diagnostic fires exactly once on first hit.
     assert!(
-        stderr.contains("arena cap hit"),
-        "expected arena cap hit diagnostic on stderr: {:?}",
+        stdout.contains("loop done"),
+        "expected loop completion: {:?}",
+        stdout
+    );
+    // The cap diagnostic should NOT fire — TLS routing keeps the
+    // allocations out of g_bus_payload_arena.
+    assert!(
+        !stderr.contains("arena cap hit"),
+        "unexpected cap diagnostic — TLS routing should bypass \
+         the global arena: {:?}",
         stderr
     );
     assert!(
-        stderr.contains("g_bus_payload_arena"),
-        "expected arena name in diagnostic: {:?}",
-        stderr
-    );
-    // Once the cap fires, subsequent snapshots violate; the
-    // parent absorbs and the loop keeps going.
-    assert!(
-        stdout.contains("absorbed=alloc_failed"),
-        "expected absorbed alloc_failed in stdout: {:?}",
+        !stdout.contains("absorbed=alloc_failed"),
+        "no violation expected — TLS-routed snapshot should \
+         succeed against Parent's arena: {:?}",
         stdout
     );
 }

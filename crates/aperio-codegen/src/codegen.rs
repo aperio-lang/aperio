@@ -3609,6 +3609,25 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             bb_append_slice_ty,
             None,
         );
+        // declare void @lotus_set_caller_arena(ptr arena)
+        // Phase-3 (2026-05-19) __caller_arena threading: stdlib
+        // primitives that previously allocated into the program-
+        // lifetime g_bus_payload_arena now read a thread-local
+        // arena pointer instead. The codegen emits a setter call
+        // before each user-callable primitive invocation, passing
+        // `current_arena_ptr()` from the calling context (locus
+        // method's self arena / free fn's __caller_arena /
+        // main's program arena). Primitives fall back to the
+        // capped g_bus_payload_arena when TLS is null (interpreter
+        // or non-Aperio C entry). See lotus_arena.c
+        // lotus_caller_arena_or_global for the read side.
+        let void_t = self.context.void_type();
+        let set_caller_arena_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_set_caller_arena",
+            set_caller_arena_ty,
+            None,
+        );
         // declare i64 @lotus_bytes_is_alloc_fail(ptr blob)
         // F.27 discriminator: 1 iff blob is the alloc-fail
         // sentinel returned from BytesBuilder snapshot()/finish()
@@ -24110,6 +24129,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function(extern_name)
             .expect("string fold/strip extern declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[s_val.into()], &format!("str.{}.ret", which))
@@ -24163,6 +24183,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_substring")
             .expect("lotus_str_substring declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -24206,6 +24227,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_repeat")
             .expect("lotus_str_repeat declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[s_val.into(), n_val.into()], "str.repeat.ret")
@@ -24260,6 +24282,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function(extern_name)
             .expect("pad extern declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -24306,6 +24329,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_replace")
             .expect("lotus_str_replace declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -26709,6 +26733,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_str_from_bytes")
             .expect("lotus_str_from_bytes declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[b_val.into()], "str_from_bytes.ret")
@@ -26746,6 +26771,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_from_str")
             .expect("lotus_bytes_from_str declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[s_val.into()], "bytes_from_str.ret")
@@ -26849,6 +26875,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_slice")
             .expect("lotus_bytes_slice declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -26893,6 +26920,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_from_int")
             .expect("lotus_bytes_from_int declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(f, &[v_val.into()], "bytes_from_int.ret")
@@ -26940,6 +26968,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .module
             .get_function("lotus_bytes_concat")
             .expect("lotus_bytes_concat declared");
+        self.emit_set_caller_arena()?;
         let call = self
             .builder
             .build_call(
@@ -34605,6 +34634,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("lotus_arena_alloc returns ptr");
         Ok(raw.into_pointer_value())
+    }
+
+    /// Phase-3 (2026-05-19): emit a `lotus_set_caller_arena(arena)`
+    /// call passing the current arena pointer. Stdlib primitives
+    /// that return heap values (Bytes / String) read this TLS to
+    /// allocate the return value in the caller's arena instead of
+    /// the leaky program-lifetime g_bus_payload_arena. Call this
+    /// IMMEDIATELY BEFORE emitting the primitive's call instruction.
+    fn emit_set_caller_arena(&mut self) -> Result<(), CodegenError> {
+        let arena = self.current_arena_ptr()?;
+        let set_fn = self
+            .module
+            .get_function("lotus_set_caller_arena")
+            .expect("lotus_set_caller_arena declared");
+        self.builder
+            .build_call(set_fn, &[arena.into()], "set_caller_arena")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
     }
 
     /// The arena pointer to allocate from at the current builder
