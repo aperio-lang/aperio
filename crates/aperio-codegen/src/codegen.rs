@@ -309,7 +309,7 @@ pub fn build_executable_with_imports(
             .map(|(segs, mangled)| (segs.clone(), mangled.clone()))
             .collect(),
         bus_state: None,
-        shm_ring_subjects: std::collections::BTreeSet::new(),
+        shm_ring_subjects: std::collections::BTreeMap::new(),
         deferred_dissolves: Vec::new(),
         in_main: false,
         current_arena_override: None,
@@ -938,15 +938,13 @@ struct Cx<'ctx, 'p> {
     /// (m45-followup); this is just a presence flag so a `<-` send
     /// in a program without subscribers errors clearly.
     bus_state: Option<BusState>,
-    /// Form K4c (2026-05-20): set of wire-subject names whose
-    /// binding is a `shm_ring(...)` transport. Populated when
-    /// `emit_bindings_prelude` walks the main locus's bindings;
-    /// `lower_send` checks membership to decide whether to route
-    /// through `lotus_bus_publish_shm_ring` (zero-copy path) or
-    /// the normal `lotus_bus_dispatch` path. Empty when no
-    /// shm_ring bindings exist; lookups on an empty set are
-    /// O(1) so the per-Send branch cost is negligible.
-    shm_ring_subjects: std::collections::BTreeSet<String>,
+    /// Form K4c/K6b (2026-05-20): per-shm_ring-binding info,
+    /// keyed by wire subject. Populated in a pre-pass over
+    /// main locus's bindings before any user-code lowering, so
+    /// both `lower_send` (publish-side short-circuit) and the
+    /// subscribe-registration codegen (subscriber-side reader
+    /// thread spawn) can consult it at call sites.
+    shm_ring_subjects: std::collections::BTreeMap<String, ShmRingBindingInfo>,
     /// Stack of "deferred-dissolve" frames: each enclosing fn
     /// body / lifecycle method body opens one. Long-lived loci
     /// (any locus with a `bus subscribe` declaration) instantiated
@@ -1125,6 +1123,24 @@ struct AccumulatorCtx<'ctx> {
 /// LLVM-side handles the prior `BusState` carried are gone.
 #[derive(Debug, Clone, Copy)]
 struct BusState;
+
+/// Form K4c/K6b (2026-05-20): per-shm_ring-binding info kept on
+/// the codegen context, keyed in `shm_ring_subjects` by the
+/// topic's wire subject. Populated in `collect_shm_ring_subjects`
+/// before user-code lowering so the publish-side
+/// (`lower_send_shm_ring`) and subscribe-side (subscriber
+/// registration in `emit_locus_birth`) can both consult it.
+#[derive(Debug, Clone)]
+struct ShmRingBindingInfo {
+    /// Name of the topic's payload struct type (single-segment
+    /// TypeRef). Used to look up the struct's size_of() at the
+    /// register call site.
+    payload_type_name: String,
+    /// User-supplied slot_count from the binding (or 128 default).
+    slot_count: u64,
+    /// User-supplied SHM object name from the binding.
+    shm_name: String,
+}
 
 /// m47 (enums): per-enum metadata. Variants in declaration order;
 /// each variant's i32 tag is its index in this list. m47-payloads
@@ -2991,6 +3007,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_bus_publish_shm_ring",
             bus_publish_shm_ring_ty,
+            None,
+        );
+
+        // Form K6b (2026-05-20): subscriber registration. Emitted
+        // at subscriber locus birth alongside the existing
+        // `lotus_bus_register` call. Opens the SHM ring (or
+        // attaches), spawns a reader thread, and registers the
+        // (self_ptr, handler_fn) pair for dispatch.
+        // declare void @lotus_bus_register_subscriber_shm_ring(
+        //   ptr subject, i64 slot_size, i64 slot_count,
+        //   ptr shm_name, ptr self_ptr, ptr handler_fn)
+        let bus_register_sub_shm_ring_ty = void_t.fn_type(
+            &[
+                ptr_t.into(),
+                i64_t.into(),
+                i64_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+            ],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bus_register_subscriber_shm_ring",
+            bus_register_sub_shm_ring_ty,
             None,
         );
 
@@ -5888,6 +5929,91 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(n)
     }
 
+    /// Form K6b (2026-05-20): emit a shm_ring subscriber
+    /// registration. Mirror of `emit_bus_register` for the
+    /// shm_ring transport — instead of routing through the
+    /// bus queue, this spawns a per-subject reader thread that
+    /// directly calls `handler_fn(self_ptr, slot_ptr)` on each
+    /// new published seqno.
+    ///
+    /// The handler fn signature codegen produces is exactly
+    /// `void(void *self, void *payload)` — same as the
+    /// existing `lotus_bus_register` handler signature, so the
+    /// user's `fn on_foo(p: Payload)` lowers identically. The
+    /// only difference is which runtime fn the registration
+    /// call lands on.
+    fn emit_bus_register_shm_ring(
+        &mut self,
+        subject: &str,
+        self_ptr: PointerValue<'ctx>,
+        handler_fn: FunctionValue<'ctx>,
+    ) -> Result<(), CodegenError> {
+        let info = self
+            .shm_ring_subjects
+            .get(subject)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "emit_bus_register_shm_ring: subject `{}` not in \
+                     shm_ring_subjects (pre-pass missed it?)",
+                    subject
+                ))
+            })?;
+        let payload_info = self
+            .user_types
+            .get(&info.payload_type_name)
+            .cloned()
+            .ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "shm_ring subscribe `{}`: payload type `{}` not \
+                     registered in user_types",
+                    subject, info.payload_type_name
+                ))
+            })?;
+        let slot_size = payload_info
+            .struct_ty
+            .size_of()
+            .expect("flat struct has compile-time size");
+        let slot_count = self.context.i64_type().const_int(info.slot_count, false);
+
+        let subj_ptr = self
+            .builder
+            .build_global_string_ptr(
+                subject,
+                &format!("lotus.shm_ring.sub.subject.{}", subject),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
+        let name_ptr = self
+            .builder
+            .build_global_string_ptr(
+                &info.shm_name,
+                &format!("lotus.shm_ring.sub.name.{}", subject),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
+        let handler_ptr = handler_fn.as_global_value().as_pointer_value();
+        let reg_fn = self
+            .module
+            .get_function("lotus_bus_register_subscriber_shm_ring")
+            .expect("lotus_bus_register_subscriber_shm_ring declared");
+        self.builder
+            .build_call(
+                reg_fn,
+                &[
+                    subj_ptr.into(),
+                    slot_size.into(),
+                    slot_count.into(),
+                    name_ptr.into(),
+                    self_ptr.into(),
+                    handler_ptr.into(),
+                ],
+                "shm_ring.sub.register",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(())
+    }
+
     /// Emit a single subscription registration as one call to
     /// `lotus_bus_register(subject, self, handler, mailbox,
     /// deserialize_fn)`. The C runtime owns the entries vec and
@@ -6667,15 +6793,46 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             _ => None,
         });
         let Some(l) = main_locus else { return };
+        // Walk topic decls to get each topic's payload-type
+        // name (we need this for the size_of lookup at
+        // codegen). For now require single-segment TypeExpr;
+        // post-v1 can widen.
+        let mut topic_payload: BTreeMap<String, String> = BTreeMap::new();
+        for item in &self.program.items {
+            if let TopDecl::Topic(t) = item {
+                if let TypeExpr::Named { path, generic_args, .. } = &t.payload {
+                    if path.segments.len() == 1 && generic_args.is_empty() {
+                        topic_payload.insert(
+                            t.name.name.clone(),
+                            path.segments[0].name.clone(),
+                        );
+                    }
+                }
+            }
+        }
         for m in &l.members {
             if let LocusMember::Bindings(b) = m {
                 for entry in &b.entries {
-                    if matches!(entry.transport, TransportSpec::ShmRing { .. }) {
+                    if let TransportSpec::ShmRing {
+                        name, slot_count, ..
+                    } = &entry.transport
+                    {
                         let subj = wire_subjects
                             .get(&entry.topic.name)
                             .cloned()
                             .unwrap_or_else(|| entry.topic.name.clone());
-                        self.shm_ring_subjects.insert(subj);
+                        let payload_name = topic_payload
+                            .get(&entry.topic.name)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.shm_ring_subjects.insert(
+                            subj,
+                            ShmRingBindingInfo {
+                                payload_type_name: payload_name,
+                                slot_count: *slot_count,
+                                shm_name: name.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -6851,11 +7008,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 "lotus.shm_ring.register",
                             )
                             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                        // Track this subject so lower_send routes
-                        // its publishes through
-                        // lotus_bus_publish_shm_ring instead of
-                        // the normal dispatch path.
-                        self.shm_ring_subjects.insert(subject.clone());
+                        // `collect_shm_ring_subjects` already
+                        // populated `shm_ring_subjects` in the
+                        // pre-pass; lower_send + the subscriber-
+                        // registration codegen consult it from
+                        // there.
                         continue;
                     }
                 };
@@ -30412,13 +30569,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             locus_name, subject, handler_name
                         ))
                     })?;
-                self.emit_bus_register(
-                    subject,
-                    self_ptr,
-                    handler_fn,
-                    None,
-                    payload_type,
-                )?;
+                // Form K6b (2026-05-20): subscriber-side branch.
+                // If the subject is shm_ring-bound, emit
+                // lotus_bus_register_subscriber_shm_ring instead
+                // of the normal lotus_bus_register. The reader
+                // thread spawned by the C runtime invokes the
+                // handler with the slot pointer.
+                if self.shm_ring_subjects.contains_key(subject) {
+                    self.emit_bus_register_shm_ring(
+                        subject,
+                        self_ptr,
+                        handler_fn,
+                    )?;
+                } else {
+                    self.emit_bus_register(
+                        subject,
+                        self_ptr,
+                        handler_fn,
+                        None,
+                        payload_type,
+                    )?;
+                }
             }
         }
 
@@ -35097,7 +35268,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // object).
         let shm_subject_const: Option<String> = match subject {
             Expr::Literal(Literal::String(s), _) => {
-                if self.shm_ring_subjects.contains(s) {
+                if self.shm_ring_subjects.contains_key(s) {
                     Some(s.clone())
                 } else {
                     None

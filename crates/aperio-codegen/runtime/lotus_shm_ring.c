@@ -43,8 +43,10 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -356,4 +358,110 @@ int lotus_bus_publish_shm_ring(const char *subject,
             "this subject\n",
             subject);
     return -1;
+}
+
+/* === Form K6b (2026-05-20) — subscriber-side reader thread ============
+ *
+ * Each subscriber locus that has a `bus { subscribe Foo as on_foo; }`
+ * declaration for a shm_ring-bound topic gets a dedicated reader
+ * thread spawned at locus birth. The reader polls the ring's
+ * published seqno; on each advance it calls
+ * `handler_fn(locus_self, slot_ptr)` for every newly committed
+ * slot.
+ *
+ * v1 simplifications:
+ *   - Handler runs on the reader thread (NOT the cooperative
+ *     scheduler). Documented constraint: shm_ring subscriber
+ *     handlers must be thread-safe and not touch shared
+ *     scheduler state. Users who need cooperative dispatch
+ *     should use `unix(...)` instead.
+ *   - No stamped-epoch staleness guard. Slow handlers risk
+ *     reading torn slot bytes if the publisher wraps past
+ *     during a read. v2 will add the F.30b-style guard.
+ *   - Thread is daemon-detached at v1. Runs until process exit.
+ *
+ * Poll cadence: 100us sleep between empty polls. Burns minimal
+ * CPU when idle; ~10-100us tail latency on receive. Tuneable
+ * post-v1.
+ */
+
+typedef struct {
+    lotus_shm_ring_t *ring;
+    void (*handler_fn)(void *self, void *slot);
+    void *self_ptr;
+} shm_ring_subscriber_t;
+
+static void *shm_ring_reader_thread(void *arg) {
+    shm_ring_subscriber_t *sub = (shm_ring_subscriber_t *)arg;
+    uint64_t last_seen = 0;
+    for (;;) {
+        uint64_t pub = lotus_shm_ring_published(sub->ring);
+        if (pub > last_seen) {
+            while (last_seen < pub) {
+                last_seen++;
+                void *slot = lotus_shm_ring_read_slot(sub->ring, last_seen);
+                if (slot) {
+                    sub->handler_fn(sub->self_ptr, slot);
+                }
+                /* slot == NULL means the publisher already wrapped
+                 * past this seqno — the slot's contents are racing
+                 * with a fresh publish. Skip silently at v1; the
+                 * post-v1 epoch guard will surface this. */
+            }
+        } else {
+            struct timespec ts = {0, 100 * 1000};  /* 100us */
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+/* Codegen emits one call per shm_ring subscriber registration at
+ * locus birth. self_ptr is the subscriber locus instance;
+ * handler_fn has signature `void(void *self, void *slot)` —
+ * codegen produces a shim that casts `slot` to the topic's
+ * payload type pointer and invokes the user's `fn on_foo(p:
+ * Payload)`. */
+void lotus_bus_register_subscriber_shm_ring(const char *subject,
+                                             uint64_t slot_size,
+                                             uint64_t slot_count,
+                                             const char *shm_name,
+                                             void *self_ptr,
+                                             void (*handler_fn)(void *self,
+                                                                 void *slot)) {
+    (void)subject;  /* held in the per-binding record below for diag */
+
+    lotus_shm_ring_t *ring =
+        lotus_shm_ring_open(shm_name, slot_size, slot_count);
+    if (!ring) {
+        fprintf(stderr,
+                "lotus_bus_register_subscriber_shm_ring(`%s`, `%s`): open "
+                "failed: %s\n",
+                subject, shm_name, strerror(errno));
+        _exit(1);
+    }
+
+    shm_ring_subscriber_t *sub =
+        (shm_ring_subscriber_t *)calloc(1, sizeof(*sub));
+    if (!sub) {
+        fprintf(stderr,
+                "lotus_bus_register_subscriber_shm_ring(`%s`): calloc "
+                "failed\n",
+                subject);
+        _exit(1);
+    }
+    sub->ring = ring;
+    sub->handler_fn = handler_fn;
+    sub->self_ptr = self_ptr;
+
+    pthread_t tid;
+    int rc = pthread_create(&tid, NULL, shm_ring_reader_thread, sub);
+    if (rc != 0) {
+        fprintf(stderr,
+                "lotus_bus_register_subscriber_shm_ring(`%s`): pthread_create "
+                "failed: %d\n",
+                subject, rc);
+        _exit(1);
+    }
+    pthread_detach(tid);  /* daemon — runs until process exit at v1 */
 }

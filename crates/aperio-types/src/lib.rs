@@ -547,10 +547,11 @@ mod binding_constraint_tests {
     }
 
     #[test]
-    fn shm_ring_with_aperio_subscriber_rejected() {
-        // Form K6a: a same-bundle Aperio subscriber on a
-        // shm_ring-bound topic produces a clear diagnostic
-        // until subscriber-side codegen lands.
+    fn shm_ring_with_aperio_subscriber_is_clean_post_k6b() {
+        // Form K6b: same-bundle Aperio subscribers on
+        // shm_ring-bound topics are typecheck-clean. The
+        // codegen wires a reader thread that dispatches to
+        // the handler.
         let src = r#"
             type TickPayload { px: Int; sz: Int; }
             topic Tick { payload: TickPayload; }
@@ -567,9 +568,9 @@ mod binding_constraint_tests {
         "#;
         let diags = check(src);
         assert!(
-            diags.iter().any(|d| d.message.contains("shm_ring")
+            !diags.iter().any(|d| d.message.contains("shm_ring")
                 && d.message.contains("Aperio-side subscribers")),
-            "expected shm_ring subscriber-not-wired diag, got: {:?}",
+            "K6a rejection should be gone after K6b, got: {:?}",
             diags
         );
     }

@@ -595,40 +595,14 @@ fn check_main_and_bindings(
                                 entry, top, diags,
                             );
 
-                            // Form K6a (2026-05-20): shm_ring is
-                            // publish-only on the Aperio side at
-                            // v1. If a same-bundle locus declares
-                            // `bus subscribe` for a shm_ring-
-                            // bound topic, emit a clear "not yet
-                            // wired" diagnostic so the user
-                            // doesn't silently get a no-op
-                            // subscription. The full subscriber-
-                            // side reader-thread + view-into-slot
-                            // codegen lands post-K6; cross-
-                            // language consumers (C readers via
-                            // `lotus_shm_ring_*`) work today.
-                            if matches!(
-                                entry.transport,
-                                TransportSpec::ShmRing { .. }
-                            ) && topic_subscribes.contains(&entry.topic.name) {
-                                diags.push(Diag::ty(
-                                    entry.topic.span,
-                                    format!(
-                                        "binding for topic `{}`: \
-                                         shm_ring transport doesn't yet \
-                                         support Aperio-side subscribers — \
-                                         the publish path is wired (Form \
-                                         K4c) but subscriber codegen + \
-                                         reader-thread integration lands \
-                                         post-K6. Subscribe to the SHM \
-                                         ring from a separate process \
-                                         using the C `lotus_shm_ring_*` \
-                                         primitives, or use a different \
-                                         transport for this topic",
-                                        entry.topic.name
-                                    ),
-                                ));
-                            }
+                            // Form K6b (2026-05-20): shm_ring
+                            // Aperio-side subscribers are wired
+                            // (reader thread + handler dispatch
+                            // in lotus_bus_register_subscriber_shm_ring).
+                            // No typecheck rejection needed; the
+                            // codegen handles both publish-only
+                            // and subscribe-bearing programs.
+                            let _ = &topic_subscribes;
                         }
                     }
                 }

@@ -562,15 +562,30 @@ Transport surface:
   [[slot-locus-design]]) for the zero-memcpy path is
   post-v1; the implicit `<-` path covers the common case.
 
-  **Subscribers (Form K6a, 2026-05-20).** Aperio-side `bus
-  subscribe` for shm_ring-bound topics is not yet wired —
-  the typechecker rejects a same-bundle `subscribe Tick`
-  when `Tick` is bound to `shm_ring(...)`, naming the
-  publisher path's K4c shipping and pointing at the C
-  `lotus_shm_ring_*` primitives as the supported v1
-  consumer path. Reader-thread + view-into-slot codegen
-  for Aperio subscribers lands when a workload needs
-  Aperio-to-Aperio zero-copy.
+  **Subscribers (Form K6b, 2026-05-20).** Aperio-side
+  `bus subscribe` for shm_ring-bound topics is wired.
+  Codegen emits a `lotus_bus_register_subscriber_shm_ring(...)`
+  call at the subscriber locus's birth lifecycle; the C
+  runtime opens the ring, spawns a dedicated reader thread
+  per binding, and dispatches each newly-committed slot to
+  the user's `fn on_foo(p: T)` handler with `p` pointing
+  directly into the ring slot (no memcpy on the subscriber
+  side).
+
+  **Threading constraint.** The handler runs on the reader
+  thread, NOT the cooperative scheduler. Handlers must be
+  thread-safe and avoid touching shared scheduler state.
+  Users who need cooperative dispatch should use
+  `unix(...)` instead. Future versions may add an optional
+  cooperative-queue routing mode at the binding level.
+
+  **Staleness.** v1 ships without a stamped-epoch read
+  guard — handlers must finish fast enough that the ring
+  doesn't wrap past the slot they're reading. If a slot
+  has wrapped at the moment the reader thread fetches it,
+  the slot is skipped silently (lotus_shm_ring_read_slot
+  returns NULL). Post-v1 work will generalize F.30b's
+  stamped-epoch guard for per-field read checks.
 
 **In-memory delivery is absence-of-entry.** A topic with no
 binding entry is delivered same-process via the cooperative
