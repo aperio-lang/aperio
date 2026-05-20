@@ -12,15 +12,18 @@
 > **Experimental language. Breaking changes welcome.**
 > **v0.x — still in the part of the curve where the design is negotiable.**
 
-Aperio is a small programming language built on one observation: half the
-orchestration tooling shipped since 2023 is an under-specified, schema-shaped
-attempt at a programming language, and *half a language* is the most expensive
-shape software can take. We wrote the other half.
+Aperio operationalizes a research program on the structural mathematics
+of systems — a substrate-invariant recursive hypergraph of typed,
+lifecycled units called **loci**, governed by a capacity-allocation
+discipline. The grammar is the operational surface of that structure:
+every declaration in an Aperio program is either a locus or a relation
+between loci. The compiler enforces that the structure you write is
+the structure the program runs as.
 
-The unit is the **locus** — typed, lifecycled, owning a memory region, talking
-to other loci over a typed bus. Everything named and structural in an Aperio
-program is a locus. Apps are loci. Services are loci. Caches are loci.
-Handlers are loci. Libraries are loci. Loci nest inside loci all the way down.
+A locus owns a memory region, has a lifecycle, and talks to other loci
+over a typed bus. Everything named and structural in an Aperio program
+is a locus. Apps are loci. Services are loci. Caches are loci. Handlers
+are loci. Libraries are loci. Loci nest inside loci all the way down.
 
 What the language deliberately doesn't have:
 
@@ -146,6 +149,10 @@ libraries stay under `lib/<name>/`; the toolchain only writes to `vendor/`.)
   community-contrib libraries (protocols, parsers, common shapes too
   specific for stdlib). Many lotus grow in a pond. Vendor via `aperio.toml`
   → `aperio fetch`.
+- **[`aperio-lang/papers`](https://github.com/aperio-lang/papers)** —
+  the structural-mathematics work the language is grounded in
+  (substrate, capacity allocation, the hypergraph model). Read here
+  for the *why* of every commitment under "state of the culture".
 - **Sibling repos** — <https://github.com/aperio-lang/examples> and
   <https://github.com/aperio-lang/bench>.
 
