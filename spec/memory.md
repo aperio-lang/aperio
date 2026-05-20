@@ -427,6 +427,23 @@ For each locus, the compiler generates:
 The runtime provides the underlying bump allocators, free-list
 machinery, scheduler integration, and lifecycle dispatcher.
 
+**Arena alignment contract (2026-05-20).** `lotus_arena_alloc(a,
+size, align)` returns a pointer whose address (not the within-
+chunk offset) is aligned to `align`. The chunk header
+(`{next, used, cap}` = 24 bytes on x86_64 LP64) sits before the
+data region, so a naive "align the offset" approach yields
+8-byte-aligned pointers even when callers ask for 16. The
+correct shape: align the cursor address `(c+1) + c->used` to
+`align`, then convert back to a within-chunk offset. The codegen
+side passes `align = 16` from `arena_alloc` to cover the widest
+scalar type (i128 / Decimal) — earlier the codegen passed 8 and
+the C side only aligned the offset, leading to `movaps` segfaults
+on Decimal stores into struct fields (fathom F7-segfault / F4
+root cause, 2026-05-20). Both layers are necessary: the codegen
+must ask for the natural alignment of the widest scalar it can
+emit, and the C arena must honor that alignment at the pointer
+level, not the offset level.
+
 ## Codegen ABI (v0)
 
 The native-codegen path (`aperio build`) lowers each locus to an

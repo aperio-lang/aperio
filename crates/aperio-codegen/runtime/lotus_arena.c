@@ -188,13 +188,34 @@ lotus_arena_t *lotus_arena_create_subregion(lotus_arena_t *parent) {
     return a;
 }
 
+/* Compute the offset within `c` that yields a pointer aligned to
+ * `align` for the request at `c->used`. The chunk's data region
+ * starts immediately after the lotus_arena_chunk_t header
+ * (3 * sizeof(void*) = 24 bytes on x86_64 LP64), so the data
+ * base is 8-byte aligned but NOT 16-byte aligned. Aligning the
+ * raw offset (lotus_align_up(used, align)) IS NOT enough — the
+ * returned pointer is `base + off`, and `base` carries its own
+ * misalignment that the bare offset-alignment ignores. Align the
+ * actual pointer address instead. Bug 2026-05-20: fathom's
+ * SymbolBook segfault root cause — Decimal (i128) stores in
+ * struct fields used `movaps`, which traps on 8-byte-aligned
+ * destinations. */
+static inline size_t lotus_arena_off_for(
+    const lotus_arena_chunk_t *c, size_t align)
+{
+    uintptr_t base = (uintptr_t)(c + 1);
+    uintptr_t cursor = base + c->used;
+    uintptr_t aligned = lotus_align_up(cursor, align);
+    return (size_t)(aligned - base);
+}
+
 void *lotus_arena_alloc(lotus_arena_t *a, size_t size, size_t align) {
     if (!a) return NULL;
     if (size == 0) size = 1;        /* every alloc gets a unique addr */
     if (align == 0) align = 8;      /* default 8-byte alignment */
 
     lotus_arena_chunk_t *c = a->head;
-    size_t off = lotus_align_up(c->used, align);
+    size_t off = lotus_arena_off_for(c, align);
     if (off + size > c->cap) {
         /* v1.x-3: recognition-class pools mark the arena
          * `fixed_size` — the cell's capacity is the budget
@@ -248,7 +269,7 @@ void *lotus_arena_alloc(lotus_arena_t *a, size_t size, size_t align) {
         fresh->next = c;
         a->head = fresh;
         c = fresh;
-        off = lotus_align_up(c->used, align);
+        off = lotus_arena_off_for(c, align);
     }
 
     char *base = (char *)(c + 1);

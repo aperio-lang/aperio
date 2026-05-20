@@ -35381,18 +35381,36 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         size: inkwell::values::IntValue<'ctx>,
         name: &str,
     ) -> Result<PointerValue<'ctx>, CodegenError> {
+        // 16-byte alignment is the load-bearing default — i128
+        // (Decimal) stores in user-struct fields generate movdqa
+        // on x86_64, which segfaults on 8-byte-aligned addresses.
+        // Bumping to 16 covers every scalar type the compiler can
+        // emit a wide store for; tradeoff is ~8 bytes of padding
+        // per arena allocation on average (most allocs are 8-byte-
+        // aligned naturally, so they pay nothing extra; only an
+        // arena head landing at an 8-but-not-16 offset bumps).
+        // Fixed 2026-05-20 after fathom F7-segfault repro.
+        self.arena_alloc_aligned(size, 16, name)
+    }
+
+    fn arena_alloc_aligned(
+        &mut self,
+        size: inkwell::values::IntValue<'ctx>,
+        align: u64,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
         let arena_ptr = self.current_arena_ptr()?;
         let i64_t = self.context.i64_type();
         let alloc_fn = self
             .module
             .get_function("lotus_arena_alloc")
             .expect("lotus_arena_alloc declared");
-        let align = i64_t.const_int(8, false);
+        let align_v = i64_t.const_int(align, false);
         let raw = self
             .builder
             .build_call(
                 alloc_fn,
-                &[arena_ptr.into(), size.into(), align.into()],
+                &[arena_ptr.into(), size.into(), align_v.into()],
                 name,
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
