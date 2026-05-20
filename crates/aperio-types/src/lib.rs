@@ -455,6 +455,98 @@ mod binding_constraint_tests {
     }
 
     #[test]
+    fn shm_ring_with_zero_copy_is_clean() {
+        // Form K4b: shm_ring is the substrate that satisfies
+        // zero_copy on a flat payload — should typecheck clean.
+        let src = r#"
+            type Ping { n: Int; v: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: shm_ring("/aperio_evt") where zero_copy, intra_machine;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("`shm_ring`")
+                || d.message.contains("zero_copy")
+                || d.message.contains("intra_machine")),
+            "shm_ring + zero_copy + intra_machine should be clean, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn shm_ring_with_cross_machine_rejected() {
+        let src = r#"
+            type Ping { n: Int; v: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: shm_ring("/aperio_evt") where cross_machine;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("host-local")
+                && d.message.contains("cross_machine")),
+            "expected shm_ring + cross_machine rejection, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn shm_ring_with_intra_process_rejected() {
+        let src = r#"
+            type Ping { n: Int; v: Int; }
+            topic Evt { payload: Ping; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: shm_ring("/aperio_evt") where intra_process;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("cross-process")
+                && d.message.contains("intra_process")),
+            "expected shm_ring + intra_process rejection, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn shm_ring_with_non_flat_payload_rejected() {
+        // Even with the right transport, a non-flat payload
+        // can't ride zero_copy.
+        let src = r#"
+            type Note { code: Int; text: String; }
+            topic Evt { payload: Note; }
+            locus Pub { bus { publish Evt; } }
+            main locus App {
+                accept(p: Pub) { }
+                bindings {
+                    Evt: shm_ring("/aperio_evt") where zero_copy;
+                }
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("not flat-shapeable")),
+            "expected non-flat-payload diag on shm_ring binding, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn binding_without_where_clause_unaffected() {
         // Regression guard: bindings without a `where` clause
         // continue to typecheck cleanly.

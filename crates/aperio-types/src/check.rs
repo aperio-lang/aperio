@@ -425,6 +425,23 @@ fn transport_satisfies(
                 .into(),
         ),
         (TransportSpec::Adapter { .. }, _) => None,
+
+        // shm_ring: POSIX SHM ring substrate. Cross-process by
+        // design (different procs mmap the same fd); host-local
+        // (POSIX SHM doesn't traverse the network); satisfies
+        // zero_copy intrinsically.
+        (TransportSpec::ShmRing { .. }, IntraProcess) => Some(
+            "`shm_ring` is cross-process by design (POSIX SHM); \
+             cannot satisfy `intra_process`"
+                .into(),
+        ),
+        (TransportSpec::ShmRing { .. }, IntraMachine) => None,
+        (TransportSpec::ShmRing { .. }, CrossMachine) => Some(
+            "`shm_ring` is host-local (POSIX SHM); cannot satisfy \
+             `cross_machine`"
+                .into(),
+        ),
+        (TransportSpec::ShmRing { .. }, ZeroCopy) => None,
     }
 }
 

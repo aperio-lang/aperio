@@ -1148,12 +1148,70 @@ impl Parser {
                     span: head_tok.span.merge(close.span),
                 })
             }
+            "shm_ring" => {
+                // Form K4b (2026-05-20): SHM ring transport.
+                // `shm_ring("/name", slot_count: N)`. Name is
+                // required; slot_count defaults to 128.
+                self.expect(TokenKind::LParen, "(")?;
+                let name = self.expect_string_literal("shm_ring name")?;
+                let mut slot_count: u64 = 128;
+                while self.eat(&TokenKind::Comma) {
+                    let key = self.expect_ident("shm_ring kwarg name")?;
+                    self.expect(TokenKind::Colon, ":")?;
+                    match key.name.as_str() {
+                        "slot_count" => {
+                            let tok = self.peek_token().clone();
+                            match tok.kind {
+                                TokenKind::IntLit(n) if n > 0 => {
+                                    self.bump();
+                                    slot_count = n as u64;
+                                }
+                                TokenKind::IntLit(n) => {
+                                    return Err(Diag::parse(
+                                        tok.span,
+                                        format!(
+                                            "shm_ring slot_count must be positive, got {}",
+                                            n
+                                        ),
+                                    ));
+                                }
+                                other => {
+                                    return Err(Diag::parse(
+                                        tok.span,
+                                        format!(
+                                            "expected positive integer for shm_ring \
+                                             `slot_count:`, got {:?}",
+                                            other
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(Diag::parse(
+                                key.span,
+                                format!(
+                                    "unknown `shm_ring` kwarg `{}` (recognized: \
+                                     `slot_count`)",
+                                    other
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let close = self.expect(TokenKind::RParen, ")")?;
+                Ok(TransportSpec::ShmRing {
+                    name,
+                    slot_count,
+                    span: head_tok.span.merge(close.span),
+                })
+            }
             other => Err(Diag::parse(
                 head_tok.span,
                 format!(
                     "unknown transport constructor `{}` (recognized: `unix(...)`, \
-                     or a capitalized adapter locus name with a `{{ ... }}` block; \
-                     in-memory delivery is absence-of-entry)",
+                     `shm_ring(...)`, or a capitalized adapter locus name with a \
+                     `{{ ... }}` block; in-memory delivery is absence-of-entry)",
                     other
                 ),
             )),
@@ -4415,6 +4473,127 @@ main locus App {
             .map(|sc| sc.kind)
             .collect();
         assert_eq!(cs, vec![BindingConstraint::CrossMachine]);
+    }
+
+    #[test]
+    fn parse_shm_ring_transport_with_default_slot_count() {
+        // Form K4b (2026-05-20): `shm_ring("/name")` parses to
+        // ShmRing with slot_count defaulting to 128.
+        let src = r#"
+type Ping { n: Int; }
+topic Evt { payload: Ping; }
+
+main locus App {
+    bindings {
+        Evt: shm_ring("/aperio_evt") where zero_copy;
+    }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let locus = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                TopDecl::Locus(l) if l.is_main => Some(l),
+                _ => None,
+            })
+            .expect("main locus");
+        let bb = locus
+            .members
+            .iter()
+            .find_map(|m| match m {
+                LocusMember::Bindings(b) => Some(b),
+                _ => None,
+            })
+            .expect("bindings block");
+        assert_eq!(bb.entries.len(), 1);
+        match &bb.entries[0].transport {
+            TransportSpec::ShmRing { name, slot_count, .. } => {
+                assert_eq!(name, "/aperio_evt");
+                assert_eq!(*slot_count, 128);
+            }
+            other => panic!("expected ShmRing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_shm_ring_with_explicit_slot_count() {
+        let src = r#"
+type Ping { n: Int; }
+topic Evt { payload: Ping; }
+
+main locus App {
+    bindings {
+        Evt: shm_ring("/aperio_evt", slot_count: 256);
+    }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let locus = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                TopDecl::Locus(l) if l.is_main => Some(l),
+                _ => None,
+            })
+            .expect("main locus");
+        let bb = locus
+            .members
+            .iter()
+            .find_map(|m| match m {
+                LocusMember::Bindings(b) => Some(b),
+                _ => None,
+            })
+            .expect("bindings block");
+        match &bb.entries[0].transport {
+            TransportSpec::ShmRing { name, slot_count, .. } => {
+                assert_eq!(name, "/aperio_evt");
+                assert_eq!(*slot_count, 256);
+            }
+            other => panic!("expected ShmRing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_shm_ring_zero_slot_count_rejected() {
+        let src = r#"
+type Ping { n: Int; }
+topic Evt { payload: Ping; }
+
+main locus App {
+    bindings {
+        Evt: shm_ring("/aperio_evt", slot_count: 0);
+    }
+}
+"#;
+        let err = parse_str(src).expect_err("expected error");
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("slot_count must be positive")),
+            "expected positive-slot-count diag, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_shm_ring_unknown_kwarg_rejected() {
+        let src = r#"
+type Ping { n: Int; }
+topic Evt { payload: Ping; }
+
+main locus App {
+    bindings {
+        Evt: shm_ring("/aperio_evt", slot_size: 80);
+    }
+}
+"#;
+        let err = parse_str(src).expect_err("expected error");
+        assert!(
+            err.iter()
+                .any(|d| d.message.contains("unknown") && d.message.contains("shm_ring")),
+            "expected unknown-kwarg diag, got: {:?}",
+            err
+        );
     }
 
     #[test]

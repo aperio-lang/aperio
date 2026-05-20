@@ -6682,6 +6682,24 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         )?;
                         continue;
                     }
+                    TransportSpec::ShmRing { .. } => {
+                        // Form K4b (2026-05-20): the parser/AST/
+                        // typecheck accept `shm_ring(...)`, but the
+                        // codegen path (slot-locus synthesis +
+                        // claim/commit lowering) lands in K4c+d.
+                        // Until then, surface a clean "not yet
+                        // wired" diagnostic so users who write the
+                        // syntax get an actionable message.
+                        return Err(CodegenError::Unsupported(format!(
+                            "binding for topic `{}`: `shm_ring(...)` codegen \
+                             not yet wired — the parser and typecheck accept \
+                             the syntax (Form K4b) but slot-locus synthesis \
+                             + claim/commit/publish lowering land in K4c. \
+                             Use `unix(...)` or omit the binding for in-process \
+                             delivery until the full zero-copy path ships.",
+                            entry.topic.name
+                        )));
+                    }
                 };
 
                 let subj_ptr = self

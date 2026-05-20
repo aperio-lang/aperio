@@ -536,6 +536,20 @@ Transport surface:
   Inbound dispatch from an adapter into the local handler set
   awaits the `__bus_local_dispatch` opening (deferred).
 
+- `shm_ring("/name", slot_count: N)` — POSIX SHM ring
+  substrate (Form K4b, 2026-05-20) backing the zero-copy
+  route. Name is the shm_open object name; slot_count
+  defaults to 128 when not specified. Satisfies
+  `intra_machine` and `zero_copy` constraints intrinsically.
+  Slot size is derived at codegen from the topic's payload
+  type (which must satisfy `is_flat_shapeable` — variadic
+  fields rejected). Substrate-provided: the runtime's
+  `lotus_shm_ring_*` primitives in `runtime/lotus_shm_ring.c`
+  own the lifecycle. Slot-locus codegen + claim/commit
+  lowering land in K4c+d; until then the parser/typecheck
+  accept the syntax but codegen emits a "not yet wired"
+  diagnostic at link time.
+
 **In-memory delivery is absence-of-entry.** A topic with no
 binding entry is delivered same-process via the cooperative
 queue. There is no `in_memory` variant — the runtime default

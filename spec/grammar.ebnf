@@ -166,11 +166,18 @@ birth_check_decl  = "birth_check" , "{" , expression , "}" , "->" ,
 bindings_block    = "bindings" , "{" , { binding_entry } , "}" ;
 binding_entry     = IDENTIFIER , ":" , transport_spec ,
                     [ binding_where ] , ";" ;
-transport_spec    = unix_transport | adapter_transport ;
+transport_spec    = unix_transport | shm_ring_transport | adapter_transport ;
 unix_transport    = "unix" , "(" , STRING_LIT , { "," , unix_kwarg } , ")" ;
 unix_kwarg        = "role" , ":" , transport_role ;
 transport_role    = "listen" | "connect" ;
 adapter_transport = LOCUS_IDENTIFIER , "{" , [ struct_init , { "," , struct_init } , [ "," ] ] , "}" ;
+
+(* Form K4b (2026-05-20): POSIX SHM ring substrate for the
+   zero-copy route. Name is the shm_open object name; slot_count
+   defaults to 128 when omitted. *)
+shm_ring_transport = "shm_ring" , "(" , STRING_LIT ,
+                     { "," , shm_ring_kwarg } , ")" ;
+shm_ring_kwarg    = "slot_count" , ":" , INT_LIT ;
 
 (* Form K (2026-05-20): operational constraints the dev team
    asserts on a binding's route. Parsed in 2026-05-20; semantic

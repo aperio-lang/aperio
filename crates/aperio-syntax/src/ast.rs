@@ -419,6 +419,25 @@ pub enum TransportSpec {
         inits: Vec<StructInit>,
         span: Span,
     },
+    /// Form K4b (2026-05-20): POSIX SHM ring transport backing the
+    /// zero-copy bus route. `shm_ring("/ring_name",
+    /// slot_count: N)` — name is the SHM object name (passed
+    /// directly to `shm_open`), slot_count is the ring depth.
+    ///
+    /// Implies `zero_copy`. Satisfies `intra_machine`. Rejects
+    /// `intra_process` (SHM is cross-process by design) and
+    /// `cross_machine` (POSIX SHM is host-local). Payload must
+    /// be `is_flat_shapeable`; the typechecker rejects bindings
+    /// where the topic's payload contains variadic fields.
+    ///
+    /// Slot size is derived at codegen from the payload type.
+    /// slot_count defaults to 128 when not specified; the
+    /// memory cost is `slot_count * slot_size`.
+    ShmRing {
+        name: String,
+        slot_count: u64,
+        span: Span,
+    },
 }
 
 /// Direction-of-traffic for point-to-point substrate transports.
