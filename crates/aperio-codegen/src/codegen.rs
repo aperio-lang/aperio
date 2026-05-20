@@ -1381,6 +1381,35 @@ fn view_coerces_to(from: &CodegenTy, to: &CodegenTy) -> bool {
     )
 }
 
+/// F.30b (5b) (2026-05-20): String/Bytes literal → StringView/BytesView
+/// coercion at storage-site defaults. Only fires when the
+/// initializer is a String / Bytes *literal* — those values live
+/// in the global string table at program-lifetime, so wrapping
+/// them in a view struct with `builder = NULL` is structurally
+/// safe (the read-site unpack helper skips the epoch check when
+/// builder is NULL). Non-literal expressions don't qualify: an
+/// arbitrary String returned from a function might not have
+/// program-lifetime semantics, and storing it as a View would
+/// silently bypass the F.30 owned-vs-view distinction.
+fn literal_to_view_coerces(
+    from: &CodegenTy,
+    to: &CodegenTy,
+    expr: &Expr,
+) -> bool {
+    let kind_ok = matches!(
+        (from, to),
+        (CodegenTy::String, CodegenTy::StringView)
+            | (CodegenTy::Bytes, CodegenTy::BytesView)
+    );
+    if !kind_ok {
+        return false;
+    }
+    matches!(
+        expr,
+        Expr::Literal(Literal::String(_), _) | Expr::Literal(Literal::Bytes(_), _)
+    )
+}
+
 fn locus_arena_elidable(l: &LocusDecl) -> bool {
     // Structural disqualifiers — these consume arena at
     // instantiation regardless of method-body content.
@@ -3684,6 +3713,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         );
         self.module.add_function(
             "lotus_str_view_data",
+            view_data_ty,
+            None,
+        );
+        // F.30b (5b): wrap a static-data ptr (String/Bytes literal)
+        // in a view struct with builder=NULL. The unpack helper
+        // skips the epoch check when builder is NULL, so the
+        // wrapped value passes through cleanly at read sites.
+        // declare ptr @lotus_view_from_static_data(ptr data)
+        self.module.add_function(
+            "lotus_view_from_static_data",
             view_data_ty,
             None,
         );
@@ -8494,16 +8533,35 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                 (DefaultInit::Expr(stored_default), ty)
                             }
                         };
-                    if let Some(ascribed) = &p.ty {
+                    // F.30b (5b): if the param is ascribed
+                    // StringView/BytesView and the default is a
+                    // String/Bytes literal, accept the mismatch and
+                    // use the ascribed (view) type as the field's
+                    // declared type. The storage-site wrap in
+                    // lower_locus_instantiation converts the literal
+                    // to a view at construction time.
+                    let default_ty = if let Some(ascribed) = &p.ty {
                         let asc_ty = self.type_expr_to_codegen_ty(ascribed)?;
-                        if asc_ty != default_ty {
+                        let literal_to_view = matches!(
+                            (&default_ty, &asc_ty),
+                            (CodegenTy::String, CodegenTy::StringView)
+                                | (CodegenTy::Bytes, CodegenTy::BytesView)
+                        );
+                        if asc_ty != default_ty && !literal_to_view {
                             return Err(CodegenError::Unsupported(format!(
                                 "locus `{}` param `{}`: declared {:?}, \
                                  default {:?}",
                                 l.name.name, p.name.name, asc_ty, default_ty
                             )));
                         }
-                    }
+                        // Promote default_ty to the ascribed View
+                        // type when the literal coercion applies, so
+                        // downstream reads see the View type, not
+                        // the literal's source type.
+                        if literal_to_view { asc_ty } else { default_ty }
+                    } else {
+                        default_ty
+                    };
                     fields.insert(
                         p.name.name.clone(),
                         (idx, default_ty.clone()),
@@ -11868,14 +11926,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Vec::with_capacity(sig.params.len() + 1);
         llvm_args.push(caller_arena.into());
         for (i, (val, ty)) in arg_pairs.iter().enumerate() {
-            if ty != &sig.params[i] {
+            let val = if view_coerces_to(ty, &sig.params[i]) {
+                // F.30b (5a): unpack view + epoch check at
+                // monomorphized generic-fn arg site.
+                self.unpack_view_if_needed(*val, ty)?
+            } else if ty != &sig.params[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "generic fn `{}` arg {} type mismatch after \
                      monomorphization: expected {:?}, got {:?}",
                     mangled, i, sig.params[i], ty
                 )));
-            }
-            llvm_args.push((*val).into());
+            } else {
+                *val
+            };
+            llvm_args.push(val.into());
         }
         let call = self
             .builder
@@ -11959,6 +12023,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 expr_kind_label(other)
             ),
         }
+    }
+
+    /// F.30b (5b) (2026-05-20): wrap a String / Bytes literal
+    /// value in a view struct for storage-site default coercion.
+    /// Only fires when the initializer is a String / Bytes
+    /// literal — those live in the global string table at
+    /// program-lifetime, so the view's `builder` field is NULL
+    /// (lotus_*_view_data skips the epoch check on that branch).
+    /// The unpack at the eventual read site is a one-load
+    /// pass-through to the literal's static pointer.
+    fn wrap_literal_as_view(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        let f = self
+            .module
+            .get_function("lotus_view_from_static_data")
+            .expect("lotus_view_from_static_data declared");
+        let call = self
+            .builder
+            .build_call(f, &[value.into()], "view.from_static")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok(call
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_view_from_static_data returns ptr"))
     }
 
     /// F.30b (2026-05-20): unpack a view's underlying data pointer
@@ -12477,6 +12567,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("fallible fn `{}` arg {}", resolved_name, i),
                 )?;
                 widened.into()
+            } else if view_coerces_to(&ty, &sig.params[i]) {
+                // F.30 / F.30b (5a): BytesView → Bytes / StringView →
+                // String at user-defined fallible-fn arg sites.
+                // Mirrors the non-fallible fn-arg coercion in
+                // lower_user_fn_call. The unpack helper emits the
+                // epoch check + extracts the underlying data ptr.
+                self.unpack_view_if_needed(v, &ty)?
             } else if ty != sig.params[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "fallible fn `{}` arg {} type mismatch: expected {:?}, \
@@ -29095,26 +29192,42 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             //   outer scope).
             let prev_field_flag = self.instantiating_for_parent_field;
             self.instantiating_for_parent_field = true;
-            let (val, val_ty, owned_via_literal) =
+            let (val, val_ty, owned_via_literal, came_from_literal) =
                 if let Some(expr) = overrides.get(fname.as_str()) {
                     let r = self.lower_expr(expr, scope)?;
                     let owned = !self.instantiating_for_parent_field;
                     self.instantiating_for_parent_field = prev_field_flag;
-                    (r.0, r.1, owned)
+                    let from_lit = matches!(
+                        expr,
+                        Expr::Literal(
+                            Literal::String(_) | Literal::Bytes(_), _),
+                    );
+                    (r.0, r.1, owned, from_lit)
                 } else {
                     match default {
                         DefaultInit::Const(pv) => {
                             self.instantiating_for_parent_field =
                                 prev_field_flag;
                             let r = self.const_param(pv);
-                            (r.0, r.1, false)
+                            // ParamValue has no Bytes variant — only
+                            // String literals can land here as a
+                            // ParamValue-shaped default.
+                            let from_lit = matches!(pv, ParamValue::String(_));
+                            (r.0, r.1, false, from_lit)
                         }
                         DefaultInit::Expr(e) => {
                             let r = self.lower_expr(e, scope)?;
                             let owned = !self.instantiating_for_parent_field;
                             self.instantiating_for_parent_field =
                                 prev_field_flag;
-                            (r.0, r.1, owned)
+                            let from_lit = matches!(
+                                e,
+                                Expr::Literal(
+                                    Literal::String(_) | Literal::Bytes(_),
+                                    _,
+                                ),
+                            );
+                            (r.0, r.1, owned, from_lit)
                         }
                         DefaultInit::Required => {
                             self.instantiating_for_parent_field =
@@ -29149,6 +29262,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     iface,
                 )?;
                 (fat.into(), declared_ty.clone())
+            } else if came_from_literal
+                && matches!(
+                    (&val_ty, &declared_ty),
+                    (CodegenTy::String, CodegenTy::StringView)
+                        | (CodegenTy::Bytes, CodegenTy::BytesView)
+                )
+            {
+                // F.30b (5b): String/Bytes literal default → View
+                // storage. The literal lives in the global string
+                // table (program-lifetime), so wrapping it in a
+                // view struct with builder=NULL is structurally
+                // safe; the read-site unpack helper skips the
+                // epoch check on the NULL branch.
+                let wrapped = self.wrap_literal_as_view(val)?;
+                (wrapped, declared_ty.clone())
             } else {
                 (val, val_ty)
             };
@@ -30428,12 +30556,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 // against the declared FnPtr signature.
                 for (i, a) in args.iter().enumerate() {
                     let (v, vt) = self.lower_expr(a, scope)?;
-                    if vt != arg_tys[i] {
+                    let v = if view_coerces_to(&vt, &arg_tys[i]) {
+                        // F.30b (5a): unpack view + epoch check at
+                        // self.fnptr arg site.
+                        self.unpack_view_if_needed(v, &vt)?
+                    } else if vt != arg_tys[i] {
                         return Err(CodegenError::Unsupported(format!(
                             "self.{} arg {}: expected {:?}, got {:?}",
                             method_name, i, arg_tys[i], vt
                         )));
-                    }
+                    } else {
+                        v
+                    };
                     call_args.push(v.into());
                     llvm_param_tys.push(self.llvm_basic_type(&arg_tys[i]).into());
                 }
@@ -30654,6 +30788,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     iface,
                 )?;
                 (fat.into(), want.clone())
+            } else if view_coerces_to(&ty, &want) {
+                // F.30 / F.30b (5a): BytesView → Bytes / StringView →
+                // String at self-method arg sites. Unpacks the view
+                // with epoch check before passing the data ptr.
+                let unpacked = self.unpack_view_if_needed(v, &ty)?;
+                (unpacked, want.clone())
             } else {
                 (v, ty)
             };
@@ -30728,12 +30868,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         llvm_param_tys.push(ptr_t.into());
         for (i, a) in args.iter().enumerate() {
             let (v, vt) = self.lower_expr(a, scope)?;
-            if vt != arg_tys[i] {
+            let v = if view_coerces_to(&vt, &arg_tys[i]) {
+                // F.30b (5a): unpack view + epoch check at fn-pointer
+                // arg site.
+                self.unpack_view_if_needed(v, &vt)?
+            } else if vt != arg_tys[i] {
                 return Err(CodegenError::Unsupported(format!(
                     "{} arg {}: expected {:?}, got {:?}",
                     callee_label, i, arg_tys[i], vt
                 )));
-            }
+            } else {
+                v
+            };
             call_args.push(v.into());
             llvm_param_tys.push(self.llvm_basic_type(&arg_tys[i]).into());
         }
@@ -31065,6 +31211,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     iface,
                 )?;
                 (fat.into(), want.clone())
+            } else if view_coerces_to(&ty, &want) {
+                // F.30 / F.30b (5a): BytesView → Bytes / StringView →
+                // String at external locus-method arg sites
+                // (`dest.append_slice(view, lo, hi)` and friends).
+                let unpacked = self.unpack_view_if_needed(v, &ty)?;
+                (unpacked, want.clone())
             } else {
                 (v, ty)
             };
@@ -32708,6 +32860,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     iname,
                 )?;
                 (fat.into(), want.clone())
+            } else if view_coerces_to(&ty, &want) {
+                // F.30b (5a): unpack view + epoch check at interface-
+                // dispatch method arg site.
+                let unpacked = self.unpack_view_if_needed(v, &ty)?;
+                (unpacked, want.clone())
             } else {
                 (v, ty)
             };
@@ -34664,6 +34821,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     iface,
                 )?;
                 (fat.into(), declared_ty.clone())
+            } else if literal_to_view_coerces(
+                &val_ty,
+                &declared_ty,
+                expr_to_lower,
+            ) {
+                // F.30b (5b): wrap a String/Bytes literal in a
+                // view struct so a `text: StringView = ""` or
+                // `body: BytesView = b""` field declaration
+                // type-checks. The wrapped view has builder=NULL,
+                // signaling lotus_*_view_data to skip the epoch
+                // check (the underlying data is program-lifetime).
+                let wrapped = self.wrap_literal_as_view(val)?;
+                (wrapped, declared_ty.clone())
             } else {
                 (val, val_ty)
             };

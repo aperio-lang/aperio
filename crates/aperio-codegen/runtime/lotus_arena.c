@@ -7041,6 +7041,26 @@ const char *lotus_str_view_data(void *view_ptr) {
     return (const char *)v->data;
 }
 
+/* F.30b (5b) (2026-05-20): wrap a static-lifetime String/Bytes
+ * pointer in a view struct for storage-site default coercion.
+ * The `builder` field is NULL — signals lotus_*_view_data that
+ * there's no epoch check to run (the underlying data is program-
+ * lifetime). Used at struct/locus field-init sites where the
+ * declared type is StringView/BytesView and the initializer is a
+ * String/Bytes literal (which are stored in the global string
+ * table, program-lifetime). */
+void *lotus_view_from_static_data(void *data) {
+    lotus_arena_t *arena = lotus_caller_arena_or_global();
+    if (!arena) return NULL;
+    lotus_view_t *v = (lotus_view_t *)lotus_arena_alloc(
+        arena, sizeof(lotus_view_t), _Alignof(lotus_view_t));
+    if (!v) return NULL;
+    v->data = data;
+    v->builder = NULL;
+    v->stamped_epoch = 0;
+    return v;
+}
+
 /* Returns 1 on success, 0 on hard failure (null handle or realloc
  * NULL). Empty / null chunk is a no-op success. The success
  * indicator is what the BytesBuilder locus's `append` method
