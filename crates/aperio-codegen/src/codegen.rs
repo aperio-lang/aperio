@@ -1731,6 +1731,23 @@ struct LocusInfo<'ctx> {
     /// the time the parent's slot-destroy runs). Cap of 64 slots
     /// per locus is well above the v1 ceiling.
     slot_borrowed_mask_field_idx: u32,
+    /// F.29 follow-up: index of the synthetic
+    /// `__locus_ref_owned_mask: i64` field. Bit N (LSB = the Nth
+    /// LocusRef-typed param field in declaration order, per
+    /// `locus_ref_bit_per_field`) is set iff that field was
+    /// initialized via a locus literal at instantiation
+    /// (parent-owned). Zero means externally provided (variable
+    /// reference override, etc.) — the cascade skips it.
+    locus_ref_owned_mask_field_idx: u32,
+    /// F.29 follow-up: bit-index map for LocusRef-typed param
+    /// fields. Keys are the field names; values are the bit
+    /// position within `__locus_ref_owned_mask`. Built in
+    /// declaration order over the locus's params (filtering on
+    /// `CodegenTy::LocusRef`). Used by the cascade emitters to
+    /// branch on ownership and by the field-init loop to set the
+    /// bit when the initializing expression produced a parent-
+    /// owned locus literal.
+    locus_ref_bit_per_field: BTreeMap<String, u32>,
     /// v1.x-3: index of the synthetic `__recpool: ptr` field —
     /// the parent-side handle into a recognition pool. Set at
     /// instantiation iff this locus's projection class is
@@ -8463,6 +8480,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let slot_borrowed_mask_field_idx = idx;
         llvm_field_tys.push(i64_t_struct.into());
         idx += 1;
+        // F.29 follow-up (2026-05-19): synthetic
+        // __locus_ref_owned_mask — bit N is set iff the Nth
+        // LocusRef-typed param field (in declaration order) was
+        // initialized via a locus literal at this instantiation
+        // (parent-owned), vs. an external override or non-locus
+        // expression (parent does not own). The cascade helpers
+        // `emit_locus_field_drains` / `emit_locus_field_dissolves`
+        // branch on the bit and skip externally-provided children,
+        // closing the double-dissolve regression where
+        // `Pub { sub: external_s }` would otherwise have the
+        // cascade tear down `external_s` while its real owner is
+        // still alive. Cap of 64 LocusRef fields per locus is well
+        // above any practical ceiling. Always present so the
+        // cascade emission stays uniform.
+        let locus_ref_owned_mask_field_idx = idx;
+        llvm_field_tys.push(i64_t_struct.into());
+        idx += 1;
         // v1.x-3: synthetic `__recpool: ptr` — parent-side recpool
         // handle (set only when this locus is Recognition class
         // with fixed_cell or shared_slab sub-mode; zero otherwise).
@@ -8816,6 +8850,36 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .opaque_struct_type(&format!("locus.{}", l.name.name));
         struct_ty.set_body(&llvm_field_tys, false);
 
+        // F.29 follow-up: assign bit positions for LocusRef-typed
+        // param fields in declaration order. The cascade emitters
+        // use these bits to discriminate parent-owned children
+        // (default-init OR locus-literal override) from externally
+        // provided ones (variable-ref override) — the latter
+        // are skipped by the cascade so they don't get
+        // double-dissolved by the parent's teardown alongside
+        // their real owner's teardown. `defaults` is in
+        // declaration order; we filter for fields whose codegen
+        // type is `LocusRef`.
+        let mut locus_ref_bit_per_field: BTreeMap<String, u32> =
+            BTreeMap::new();
+        let mut next_bit: u32 = 0;
+        for (fname, _) in defaults.iter() {
+            if let Some((_, ty)) = fields.get(fname) {
+                if matches!(ty, CodegenTy::LocusRef(_)) {
+                    locus_ref_bit_per_field.insert(fname.clone(), next_bit);
+                    next_bit += 1;
+                }
+            }
+        }
+        if next_bit > 64 {
+            return Err(CodegenError::Unsupported(format!(
+                "locus `{}` declares more than 64 LocusRef-typed \
+                 param fields ({}); the `__locus_ref_owned_mask` \
+                 bitmask only carries 64 bits",
+                l.name.name, next_bit
+            )));
+        }
+
         self.user_loci.insert(
             l.name.name.clone(),
             LocusInfo {
@@ -8846,6 +8910,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 restart_in_place_pending_field_idx,
                 drain_requested_field_idx,
                 slot_borrowed_mask_field_idx,
+                locus_ref_owned_mask_field_idx,
+                locus_ref_bit_per_field,
                 recpool_field_idx,
                 recpool_release_pool_field_idx,
                 recpool_release_kind_field_idx,
@@ -28245,6 +28311,30 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // arena ptr; arena_alloc's lookup prefers an override over
         // both `current_self` (the parent, here) and the program
         // global.
+        // F.29 follow-up: zero-init __locus_ref_owned_mask BEFORE
+        // the field-init loop, so the OR-sets that fire when a
+        // LocusRef-typed field is initialized via a locus literal
+        // aren't clobbered by a later zero-init pass. The cascade
+        // emitters read this mask at teardown; bits set here
+        // survive past the loop to flag parent-owned children.
+        {
+            let i64_t_zero = self.context.i64_type();
+            let zero_mask = i64_t_zero.const_int(0, false);
+            let lrom_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    info.locus_ref_owned_mask_field_idx,
+                    &format!(
+                        "{}.__locus_ref_owned_mask.ptr", locus_name
+                    ),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(lrom_ptr, zero_mask)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
         let prev_arena_override = self.current_arena_override;
         self.current_arena_override = Some(new_arena.into_pointer_value());
         for (fname, default) in info.defaults.iter() {
@@ -28258,35 +28348,60 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // semantics. Other expression shapes ignore the flag.
             // Cleared after each lower_expr so it doesn't leak
             // past this field's evaluation.
+            //
+            // F.29 follow-up (2026-05-19): after lower_expr, the
+            // flag's state tells us whether this field's value-
+            // expr produced a parent-owned locus literal:
+            // - `lower_locus_instantiation` consumes the flag via
+            //   `mem::take` when it enters the `parent_owns_via_field`
+            //   branch (true → false). So `owned_via_literal` is
+            //   `!self.instantiating_for_parent_field` after
+            //   lower_expr returns.
+            // - Non-literal exprs (variable ref, const, conditional
+            //   without a literal in the value-producing branch)
+            //   leave the flag at true, so `owned_via_literal` is
+            //   false. Const/Required don't invoke lower_expr at
+            //   all and short-circuit to false. We use this signal
+            //   to OR-set the matching bit in
+            //   `__locus_ref_owned_mask` below, so the cascade
+            //   knows which children to tear down at this parent's
+            //   dissolve vs. leave alone (they're owned by an
+            //   outer scope).
             let prev_field_flag = self.instantiating_for_parent_field;
             self.instantiating_for_parent_field = true;
-            let (val, val_ty) = if let Some(expr) = overrides.get(fname.as_str())
-            {
-                let r = self.lower_expr(expr, scope)?;
-                self.instantiating_for_parent_field = prev_field_flag;
-                r
-            } else {
-                match default {
-                    DefaultInit::Const(pv) => {
-                        self.instantiating_for_parent_field = prev_field_flag;
-                        self.const_param(pv)
+            let (val, val_ty, owned_via_literal) =
+                if let Some(expr) = overrides.get(fname.as_str()) {
+                    let r = self.lower_expr(expr, scope)?;
+                    let owned = !self.instantiating_for_parent_field;
+                    self.instantiating_for_parent_field = prev_field_flag;
+                    (r.0, r.1, owned)
+                } else {
+                    match default {
+                        DefaultInit::Const(pv) => {
+                            self.instantiating_for_parent_field =
+                                prev_field_flag;
+                            let r = self.const_param(pv);
+                            (r.0, r.1, false)
+                        }
+                        DefaultInit::Expr(e) => {
+                            let r = self.lower_expr(e, scope)?;
+                            let owned = !self.instantiating_for_parent_field;
+                            self.instantiating_for_parent_field =
+                                prev_field_flag;
+                            (r.0, r.1, owned)
+                        }
+                        DefaultInit::Required => {
+                            self.instantiating_for_parent_field =
+                                prev_field_flag;
+                            return Err(CodegenError::Unsupported(format!(
+                                "locus `{}` instantiation: param `{}` is \
+                                 required (no default) — supply it as \
+                                 `{} {{ {}: ... }}`",
+                                locus_name, fname, locus_name, fname
+                            )));
+                        }
                     }
-                    DefaultInit::Expr(e) => {
-                        let r = self.lower_expr(e, scope)?;
-                        self.instantiating_for_parent_field = prev_field_flag;
-                        r
-                    }
-                    DefaultInit::Required => {
-                        self.instantiating_for_parent_field = prev_field_flag;
-                        return Err(CodegenError::Unsupported(format!(
-                            "locus `{}` instantiation: param `{}` is \
-                             required (no default) — supply it as \
-                             `{} {{ {}: ... }}`",
-                            locus_name, fname, locus_name, fname
-                        )));
-                    }
-                }
-            };
+                };
             let (slot_idx, declared_ty) = info
                 .fields
                 .get(fname)
@@ -28330,6 +28445,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             self.builder
                 .build_store(field_ptr, val)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            // F.29 follow-up: OR the bit for this field into
+            // `__locus_ref_owned_mask` if the field is LocusRef-
+            // typed AND the value came from a parent-owned locus
+            // literal. Externally-provided overrides leave the
+            // bit clear so the cascade skips them — closes the
+            // double-dissolve regression where the cascade
+            // tore down loci it didn't own.
+            if owned_via_literal {
+                if let Some(&bit_pos) =
+                    info.locus_ref_bit_per_field.get(fname.as_str())
+                {
+                    let i64_t_local = self.context.i64_type();
+                    let mask_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            info.struct_ty,
+                            self_ptr,
+                            info.locus_ref_owned_mask_field_idx,
+                            &format!(
+                                "{}.__locus_ref_owned_mask.set.ptr",
+                                locus_name
+                            ),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    let prev_mask = self
+                        .builder
+                        .build_load(
+                            i64_t_local,
+                            mask_ptr,
+                            &format!(
+                                "{}.__locus_ref_owned_mask.prev",
+                                locus_name
+                            ),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .into_int_value();
+                    let bit = i64_t_local.const_int(1u64 << bit_pos, false);
+                    let new_mask = self
+                        .builder
+                        .build_or(
+                            prev_mask,
+                            bit,
+                            &format!(
+                                "{}.__locus_ref_owned_mask.or",
+                                locus_name
+                            ),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(mask_ptr, new_mask)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
+            }
         }
         self.current_arena_override = prev_arena_override;
 
@@ -28419,6 +28587,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // Bits get OR'd in below during slot init when a parent
         // has `as_parent_for ThisLocus` for one of this child's
         // slots.
+        //
+        // NOTE: this zero-init runs AFTER slot init (line ~28018);
+        // a borrow that ORs a bit during slot init would be
+        // clobbered here. In practice no currently-exercised path
+        // combines borrow with this ordering, but the v1 layout
+        // ordering should be revisited.
         let sbm_ptr = self
             .builder
             .build_struct_gep(
@@ -28431,6 +28605,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.builder
             .build_store(sbm_ptr, zero)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // F.29 follow-up: __locus_ref_owned_mask is zero-init'd
+        // earlier — see the matching block right before the
+        // field-init loop. The bits OR'd in by the field-init
+        // loop must survive past it; doing the zero-init here
+        // would clobber them.
 
         // v1.x-3: init the three synthetic recpool fields.
         //
@@ -34456,6 +34635,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Some(i) => i,
                 None => continue, // shouldn't happen for a typed field
             };
+            // F.29 follow-up: ownership branch. Wrap the cascade
+            // body in an `if (__locus_ref_owned_mask >> bit) & 1`
+            // check so externally-provided fields (variable-ref
+            // overrides) skip the per-child teardown — they're
+            // owned by an outer scope and will tear themselves
+            // down at THEIR scope exit. Without the gate, the
+            // parent's cascade would dissolve the external and
+            // its real owner's later teardown would hit freed
+            // memory.
+            let (owned_then_bb, owned_after_bb) = self
+                .emit_locus_field_owned_branch(
+                    info, self_ptr, locus_name, &fname,
+                    "cascade.dissolve",
+                )?;
+            let after_bb = match (owned_then_bb, owned_after_bb) {
+                (Some(then_bb), Some(after_bb)) => {
+                    self.builder.position_at_end(then_bb);
+                    Some(after_bb)
+                }
+                _ => None,
+            };
             // GEP the field slot, load the inner self_ptr.
             let field_slot_ptr = self
                 .builder
@@ -34509,8 +34709,96 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // nothing in its arena, the slot was created at birth
             // and must be destroyed for symmetry.
             self.emit_locus_arena_destroy(&inner_info, inner_ptr, &inner_name)?;
+            // Close the owned-branch (if one was emitted): jump to
+            // the after-bb and position the builder there so the
+            // next field's emission begins in the correct block.
+            if let Some(after_bb) = after_bb {
+                self.builder
+                    .build_unconditional_branch(after_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(after_bb);
+            }
         }
         Ok(())
+    }
+
+    /// F.29 follow-up: emit the `owned-bit gate` around a
+    /// per-field cascade body. Returns `(Some(then_bb), Some(after_bb))`
+    /// when the field is LocusRef-typed and the locus has a
+    /// non-empty ownership-mask layout — caller positions the
+    /// builder at `then_bb`, emits the cascade body, then must
+    /// branch to `after_bb` and position there at the end.
+    /// Returns `(None, None)` for non-LocusRef fields (caller
+    /// continues emission in-line as before). The cascade body
+    /// stays linear in that no-gate case.
+    fn emit_locus_field_owned_branch(
+        &mut self,
+        info: &LocusInfo<'ctx>,
+        self_ptr: PointerValue<'ctx>,
+        locus_name: &str,
+        fname: &str,
+        tag: &str,
+    ) -> Result<
+        (
+            Option<inkwell::basic_block::BasicBlock<'ctx>>,
+            Option<inkwell::basic_block::BasicBlock<'ctx>>,
+        ),
+        CodegenError,
+    > {
+        let bit_pos = match info.locus_ref_bit_per_field.get(fname) {
+            Some(&b) => b,
+            None => return Ok((None, None)),
+        };
+        let func = self.current_fn.expect("current_fn set");
+        let then_bb = self
+            .context
+            .append_basic_block(func, &format!("{}.{}.owned.then", tag, fname));
+        let after_bb = self
+            .context
+            .append_basic_block(func, &format!("{}.{}.owned.after", tag, fname));
+        let i64_t_local = self.context.i64_type();
+        let mask_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                self_ptr,
+                info.locus_ref_owned_mask_field_idx,
+                &format!(
+                    "{}.{}.{}.mask.ptr", locus_name, tag, fname
+                ),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let mask = self
+            .builder
+            .build_load(
+                i64_t_local,
+                mask_ptr,
+                &format!("{}.{}.{}.mask", locus_name, tag, fname),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let bit = i64_t_local.const_int(1u64 << bit_pos, false);
+        let anded = self
+            .builder
+            .build_and(
+                mask,
+                bit,
+                &format!("{}.{}.{}.anded", locus_name, tag, fname),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let owned = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                anded,
+                i64_t_local.const_zero(),
+                &format!("{}.{}.{}.owned", locus_name, tag, fname),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(owned, then_bb, after_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((Some(then_bb), Some(after_bb)))
     }
 
     /// Phase-2 (3) drain cascade. Per spec/runtime.md: "drain()
@@ -34547,6 +34835,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 Some(f) if !inner_info.empty_lifecycle.contains("drain") => *f,
                 _ => continue,
             };
+            // F.29 follow-up: ownership branch (same gate as
+            // emit_locus_field_dissolves). Externally-provided
+            // fields skip the cascade — their real owner runs
+            // drain at THEIR scope exit.
+            let (owned_then_bb, owned_after_bb) = self
+                .emit_locus_field_owned_branch(
+                    info, self_ptr, locus_name, &fname,
+                    "cascade.drain",
+                )?;
+            let after_bb = match (owned_then_bb, owned_after_bb) {
+                (Some(then_bb), Some(after_bb)) => {
+                    self.builder.position_at_end(then_bb);
+                    Some(after_bb)
+                }
+                _ => None,
+            };
             let field_slot_ptr = self
                 .builder
                 .build_struct_gep(
@@ -34572,6 +34876,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("{}.cascade.drain", inner_name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            if let Some(after_bb) = after_bb {
+                self.builder
+                    .build_unconditional_branch(after_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(after_bb);
+            }
         }
         Ok(())
     }

@@ -218,6 +218,75 @@ fn drain_cascades_depth_first_before_outer_drain() {
 }
 
 #[test]
+fn cascade_skips_externally_provided_locus_field() {
+    // F.29 follow-up: a parent-locus field whose value at
+    // instantiation is an externally-owned locus (variable
+    // reference, not a literal in the constructor) must NOT be
+    // torn down by the parent's cascade — its real owner (the
+    // outer let-binding's scope) tears it down at the
+    // appropriate time. Pre-fix the cascade walked all
+    // LocusRef-typed fields unconditionally, dissolving the
+    // external while it was still live; the external's real
+    // teardown then hit freed memory (the
+    // closed_world_nested_struct regression).
+    //
+    // Observable proof: `Inner.dissolve tag=1` should print
+    // exactly once (at the outer scope's let-binding dissolve,
+    // not at the parent's cascade — and never twice).
+    let src = r#"
+        locus Inner {
+            params { tag: Int = 0; }
+            dissolve() {
+                println("Inner.dissolve tag=", self.tag);
+            }
+        }
+        locus Outer {
+            params { sub: Inner; }
+            dissolve() {
+                println("Outer.dissolve");
+            }
+        }
+        fn use_pair() {
+            let s = Inner { tag: 1 };
+            Outer { sub: s };
+            println("after Outer");
+        }
+        fn main() {
+            use_pair();
+            println("after use_pair");
+        }
+    "#;
+    let (stdout, status) = build_and_run("external_field", src);
+    assert!(status.success(), "non-zero: {:?}\n{}", status, stdout);
+    let inner_count = stdout.matches("Inner.dissolve tag=1").count();
+    assert_eq!(
+        inner_count, 1,
+        "Inner should dissolve exactly once (by its real owner, \
+         not the Outer cascade): got {} times in {:?}",
+        inner_count, stdout
+    );
+    assert!(stdout.contains("Outer.dissolve"), "outer: {:?}", stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("missing {:?} in:\n{}", needle, stdout))
+    };
+    // Outer's user dissolve still fires; the cascade skipping
+    // applies only to the inner-teardown half.
+    assert!(pos("Outer.dissolve") < pos("after Outer"), "{}", stdout);
+    // Inner's real owner is `let s` in use_pair; its dissolve
+    // fires at use_pair's scope exit, after Outer's body has
+    // gone.
+    assert!(
+        pos("after Outer") < pos("Inner.dissolve tag=1"),
+        "{}",
+        stdout
+    );
+}
+
+#[test]
 fn many_iterations_dont_blow_memory() {
     // Without the cascade dissolve, each Holder leaks one
     // malloc-backed BytesBuilder header + buffer per iteration.
