@@ -12285,7 +12285,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         &[
                             dest_arena.into(),
                             bytes.into(),
-                            i64_t.const_int(8, false).into(),
+                            // 16-byte align matches the rest of the
+                            // codebase's struct-alloc default — i128
+                            // fields nested in a tuple element need
+                            // movdqa-compatible alignment. fathom
+                            // segfault repro: 3+ Decimal fields in
+                            // a @form(hashmap) Entry, post-Phase-4
+                            // scratch where the deep-copy went via
+                            // this arm.
+                            i64_t.const_int(16, false).into(),
                         ],
                         "fn.ret.tuple.alloc",
                     )
@@ -12369,7 +12377,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         &[
                             dest_arena.into(),
                             bytes.into(),
-                            i64_t.const_int(8, false).into(),
+                            // 16-byte align for i128 elements / i128
+                            // nested in element structs. Same fathom
+                            // segfault root as the tuple/struct arms.
+                            i64_t.const_int(16, false).into(),
                         ],
                         "fn.ret.arr.alloc",
                     )
@@ -12462,7 +12473,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         &[
                             dest_arena.into(),
                             bytes.into(),
-                            i64_t.const_int(8, false).into(),
+                            // 16-byte align — matches the standard
+                            // user-struct alloc path (arena_alloc's
+                            // default after the 2026-05-20 F7-segv
+                            // fix). i128 (Decimal) fields generate
+                            // movdqa on x86_64 which traps on 8-byte
+                            // alignment. fathom segfault repro: 3+
+                            // Decimal fields in a @form(hashmap)
+                            // Entry, triggered by the Phase-4
+                            // method-scratch deep-copy going through
+                            // this arm.
+                            i64_t.const_int(16, false).into(),
                         ],
                         "fn.ret.struct.alloc",
                     )
@@ -12555,7 +12576,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         &[
                             dest_arena.into(),
                             i64_t.const_int(16, false).into(),
-                            i64_t.const_int(8, false).into(),
+                            // 16-byte align for parity with the
+                            // sibling arms. The fat-pointer itself
+                            // is two i64 slots, but uniform 16-align
+                            // avoids future surprises if the layout
+                            // ever sprouts a wider slot.
+                            i64_t.const_int(16, false).into(),
                         ],
                         "fn.ret.iface.alloc",
                     )

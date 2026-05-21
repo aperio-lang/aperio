@@ -113,6 +113,59 @@ fn push_directly_from_method_body_survives_arena_clobber() {
 }
 
 #[test]
+fn hashmap_set_with_three_plus_decimal_fields_does_not_segfault() {
+    // fathom-reported (2026-05-21): a `@form(hashmap)` Entry
+    // type with 3+ Decimal fields SIGSEGV'd at insert. Root
+    // cause: emit_return_value_deep_copy's TypeRef-struct arm
+    // alloc'd the destination struct with align=8, but i128
+    // (Decimal) fields generate movdqa on x86_64 which traps
+    // on 8-byte alignment. The Phase-4 method-scratch reclaim
+    // routes hashmap.set through this arm because the value
+    // struct needs to anchor in the receiver's __arena instead
+    // of the caller's scratch — making the alignment bug
+    // suddenly load-bearing.
+    //
+    // The fix bumps every emit_return_value_deep_copy alloc
+    // site (Tuple / Array / TypeRef / Interface) to align=16,
+    // matching the standard arena_alloc default applied to
+    // user-struct allocs after the 2026-05-20 F7-segv fix.
+    let src = r#"
+        type Quote {
+            id: Int;
+            bid: Decimal;
+            ask: Decimal;
+            mid: Decimal;
+        }
+
+        @form(hashmap)
+        locus QuoteMap {
+            capacity { pool quotes of Quote indexed_by id; }
+        }
+
+        fn main() {
+            let m = QuoteMap { };
+            m.set(Quote { id: 1, bid: 1.5d, ask: 2.5d, mid: 2.0d });
+            m.set(Quote { id: 2, bid: 3.5d, ask: 4.5d, mid: 4.0d });
+            let q1 = m.get(1) or raise;
+            let q2 = m.get(2) or raise;
+            println("q1 bid=", q1.bid, " ask=", q1.ask, " mid=", q1.mid);
+            println("q2 bid=", q2.bid, " ask=", q2.ask, " mid=", q2.mid);
+        }
+    "#;
+    let (stdout, status) = build_and_run("three_dec_hashmap", src);
+    assert!(
+        status.success(),
+        "3-decimal hashmap Entry SIGSEGV'd — i128 alignment in \
+         emit_return_value_deep_copy regressed; status: {:?}, \
+         stdout: {:?}",
+        status,
+        stdout,
+    );
+    assert!(stdout.contains("q1 bid=1.5 ask=2.5 mid=2"), "stdout: {:?}", stdout);
+    assert!(stdout.contains("q2 bid=3.5 ask=4.5 mid=4"), "stdout: {:?}", stdout);
+}
+
+#[test]
 fn hashmap_set_with_dynamic_string_from_method_survives() {
     // Same shape as the vec.push dynamic-String repro, but
     // against @form(hashmap). hashmap_set memcpys the value
