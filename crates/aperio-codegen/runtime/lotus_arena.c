@@ -2527,22 +2527,34 @@ int lotus_str_eq(const char *l, const char *r) {
  * subregion destroy. Same shape as concat with a NULL right side
  * — kept as a separate symbol so the call-site IR is one helper
  * call, not a concat-with-empty-literal dance. */
-/* 2026-05-21: static-literal skip. String literals (`"foo"`) lower
- * to globals in the binary's .rodata segment — program-lifetime,
- * safe to alias forever. Cloning them into an arena is pure
- * waste; the cloned bytes have the same lifetime as the original
- * pointer (which is already infinite). The hashmap.set / vec.push
- * / locus-field-init deep-copy paths shipped this session clone
- * every String field unconditionally, including statically-known
- * metric names ("heartbeats_total") and other long-lived keys.
+/* 2026-05-21: clone-skip optimizations for lotus_str_clone /
+ * lotus_bytes_clone. Two cases pass through without allocating:
  *
- * Linker-provided symbols `__executable_start` and `_edata` bracket
- * the binary's mapped image (text + rodata + initialized data).
- * Any pointer inside that range came from a static-storage global,
- * is program-lifetime, and pass-through is safe. glibc exports
- * these symbols on every Linux build; the #ifdef gates them out
- * on non-glibc platforms where the clone is just paid as it was
- * before. */
+ *  (a) Static-literal skip — src is in the binary's .rodata /
+ *      initialized-data range. String literals (`"foo"`) lower
+ *      to globals in .rodata; cloning them is wasted because
+ *      the original pointer is already program-lifetime. Bounded
+ *      by linker-provided `__executable_start` and `_edata`
+ *      (glibc exports both on every Linux build).
+ *
+ *  (b) Same-arena skip — src is already inside one of dest's
+ *      chunks. This catches the dominant pond/metrics pattern
+ *      where a Counter / Gauge's `.inc()` / `.set()` reads
+ *      `e = store.get(self.key)` and writes back
+ *      `store.set(MetricEntry { key: e.key, name: e.name, ... })`.
+ *      `e.key` and `e.name` were cloned into the store's arena
+ *      on the original insert; re-cloning them into the same
+ *      arena on every update wastes O(N) bytes per call. Each
+ *      arena typically holds 1-10 chunks, so the walk is cheap
+ *      (single-digit ns at typical chunk counts). Long-running
+ *      arenas with hundreds of chunks pay more — sortable
+ *      chunk lookup is a future optimization if a workload
+ *      surfaces the cost.
+ *
+ * Both skips return src unchanged. The hashmap.set / vec.push /
+ * locus-field-init deep-copy paths use this for their String
+ * field clones; the savings compound when the same metric is
+ * updated thousands of times per second. */
 #if defined(__GLIBC__)
 extern char __executable_start[];
 extern char _edata[];
@@ -2556,8 +2568,21 @@ static inline int lotus_str_is_static_literal(const char *s) {
 }
 #endif
 
+static int lotus_ptr_in_arena(const lotus_arena_t *a, const void *p) {
+    if (!a || !p) return 0;
+    const char *cp = (const char *)p;
+    for (const lotus_arena_chunk_t *c = a->head; c; c = c->next) {
+        const char *base = (const char *)(c + 1);
+        if (cp >= base && cp < base + c->cap) return 1;
+    }
+    return 0;
+}
+
 char *lotus_str_clone(lotus_arena_t *a, const char *s) {
     if (lotus_str_is_static_literal(s)) {
+        return (char *)s;
+    }
+    if (lotus_ptr_in_arena(a, s)) {
         return (char *)s;
     }
     size_t n = strlen(s);
@@ -2731,6 +2756,17 @@ void *lotus_bytes_from_buf(lotus_arena_t *a, const void *src, int64_t len) {
  * sentinel via the existing patterns. */
 void *lotus_bytes_clone(lotus_arena_t *a, const void *src) {
     if (!a || !src) return NULL;
+    /* Same clone-skip optimizations as lotus_str_clone — static-
+     * literal Bytes (b"..." globals) and same-arena clones pass
+     * through without re-allocating. Bytes carries a length
+     * prefix, so the in-arena check uses the prefix address
+     * (start of the blob), not the payload. */
+    if (lotus_str_is_static_literal((const char *)src)) {
+        return (void *)src;
+    }
+    if (lotus_ptr_in_arena(a, src)) {
+        return (void *)src;
+    }
     int64_t len = lotus_bytes_len(src);
     if (len < 0) len = 0;
     void *blob = lotus_bytes_create(a, len);
