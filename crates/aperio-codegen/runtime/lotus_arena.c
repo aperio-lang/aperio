@@ -3170,6 +3170,26 @@ int lotus_tcp_close_fd(int fd) {
     return close(fd);
 }
 
+/* C-iii (2026-05-21): graceful interrupt for a blocking accept().
+ * shutdown(SHUT_RDWR) on a listen socket forces accept() to
+ * return immediately with an error on every OS that ships POSIX
+ * sockets — Linux returns EBADF/EINVAL, macOS returns EINVAL.
+ * The fd stays open; the caller's accept loop is expected to
+ * notice the failure and break. We don't close the fd here so
+ * dissolve()'s subsequent close stays the canonical teardown
+ * path (and so racing threads can't get a fresh fd handed
+ * back from the kernel between this call and dissolve).
+ *
+ * Returns the shutdown() return value (0 on success, -1 on
+ * error; not fatal — already-shutdown / closed fd is a no-op
+ * from the caller's perspective). Safe to call from any
+ * thread, including cross-scheduler — that's the whole point.
+ */
+int lotus_tcp_shutdown_listen_socket(int fd) {
+    if (fd < 0) return 0;
+    return shutdown(fd, SHUT_RDWR);
+}
+
 /* Forward decl — defined later (next to lotus_bus_payload_arena
  * proper). Lets the UDP block below build Bytes blobs in the
  * payload arena. */

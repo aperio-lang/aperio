@@ -3246,6 +3246,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let tcp_close_ty = i32_t.fn_type(&[i32_t.into()], false);
         self.module
             .add_function("lotus_tcp_close_fd", tcp_close_ty, None);
+        // declare i32 @lotus_tcp_shutdown_listen_socket(i32 fd)
+        // C-iii (2026-05-21): shutdown(SHUT_RDWR) on the listen
+        // fd to interrupt a blocking accept() from any thread.
+        // The fd stays open; dissolve() does the actual close.
+        // Returns the shutdown() syscall result (0 / -1).
+        let tcp_shutdown_listen_ty =
+            i32_t.fn_type(&[i32_t.into()], false);
+        self.module.add_function(
+            "lotus_tcp_shutdown_listen_socket",
+            tcp_shutdown_listen_ty,
+            None,
+        );
 
         // TLS substrate (std::io::tls::*). Client-only at v1:
         // a handshaked connection identified by an opaque int
@@ -23607,6 +23619,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_tcp_close_fd(args, scope)?;
                 Ok(())
             }
+            ["std", "io", "tcp", "__shutdown_listen_socket"] => {
+                let _ = self.lower_std_io_tcp_shutdown_listen_socket(args, scope)?;
+                Ok(())
+            }
             ["std", "io", "udp", "__close"]
             | ["std", "io", "udp", "close"] => {
                 let _ = self.lower_std_io_udp_close(args, scope)?;
@@ -24275,6 +24291,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "tcp", "__close_fd"]
             | ["std", "io", "tcp", "close_fd"] => {
                 self.lower_std_io_tcp_close_fd(args, scope)
+            }
+            ["std", "io", "tcp", "__shutdown_listen_socket"] => {
+                self.lower_std_io_tcp_shutdown_listen_socket(args, scope)
             }
             ["std", "io", "udp", "__close"]
             | ["std", "io", "udp", "close"] => {
@@ -28935,6 +28954,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let ret_i64 = self
             .builder
             .build_int_s_extend(ret_i32, i64_t, "close.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((ret_i64.into(), CodegenTy::Int))
+    }
+
+    /// `std::io::tcp::__shutdown_listen_socket(fd: Int) -> Int`.
+    /// C-iii (2026-05-21): graceful interrupt for a blocking
+    /// accept(). Calls `shutdown(fd, SHUT_RDWR)` to release any
+    /// thread sitting in accept on this listen socket. The fd
+    /// stays open — dissolve() handles the close. Returns the
+    /// syscall return value (0 / -1). Safe to call from any
+    /// thread, including cross-scheduler — that's the whole
+    /// point of this primitive.
+    fn lower_std_io_tcp_shutdown_listen_socket(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__shutdown_listen_socket takes 1 arg \
+                 (fd), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::tcp::__shutdown_listen_socket: fd must \
+                 be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_tcp_shutdown_listen_socket")
+            .expect("lotus_tcp_shutdown_listen_socket declared");
+        let ret_i32 = self
+            .builder
+            .build_call(f, &[fd_i32.into()], "shutdown_listen.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let ret_i64 = self
+            .builder
+            .build_int_s_extend(ret_i32, i64_t, "shutdown_listen.i64")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok((ret_i64.into(), CodegenTy::Int))
     }

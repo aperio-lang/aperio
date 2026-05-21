@@ -713,6 +713,56 @@ naming the fix paths (rename your type, match the stdlib
 shape, or use the qualified path). Previously this case
 panicked at codegen time.
 
+### `Server.shutdown()` — interruptible accept loop (2026-05-21)
+
+`std::http::Server` exposes a `shutdown()` method that calls
+`shutdown(SHUT_RDWR)` on the listen socket, forcing any thread
+blocked in `accept()` on this socket to return immediately with
+an error. The accept loop in `run()` detects the negative return
+and breaks; `dissolve()` does the actual `close()`.
+
+`shutdown()` is **safe to call from any thread, including
+cross-scheduler** — that's the whole point. A cooperative-
+scheduled Server can't pump its own `shutdown()` call because the
+scheduler is parked in `accept()`, so the wake-up has to come
+from outside. Typical pattern (e.g. fathom's mdgw with a
+duration-bounded WS recv loop):
+
+```aperio
+locus App {
+    params {
+        gateway: KrakenMdgw = KrakenMdgw { duration_s: 60 };
+        metrics: std::http::Server = std::http::Server {
+            port: 9100, handler: MetricsHandler { }
+        };
+    }
+    run() {
+        // gateway is pinned — runs on its own thread.
+        // metrics is cooperative — its run() blocks in accept.
+        // When gateway's run() finishes, signal metrics to
+        // wind down from the pinned thread.
+        // (pseudo-code — exact cross-locus handle is venue-
+        //  specific; the point is the call is cross-thread)
+        self.metrics.shutdown();
+    }
+}
+```
+
+Without `shutdown()`, an idle Server kept the binary alive until
+external SIGKILL — and on restart-within-60s the prior listen
+fd's TIME_WAIT would block the re-bind (see the `SO_REUSEPORT`
+addition in `199f861`, which closed the bind-side of the same
+restart-window friction). `shutdown()` closes the loop on the
+accept-side.
+
+Failure mode pre-shutdown(): if `listen_fd` got closed externally
+while the loop was in `accept()`, the loop spun on EBADF and
+spammed `lotus_tcp_accept_one: accept: Bad file descriptor` at
+line rate (fathom's mdgw saw 1.6M log lines in seconds). The
+loop now treats any negative `accept_one` return as a clean
+shutdown signal, so even degenerate fd closes terminate
+gracefully.
+
 ### `Server.ready_signal` — synchronization for piped oracles (2026-05-17)
 
 `std::http::Server` accepts an optional `ready_signal: String = ""`
