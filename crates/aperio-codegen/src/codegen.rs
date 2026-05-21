@@ -3525,6 +3525,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             i64_t.fn_type(&[ptr_t.into(), ptr_t.into(), i64_t.into()], false);
         self.module
             .add_function("lotus_fs_read_file", fs_read_ty, None);
+        // declare ptr @lotus_fs_read_file_growing(ptr arena, ptr path)
+        // 2026-05-21: size-tolerant variant for synthesized files
+        // (/proc/*, /sys/*, FIFO pipes) where fstat returns 0.
+        // Returns a NUL-terminated arena-allocated String or NULL
+        // on error. read_file's fallible codegen path routes
+        // through this so /proc/self/statm-style reads return
+        // the real bytes instead of an empty string.
+        let fs_read_growing_ty =
+            ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_fs_read_file_growing",
+            fs_read_growing_ty,
+            None,
+        );
 
         // declare i32 @lotus_fs_write_file(ptr path, ptr buf, i64 len)
         // returns 0 or -1.
@@ -14302,9 +14316,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     }
 
     /// `std::io::fs::read_file(path) -> String fallible(IoError)`.
-    /// Mirrors lower_std_io_fs_read_file's read-into-payload-arena
-    /// shape but branches on `raw_n < 0` to emit IoError instead
-    /// of silently clamping to an empty string.
+    /// 2026-05-21: routes through `lotus_fs_read_file_growing`,
+    /// which doesn't trust fstat for sizing. For synthesized
+    /// files (`/proc/*`, `/sys/*`, FIFO pipes) the previous
+    /// fstat-then-read pattern returned an empty String because
+    /// `st_size = 0` — fathom hit this trying to read
+    /// `/proc/self/statm`. The growing-buffer variant reads into
+    /// a doubling buffer (4 KiB → 64 MiB cap) and returns a
+    /// NUL-terminated String anchored in the caller's arena.
+    /// NULL return → IoError via the standard
+    /// `complete_io_fallible_call` shape.
     fn lower_std_io_fs_read_file_fallible(
         &mut self,
         args: &[Expr],
@@ -14324,99 +14345,38 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let path_val = self.unpack_view_if_needed(path_val, &path_ty)?;
-        let i32_t = self.context.i32_type();
-        let i64_t = self.context.i64_type();
-        let i8_t = self.context.i8_type();
-        let zero64 = i64_t.const_zero();
-
-        // file_size for sizing the buffer.
-        let size_fn = self
+        let arena = self.current_arena_ptr()?;
+        let read_fn = self
             .module
-            .get_function("lotus_fs_file_size")
-            .expect("lotus_fs_file_size declared");
-        let raw_size = self
-            .builder
-            .build_call(size_fn, &[path_val.into()], "fs.size")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .expect("returns i64")
-            .into_int_value();
-        let size_neg = self
-            .builder
-            .build_int_compare(
-                inkwell::IntPredicate::SLT,
-                raw_size,
-                zero64,
-                "size.neg",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let safe_size = self
-            .builder
-            .build_select(size_neg, zero64, raw_size, "size.safe")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .into_int_value();
-        // +1 for NUL terminator.
-        let alloc_size = self
-            .builder
-            .build_int_add(safe_size, i64_t.const_int(1, false), "alloc.size")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let alloc_fn = self
-            .module
-            .get_function("lotus_bus_payload_arena_alloc")
-            .expect("lotus_bus_payload_arena_alloc declared");
+            .get_function("lotus_fs_read_file_growing")
+            .expect("lotus_fs_read_file_growing declared");
         let buf_ptr = self
             .builder
             .build_call(
-                alloc_fn,
-                &[alloc_size.into(), i64_t.const_int(1, false).into()],
-                "fs.buf",
+                read_fn,
+                &[arena.into(), path_val.into()],
+                "fs.read_growing",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
             .try_as_basic_value()
             .left()
             .expect("returns ptr")
             .into_pointer_value();
-        let read_fn = self
-            .module
-            .get_function("lotus_fs_read_file")
-            .expect("lotus_fs_read_file declared");
-        let raw_n = self
+        // NULL → error.
+        let i64_t = self.context.i64_type();
+        let buf_as_int = self
             .builder
-            .build_call(
-                read_fn,
-                &[path_val.into(), buf_ptr.into(), safe_size.into()],
-                "fs.read",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .try_as_basic_value()
-            .left()
-            .expect("returns i64")
-            .into_int_value();
+            .build_ptr_to_int(buf_ptr, i64_t, "buf.as_int")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let is_err = self
             .builder
             .build_int_compare(
-                inkwell::IntPredicate::SLT,
-                raw_n,
-                zero64,
+                inkwell::IntPredicate::EQ,
+                buf_as_int,
+                i64_t.const_zero(),
                 "read.is_err",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        // NUL-terminate at offset safe_n (clamp to 0 if err).
-        let safe_n = self
-            .builder
-            .build_select(is_err, zero64, raw_n, "n.safe")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .into_int_value();
-        let nul_ptr = unsafe {
-            self.builder
-                .build_in_bounds_gep(i8_t, buf_ptr, &[safe_n], "nul.ptr")
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-        };
-        self.builder
-            .build_store(nul_ptr, i8_t.const_zero())
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let _ = i32_t;
         self.complete_io_fallible_call(
             is_err,
             path_val,

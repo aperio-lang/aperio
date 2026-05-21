@@ -3554,6 +3554,81 @@ const char *lotus_fs_mktemp(const char *prefix, const char *suffix);
  * comparing the return against the cap. Files larger than what
  * fits in size_t are not supported (extremely rare on the v0
  * target). */
+/* 2026-05-21: size-tolerant read variant that doesn't trust
+ * fstat. For synthesized files (`/proc` entries, `/sys`
+ * entries, FIFO pipes, sockets) fstat returns `st_size = 0`
+ * even though read(2) yields real content — the existing
+ * read_file path pre-allocates a 0-byte buffer and reads
+ * nothing, surfacing an empty String. fathom hit this trying
+ * to expose `/proc/self/statm` as a Prometheus gauge.
+ *
+ * This variant reads into a growing buffer (4 KiB initial,
+ * doubling, capped at 64 MiB) and returns a NUL-terminated
+ * String pointer allocated in `a`. NULL on any error (open,
+ * read, alloc-fail, exceeded cap). Used by the std::io::fs::
+ * read_file codegen path; the older fstat-then-read function
+ * stays callable for tests that wrote against the old buffer-
+ * provided-by-caller shape.
+ *
+ * 64 MiB cap is a runaway-guard, not a memory budget — for
+ * the /proc use case real files are 4–64 KiB. Any caller
+ * hitting the cap is reading something they probably want a
+ * streaming API for. We surface "exceeded cap" as the same
+ * NULL the open/read errors do; callers can distinguish via
+ * errno (EFBIG when the cap fires). */
+#define LOTUS_FS_READ_FILE_GROWING_CAP ((size_t)64 * 1024 * 1024)
+
+char *lotus_fs_read_file_growing(lotus_arena_t *a, const char *path) {
+    if (!a || !path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return NULL;
+    }
+    size_t cap = 4096;
+    char *buf = (char *)lotus_arena_alloc(a, cap + 1, 1);
+    if (!buf) {
+        close(fd);
+        errno = ENOMEM;
+        return NULL;
+    }
+    size_t used = 0;
+    for (;;) {
+        if (used == cap) {
+            size_t new_cap = cap * 2;
+            if (new_cap > LOTUS_FS_READ_FILE_GROWING_CAP) {
+                close(fd);
+                errno = EFBIG;
+                return NULL;
+            }
+            char *new_buf =
+                (char *)lotus_arena_alloc(a, new_cap + 1, 1);
+            if (!new_buf) {
+                close(fd);
+                errno = ENOMEM;
+                return NULL;
+            }
+            memcpy(new_buf, buf, used);
+            buf = new_buf;
+            cap = new_cap;
+        }
+        ssize_t r = read(fd, buf + used, cap - used);
+        if (r > 0) {
+            used += (size_t)r;
+            continue;
+        }
+        if (r == 0) break;
+        if (errno == EINTR) continue;
+        close(fd);
+        return NULL;
+    }
+    close(fd);
+    buf[used] = '\0';
+    return buf;
+}
+
 ssize_t lotus_fs_read_file(const char *path,
                            void *out_buf,
                            size_t out_cap) {

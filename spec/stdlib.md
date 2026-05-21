@@ -731,14 +731,31 @@ reports the underlying value in KiB and we multiply by 1024
 unconditionally; macOS / BSD parity is one `#ifdef` away if a
 workload ever asks.
 
-**Why this lives as a path-call, not `std::io::fs::read_file
-("/proc/self/statm")`:** synthesized `/proc` files report
-`st_size == 0`, and `read_file` sizes its internal buffer via
-`fstat` — the resulting read returns the empty string. Until
-`read_file` learns to grow its buffer on short reads (separate
-follow-up), `rss_bytes()` is the supported path. Pair with
-fathom's mdgw observability shape: stamp RSS into a Prometheus
-gauge once per heartbeat, alarm on growth slopes.
+**Why this lives as a path-call alongside reading `/proc/self/
+statm`:** `rss_bytes()` exposes the **peak** RSS via getrusage;
+the read_file path (now size-tolerant — see below) gets you the
+**current** RSS by parsing `/proc/self/statm` line one's second
+field. For alarm thresholds peak is usually what matters; for
+heartbeat gauges current is the right number. Both surfaces
+ship now. Pair with fathom's mdgw observability shape: stamp
+RSS into a Prometheus gauge once per heartbeat, alarm on
+growth slopes.
+
+### `read_file` size-tolerant for synthesized files (2026-05-21)
+
+`std::io::fs::read_file(path)` now uses a growing buffer
+internally (4 KiB initial, doubling, 64 MiB cap) instead of
+pre-sizing from `fstat`. The old fstat-then-read pattern
+returned an empty String for any file whose kernel-reported
+`st_size` was 0 — synthesized files under `/proc` and `/sys`,
+FIFO pipes, sockets, all of them. Now `read_file
+("/proc/self/statm")` returns the real bytes.
+
+The 64 MiB cap is a runaway guard, not a memory budget — for
+the `/proc` and config-file cases real files are 4–64 KiB.
+Callers hitting the cap probably want a streaming API; the
+cap surfaces as the same `IoError` shape the open/read failures
+do (errno = EFBIG so they can distinguish if they care).
 
 ### `Server.shutdown()` — interruptible accept loop (2026-05-21)
 
