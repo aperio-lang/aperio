@@ -127,7 +127,49 @@ typedef struct lotus_arena {
     const char          *cap_diag_name;
 } lotus_arena_t;
 
+/* Per-thread freelist of default-sized chunks (2026-05-21
+ * follow-up to the Phase-4 per-method scratch reclaim). The
+ * scratch open/destroy cycle does one malloc + one free per
+ * method call; for hot paths (every locus method call) that's
+ * ~100–400 ns of overhead even when the body itself does
+ * almost nothing. The fix is to keep recently-freed
+ * default-sized chunks in a thread-local LRU and hand them
+ * back out on the next `lotus_arena_new_chunk` request.
+ *
+ * Thread-local because chunks must not migrate across
+ * schedulers — a chunk freed on one thread that gets handed
+ * to another would race with the freeing thread's `used`
+ * cursor reset and (worse) hand out memory the donating
+ * thread might still be touching during the same call frame.
+ * Cap intentionally small: 16 × 64 KiB = 1 MiB per-thread
+ * resident overhead. Bigger arenas (which we get when callers
+ * pass a size larger than `default_chunk_size`) bypass the
+ * pool — only the common-case 64 KiB chunks are recycled,
+ * keeping the freelist policy obvious.
+ *
+ * Not synchronized: `__thread` provides per-thread storage,
+ * so each scheduler thread has its own freelist with no
+ * contention. The Bus-arena reclaim spec memo names this
+ * primitive but defers it; this is that primitive landing
+ * for real. */
+#define LOTUS_CHUNK_POOL_CAP 16
+
+static __thread lotus_arena_chunk_t *
+    g_chunk_pool[LOTUS_CHUNK_POOL_CAP];
+static __thread int g_chunk_pool_count = 0;
+
 static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
+    /* Pool only the common-case default chunk size. Mixing
+     * sizes in one freelist would force a scan per pop. */
+    if (cap == LOTUS_ARENA_CHUNK_BYTES && g_chunk_pool_count > 0) {
+        lotus_arena_chunk_t *c =
+            g_chunk_pool[--g_chunk_pool_count];
+        c->next = NULL;
+        c->used = 0;
+        /* c->cap already == LOTUS_ARENA_CHUNK_BYTES; the pool
+         * is invariant on that. */
+        return c;
+    }
     lotus_arena_chunk_t *c =
         (lotus_arena_chunk_t *)malloc(sizeof(lotus_arena_chunk_t) + cap);
     if (!c) return NULL;
@@ -135,6 +177,21 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
     c->used = 0;
     c->cap  = cap;
     return c;
+}
+
+/* Symmetric: return a chunk to the thread-local pool, or free
+ * it via libc if the pool is full or the chunk isn't default-
+ * sized. Called by `lotus_arena_destroy` for every chunk in
+ * the dying arena's list. */
+static void lotus_arena_release_chunk(lotus_arena_chunk_t *c) {
+    if (!c) return;
+    if (c->cap == LOTUS_ARENA_CHUNK_BYTES
+        && g_chunk_pool_count < LOTUS_CHUNK_POOL_CAP)
+    {
+        g_chunk_pool[g_chunk_pool_count++] = c;
+        return;
+    }
+    free(c);
 }
 
 static inline size_t lotus_align_up(size_t n, size_t a) {
@@ -314,7 +371,7 @@ void lotus_arena_destroy(lotus_arena_t *a) {
     lotus_arena_chunk_t *c = a->head;
     while (c) {
         lotus_arena_chunk_t *next = c->next;
-        free(c);
+        lotus_arena_release_chunk(c);
         c = next;
     }
     if (a->free_list) free(a->free_list);
