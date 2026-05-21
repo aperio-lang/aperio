@@ -442,8 +442,65 @@ static void lotus_init_glibc_malloc_tuning(void) {
 #endif
 }
 
+/* 2026-05-21: pre-fill the per-thread pool on first touch with
+ * `LOTUS_CHUNK_POOL_PREFILL` chunks. Downstream diagnostic
+ * showed 71.5% pool hit rate on a real hot path with a pool
+ * that oscillates near empty (pool_size=5 at exit) because
+ * alloc-rate and release-rate are tightly coupled in time —
+ * the pool's high-water depends on the lag between a release
+ * and the next request. Pre-filling moves the steady-state
+ * floor up by PREFILL; bursts that would otherwise drain the
+ * pool to 0 now drain to (PREFILL - burst_depth), eliminating
+ * the misses that surface as 64 KiB malloc churn.
+ *
+ * PREFILL = 32 → 2 MiB resident per thread that ever touches
+ * the pool. Acceptable for the long-lived pinned-thread model
+ * Aperio targets; large thread-pool workloads would pay
+ * 2 MiB × thread count, but those aren't the canonical use
+ * case. Configurable via the env var if a workload disagrees. */
+#define LOTUS_CHUNK_POOL_PREFILL_DEFAULT 32
+
+static __thread int g_chunk_pool_prefilled = 0;
+
+static int lotus_chunk_pool_prefill_count(void) {
+    static int initialized = 0;
+    static int count = LOTUS_CHUNK_POOL_PREFILL_DEFAULT;
+    if (!initialized) {
+        initialized = 1;
+        const char *env = getenv("LOTUS_CHUNK_POOL_PREFILL");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && v >= 0) {
+                /* 0 disables; otherwise clamped to pool cap. */
+                count = (int)v;
+                if (count > LOTUS_CHUNK_POOL_CAP) {
+                    count = LOTUS_CHUNK_POOL_CAP;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+static void lotus_chunk_pool_prefill_if_needed(void) {
+    if (g_chunk_pool_prefilled) return;
+    g_chunk_pool_prefilled = 1;
+    int target = lotus_chunk_pool_prefill_count();
+    while (g_chunk_pool_count < target) {
+        lotus_arena_chunk_t *c = (lotus_arena_chunk_t *)
+            malloc(sizeof(lotus_arena_chunk_t) + LOTUS_ARENA_CHUNK_BYTES);
+        if (!c) break;
+        c->next = NULL;
+        c->used = 0;
+        c->cap = LOTUS_ARENA_CHUNK_BYTES;
+        g_chunk_pool[g_chunk_pool_count++] = c;
+    }
+}
+
 static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
     lotus_mark_thread_for_pool_dtor();
+    lotus_chunk_pool_prefill_if_needed();
     /* Pool only the common-case default chunk size. Mixing
      * sizes in one freelist would force a scan per pop. */
     if (cap == LOTUS_ARENA_CHUNK_BYTES && g_chunk_pool_count > 0) {
