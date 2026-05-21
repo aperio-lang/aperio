@@ -162,7 +162,17 @@ typedef struct lotus_arena {
  * contention. The Bus-arena reclaim spec memo names this
  * primitive but defers it; this is that primitive landing
  * for real. */
-#define LOTUS_CHUNK_POOL_CAP 16
+/* 2026-05-21: bumped from 16 to 256. Per-method scratch reclaim
+ * shipping in 7cc4439 made arena create/destroy a hot-path
+ * operation (~6 kHz on a real-world recv loop), and a 16-slot
+ * cache was missing 99.6% of the time — each miss returned the
+ * chunk to glibc heap and contributed to per-thread arena
+ * fragmentation. 256 slots × 64 KiB = 16 MiB per-thread
+ * resident high-water, which is acceptable for the workloads
+ * that benefit from the cache; smaller workloads use far less
+ * because the pool grows on demand and only holds what's been
+ * released. */
+#define LOTUS_CHUNK_POOL_CAP 256
 
 static __thread lotus_arena_chunk_t *
     g_chunk_pool[LOTUS_CHUNK_POOL_CAP];
@@ -394,11 +404,18 @@ static lotus_arena_t *lotus_arena_alloc_struct(void) {
     lotus_arena_t *a = (lotus_arena_t *)malloc(sizeof(lotus_arena_t));
     if (!a) return NULL;
     a->default_chunk_size = LOTUS_ARENA_CHUNK_BYTES;
-    a->head = lotus_arena_new_chunk(a->default_chunk_size);
-    if (!a->head) {
-        free(a);
-        return NULL;
-    }
+    /* 2026-05-21: defer the initial chunk to the first
+     * `lotus_arena_alloc` call. Per-method scratch reclaim
+     * makes arena create/destroy a hot-path op; the dominant
+     * shape (`DurationInt.to_ns`, `__json_find_field_raw` /
+     * `peek_header` returning early, etc.) is "open scratch,
+     * do non-allocating work, close scratch" — eagerly
+     * mallocing a 64 KiB chunk for those is pure waste. The
+     * head-NULL path in `lotus_arena_alloc` is the same code
+     * the head-full path takes (allocate a fresh chunk, make
+     * it head), so the runtime cost on actually-allocating
+     * scratches is unchanged. */
+    a->head = NULL;
     a->parent     = NULL;
     a->slot       = -1;
     a->free_list  = NULL;
@@ -406,7 +423,7 @@ static lotus_arena_t *lotus_arena_alloc_struct(void) {
     a->free_cap   = 0;
     a->next_slot  = 0;
     a->fixed_size = 0;
-    a->chunk_byte_total = a->head->cap;
+    a->chunk_byte_total = 0;
     a->chunk_byte_cap   = 0;
     a->cap_diag_name    = NULL;
     return a;
@@ -469,8 +486,23 @@ void *lotus_arena_alloc(lotus_arena_t *a, size_t size, size_t align) {
     if (align == 0) align = 8;      /* default 8-byte alignment */
 
     lotus_arena_chunk_t *c = a->head;
-    size_t off = lotus_arena_off_for(c, align);
-    if (off + size > c->cap) {
+    /* 2026-05-21: lazy initial chunk. `lotus_arena_alloc_struct`
+     * leaves head == NULL so per-method scratches that never
+     * allocate cost zero mallocs end-to-end. The first call
+     * here falls through to the fresh-chunk path below by
+     * forcing the "doesn't fit" branch. Subsequent reads of
+     * head are guaranteed non-null because the path either
+     * filled head from the pool or just mallocd a new chunk. */
+    size_t off;
+    int needs_fresh;
+    if (!c) {
+        needs_fresh = 1;
+        off = 0;  /* unused; silences may-be-uninitialized */
+    } else {
+        off = lotus_arena_off_for(c, align);
+        needs_fresh = (off + size > c->cap);
+    }
+    if (needs_fresh) {
         /* v1.x-3: recognition-class pools mark the arena
          * `fixed_size` — the cell's capacity is the budget
          * spelled at the locus's projection annotation, and
