@@ -914,6 +914,24 @@ reclaim on a real-world long-running workload:
        for very-long-running arenas; deferred until a
        workload surfaces the cost.
 
+  4. **Outer-struct same-arena skip at cross-arena store
+     boundaries** (2026-05-22 PM). The hashmap.set / vec.set
+     / vec.push / ring_buffer.push deep-copy paths (from
+     `5300071` / `d435e9b` / `ea0a609`) now run a runtime
+     `lotus_arena_contains_ptr(dest_arena, src)` check before
+     allocating a fresh struct in the destination arena. When
+     the value already lives in dest — same-arena RMW shape,
+     `let e = store.get(key); store.set(Cell { ...e... })` —
+     the entire outer-struct allocation + field-recursion is
+     skipped and `src` passes through. Complements skip (3),
+     which only covered the leaf String/Bytes clone calls
+     inside the recursive walk. Emitted as an LLVM conditional
+     branch with a 2-way phi over the deep-copy and the
+     pass-through arm; same O(chunks) walk cost as (3). For
+     fresh values built in method scratch (the dominant
+     create-from-external-data shape) the check misses and we
+     fall through to the existing allocate-and-copy.
+
 **m49 closes the free-fn gap.** Every non-main free fn takes
 an implicit `__caller_arena: ptr` first param at the LLVM ABI.
 `main` keeps the program-wide `arena.global` it always had —

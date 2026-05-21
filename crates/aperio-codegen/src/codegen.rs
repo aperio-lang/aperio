@@ -2336,6 +2336,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let arena_destroy_ty = void_t.fn_type(&[ptr_t.into()], false);
         self.module
             .add_function("lotus_arena_destroy", arena_destroy_ty, None);
+        // declare i32 @lotus_arena_contains_ptr(ptr arena, ptr p)
+        // Returns 1 if `p` is inside one of `arena`'s chunks. Used
+        // by the codegen's same-arena skip at cross-arena store
+        // boundaries (hashmap.set / vec.set / vec.push /
+        // ring_buffer.push) to pass-through values that already
+        // live in the destination arena — the dominant cost on the
+        // read-modify-write pattern (get an entry, mutate locally,
+        // put it back) where the value's heap fields are already
+        // anchored in the receiver locus's __arena.
+        let arena_contains_ty =
+            self.context.i32_type()
+                .fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_arena_contains_ptr",
+            arena_contains_ty,
+            None,
+        );
 
         // v1.x-3: recognition projection class — bitmap-tracked
         // fixed_cell pool and bump-allocated shared_slab pool.
@@ -12212,6 +12229,156 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// TypeRef, has-payload-Enum) reject for v0.1 — none currently
     /// appear as free-fn returns; ship as a follow-up when a
     /// workload demands.
+    /// Cross-arena store deep-copy with a runtime same-arena skip.
+    /// Used at @form(hashmap).set / @form(vec).set / .push /
+    /// @form(ring_buffer).push — sites where the value being
+    /// stored crosses from the caller's method scratch into a
+    /// long-lived locus arena, so heap-pointer fields need to
+    /// re-anchor (the deep-copy invariant from `5300071` /
+    /// `d435e9b` / `ea0a609`).
+    ///
+    /// The runtime check (`lotus_arena_contains_ptr`) catches the
+    /// read-modify-write pattern where the value already lives in
+    /// the destination arena — e.g. the metrics shape:
+    ///
+    /// ```ignore
+    /// let e = self.store.get(self.key) or MetricEntry { };
+    /// self.store.set(MetricEntry { key: e.key, ... });
+    /// ```
+    ///
+    /// `e` is in `self.store.__arena`; the freshly-built outer
+    /// struct literal is in method scratch but its fields point
+    /// back into the store. `lotus_str_clone` already handles the
+    /// String/Bytes fields via 2026-05-21's same-arena skip; this
+    /// adds the equivalent for the outer struct when the entire
+    /// value is already in dest. For new entries built from
+    /// external data (the dominant BookApplier upsert shape) the
+    /// check misses and we fall through to the existing deep-copy
+    /// — one extra arena walk per store, but the walk is O(chunks)
+    /// and the trade-off mirrors `6a56d7c`'s.
+    ///
+    /// Pass-through for non-pointer-shaped types (scalars, FnPtr,
+    /// views) — no allocation to skip.
+    fn emit_cross_arena_store_deep_copy(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        ty: &CodegenTy,
+        dest_arena: PointerValue<'ctx>,
+        site_name: &str,
+    ) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        // Types that emit_return_value_deep_copy already handles
+        // cheaply (pure SSA identity, or already-skipped clones)
+        // — branch insertion would just be noise. Forward
+        // directly.
+        match ty {
+            CodegenTy::Int
+            | CodegenTy::Float
+            | CodegenTy::Bool
+            | CodegenTy::Decimal
+            | CodegenTy::Time
+            | CodegenTy::Duration
+            | CodegenTy::FnPtr { .. }
+            | CodegenTy::BytesView
+            | CodegenTy::StringView
+            | CodegenTy::LocusRef(_)
+            | CodegenTy::String
+            | CodegenTy::Bytes => {
+                return self.emit_return_value_deep_copy(
+                    value,
+                    ty,
+                    dest_arena,
+                );
+            }
+            _ => {}
+        }
+        // Pointer-shaped compound (TypeRef, Tuple, Array,
+        // Interface, has-payload Enum). Emit the runtime check.
+        let src_ptr = value.into_pointer_value();
+        let contains_fn = self
+            .module
+            .get_function("lotus_arena_contains_ptr")
+            .expect("lotus_arena_contains_ptr declared");
+        let contains_i32 = self
+            .builder
+            .build_call(
+                contains_fn,
+                &[dest_arena.into(), src_ptr.into()],
+                &format!("{}.in_dest_arena", site_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("lotus_arena_contains_ptr returns i32")
+            .into_int_value();
+        let i32_t = self.context.i32_type();
+        let cond = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                contains_i32,
+                i32_t.const_zero(),
+                &format!("{}.same_arena", site_name),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let current_fn = self
+            .builder
+            .get_insert_block()
+            .and_then(|bb| bb.get_parent())
+            .expect("inside a function");
+        let skip_bb = self.context.append_basic_block(
+            current_fn,
+            &format!("{}.deep_copy.skip", site_name),
+        );
+        let copy_bb = self.context.append_basic_block(
+            current_fn,
+            &format!("{}.deep_copy.do", site_name),
+        );
+        let join_bb = self.context.append_basic_block(
+            current_fn,
+            &format!("{}.deep_copy.join", site_name),
+        );
+        self.builder
+            .build_conditional_branch(cond, skip_bb, copy_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // skip arm: pass src through.
+        self.builder.position_at_end(skip_bb);
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // copy arm: existing deep-copy.
+        self.builder.position_at_end(copy_bb);
+        let copied = self.emit_return_value_deep_copy(
+            value,
+            ty,
+            dest_arena,
+        )?;
+        // The deep-copy is straight-line for the compound arms
+        // (no internal branching), so the builder is still
+        // positioned in copy_bb. Grab the actual incoming block
+        // for the phi in case future deep-copy logic grows
+        // branches.
+        let copy_end = self
+            .builder
+            .get_insert_block()
+            .expect("copy block still positioned");
+        self.builder
+            .build_unconditional_branch(join_bb)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // join: phi src / copied.
+        self.builder.position_at_end(join_bb);
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let phi = self
+            .builder
+            .build_phi(ptr_t, &format!("{}.deep_copy.phi", site_name))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let src_basic: BasicValueEnum = src_ptr.into();
+        phi.add_incoming(&[(&src_basic, skip_bb), (&copied, copy_end)]);
+        Ok(phi.as_basic_value())
+    }
+
     fn emit_return_value_deep_copy(
         &mut self,
         value: BasicValueEnum<'ctx>,
@@ -16822,10 +16989,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         CodegenError::LlvmEmit(e.to_string())
                     })?
                     .into_pointer_value();
-                let val = self.emit_return_value_deep_copy(
+                let val = self.emit_cross_arena_store_deep_copy(
                     val,
                     &elem_ty,
                     dest_arena,
+                    &format!("{}.vec_set", locus_name),
                 )?;
                 // The C ABI takes the new element as a pointer
                 // (matching lotus_vec_get's out-pointer shape). Stash
@@ -32885,10 +33053,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         CodegenError::LlvmEmit(e.to_string())
                     })?
                     .into_pointer_value();
-                let arg_val = self.emit_return_value_deep_copy(
+                let arg_val = self.emit_cross_arena_store_deep_copy(
                     arg_val,
                     &slot.elem_ty,
                     dest_arena,
+                    &format!("{}.vec_push", locus_name),
                 )?;
                 // Materialize the (now arena-anchored) arg in an
                 // alloca so we can hand its address to
@@ -33490,10 +33659,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         CodegenError::LlvmEmit(e.to_string())
                     })?
                     .into_pointer_value();
-                let arg_val = self.emit_return_value_deep_copy(
+                let arg_val = self.emit_cross_arena_store_deep_copy(
                     arg_val,
                     &expected_value_ty,
                     dest_arena,
+                    &format!("{}.hashmap_set", locus_name),
                 )?;
                 // The value lowered to a TypeRef arrives as a
                 // pointer to the struct (user_type instantiations
@@ -34035,10 +34205,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         CodegenError::LlvmEmit(e.to_string())
                     })?
                     .into_pointer_value();
-                let arg_val = self.emit_return_value_deep_copy(
+                let arg_val = self.emit_cross_arena_store_deep_copy(
                     arg_val,
                     &slot.elem_ty,
                     dest_arena,
+                    &format!("{}.ring_buffer_push", locus_name),
                 )?;
                 let llvm_elem_ty = self.llvm_basic_type(&slot.elem_ty);
                 let arg_alloca = self.alloca_in_entry(

@@ -2731,6 +2731,22 @@ static int lotus_ptr_in_arena(const lotus_arena_t *a, const void *p) {
     return 0;
 }
 
+/* Public surface for the codegen's same-arena skip at cross-arena
+ * store boundaries (hashmap.set, vec.set, vec.push,
+ * ring_buffer.push). The inner str/bytes clone helpers still use
+ * the static inline above for tighter codegen on the hot
+ * scalar-field paths; this wrapper exists so the LLVM-side
+ * outer-struct skip can call into the same arena walk without
+ * exposing the chunk struct layout. Returns 1 if `p` is inside
+ * one of `a`'s chunk data regions, 0 otherwise. O(chunks) — at
+ * steady-state arenas usually hold 1-10 chunks so the cost is
+ * single-digit ns; long-running arenas with hundreds of chunks
+ * pay more (a sortable chunk index is a future optimization if
+ * a workload surfaces the walk as a hotspot). */
+int lotus_arena_contains_ptr(const lotus_arena_t *a, const void *p) {
+    return lotus_ptr_in_arena(a, p);
+}
+
 char *lotus_str_clone(lotus_arena_t *a, const char *s) {
     if (lotus_str_is_static_literal(s)) {
         return (char *)s;
