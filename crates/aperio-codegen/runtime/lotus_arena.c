@@ -33,6 +33,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <limits.h>
+#include <malloc.h>
 #include <string.h>
 #include <pthread.h>
 #include <sched.h>
@@ -197,14 +199,38 @@ static size_t lotus_arena_big_chunk_threshold(void) {
     return threshold;
 }
 
+/* Per-process event cap. Default 200 keeps stderr survivable on
+ * a tight-loop workload; the pattern is usually obvious in the
+ * first 200 events. Override via LOTUS_ARENA_LOG_BIG_MAX_EVENTS=N
+ * (set 0 for unlimited). Parsed once on first use; cached. */
+static int lotus_arena_big_max_events(void) {
+    static int initialized = 0;
+    static int cap = 200;
+    if (!initialized) {
+        initialized = 1;
+        const char *env = getenv("LOTUS_ARENA_LOG_BIG_MAX_EVENTS");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env) {
+                /* Negative or 0 → unlimited (INT_MAX); positive →
+                 * exact cap. The "0 = unlimited" convention matches
+                 * /dev/-style "no limit" sentinels and is what the
+                 * downstream consumer asked for. */
+                cap = (v <= 0) ? INT_MAX : (int)v;
+            }
+        }
+    }
+    return cap;
+}
+
 /* Emit a one-line diagnostic with size, monotonic seqno, and a
- * small backtrace. Cap at the first ~200 events to keep stderr
- * from drowning in a tight loop — once a workload has logged 200
- * big allocs, the pattern is usually obvious. */
+ * small backtrace. Capped per `lotus_arena_big_max_events` (200
+ * by default; LOTUS_ARENA_LOG_BIG_MAX_EVENTS=0 lifts the cap). */
 static void lotus_log_big_alloc_event(const char *label, size_t cap) {
     static _Atomic int seq = 0;
     int n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed);
-    if (n >= 200) return;
+    if (n >= lotus_arena_big_max_events()) return;
     fprintf(stderr,
             "[%s #%d] cap=%zu bytes (%.2f MiB)\n",
             label, n, cap, (double)cap / (1024.0 * 1024.0));
@@ -284,6 +310,40 @@ void *__wrap_mmap(void *addr, size_t length, int prot,
         lotus_log_big_alloc_event("mmap_big", length);
     }
     return __real_mmap(addr, length, prot, flags, fd, offset);
+}
+
+/* 2026-05-21 follow-up: glibc malloc tuning hook. The default
+ * glibc allocator can create up to 8 × ncpu per-thread arenas,
+ * each of which mmaps 64 MiB "heap" segments on demand and
+ * accumulates them when long-lived + short-lived allocations
+ * interleave (heap fragmentation). On a long-running daemon
+ * with stable thread count, this surfaces as continuously
+ * growing virtual address space (100+ MB/sec) even though the
+ * resident working set stays small (~5 MB per 64 MiB segment).
+ *
+ * mallopt(M_ARENA_MAX, N) caps the per-thread arena count
+ * globally. N=1 forces a single arena (max contention, min
+ * virtual bloat). The right N depends on thread count; for the
+ * Aperio model (cooperative scheduler + a small number of
+ * pinned-locus threads) the default ncpu × 8 is overkill.
+ *
+ * Opt-in via env var so we don't surprise anyone whose
+ * workload benefits from the multi-arena default. Set
+ * LOTUS_GLIBC_ARENA_MAX=1 to force a single arena; any
+ * positive integer N caps the count at N. Unset / 0 keeps
+ * the glibc default. Runs at process startup before any user
+ * allocation (mallopt for M_ARENA_MAX is only effective
+ * before allocations land in extra arenas). */
+__attribute__((constructor))
+static void lotus_init_glibc_malloc_tuning(void) {
+    const char *env = getenv("LOTUS_GLIBC_ARENA_MAX");
+    if (!env || !env[0]) return;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || v <= 0) return;
+#ifdef M_ARENA_MAX
+    mallopt(M_ARENA_MAX, (int)v);
+#endif
 }
 
 static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
