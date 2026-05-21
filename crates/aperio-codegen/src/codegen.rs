@@ -16715,6 +16715,42 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 } else {
                     val
                 };
+                // Bus-arena reclaim follow-up (2026-05-21):
+                // mirror the @form(vec).push deep-copy at the
+                // set-from-method-body site. lotus_vec_set
+                // memcpys the value into the slot, so any heap
+                // fields inside `val` need to anchor in the
+                // receiver's __arena instead of aliasing the
+                // caller's per-method scratch.
+                let ptr_t_for_arena =
+                    self.context.ptr_type(AddressSpace::default());
+                let dest_arena_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        locus_self_ptr,
+                        info.arena_field_idx,
+                        &format!("{}.__arena.for_set.ptr", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?;
+                let dest_arena = self
+                    .builder
+                    .build_load(
+                        ptr_t_for_arena,
+                        dest_arena_field_ptr,
+                        &format!("{}.__arena.for_set", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .into_pointer_value();
+                let val = self.emit_return_value_deep_copy(
+                    val,
+                    &elem_ty,
+                    dest_arena,
+                )?;
                 // The C ABI takes the new element as a pointer
                 // (matching lotus_vec_get's out-pointer shape). Stash
                 // the SSA value into a stack alloca, hand its address
