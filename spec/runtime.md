@@ -1195,6 +1195,26 @@ and the `try_eval_form_ring_buffer_call` dispatcher. The deque
 backing differs from the C struct's circular array, but the
 observable push/pop/len/is_full semantics match.
 
+## Diagnostic + tuning env vars
+
+A small set of env vars toggle runtime instrumentation and
+glibc tuning hooks. All are opt-in; unset (the default) keeps
+the runtime quiet.
+
+| Env var | Effect |
+|---|---|
+| `LOTUS_ARENA_LOG_BIG_CHUNKS=<N>` | Logs every arena chunk + libc allocator (malloc / realloc / calloc / mmap) >= `<N>` bytes to stderr with size, monotonic seqno, and 8-frame backtrace. Use `1` (= 1 MiB) as a shortcut; any positive decimal byte count works (e.g. `4096`). Each event labeled by source: `arena_big_chunk`, `malloc_big`, `realloc_big`, `calloc_big`, `mmap_big`. |
+| `LOTUS_ARENA_LOG_BIG_MAX_EVENTS=<N>` | Caps the log at `<N>` events per process. Default 200. Set to 0 for unlimited (useful when watching low-rate sub-MiB allocation patterns over a long window). |
+| `LOTUS_CHUNK_POOL_STATS=1` | Dumps per-thread chunk-pool hit / miss / store / overflow counters to stderr at process exit. Diagnostic for "pool isn't recycling" symptoms — pairs hits vs misses, stores vs overflows. The atexit handler runs on the main thread; counters are `__thread` so the dump is that thread's view. |
+| `LOTUS_GLIBC_ARENA_MAX=<N>` | Calls `mallopt(M_ARENA_MAX, <N>)` at startup. Caps glibc's per-thread malloc arena count. `1` forces a single arena (max contention, min virtual-address fragmentation); higher `<N>` trades contention for parallelism. Useful belt-and-suspenders against the per-thread arena heap-segment proliferation glibc default tuning can produce on long-running daemons. Unset keeps glibc's default. |
+| `LOTUS_BUS_PAYLOAD_ARENA_CAP=<N>` | Overrides the lazy-global bus payload arena's byte cap (default 64 MiB). When the cap fires, `lotus_arena_alloc` returns NULL and the existing alloc-fail paths (`empty_global` / `alloc_failed` violation) surface degraded service rather than OOM-killing the process. |
+
+The arena-chunk pool and -wrap=malloc family ship in every
+binary unconditionally; the env vars are zero-cost when unset
+(one int read + one branch per allocation). The `-rdynamic`
+link flag is similarly unconditional so backtrace symbols
+resolve without addr2line.
+
 ## Runtime size budget
 
 The runtime should be small enough that a hello-world program

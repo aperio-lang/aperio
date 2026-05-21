@@ -867,6 +867,53 @@ vec without the wrapping locus owning it would still
 dangle — same boundary the cross-seed-segv fix originally
 documented; the fix here doesn't widen or narrow it.
 
+**Phase-4 perf follow-ons (2026-05-21).** Three substrate
+tunings that fell out of profiling the per-method scratch
+reclaim on a real-world long-running workload:
+
+  1. **Lazy initial chunk.** `lotus_arena_alloc_struct`
+     leaves `head = NULL`; `lotus_arena_alloc` falls through
+     to its existing fresh-chunk path on the first call.
+     The dominant scratch shape on a hot dispatch path is
+     "open scratch → do non-allocating work → close
+     scratch" (e.g. a method body that only reads / does
+     arithmetic). Eagerly mallocing a 64 KiB chunk for
+     those scratches was pure waste — the lazy variant pays
+     zero mallocs end-to-end for non-allocating bodies.
+
+  2. **Thread-local chunk pool, 256 slots.** Bumped from 16
+     after observing ~99.6% miss rate at hot-path scratch-
+     churn rates. Each scheduler thread holds up to 256 ×
+     64 KiB = 16 MiB of recycled chunks ready for the next
+     scratch open. Pool predicate: only default-sized
+     chunks (`c->cap == LOTUS_ARENA_CHUNK_BYTES`) recycle;
+     larger one-off chunks bypass the pool and free via
+     libc directly. `LOTUS_CHUNK_POOL_STATS=1` dumps the
+     per-thread counters at exit.
+
+  3. **`lotus_str_clone` / `lotus_bytes_clone` skip
+     optimizations.** Two cases pass through without
+     allocating:
+
+     * Static-literal skip — `src` is in the binary's
+       `[__executable_start, _edata)` range (text + rodata
+       + initialized data). String literals (`"foo"`)
+       lower to globals in .rodata; cloning them into an
+       arena is pointless since the original pointer is
+       already program-lifetime. Glibc-only via
+       `__GLIBC__` ifdef; other platforms pay the clone.
+     * Same-arena skip — `src` is already inside one of
+       the destination arena's chunks. Catches the
+       dominant `Counter.inc` / `Gauge.set` pattern where
+       the caller reads `e = store.get(key)` and writes
+       back `store.set(MetricEntry { key: e.key, ... })`
+       — the fields are already in the store's arena, so
+       re-cloning them is wasted memcpy. O(chunks); typical
+       arenas have 1–10 chunks so the walk is single-digit
+       ns. A sortable chunk index would tighten the bound
+       for very-long-running arenas; deferred until a
+       workload surfaces the cost.
+
 **m49 closes the free-fn gap.** Every non-main free fn takes
 an implicit `__caller_arena: ptr` first param at the LLVM ABI.
 `main` keeps the program-wide `arena.global` it always had —
