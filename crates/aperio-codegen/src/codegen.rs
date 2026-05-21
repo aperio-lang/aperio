@@ -2323,6 +2323,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let arena_create_ty = ptr_t.fn_type(&[], false);
         self.module
             .add_function("lotus_arena_create", arena_create_ty, None);
+        // declare ptr @lotus_arena_create_labeled(ptr label)
+        // 2026-05-22 PM: codegen-side entry point that stashes a
+        // human-readable label on the residency registry entry
+        // (LOTUS_ARENA_RESIDENCY=1 dump). Called at locus
+        // instantiation with the locus name as a global string
+        // literal so the residency snapshot identifies which
+        // locus owns which arena without needing to resolve
+        // construction backtraces.
+        let arena_create_labeled_ty =
+            ptr_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_arena_create_labeled",
+            arena_create_labeled_ty,
+            None,
+        );
         // m22: chunked-class parent calls this when accepting a
         // child; the child arena registers a slot index in the
         // parent so destroy can free-list it for reuse.
@@ -6760,21 +6775,35 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // Prelude: spin up the program-wide arena. Every
         // `arena_alloc` call site loads `@lotus.arena.global`, so
         // this store has to happen before any user code runs.
-        let arena_create = self
+        // Use the labeled variant so the residency dump can tag
+        // this arena distinctly from user locus arenas.
+        let arena_create_labeled = self
             .module
-            .get_function("lotus_arena_create")
-            .expect("lotus_arena_create declared");
+            .get_function("lotus_arena_create_labeled")
+            .expect("lotus_arena_create_labeled declared");
+        let arena_global_label_ptr = self
+            .builder
+            .build_global_string_ptr(
+                "lotus.arena.global",
+                "lotus.arena.global.label",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .as_pointer_value();
         let arena_global = self
             .module
             .get_global("lotus.arena.global")
             .expect("arena global declared");
         let arena_ptr = self
             .builder
-            .build_call(arena_create, &[], "arena.init")
+            .build_call(
+                arena_create_labeled,
+                &[arena_global_label_ptr.into()],
+                "arena.init",
+            )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
             .try_as_basic_value()
             .left()
-            .expect("arena_create returns ptr");
+            .expect("arena_create_labeled returns ptr");
         self.builder
             .build_store(arena_global.as_pointer_value(), arena_ptr)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
@@ -30035,16 +30064,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     let caller_arena = self.current_arena_ptr()?;
                     caller_arena.into()
                 } else {
-                    let arena_create = self
+                    // Use the labeled variant so
+                    // LOTUS_ARENA_RESIDENCY dumps name the locus
+                    // owning each arena. The label is a global
+                    // string literal — same lifetime as the
+                    // binary, satisfies the residency-entry
+                    // pointer-outlives-arena contract.
+                    let arena_create_labeled = self
                         .module
-                        .get_function("lotus_arena_create")
-                        .expect("lotus_arena_create declared");
+                        .get_function("lotus_arena_create_labeled")
+                        .expect("lotus_arena_create_labeled declared");
+                    let label_ptr = self
+                        .builder
+                        .build_global_string_ptr(
+                            locus_name,
+                            &format!("{}.arena.label", locus_name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                        .as_pointer_value();
                     self.builder
-                        .build_call(arena_create, &[], &format!("{}.arena", locus_name))
+                        .build_call(
+                            arena_create_labeled,
+                            &[label_ptr.into()],
+                            &format!("{}.arena", locus_name),
+                        )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
                         .try_as_basic_value()
                         .left()
-                        .expect("arena_create returns ptr")
+                        .expect("arena_create_labeled returns ptr")
                 }
             }
             AcquireStrategy::Subregion => {

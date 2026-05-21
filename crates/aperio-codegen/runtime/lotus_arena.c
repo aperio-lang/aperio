@@ -286,12 +286,27 @@ static void lotus_chunk_pool_stats_install(void) {
  * Programs that exit via `_exit(N)` skip atexit; callers wanting
  * a dump on signal / panic / explicit checkpoint can invoke
  * `lotus_arena_residency_dump_fd(int fd)` directly. */
+/* Backtrace capture depth at arena birth. 24 covers typical Aperio
+ * call stacks; the first 2 frames (backtrace itself + register
+ * helper) are stripped at dump time. Bumped from 8 after a
+ * fathom long-burn produced backtraces that bottomed out in
+ * libc-start before reaching any user-meaningful frame — the
+ * shallow capture was eating the construction site under
+ * inlining + recurse depth. */
+#define LOTUS_ARENA_RESIDENCY_BACKTRACE_DEPTH 24
+
 typedef struct lotus_arena_residency_entry {
     struct lotus_arena_residency_entry *next;
     struct lotus_arena *arena;
     int id;
+    /* Optional human-readable tag set by lotus_arena_create_labeled
+     * (codegen passes the locus name) or by hand for C-side
+     * specials (g_bus_payload_arena). NULL when the arena was
+     * created via plain lotus_arena_create with no label —
+     * caller falls back to the backtrace for identification. */
+    const char *label;
 #if defined(__GLIBC__)
-    void *birth_frames[8];
+    void *birth_frames[LOTUS_ARENA_RESIDENCY_BACKTRACE_DEPTH];
     int   birth_frame_count;
 #endif
 } lotus_arena_residency_entry_t;
@@ -311,20 +326,44 @@ static int lotus_arena_residency_enabled(void) {
     return enabled;
 }
 
-static void lotus_arena_residency_register(struct lotus_arena *a) {
+static void lotus_arena_residency_register(struct lotus_arena *a,
+                                            const char *label) {
     if (!lotus_arena_residency_enabled() || !a) return;
     lotus_arena_residency_entry_t *e = (lotus_arena_residency_entry_t *)
         malloc(sizeof(lotus_arena_residency_entry_t));
     if (!e) return;
     e->arena = a;
+    e->label = label;
     e->id = atomic_fetch_add_explicit(
         &g_arena_residency_seq, 1, memory_order_relaxed);
 #if defined(__GLIBC__)
-    e->birth_frame_count = backtrace(e->birth_frames, 8);
+    e->birth_frame_count = backtrace(
+        e->birth_frames, LOTUS_ARENA_RESIDENCY_BACKTRACE_DEPTH);
 #endif
     pthread_mutex_lock(&g_arena_residency_lock);
     e->next = g_arena_residency_head;
     g_arena_residency_head = e;
+    pthread_mutex_unlock(&g_arena_residency_lock);
+}
+
+/* Late-binding label setter — codegen / C-side initializers can
+ * call this after lotus_arena_create to attach a human-readable
+ * tag to the arena's registry entry. Useful when the label isn't
+ * known at create time, or for retrofitting the bus payload
+ * arena lazy-init path. No-op when residency logging is disabled
+ * or the arena isn't registered. */
+void lotus_arena_set_label(struct lotus_arena *a, const char *label);
+
+void lotus_arena_set_label(struct lotus_arena *a, const char *label) {
+    if (!lotus_arena_residency_enabled() || !a) return;
+    pthread_mutex_lock(&g_arena_residency_lock);
+    for (lotus_arena_residency_entry_t *e = g_arena_residency_head;
+         e; e = e->next) {
+        if (e->arena == a) {
+            e->label = label;
+            break;
+        }
+    }
     pthread_mutex_unlock(&g_arena_residency_lock);
 }
 
@@ -423,9 +462,11 @@ void lotus_arena_residency_dump_fd(int fd) {
     for (size_t j = 0; j < n; j++) {
         lotus_arena_residency_entry_t *e = rows[j].entry;
         fprintf(out,
-                "  [#%d arena=%p] chunks=%zu bytes=%zu (%.2f MiB) "
-                "parent=%p\n",
-                e->id, (void *)e->arena, rows[j].chunks, rows[j].bytes,
+                "  [#%d arena=%p label=%s] chunks=%zu bytes=%zu "
+                "(%.2f MiB) parent=%p\n",
+                e->id, (void *)e->arena,
+                e->label ? e->label : "<unlabeled>",
+                rows[j].chunks, rows[j].bytes,
                 (double)rows[j].bytes / (1024.0 * 1024.0),
                 (void *)e->arena->parent);
 #if defined(__GLIBC__)
@@ -787,7 +828,19 @@ lotus_arena_t *lotus_arena_create(void) {
      * LOTUS_ARENA_RESIDENCY dump can attribute bytes back to
      * the construction site. Subregions are skipped in
      * `lotus_arena_create_subregion`. */
-    lotus_arena_residency_register(a);
+    lotus_arena_residency_register(a, NULL);
+    return a;
+}
+
+/* Codegen entry point for locus arena creation — same as
+ * lotus_arena_create but stashes `label` on the residency entry
+ * so the dump emits a human-readable tag (typically the locus
+ * name) instead of just an address + backtrace. The label
+ * pointer must outlive the arena; codegen passes a global string
+ * literal so this is automatic. */
+lotus_arena_t *lotus_arena_create_labeled(const char *label) {
+    lotus_arena_t *a = lotus_arena_alloc_struct();
+    lotus_arena_residency_register(a, label);
     return a;
 }
 
@@ -5737,7 +5790,7 @@ static pthread_mutex_t  g_bus_payload_arena_mutex = PTHREAD_MUTEX_INITIALIZER;
     ((size_t)64 * 1024 * 1024)
 
 static lotus_arena_t *lotus_bus_payload_arena_create_capped(void) {
-    lotus_arena_t *a = lotus_arena_create();
+    lotus_arena_t *a = lotus_arena_create_labeled("g_bus_payload_arena");
     if (!a) return NULL;
     size_t cap = LOTUS_BUS_PAYLOAD_ARENA_DEFAULT_CAP_BYTES;
     const char *env = getenv("LOTUS_BUS_PAYLOAD_ARENA_CAP");
