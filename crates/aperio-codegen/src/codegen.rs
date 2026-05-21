@@ -32509,12 +32509,62 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 } else {
                     arg_val
                 };
-                // Materialize the arg in an alloca so we can hand
-                // its address to lotus_vec_push. The runtime
-                // memcpys elem_size bytes from this address.
-                // Entry-block hoist so a push call in a loop body
-                // doesn't grow the frame per iteration (1M pushes
-                // × 8 bytes = 8 MB → SIGSEGV).
+                // Bus-arena reclaim (2026-05-21) follow-up:
+                // when the push happens from a method body whose
+                // scratch is destroyed at method-exit, the
+                // freshly-built struct literal (arg_val) lives in
+                // scratch. lotus_vec_push memcpys the struct
+                // bytes into the vec's buffer in the receiver
+                // locus's arena — but if the struct's fields are
+                // heap pointers (String, Bytes, nested struct,
+                // ...) those pointers still aim at scratch and
+                // dangle after method exit. Deep-copy the elem
+                // into the receiver's __arena BEFORE the push so
+                // the heap fields are anchored in the vec's
+                // owning arena, surviving every caller's scratch
+                // destroy. Scalars / view types / loci /
+                // fn-pointers pass through identically via
+                // `emit_return_value_deep_copy`. For pushes from
+                // main (scratch_active is false), the dest arena
+                // is the same as the source — the deep-copy is a
+                // wasted memcpy (matching the same trade-off
+                // accepted for free-fn epilogues post the
+                // Bytes-arm fix). Catches the regression pinned
+                // by tests/cross_locus_from_method.rs.
+                let dest_arena_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        locus_self_ptr,
+                        info.arena_field_idx,
+                        &format!("{}.__arena.for_push.ptr", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?;
+                let dest_arena = self
+                    .builder
+                    .build_load(
+                        ptr_t,
+                        dest_arena_field_ptr,
+                        &format!("{}.__arena.for_push", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .into_pointer_value();
+                let arg_val = self.emit_return_value_deep_copy(
+                    arg_val,
+                    &slot.elem_ty,
+                    dest_arena,
+                )?;
+                // Materialize the (now arena-anchored) arg in an
+                // alloca so we can hand its address to
+                // lotus_vec_push. The runtime memcpys elem_size
+                // bytes from this address. Entry-block hoist so
+                // a push call in a loop body doesn't grow the
+                // frame per iteration (1M pushes × 8 bytes = 8
+                // MB → SIGSEGV).
                 let llvm_elem_ty =
                     self.llvm_basic_type(&slot.elem_ty);
                 let arg_alloca = self.alloca_in_entry(
