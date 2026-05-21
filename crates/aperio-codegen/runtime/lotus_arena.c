@@ -262,6 +262,201 @@ static void lotus_chunk_pool_stats_install(void) {
     }
 }
 
+/* LOTUS_ARENA_RESIDENCY (2026-05-22 PM): per-long-lived-arena
+ * byte counter, sampled at process exit. Answers the diagnostic
+ * question "which long-lived arena's residency is growing under
+ * sustained churn?" — LOTUS_ARENA_LOG_BIG_CHUNKS only catches
+ * allocation events at the call site, not where the bytes
+ * actually live.
+ *
+ * Enabled by setting `LOTUS_ARENA_RESIDENCY=1` (or any non-zero
+ * value). When enabled, every top-level arena (created via
+ * `lotus_arena_create` — locus arenas + g_bus_payload_arena,
+ * NOT method-scratch subregions) is linked into a global registry
+ * at create time with a backtrace captured for the construction
+ * site. At process exit (atexit), the dumper walks the live set
+ * and emits one line per arena with chunk count, total bytes,
+ * parent pointer, and the construction backtrace.
+ *
+ * Subregions (`lotus_arena_create_subregion`) are intentionally
+ * skipped — they're method scratch with method-bounded lifetimes,
+ * not the long-lived residency we care about. Their parent's
+ * total is what shows up in the dump.
+ *
+ * Programs that exit via `_exit(N)` skip atexit; callers wanting
+ * a dump on signal / panic / explicit checkpoint can invoke
+ * `lotus_arena_residency_dump_fd(int fd)` directly. */
+typedef struct lotus_arena_residency_entry {
+    struct lotus_arena_residency_entry *next;
+    struct lotus_arena *arena;
+    int id;
+#if defined(__GLIBC__)
+    void *birth_frames[8];
+    int   birth_frame_count;
+#endif
+} lotus_arena_residency_entry_t;
+
+static lotus_arena_residency_entry_t *g_arena_residency_head = NULL;
+static pthread_mutex_t g_arena_residency_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_arena_residency_seq = 0;
+
+static int lotus_arena_residency_enabled(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        initialized = 1;
+        const char *env = getenv("LOTUS_ARENA_RESIDENCY");
+        enabled = env && env[0] && env[0] != '0';
+    }
+    return enabled;
+}
+
+static void lotus_arena_residency_register(struct lotus_arena *a) {
+    if (!lotus_arena_residency_enabled() || !a) return;
+    lotus_arena_residency_entry_t *e = (lotus_arena_residency_entry_t *)
+        malloc(sizeof(lotus_arena_residency_entry_t));
+    if (!e) return;
+    e->arena = a;
+    e->id = atomic_fetch_add_explicit(
+        &g_arena_residency_seq, 1, memory_order_relaxed);
+#if defined(__GLIBC__)
+    e->birth_frame_count = backtrace(e->birth_frames, 8);
+#endif
+    pthread_mutex_lock(&g_arena_residency_lock);
+    e->next = g_arena_residency_head;
+    g_arena_residency_head = e;
+    pthread_mutex_unlock(&g_arena_residency_lock);
+}
+
+static void lotus_arena_residency_unregister(struct lotus_arena *a) {
+    if (!lotus_arena_residency_enabled() || !a) return;
+    pthread_mutex_lock(&g_arena_residency_lock);
+    lotus_arena_residency_entry_t **link = &g_arena_residency_head;
+    while (*link) {
+        if ((*link)->arena == a) {
+            lotus_arena_residency_entry_t *gone = *link;
+            *link = gone->next;
+            free(gone);
+            break;
+        }
+        link = &(*link)->next;
+    }
+    pthread_mutex_unlock(&g_arena_residency_lock);
+}
+
+/* Public dump entry point. Callable from anywhere — atexit hook,
+ * signal handler, fathom-side checkpoint, panic path. Writes one
+ * line per still-alive registered arena to the given fd. The
+ * dump is sorted descending by total bytes so the heaviest arena
+ * surfaces at the top. */
+void lotus_arena_residency_dump_fd(int fd);
+
+void lotus_arena_residency_dump_fd(int fd) {
+    if (!lotus_arena_residency_enabled()) return;
+    pthread_mutex_lock(&g_arena_residency_lock);
+
+    /* Snapshot to an array so we can sort + emit without holding
+     * the lock through stdio. Backtrace symbol resolution can
+     * touch malloc; holding the lock through it would risk
+     * deadlock if a registration races during the dump. */
+    size_t n = 0;
+    for (lotus_arena_residency_entry_t *e = g_arena_residency_head;
+         e; e = e->next) {
+        n++;
+    }
+    lotus_arena_residency_entry_t **arr = (lotus_arena_residency_entry_t **)
+        malloc(n * sizeof(lotus_arena_residency_entry_t *));
+    if (!arr) {
+        pthread_mutex_unlock(&g_arena_residency_lock);
+        return;
+    }
+    size_t i = 0;
+    for (lotus_arena_residency_entry_t *e = g_arena_residency_head;
+         e; e = e->next) {
+        arr[i++] = e;
+    }
+    pthread_mutex_unlock(&g_arena_residency_lock);
+
+    /* Compute byte totals (sum of chunk caps) for each arena. */
+    typedef struct {
+        lotus_arena_residency_entry_t *entry;
+        size_t bytes;
+        size_t chunks;
+    } row_t;
+    row_t *rows = (row_t *)malloc(n * sizeof(row_t));
+    if (!rows) {
+        free(arr);
+        return;
+    }
+    for (size_t j = 0; j < n; j++) {
+        size_t bytes = 0, chunks = 0;
+        for (const lotus_arena_chunk_t *c = arr[j]->arena->head;
+             c; c = c->next) {
+            chunks++;
+            bytes += c->cap;
+        }
+        rows[j].entry = arr[j];
+        rows[j].bytes = bytes;
+        rows[j].chunks = chunks;
+    }
+    /* Insertion sort by bytes descending (n is small — handfuls
+     * to tens of arenas in typical use). */
+    for (size_t a = 1; a < n; a++) {
+        row_t key = rows[a];
+        size_t b = a;
+        while (b > 0 && rows[b - 1].bytes < key.bytes) {
+            rows[b] = rows[b - 1];
+            b--;
+        }
+        rows[b] = key;
+    }
+
+    FILE *out = (fd == fileno(stderr)) ? stderr : fdopen(dup(fd), "w");
+    if (!out) {
+        free(rows);
+        free(arr);
+        return;
+    }
+    fprintf(out,
+            "[arena_residency dump] %zu live arenas, "
+            "sorted by bytes desc:\n", n);
+    for (size_t j = 0; j < n; j++) {
+        lotus_arena_residency_entry_t *e = rows[j].entry;
+        fprintf(out,
+                "  [#%d arena=%p] chunks=%zu bytes=%zu (%.2f MiB) "
+                "parent=%p\n",
+                e->id, (void *)e->arena, rows[j].chunks, rows[j].bytes,
+                (double)rows[j].bytes / (1024.0 * 1024.0),
+                (void *)e->arena->parent);
+#if defined(__GLIBC__)
+        if (e->birth_frame_count > 2) {
+            fflush(out);
+            backtrace_symbols_fd(
+                e->birth_frames + 2,
+                e->birth_frame_count - 2,
+                fileno(out));
+        }
+#endif
+    }
+    fflush(out);
+    if (out != stderr) {
+        fclose(out);
+    }
+    free(rows);
+    free(arr);
+}
+
+static void lotus_arena_residency_dump_atexit(void) {
+    lotus_arena_residency_dump_fd(fileno(stderr));
+}
+
+__attribute__((constructor))
+static void lotus_arena_residency_install(void) {
+    if (lotus_arena_residency_enabled()) {
+        atexit(lotus_arena_residency_dump_atexit);
+    }
+}
+
 /* LOTUS_ARENA_LOG_BIG_CHUNKS (2026-05-21): on first call, parse
  * the env var to a byte threshold. Subsequent calls return the
  * cached threshold. 0 disables logging. The env var value is
@@ -585,7 +780,15 @@ static lotus_arena_t *lotus_arena_alloc_struct(void) {
 /* Public ABI ---------------------------------------------------- */
 
 lotus_arena_t *lotus_arena_create(void) {
-    return lotus_arena_alloc_struct();
+    lotus_arena_t *a = lotus_arena_alloc_struct();
+    /* Top-level arenas (no parent) are the long-lived residency
+     * targets — locus __arenas, g_bus_payload_arena, anything
+     * not bounded by a method's exit. Register them so the
+     * LOTUS_ARENA_RESIDENCY dump can attribute bytes back to
+     * the construction site. Subregions are skipped in
+     * `lotus_arena_create_subregion`. */
+    lotus_arena_residency_register(a);
+    return a;
 }
 
 /* Carve a sub-region of `parent`. The sub-region holds its own
@@ -744,6 +947,14 @@ void lotus_arena_destroy(lotus_arena_t *a) {
             p->free_list[p->free_count++] = a->slot;
         }
     }
+
+    /* LOTUS_ARENA_RESIDENCY: drop the registry entry (if any)
+     * before freeing the arena struct. Subregions never
+     * registered so the unregister walk no-ops on them; the
+     * registry's linear scan is fine here since arena destroys
+     * are rare and unregister is only meaningful for the env-var
+     * enabled diagnostic path anyway. */
+    lotus_arena_residency_unregister(a);
 
     lotus_arena_chunk_t *c = a->head;
     while (c) {

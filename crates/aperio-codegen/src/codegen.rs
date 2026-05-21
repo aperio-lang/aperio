@@ -3278,6 +3278,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let rss_bytes_ty = i64_t.fn_type(&[], false);
         self.module
             .add_function("lotus_process_rss_bytes", rss_bytes_ty, None);
+        // declare void @lotus_arena_residency_dump_fd(i32 fd)
+        // 2026-05-22 PM: writes per-arena residency snapshot
+        // (bytes / chunks / construction backtrace) to the given
+        // fd. No-op when LOTUS_ARENA_RESIDENCY is unset. The
+        // Aperio surface `std::process::dump_arena_residency()`
+        // calls this with stderr's fd; fathom-side daemons wire
+        // it into their checkpoint hook so locus arenas are
+        // still alive when the snapshot is taken (atexit fires
+        // post-dissolve and would report an empty set).
+        let residency_dump_ty =
+            void_t.fn_type(&[i32_t.into()], false);
+        self.module.add_function(
+            "lotus_arena_residency_dump_fd",
+            residency_dump_ty,
+            None,
+        );
 
         // m73b: TCP primitives reachable from Aperio source via
         // the `std::io::tcp::__*` magic-path calls. lotus_tcp_t
@@ -23957,6 +23973,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_process_rss_bytes(args)?;
                 Ok(())
             }
+            ["std", "process", "dump_arena_residency"] => {
+                let _ = self.lower_std_process_dump_arena_residency(args)?;
+                Ok(())
+            }
             ["std", "io", "tcp", "__listen_socket"] => {
                 let _ = self.lower_std_io_tcp_listen_socket(args, scope)?;
                 Ok(())
@@ -24643,6 +24663,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         match segs {
             ["std", "process", "pid"] => self.lower_std_process_pid(args),
             ["std", "process", "rss_bytes"] => self.lower_std_process_rss_bytes(args),
+            ["std", "process", "dump_arena_residency"] => {
+                self.lower_std_process_dump_arena_residency(args)
+            }
             ["std", "io", "tcp", "__listen_socket"] => {
                 self.lower_std_io_tcp_listen_socket(args, scope)
             }
@@ -25657,6 +25680,47 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("lotus_process_rss_bytes returns i64");
         Ok((bytes, CodegenTy::Int))
+    }
+
+    /// `std::process::dump_arena_residency()` (2026-05-22 PM).
+    /// Writes per-arena residency snapshot (bytes / chunks /
+    /// construction backtrace) to stderr. No-op unless the
+    /// program was started with `LOTUS_ARENA_RESIDENCY=1`. The
+    /// dump runs synchronously and walks the live registry under
+    /// a mutex; safe to call from any thread, but reserve for
+    /// stats-emit / checkpoint hooks (locus dissolve at scope
+    /// exit will hide the residency from later snapshots, which
+    /// is why an atexit hook alone won't catch a long-running
+    /// daemon's locus arenas — fathom calls this from its
+    /// checkpoint tick).
+    fn lower_std_process_dump_arena_residency(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "std::process::dump_arena_residency takes 0 arguments, got {}",
+                args.len()
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_arena_residency_dump_fd")
+            .expect("lotus_arena_residency_dump_fd declared");
+        // fd=2 → stderr. Matches the diagnostic conventions of
+        // LOTUS_ARENA_LOG_BIG_CHUNKS and LOTUS_CHUNK_POOL_STATS.
+        let i32_t = self.context.i32_type();
+        let stderr_fd = i32_t.const_int(2, false);
+        self.builder
+            .build_call(f, &[stderr_fd.into()], "arena_residency.dump")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Void return — surface as `Bool(true)` so the surface is
+        // call-as-expression compatible without forcing a stmt-only
+        // syntax. Matches the cheap "returns true" pattern used by
+        // a few other observability primitives. Actually return
+        // unit-like Int(0) to avoid implying a meaningful value.
+        let i64_t = self.context.i64_type();
+        Ok((i64_t.const_int(0, false).into(), CodegenTy::Int))
     }
 
     /// Lower `std::io::tcp::__listen_socket(host: String,
