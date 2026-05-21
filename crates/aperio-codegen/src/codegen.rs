@@ -452,7 +452,13 @@ pub fn build_executable_with_imports(
         // tells which path fired. Catches allocations that
         // bypass the arena chunk path (BytesBuilder grow-by-
         // doubling realloc, hashmap grow calloc, openssl /
-        // libc internals via mmap).
+        // libc internals via mmap). `-D` is paired with the
+        // `-Wl,--wrap` flags so the wrapper bodies are only
+        // compiled when their `__real_*` counterparts will be
+        // resolvable at link time — sidecar test drivers that
+        // compile lotus_arena.c without the wrap flags skip
+        // the wrapper definitions entirely.
+        .arg("-DLOTUS_ENABLE_WRAP_MALLOC")
         .arg("-Wl,--wrap=malloc")
         .arg("-Wl,--wrap=realloc")
         .arg("-Wl,--wrap=calloc")

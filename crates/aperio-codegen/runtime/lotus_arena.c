@@ -202,11 +202,12 @@ static int lotus_chunk_pool_stats_enabled(void) {
     return enabled;
 }
 
-static void lotus_chunk_pool_stats_dump(void) {
-    if (!lotus_chunk_pool_stats_enabled()) return;
+static void lotus_chunk_pool_stats_emit(const char *label) {
     fprintf(stderr,
-            "[chunk_pool main-thread] hits=%llu misses=%llu "
+            "[chunk_pool %s tid=%lu] hits=%llu misses=%llu "
             "stores=%llu overflows=%llu pool_size=%d\n",
+            label,
+            (unsigned long)pthread_self(),
             (unsigned long long)g_chunk_pool_hits,
             (unsigned long long)g_chunk_pool_misses,
             (unsigned long long)g_chunk_pool_stores,
@@ -215,10 +216,49 @@ static void lotus_chunk_pool_stats_dump(void) {
     fflush(stderr);
 }
 
+static void lotus_chunk_pool_stats_dump_main(void) {
+    if (!lotus_chunk_pool_stats_enabled()) return;
+    lotus_chunk_pool_stats_emit("main-thread");
+}
+
+/* pthread-key destructor: fires when a non-main thread exits
+ * (pthread_exit / return-from-start). Lets per-thread chunk
+ * pool counters dump for every scheduler thread, not just the
+ * main thread that runs the atexit hook. Triggered by the
+ * `mark_thread_for_dtor` helper below, which sets a non-NULL
+ * sentinel on first chunk pool touch — subsequent operations
+ * skip the setspecific call via the `g_thread_marked` thread-
+ * local flag. */
+static pthread_key_t g_chunk_pool_stats_thread_key;
+static int g_chunk_pool_stats_key_init = 0;
+static __thread int g_thread_marked_for_pool_dtor = 0;
+
+static void lotus_chunk_pool_stats_thread_dtor(void *unused) {
+    (void)unused;
+    if (!lotus_chunk_pool_stats_enabled()) return;
+    /* Skip threads that never actually touched the pool — the
+     * sentinel was set on first touch, so anything that gets
+     * the destructor call had at least one event. The main
+     * thread's atexit handler covers itself separately so we
+     * don't double-dump. */
+    lotus_chunk_pool_stats_emit("thread-exit");
+}
+
+static inline void lotus_mark_thread_for_pool_dtor(void) {
+    if (g_thread_marked_for_pool_dtor) return;
+    if (!g_chunk_pool_stats_key_init) return;
+    pthread_setspecific(g_chunk_pool_stats_thread_key, (void *)1);
+    g_thread_marked_for_pool_dtor = 1;
+}
+
 __attribute__((constructor))
 static void lotus_chunk_pool_stats_install(void) {
     if (lotus_chunk_pool_stats_enabled()) {
-        atexit(lotus_chunk_pool_stats_dump);
+        atexit(lotus_chunk_pool_stats_dump_main);
+        if (pthread_key_create(&g_chunk_pool_stats_thread_key,
+                               lotus_chunk_pool_stats_thread_dtor) == 0) {
+            g_chunk_pool_stats_key_init = 1;
+        }
     }
 }
 
@@ -316,16 +356,17 @@ static void lotus_arena_log_big_chunk(size_t cap) {
  * (e.g. mmap_big vs realloc_big), and so existing arena_big_chunk
  * entries stay easy to grep for.
  *
- * The wrapping is unconditional at link time — every binary
- * goes through these wrappers. The cost when disabled (env var
- * unset) is one int read + one branch per allocation, which is
- * a rounding error compared to the syscall / heap-walk cost the
- * allocator itself pays.
+ * Gated by `-DLOTUS_ENABLE_WRAP_MALLOC` so the main `aperio
+ * build` clang invocation pulls in the wrappers (and pairs them
+ * with `-Wl,--wrap=malloc` etc. so ld renames calls), while
+ * sidecar test drivers that compile `lotus_arena.c` directly
+ * without the wrap flags don't drag in the `__real_*` references
+ * that would otherwise fail to link.
  *
- * Forward decls for the __real_* counterparts come from
- * `-Wl,--wrap=<fn>`: ld renames every malloc reference in this
- * TU to __wrap_malloc, and __real_malloc is the genuine libc
- * malloc. */
+ * The wrapping cost when the env var is unset is one int read +
+ * one branch per allocation — rounding error compared to the
+ * syscall / heap-walk cost the allocator itself pays. */
+#ifdef LOTUS_ENABLE_WRAP_MALLOC
 extern void *__real_malloc(size_t size);
 extern void *__real_realloc(void *ptr, size_t size);
 extern void *__real_calloc(size_t nmemb, size_t size);
@@ -365,6 +406,7 @@ void *__wrap_mmap(void *addr, size_t length, int prot,
     }
     return __real_mmap(addr, length, prot, flags, fd, offset);
 }
+#endif /* LOTUS_ENABLE_WRAP_MALLOC */
 
 /* 2026-05-21 follow-up: glibc malloc tuning hook. The default
  * glibc allocator can create up to 8 × ncpu per-thread arenas,
@@ -401,6 +443,7 @@ static void lotus_init_glibc_malloc_tuning(void) {
 }
 
 static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
+    lotus_mark_thread_for_pool_dtor();
     /* Pool only the common-case default chunk size. Mixing
      * sizes in one freelist would force a scan per pop. */
     if (cap == LOTUS_ARENA_CHUNK_BYTES && g_chunk_pool_count > 0) {
@@ -435,6 +478,7 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
  * the dying arena's list. */
 static void lotus_arena_release_chunk(lotus_arena_chunk_t *c) {
     if (!c) return;
+    lotus_mark_thread_for_pool_dtor();
     if (c->cap == LOTUS_ARENA_CHUNK_BYTES
         && g_chunk_pool_count < LOTUS_CHUNK_POOL_CAP)
     {
