@@ -33244,6 +33244,46 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )));
                 }
 
+                // Bus-arena reclaim follow-up (2026-05-21): when
+                // set() runs from inside a method body, the struct
+                // literal lives in the caller's per-call scratch.
+                // hashmap_set memcpys the struct bytes into the
+                // slot — but heap-pointer fields (String / Bytes
+                // / TypeRef / Tuple / Array) still alias scratch
+                // and dangle on method exit. Deep-copy into the
+                // receiver locus's __arena BEFORE the set so
+                // those fields anchor where the map lives. Same
+                // shape as the @form(vec).push deep-copy from
+                // 5300071.
+                let dest_arena_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        locus_self_ptr,
+                        info.arena_field_idx,
+                        &format!("{}.__arena.for_set.ptr", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?;
+                let ptr_t_for_arena =
+                    self.context.ptr_type(AddressSpace::default());
+                let dest_arena = self
+                    .builder
+                    .build_load(
+                        ptr_t_for_arena,
+                        dest_arena_field_ptr,
+                        &format!("{}.__arena.for_set", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .into_pointer_value();
+                let arg_val = self.emit_return_value_deep_copy(
+                    arg_val,
+                    &expected_value_ty,
+                    dest_arena,
+                )?;
                 // The value lowered to a TypeRef arrives as a
                 // pointer to the struct (user_type instantiations
                 // return `*StructTy`). Pass it directly as
@@ -33754,6 +33794,41 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         locus_name, slot.elem_ty, arg_ty
                     )));
                 }
+                // Bus-arena reclaim follow-up (2026-05-21): same
+                // cross-arena deep-copy as @form(vec).push +
+                // @form(hashmap).set. Heap-pointer fields in the
+                // pushed value would alias the caller's method
+                // scratch and dangle on method exit; anchor them
+                // in the receiver locus's __arena instead.
+                let ptr_t_for_arena =
+                    self.context.ptr_type(AddressSpace::default());
+                let dest_arena_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        locus_self_ptr,
+                        info.arena_field_idx,
+                        &format!("{}.__arena.for_push.ptr", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?;
+                let dest_arena = self
+                    .builder
+                    .build_load(
+                        ptr_t_for_arena,
+                        dest_arena_field_ptr,
+                        &format!("{}.__arena.for_push", locus_name),
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .into_pointer_value();
+                let arg_val = self.emit_return_value_deep_copy(
+                    arg_val,
+                    &slot.elem_ty,
+                    dest_arena,
+                )?;
                 let llvm_elem_ty = self.llvm_basic_type(&slot.elem_ty);
                 let arg_alloca = self.alloca_in_entry(
                     llvm_elem_ty,

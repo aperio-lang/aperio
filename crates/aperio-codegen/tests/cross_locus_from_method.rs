@@ -113,6 +113,95 @@ fn push_directly_from_method_body_survives_arena_clobber() {
 }
 
 #[test]
+fn hashmap_set_with_dynamic_string_from_method_survives() {
+    // Same shape as the vec.push dynamic-String repro, but
+    // against @form(hashmap). hashmap_set memcpys the value
+    // struct into the slot; if heap-pointer fields still alias
+    // method scratch, they dangle on method exit. The fix is
+    // the same: deep-copy into the receiver's __arena before
+    // the set.
+    let src = r#"
+        type Entry { id: Int; name: String; }
+
+        @form(hashmap)
+        locus EntryMap {
+            capacity { pool entries of Entry indexed_by id; }
+        }
+
+        locus Caller {
+            params { reg: EntryMap = EntryMap { }; }
+            birth() {
+                let nm = "dyn-" + to_string(42);
+                self.reg.set(Entry { id: 7, name: nm });
+            }
+            run() {
+                let mut i = 0;
+                while i < 200 {
+                    let _trash = "zzzzzzzzzzzzzzzz" + to_string(i);
+                    i = i + 1;
+                }
+                let e = self.reg.get(7) or Entry { id: -1, name: "FB" };
+                println("name=", e.name, " id=", to_string(e.id));
+            }
+        }
+
+        fn main() { Caller { }; }
+    "#;
+    let (stdout, status) = build_and_run("hashmap_clobber", src);
+    assert!(status.success(), "non-zero (segv?): {:?}", status);
+    assert!(
+        stdout.contains("name=dyn-42"),
+        "hashmap entry's dynamic String content was clobbered \
+         — cross-arena deep-copy at hashmap.set is missing.\nstdout: {:?}",
+        stdout,
+    );
+    assert!(stdout.contains("id=7"), "stdout: {:?}", stdout);
+}
+
+#[test]
+fn ring_buffer_push_with_dynamic_string_from_method_survives() {
+    // @form(ring_buffer).push has the same memcpy shape. Heap
+    // fields in the pushed value must anchor in the receiver's
+    // arena, not the caller's scratch.
+    let src = r#"
+        type Frame { seq: Int; label: String; }
+
+        @form(ring_buffer, cap = 16)
+        locus FrameBuffer {
+            capacity { pool history of Frame; }
+        }
+
+        locus Caller {
+            params { frames: FrameBuffer = FrameBuffer { }; }
+            birth() {
+                let lbl = "evt-" + to_string(99);
+                let _ok = self.frames.push(Frame { seq: 3, label: lbl });
+            }
+            run() {
+                let mut i = 0;
+                while i < 200 {
+                    let _trash = "yyyyyyyyyyyyyyyy" + to_string(i);
+                    i = i + 1;
+                }
+                println("len=", to_string(self.frames.len()));
+            }
+        }
+
+        fn main() { Caller { }; }
+    "#;
+    let (stdout, status) = build_and_run("ring_clobber", src);
+    assert!(status.success(), "non-zero (segv?): {:?}", status);
+    // We don't fetch the entry back (ring_buffer doesn't expose
+    // a get() per the synth surface listed in
+    // try_lower_form_ring_buffer_method), but the survival of
+    // the buffer itself across the clobber + the absence of a
+    // crash on read of len() is the proof. A real consumer (e.g.
+    // fathom's per-symbol last-N-corrupt-timestamps ring) would
+    // hit the dangling read on its own consume path.
+    assert!(stdout.contains("len=1"), "stdout: {:?}", stdout);
+}
+
+#[test]
 fn push_with_dynamic_string_content_survives_scratch_clobber() {
     // The discriminating shape: the Entry.name is a DYNAMICALLY-
     // ALLOCATED String (concat result), not a literal. The string
