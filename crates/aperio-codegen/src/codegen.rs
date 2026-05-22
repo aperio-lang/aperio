@@ -21065,7 +21065,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 } else {
                     if in_method_with_scratch {
+                        // Save/restore scratch state so subsequent
+                        // `return` statements in the same method
+                        // body also emit the destroy. Without this,
+                        // a method with N early returns only
+                        // reclaims the scratch on whichever return
+                        // codegen visits first — every other return
+                        // path leaks the subregion (chunks stay in
+                        // pool/malloc). Surfaced 2026-05-22 PM by
+                        // fathom's KrakenMdgw dispatch() (8+ returns,
+                        // ~10 MiB/min residency growth that bisected
+                        // to the multi-return path).
+                        let saved_scratch = self.current_method_scratch;
+                        let saved_caller =
+                            self.current_method_caller_arena;
                         self.close_method_scratch()?;
+                        self.current_method_scratch = saved_scratch;
+                        self.current_method_caller_arena = saved_caller;
                     }
                     self.builder
                         .build_return(None)
@@ -21141,7 +21157,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 } else if in_method_with_scratch {
                     let copied = self.emit_method_return_deep_copy(v, &declared_ty)?;
+                    // Multi-return scratch-destroy fix — see
+                    // matching note in the void-return arm above.
+                    let saved_scratch = self.current_method_scratch;
+                    let saved_caller =
+                        self.current_method_caller_arena;
                     self.close_method_scratch()?;
+                    self.current_method_scratch = saved_scratch;
+                    self.current_method_caller_arena = saved_caller;
                     self.builder
                         .build_return(Some(&copied))
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
