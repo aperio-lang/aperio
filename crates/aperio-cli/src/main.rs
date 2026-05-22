@@ -527,10 +527,21 @@ fn resolve_imports(
 /// importer's alias, so two parallel paths to the same lib live
 /// as separate compiled copies (per-importer namespacing). Cycles
 /// are bounded by the canonical-path `visited` set.
+/// Per-build entry context that Stage-2 FFI uses to walk imports
+/// after resolution. The caller resolves imports once for normal
+/// codegen; this context lets a second walk (just for FFI
+/// manifest pickup) happen against the same lookup roots without
+/// re-reading the entry file.
+pub struct EntryCtx {
+    pub entry_dir: PathBuf,
+    pub workspace_root: Option<PathBuf>,
+    pub imports: Vec<aperio_syntax::ast::Import>,
+}
+
 fn parse_with_imports(
     entry: &Path,
 ) -> Result<
-    (Program, ImportRenames, BTreeMap<PathBuf, String>),
+    (Program, ImportRenames, BTreeMap<PathBuf, String>, EntryCtx),
     Vec<(PathBuf, aperio_syntax::Diag, String)>,
 > {
     let mut sources: BTreeMap<PathBuf, String> = BTreeMap::new();
@@ -564,6 +575,7 @@ fn parse_with_imports(
     visited.insert(entry_canon.clone());
     sources.insert(entry_canon, entry_source);
 
+    let entry_imports = entry_program.imports.clone();
     let mut merged_items = entry_program.items;
     let mut renames: ImportRenames = Vec::new();
 
@@ -590,7 +602,12 @@ fn parse_with_imports(
         items: merged_items,
         span: entry_program.span,
     };
-    Ok((merged, renames, sources))
+    let ctx = EntryCtx {
+        entry_dir,
+        workspace_root,
+        imports: entry_imports,
+    };
+    Ok((merged, renames, sources, ctx))
 }
 
 
@@ -673,7 +690,7 @@ fn run_program(target: &Path) -> ExitCode {
         // per the known limitation). Cross-seed imports through
         // `aperio run` will likewise fail on `alias::Name` paths;
         // use `aperio build` for programs with imports.
-        let (program, _renames, sources) = match parse_with_imports(target) {
+        let (program, _renames, sources, _ctx) = match parse_with_imports(target) {
             Ok(x) => x,
             Err(errors) => {
                 for (path, d, src) in &errors {
@@ -760,8 +777,8 @@ fn run_build(target: &Path) -> ExitCode {
     // directory shape is the user-facing answer to the
     // single-file-app-monolith friction; the file shape stays for
     // backwards compatibility and for one-off scripts.
-    let (program, renames, sources, output) = if target.is_file() {
-        let (program, renames, sources) = match parse_with_imports(target) {
+    let (program, renames, sources, output, entry_ctx) = if target.is_file() {
+        let (program, renames, sources, ctx) = match parse_with_imports(target) {
             Ok(x) => x,
             Err(errors) => {
                 for (path, d, src) in &errors {
@@ -773,7 +790,7 @@ fn run_build(target: &Path) -> ExitCode {
         };
         // hello-world.ap → hello-world
         let output = target.with_extension("");
-        (program, renames, sources, output)
+        (program, renames, sources, output, ctx)
     } else if target.is_dir() {
         let files = match collect_ap_files(target) {
             Ok(f) => f,
@@ -858,7 +875,12 @@ fn run_build(target: &Path) -> ExitCode {
             .unwrap_or_else(|| "main".to_string());
         let mut output = target.to_path_buf();
         output.push(&bin_name);
-        (with_imports, renames, path_sources, output)
+        let ctx = EntryCtx {
+            entry_dir: target.to_path_buf(),
+            workspace_root,
+            imports: union_imports,
+        };
+        (with_imports, renames, path_sources, output, ctx)
     } else {
         eprintln!("not a file or directory: {}", target.display());
         return ExitCode::from(1);
@@ -881,13 +903,26 @@ fn run_build(target: &Path) -> ExitCode {
         }
         return ExitCode::from(1);
     }
-    let options = match parse_build_options() {
+    let mut options = match parse_build_options() {
         Ok(o) => o,
         Err(msg) => {
             eprintln!("{}", msg);
             return ExitCode::from(2);
         }
     };
+    // Stage-2 FFI: append the FFI surface declared by each
+    // imported lib's aperio.toml [ffi] section. CLI flags from
+    // parse_build_options come first (preserves the manual
+    // escape hatch); toml-sourced flags append. Duplicates are
+    // tolerated — clang's `-lX -lX` is harmless, and the linker
+    // dedupes csrc translation-unit contents at symbol level.
+    let toml_opts = collect_ffi_from_imports(
+        &entry_ctx.imports,
+        &entry_ctx.entry_dir,
+        entry_ctx.workspace_root.as_deref(),
+    );
+    options.link_libs.extend(toml_opts.link_libs);
+    options.csrc_files.extend(toml_opts.csrc_files);
     match aperio_codegen::build_executable_with_options(
         &program,
         &output,
@@ -903,6 +938,70 @@ fn run_build(target: &Path) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Stage-2 FFI (2026-05-22): walk a program's top-level imports,
+/// resolve each one against the entry's directory + workspace
+/// root (same lookup `resolve_imports` uses), and accumulate the
+/// `[ffi]` section of each imported lib's `aperio.toml` into a
+/// `BuildOptions`. `csrc` paths are resolved relative to the
+/// lib's own directory; `link` libs append unconditionally.
+///
+/// Single-file imports (`import "helpers"` resolving to
+/// `helpers.ap`) carry no `aperio.toml` and contribute nothing
+/// here. Imports that don't resolve are silently skipped — the
+/// main resolver surfaces those as diagnostics; double-erroring
+/// here just adds noise.
+///
+/// De-duplication: a lib referenced under two aliases or pulled
+/// in transitively (Stage 2 only walks the top-level imports;
+/// transitive FFI is a Stage 2-follow-on if/when needed)
+/// contributes its flags once per unique lib directory.
+fn collect_ffi_from_imports(
+    imports: &[aperio_syntax::ast::Import],
+    importer_dir: &Path,
+    workspace_root: Option<&Path>,
+) -> aperio_codegen::BuildOptions {
+    let mut opts = aperio_codegen::BuildOptions::default();
+    let mut seen_dirs: std::collections::BTreeSet<PathBuf> =
+        std::collections::BTreeSet::new();
+    for imp in imports {
+        if imp.path.starts_with("std/") || imp.path == "std" {
+            continue;
+        }
+        let target = match resolve_import(importer_dir, workspace_root, &imp.path) {
+            Some(t) => t,
+            None => continue,
+        };
+        let lib_dir = match target {
+            ImportTarget::SingleFile(_) => continue,
+            ImportTarget::Directory(d) => d,
+        };
+        let canon = lib_dir.canonicalize().unwrap_or_else(|_| lib_dir.clone());
+        if !seen_dirs.insert(canon) {
+            continue;
+        }
+        match crate::pkg::read_lib_ffi(&lib_dir) {
+            Ok(Some(ffi)) => {
+                for lib in ffi.link {
+                    opts.link_libs.push(lib);
+                }
+                for csrc in ffi.csrc {
+                    let csrc_path = lib_dir.join(csrc);
+                    opts.csrc_files.push(csrc_path);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: reading aperio.toml in {}: {}",
+                    lib_dir.display(),
+                    e,
+                );
+            }
+        }
+    }
+    opts
 }
 
 /// Stage-1 FFI (2026-05-22): parse `--link` / `--csrc` flags from

@@ -80,6 +80,7 @@ matching C-ABI representation at the call boundary:
 | `BytesView` / `StringView` | `{ ptr, i64 }` (struct by value) | `lotus_view_t` | 16-byte F.30b view layout. C glue MAY use `lotus_view_data` to recover the payload pointer + length. |
 | `Duration` / `Time` | `i64` | `int64_t` | Both are 64-bit nanosecond counts under the hood. |
 | `()` (unit) | `void` | `void` | Return-position only — declared as `-> ()` or omitted entirely. Empty-tuple return type accepted but normalized to `()`. |
+| User struct (`type T { ... }`) | `ptr` | `const T *` (param) / `T *out` (sret return) | Passed by pointer at the boundary; struct returns use a hidden sret first arg (see User-type structs section below). Layout match is the library author's responsibility. |
 
 Reserved at Stage 1 (typecheck rejects with a clear diagnostic):
 
@@ -94,12 +95,60 @@ Reserved at Stage 1 (typecheck rejects with a clear diagnostic):
 - Function-pointer types — wrap as a struct/handle at the C side.
 - `LocusRef`, `Cell` — Aperio-internal.
 
-User-type structs (`type Color { r: Int = 0; ... }`) pass through
-the typechecker but Stage 1 codegen does not yet wire C-ABI struct
-marshalling. Library authors who need struct-by-value parameters
-should wait for the struct-passing PR; the typecheck-allowed-but-
-codegen-rejects path surfaces a clear `Unsupported` error at
-build time.
+### User-type structs
+
+User-type structs (`type Color { r: Int = 0; ... }`) are passed
+**by pointer** at the C-ABI boundary, not by value. The Aperio
+side already stores user structs as heap pointers, so the natural
+mapping is `ptr` at the LLVM level. C glue authors write:
+
+```c
+// Param-position: const T * (or T * if the callee mutates).
+void raylib_clear_background(const Color *c) {
+    ClearBackground((::Color){
+        (uint8_t)c->r, (uint8_t)c->g,
+        (uint8_t)c->b, (uint8_t)c->a,
+    });
+}
+```
+
+Struct returns use **sret-style**: Aperio allocates the return
+slot in the caller's arena and passes a pointer as a hidden first
+argument. The LLVM-level fn signature is `void foo(T *out,
+<user args>)`; the C glue writes the struct into `*out`:
+
+```c
+// Return-position: hidden T *out first param, returns void.
+void vec3i_scale(Vec3i *out, const Vec3i *v, int64_t k) {
+    out->x = v->x * k;
+    out->y = v->y * k;
+    out->z = v->z * k;
+}
+```
+
+The Aperio-side call expression
+```aperio
+let scaled = vec3i_scale(v, 10);
+```
+sees the sret slot's pointer as its result — same value-shape
+as any other struct-returning expression. The sret transformation
+is hidden from user code; only the C glue author sees it.
+
+**Why pointer + sret instead of by-value:** SysV / Win64 / aarch64
+all classify struct-by-value differently based on size. A
+portable implementation would need a per-platform ABI-lowering
+pass. The pointer convention sidesteps that entirely — every
+target lowers `ptr` the same way — at the cost of one
+dereference per arg on the C side. For the workloads Aperio is
+shaped for (locus methods, bus dispatch, FFI to system
+libraries), that cost is negligible compared to the portability
+win.
+
+**Layout contract:** the Aperio struct's field order + types must
+match the C struct on the other side. The library author
+guarantees this. Future spec iteration may add a compile-time
+layout-assertion mechanism (`@ffi_layout("c")` on the `type`
+decl); today the contract is documented but not machine-checked.
 
 ## Calling convention
 
@@ -162,9 +211,50 @@ aperio build mydir/ --link raylib --csrc pond/raylib/glue.c \
 Both flags are optional; programs that don't use `@ffi`
 declarations don't need either.
 
-Stage 2 (future work) will read these from imported libs'
-`aperio.toml [ffi]` sections automatically — `import "pond/raylib"`
-will be sufficient. Stage 1 wires the CLI flags only.
+### `aperio.toml [ffi]` auto-pickup (Stage 2)
+
+When `aperio build` resolves an `import` against a directory
+that contains an `aperio.toml`, it reads the file's `[ffi]`
+section and appends those values to the build's link surface
+automatically. Library authors ship:
+
+```toml
+# pond/raylib/aperio.toml
+[ffi]
+link = ["raylib"]
+csrc = ["glue.c"]
+```
+
+Consumers then just `import`:
+
+```aperio
+// myapp/main.ap
+import "vendor/raylib" as ray;
+
+fn main() {
+    let w = ray::Window { width: 1280, height: 720 };
+    ...
+}
+```
+
+`aperio build myapp/` reads `vendor/raylib/aperio.toml`, picks
+up `link=["raylib"]` + `csrc=["glue.c"]`, and threads them
+through to the clang invocation. The CLI flags from the prior
+section still work as additive overrides (CLI first, then toml-
+sourced); duplicates are tolerated. Single-file imports
+(`import "helpers"` → `helpers.ap`) have no companion toml and
+contribute nothing.
+
+De-duplication: a lib referenced under two aliases or via
+multiple files in the same seed contributes its FFI flags once
+per unique resolved directory.
+
+Transitive FFI is NOT walked at Stage 2: only the entry's
+top-level imports are scanned for `aperio.toml`. If a directly-
+imported lib itself imports another `@ffi`-using lib, the
+transitive lib's `[ffi]` must be re-declared (or surfaced via
+manual `--link` / `--csrc`) at the entry. Resolved if a workload
+surfaces the need.
 
 ## Library-author surface
 

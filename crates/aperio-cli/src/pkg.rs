@@ -34,11 +34,50 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-/// `aperio.toml` at the repo root.
+/// `aperio.toml` at the repo root (or any vendored / hand-
+/// maintained lib's root).
 #[derive(Deserialize, Default, Debug)]
 pub struct Manifest {
     #[serde(default)]
     pub deps: BTreeMap<String, DepSpec>,
+    /// Stage-2 FFI (2026-05-22): `[ffi]` section declares the
+    /// C-side surface needed to link this lib. Picked up by
+    /// `aperio build` when this lib is imported — its `link`
+    /// libs append to the clang `-l` line and its `csrc` files
+    /// compile alongside the runtime. Empty / absent for libs
+    /// that don't use `@ffi("c")` declarations.
+    #[serde(default)]
+    pub ffi: FfiManifest,
+}
+
+/// `[ffi]` section of `aperio.toml`. Paths in `csrc` are resolved
+/// relative to the `aperio.toml`'s own directory; `link` entries
+/// are library names handed to the linker as `-l<name>`.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct FfiManifest {
+    #[serde(default)]
+    pub link: Vec<String>,
+    #[serde(default)]
+    pub csrc: Vec<String>,
+}
+
+/// Read just the `[ffi]` section from a lib's `aperio.toml` if
+/// it has one. Returns `None` when the file doesn't exist or has
+/// no `[ffi]` section; that's the steady state for pure-Aperio
+/// libs and isn't an error condition.
+pub fn read_lib_ffi(lib_dir: &Path) -> Result<Option<FfiManifest>, String> {
+    let manifest_path = lib_dir.join("aperio.toml");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let src = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("read {}: {}", manifest_path.display(), e))?;
+    let m: Manifest = toml::from_str(&src)
+        .map_err(|e| format!("parse {}: {}", manifest_path.display(), e))?;
+    if m.ffi.link.is_empty() && m.ffi.csrc.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(m.ffi))
 }
 
 /// One entry in the `[deps]` table. Exactly zero or one of

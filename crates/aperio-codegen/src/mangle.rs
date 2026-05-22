@@ -70,6 +70,23 @@ pub fn build_seed_renames(
     let mut out: HashMap<String, String> = HashMap::new();
     for (stem, prog) in programs {
         for item in &prog.items {
+            // Stage-2 FFI (2026-05-22): `@ffi("c") fn name(...)`
+            // declarations must keep the literal `name` as their
+            // LLVM symbol — the linker resolves against C glue
+            // that exports that exact name. Map identity so the
+            // mangler walk doesn't rewrite the fn name, AND the
+            // per-build path-rename table gets `(alias::name,
+            // name)` so call sites still resolve correctly.
+            // Library authors who want symbol uniqueness across
+            // multiple FFI libs should prefix at the C side
+            // (raylib_init_window vs glfw_init_window) — the
+            // substrate doesn't auto-namespace FFI symbols.
+            if let TopDecl::Fn(f) = item {
+                if f.ffi.is_some() {
+                    out.insert(f.name.name.clone(), f.name.name.clone());
+                    continue;
+                }
+            }
             if let Some(n) = top_decl_name(item) {
                 out.insert(n.to_string(), mangled(alias, stem, n));
             }

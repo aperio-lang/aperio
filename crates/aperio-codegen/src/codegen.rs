@@ -11903,15 +11903,38 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some(t) => Some(self.type_expr_to_codegen_ty(t)?),
             None => None,
         };
-        let fn_ty = match &ret_ty {
-            Some(rt) => {
-                let llvm_ret = self.llvm_ffi_return_type(rt, &f.name.name)?;
-                llvm_ret.fn_type(&llvm_param_tys, false)
-            }
-            None => self
-                .context
+        // sret-style struct returns: when the Aperio fn declares
+        // `-> TypeRef(...)`, the LLVM signature gets a hidden ptr
+        // param prepended (caller allocates the slot, callee
+        // fills) and returns void. The Aperio call site allocates
+        // the slot in its arena and surfaces the pointer as the
+        // expression's value — symmetric with how user-type
+        // instantiations already work. C glue authors write
+        //   `void foo(T *out, ...) { *out = ...; }`
+        // matching the signature.
+        let struct_return = matches!(&ret_ty, Some(CodegenTy::TypeRef(_)));
+        if struct_return {
+            let ptr_t = self.context.ptr_type(AddressSpace::default());
+            // Prepend the sret slot pointer.
+            llvm_param_tys.insert(0, ptr_t.into());
+        }
+        let fn_ty = if struct_return {
+            // sret signature: void return, prepended ptr first arg.
+            self.context
                 .void_type()
-                .fn_type(&llvm_param_tys, false),
+                .fn_type(&llvm_param_tys, false)
+        } else {
+            match &ret_ty {
+                Some(rt) => {
+                    let llvm_ret =
+                        self.llvm_ffi_return_type(rt, &f.name.name)?;
+                    llvm_ret.fn_type(&llvm_param_tys, false)
+                }
+                None => self
+                    .context
+                    .void_type()
+                    .fn_type(&llvm_param_tys, false),
+            }
         };
         let func = self.module.add_function(&f.name.name, fn_ty, None);
         self.user_fns.insert(
@@ -11931,10 +11954,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
     /// FFI parameter-type lowering. Maps an Aperio codegen type to
     /// the LLVM type used at the C-ABI boundary per `spec/ffi.md`.
-    /// User-type structs (TypeRef) are not yet wired for FFI
-    /// codegen at Stage 1 — returns a clear `Unsupported` error
-    /// so the library author knows to wait for the struct-passing
-    /// PR rather than silently misuse it.
+    /// User-type structs (TypeRef) pass by value; the call-site
+    /// loads the struct from its heap pointer and passes the
+    /// value, and LLVM lowers struct-by-value per the platform
+    /// ABI (SysV register-classification on x86_64, etc.).
     fn llvm_ffi_param_type(
         &self,
         ty: &CodegenTy,
@@ -11953,8 +11976,33 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 // 16-byte struct by value: { ptr, i64 }.
                 Ok(self.view_struct_ty().into())
             }
-            CodegenTy::TypeRef(_)
-            | CodegenTy::Tuple(_)
+            CodegenTy::TypeRef(name) => {
+                // Stage 1 follow-on (2026-05-22): user-type struct
+                // passed by POINTER, not by value. The Aperio side
+                // stores user structs as heap pointers already, so
+                // the natural mapping is `ptr` at the C-ABI level.
+                // The glue's C-side signature receives `const T *`
+                // (or `T *` if it mutates); SysV's struct-by-value
+                // classification rules are sidestepped entirely,
+                // which makes the substrate portable across
+                // x86_64-SysV / Win64 / aarch64 without per-platform
+                // ABI-lowering passes. Library authors trade a
+                // slightly more verbose glue (one dereference per
+                // arg) for predictable codegen.
+                //
+                // Verify the type is declared so we surface a
+                // useful diagnostic at declaration time, not at
+                // link time when the symbol references go unresolved.
+                self.user_types.get(name).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "@ffi fn `{}` parameter `{}`: user type `{}` \
+                         is not declared in this program",
+                        fn_name, param_name, name
+                    ))
+                })?;
+                Ok(ptr_t.into())
+            }
+            CodegenTy::Tuple(_)
             | CodegenTy::Array(_, _)
             | CodegenTy::Interface(_)
             | CodegenTy::Enum(_)
@@ -11963,16 +12011,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | CodegenTy::FnPtr { .. }
             | CodegenTy::Decimal => Err(CodegenError::Unsupported(format!(
                 "@ffi fn `{}` parameter `{}`: type {:?} is not yet wired \
-                 for FFI codegen at Stage 1 (typecheck permitted it but \
-                 the LLVM marshalling has not landed). See spec/ffi.md \
-                 for the supported set.",
+                 for FFI codegen at Stage 1. See spec/ffi.md.",
                 fn_name, param_name, ty
             ))),
         }
     }
 
     /// FFI return-type lowering. Mirror of `llvm_ffi_param_type`
-    /// for the return slot.
+    /// for the return slot. User-type structs use sret-style: the
+    /// caller allocates the return slot in its arena, passes a
+    /// pointer to it as a SYNTHETIC FIRST ARG, and the LLVM-level
+    /// fn returns void. The actual sret transformation happens in
+    /// `declare_ffi_fn` (it sees TypeRef return → prepends the
+    /// hidden ptr param and substitutes void); this helper returns
+    /// the *abstract* user-facing return shape (`ptr`) so call
+    /// sites can plumb the slot allocation symmetrically.
     fn llvm_ffi_return_type(
         &self,
         ty: &CodegenTy,
@@ -11988,6 +12041,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             CodegenTy::String | CodegenTy::Bytes => Ok(ptr_t.into()),
             CodegenTy::BytesView | CodegenTy::StringView => {
                 Ok(self.view_struct_ty().into())
+            }
+            CodegenTy::TypeRef(name) => {
+                self.user_types.get(name).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "@ffi fn `{}` return type: user type `{}` is \
+                         not declared in this program",
+                        fn_name, name
+                    ))
+                })?;
+                // sret slot pointer — caller allocates, callee
+                // fills. See declare_ffi_fn for the signature
+                // transformation that hides this from user code.
+                Ok(ptr_t.into())
             }
             _ => Err(CodegenError::Unsupported(format!(
                 "@ffi fn `{}` return type {:?} is not yet wired for \
@@ -13688,7 +13754,53 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             )));
         }
         let mut lowered_args: Vec<inkwell::values::BasicMetadataValueEnum> =
-            Vec::with_capacity(args.len());
+            Vec::with_capacity(args.len() + 1);
+        // sret-style struct return: allocate the slot in the
+        // caller's arena BEFORE the user-visible args (the
+        // declaration prepended the sret ptr). The slot's pointer
+        // is what the call expression yields as its value; the C
+        // glue writes the struct into it during the call.
+        let sret_slot: Option<(inkwell::values::PointerValue<'ctx>, String)> =
+            if let Some(CodegenTy::TypeRef(type_name)) = &sig.ret {
+                let info = self.user_types.get(type_name).ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "@ffi fn `{}` return: user type `{}` not declared",
+                        name, type_name
+                    ))
+                })?;
+                let size = info.struct_ty.size_of().ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "@ffi fn `{}` return: cannot size user type `{}`",
+                        name, type_name
+                    ))
+                })?;
+                let alloc_fn = self
+                    .module
+                    .get_function("lotus_arena_alloc")
+                    .expect("lotus_arena_alloc declared");
+                let arena = self.current_arena_ptr()?;
+                let i64_t = self.context.i64_type();
+                let slot = self
+                    .builder
+                    .build_call(
+                        alloc_fn,
+                        &[
+                            arena.into(),
+                            size.into(),
+                            i64_t.const_int(16, false).into(),
+                        ],
+                        &format!("ffi.{}.sret_alloc", type_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("arena_alloc returns ptr")
+                    .into_pointer_value();
+                lowered_args.push(slot.into());
+                Some((slot, type_name.clone()))
+            } else {
+                None
+            };
         for (i, arg) in args.iter().enumerate() {
             let (val, val_ty) = self.lower_expr(arg, scope)?;
             let expected = &sig.params[i];
@@ -13714,6 +13826,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                         zext.into()
                     }
+                    CodegenTy::TypeRef(_) => {
+                        // User-type struct passes by pointer. Aperio
+                        // already holds the value as a heap ptr, so
+                        // pass directly. C glue dereferences:
+                        //   void foo(const T *p) { use(p->field); }
+                        val
+                    }
                     _ => val,
                 };
             lowered_args.push(coerced.into());
@@ -13723,6 +13842,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_call(sig.func, &lowered_args, &format!("{}.ffi.call", name))
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let ret_ty_opt = sig.ret.clone();
+        // sret-style struct return: the LLVM call returned void
+        // (the C glue wrote into the slot we passed); yield the
+        // slot's pointer as the expression's value.
+        if let Some((slot_ptr, _type_name)) = sret_slot {
+            let ret_ty = ret_ty_opt.expect("sret_slot implies ret_ty is Some");
+            return Ok(Some((slot_ptr.into(), ret_ty)));
+        }
         match ret_ty_opt {
             None => Ok(None),
             Some(ret_ty) => {

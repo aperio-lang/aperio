@@ -98,13 +98,11 @@ Lifetime rules:
 
 ## Staging
 
-| Stage | Scope | Output |
-|---|---|---|
-| 1 | Parser + typecheck + LLVM `declare` emit for `@ffi` decls. Manual link flags via `aperio build --link X --csrc Y.c`. | Library authors can ship `.c` glue separately and consumers add link flags by hand. Validates the mechanism end-to-end. |
-| 2 | `aperio.toml [ffi]` section read by `aperio build`. Per-lib `link` + `csrc` automatically accumulated from imported libs. | `import "pond/raylib"` is sufficient. No manual flags. |
-| 3 | pond conventions — pattern doc for "how to write an FFI binding lib." Recommended `glue.c` shape, what to wrap, what to leave bare, layout-stability guidance for value-type marshalling. | Ecosystem ergonomics. Reproducible binding-package shape. |
-
-Stage 1 alone unblocks iris's raylib/pty path (they vendor pond/raylib, build with `--link raylib --csrc pond/raylib/src/glue.c`). It's strictly more useful than waiting for Stage 2.
+| Stage | Scope | Output | Status |
+|---|---|---|---|
+| 1 | Parser + typecheck + LLVM `declare` emit for `@ffi` decls. Manual link flags via `aperio build --link X --csrc Y.c`. | Library authors can ship `.c` glue separately and consumers add link flags by hand. Validates the mechanism end-to-end. | shipped 2026-05-22 (a5f71c7) |
+| 2 | `aperio.toml [ffi]` section read by `aperio build`. Per-lib `link` + `csrc` automatically accumulated from imported libs. | `import "pond/raylib"` is sufficient. No manual flags. | shipped 2026-05-22 |
+| 3 | pond conventions — pattern doc for "how to write an FFI binding lib." Recommended `glue.c` shape, what to wrap, what to leave bare, layout-stability guidance for value-type marshalling. | Ecosystem ergonomics. Reproducible binding-package shape. | shipped 2026-05-22 (`agents/binding-packages.md`) |
 
 ## First-PR scope (Stage 1)
 

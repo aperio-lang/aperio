@@ -227,6 +227,18 @@ locus's lifetime arena — but the substrate closes more of those
 shapes than you'd expect, and the file's "When NOT to worry"
 section preempts overcautious code.
 
+## Binding an external C library
+
+Aperio binds to non-stdlib C libraries (raylib, sqlite, curl, ...)
+via user-extensible `@ffi("c")` declarations — no stdlib
+expansion or compiler change needed. If you're writing a binding
+library (typically landing in pond), read
+[`agents/binding-packages.md`](./agents/binding-packages.md) for
+the recommended file layout, the wrap-vs-leave-bare conventions,
+the C-glue skeleton, and the testing pattern. The substrate
+contract for the FFI surface itself is in
+[`spec/ffi.md`](./spec/ffi.md).
+
 ## Inline structural failure
 
 For "catch a value error in a locus method and shut this locus

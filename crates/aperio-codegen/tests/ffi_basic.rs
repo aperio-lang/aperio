@@ -101,6 +101,52 @@ fn ffi_void_return_with_no_args_invokes_c_side_effect() {
 }
 
 #[test]
+fn ffi_user_type_struct_passes_by_pointer_and_returns_via_sret() {
+    // User-type struct marshalling: Aperio passes the struct as a
+    // pointer (C glue dereferences); the C glue fills a caller-
+    // allocated return slot for struct returns. See spec/ffi.md.
+    let aperio_src = r#"
+        type Vec3i { x: Int = 0; y: Int = 0; z: Int = 0; }
+        @ffi("c") fn vec3i_sum(v: Vec3i) -> Int;
+        @ffi("c") fn vec3i_scale(v: Vec3i, k: Int) -> Vec3i;
+        fn main() {
+            let v = Vec3i { x: 1, y: 2, z: 3 };
+            let s = vec3i_sum(v);
+            println("sum=", s);
+            let scaled = vec3i_scale(v, 10);
+            println("scaled=(", scaled.x, ",", scaled.y, ",", scaled.z, ")");
+        }
+    "#;
+    let csrc = r#"
+        #include <stdint.h>
+        typedef struct { int64_t x; int64_t y; int64_t z; } Vec3i;
+        int64_t vec3i_sum(const Vec3i *v) {
+            return v->x + v->y + v->z;
+        }
+        void vec3i_scale(Vec3i *out, const Vec3i *v, int64_t k) {
+            out->x = v->x * k;
+            out->y = v->y * k;
+            out->z = v->z * k;
+        }
+    "#;
+    let bin = build_with_csrc("struct_roundtrip", aperio_src, csrc);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("sum=6"),
+        "expected `sum=6` in stdout; got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("scaled=(10,20,30)"),
+        "expected `scaled=(10,20,30)` in stdout; got: {:?}",
+        stdout
+    );
+}
+
+#[test]
 fn ffi_string_arg_passes_nul_terminated_to_c() {
     // String → const char *. The C side calls strlen on it to
     // confirm the pointer is a valid NUL-terminated string.
