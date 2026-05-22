@@ -185,8 +185,10 @@ fn self_field_heap_store_deep_copies_into_self_arena() {
     // birth() stores a fresh String concat to self.label. The
     // concat lives in the method scratch; without the deep-copy
     // the field would hold a dangling pointer to freed memory.
-    // We pin the IR shape: `self.label =` emits a `lotus_str_clone`
-    // before the GEP'd store.
+    // We pin the IR shape: `self.label =` emits an in-place
+    // assign helper that either reuses the existing buffer (when
+    // it fits) or clones into self.__arena. Either way the field
+    // outlives the scratch destroy.
     let src = r#"
         locus L {
             params { label: String = ""; }
@@ -203,12 +205,16 @@ fn self_field_heap_store_deep_copies_into_self_arena() {
     let body = carve_fn_body(&ir, "L.birth");
     // The birth body should:
     //   1. concat → lives in scratch
-    //   2. lotus_str_clone(self.__arena, concat) — the deep-copy
-    //   3. store the cloned ptr into self.label
+    //   2. lotus_str_assign_in_place(self.__arena, existing, concat)
+    //      — reuses the existing slot's buffer when it fits, falls
+    //      back to lotus_str_clone internally otherwise (this is the
+    //      2026-05-22 PM follow-on; pre-fix this was a direct
+    //      lotus_str_clone)
+    //   3. store the result into self.label
     assert!(
-        body.contains("@lotus_str_clone"),
-        "L.birth must deep-copy heap-typed self.label store \
-         via lotus_str_clone; body:\n{}",
+        body.contains("@lotus_str_assign_in_place"),
+        "L.birth must route heap-typed self.label store \
+         via lotus_str_assign_in_place; body:\n{}",
         body,
     );
     // Behavioral: actually run the binary and check label survives

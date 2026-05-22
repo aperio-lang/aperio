@@ -2665,6 +2665,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function("lotus_str_clone", str_clone_ty, None);
+        // declare ptr @lotus_str_assign_in_place(ptr arena, ptr old, ptr new)
+        // — used at the `self.X = String` field-assign site to
+        // reuse the old buffer when new fits. Closes the leak
+        // class for per-delta String field reassignment without
+        // changing the String ABI. See lotus_arena.c for the
+        // structural details.
+        let str_assign_inplace_ty = ptr_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_str_assign_in_place",
+            str_assign_inplace_ty,
+            None,
+        );
         // F.30: deep-copy Bytes blob (length-prefixed) into a
         // destination arena. Companion to lotus_str_clone for
         // BytesView → Bytes upgrades via `std::bytes::clone`.
@@ -21281,7 +21296,63 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     }
                     _ => e,
                 };
+                // m49 sret-style return-arena routing
+                // (2026-05-22 PM, fathom KrakenMdgw / SymbolBook
+                // leak class). For a method body that's about to
+                // return a fresh aggregate literal whose field
+                // initializers are themselves fresh allocations
+                // (no aliasing into scratch or self.__arena), set
+                // `current_arena_override = caller_arena` for the
+                // duration of the return-expr lowering. Fresh
+                // allocations (the outer struct, sub-literals,
+                // nested call results) route through `current_arena
+                // _ptr` which honors the override, so they land
+                // directly in caller storage instead of the method's
+                // scratch subregion. The boundary deep-copy in
+                // `emit_method_return_deep_copy` then contains-
+                // checks the value and passes it through unchanged
+                // — no second memcpy, no fresh alloc.
+                //
+                // Field-pointer safety: while override is active,
+                // populate_user_type_fields emits a same-arena-skip
+                // deep-copy on each heap field of any struct literal
+                // lowered (recursive). Alias-field initializers
+                // (let-bound transients, self.X reads from another
+                // arena) anchor in caller_arena; fields already in
+                // caller_arena pass through unchanged. populate's
+                // deep-copy is gated on the override being set, so
+                // ordinary struct construction (hashmap.set's Cell
+                // argument, locus param defaults, etc.) is
+                // unaffected and downstream anchor same-arena skips
+                // remain intact.
+                let saved_arena_override = self.current_arena_override;
+                let route_via_override = in_method_with_scratch
+                    && Self::ty_needs_self_field_deep_copy(&declared_ty);
+                if route_via_override {
+                    let ptr_t = self
+                        .context
+                        .ptr_type(AddressSpace::default());
+                    let caller_slot = self
+                        .current_method_caller_arena
+                        .expect(
+                            "method scratch active implies caller-arena \
+                             snapshot",
+                        );
+                    let caller_arena = self
+                        .builder
+                        .build_load(
+                            ptr_t,
+                            caller_slot,
+                            "method.caller_arena.for_return",
+                        )
+                        .map_err(|e| {
+                            CodegenError::LlvmEmit(e.to_string())
+                        })?
+                        .into_pointer_value();
+                    self.current_arena_override = Some(caller_arena);
+                }
                 let (v, got_ty) = self.lower_expr(e_to_lower, scope)?;
+                self.current_arena_override = saved_arena_override;
                 // G20 / F.20 Phase B follow-up: implicit
                 // locus → interface coercion at return position,
                 // mirroring the call-site shape in lower_user_fn_call.
@@ -36756,6 +36827,33 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ///   - `lower_user_type_instantiation` (arena-allocates storage),
     ///   - `lower_send`'s ephemeral-payload fast path (stack-allocs
     ///     storage in the entry block).
+    ///
+    /// Field-level deep-copy is OFF by default. Downstream consumers
+    /// that need arena-anchored fields (hashmap.set, vec.push,
+    /// locus-field self.X store, free-fn return epilogue) run their
+    /// own `emit_cross_arena_store_deep_copy` /
+    /// `anchor_struct_fields_in_place` against the populated struct;
+    /// pushing the deep-copy down to this layer defeats the
+    /// downstream's same-arena skip (the `e = store.get(); store.
+    /// set(MetricEntry { key: e.key, ... })` pattern from the pond
+    /// metrics workload — measured as MetricMap chunk growth in
+    /// fathom's residency dump when the deep-copy was unconditional).
+    ///
+    /// One exception: when `current_arena_override` is active —
+    /// which only happens during the Stage 1 return-arena routing
+    /// in `lower_return` for a method-with-scratch returning an
+    /// aggregate — the outer struct is being placed in caller_arena
+    /// rather than the method's scratch, and the boundary deep-copy
+    /// will be skipped by the same-arena check. If a heap field
+    /// initializer aliases a value in some OTHER arena (the calling
+    /// method's scratch, self.__arena, etc.) the stored pointer
+    /// would dangle after that arena's destroy. Under override we
+    /// emit `emit_cross_arena_store_deep_copy_ptr` per heap field;
+    /// the helper's same-arena skip makes it a no-op when the field
+    /// is already in caller_arena (typical case — sub-literals also
+    /// lowered under the same override), and falls through to
+    /// recursive deep-copy when it's not (the alias-safe path for
+    /// literals like `BookSignalSnapshot { buys: let_bound_value }`).
     fn populate_user_type_fields(
         &mut self,
         type_name: &str,
@@ -36877,6 +36975,37 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     type_name, fname, declared_ty, val_ty
                 )));
             }
+            // Conditional field-level deep-copy: only when override
+            // is active (Stage 1 return-arena routing). Routes each
+            // heap field through the same-arena skip wrapper so
+            // alias initializers anchor in override arena while
+            // already-anchored or fresh-allocated-under-override
+            // fields pass through unchanged. See fn doc for the
+            // rationale on why this is OFF by default.
+            let val = if let Some(arena) = self.current_arena_override {
+                let needs_copy = val.is_pointer_value()
+                    && matches!(
+                        &declared_ty,
+                        CodegenTy::String
+                            | CodegenTy::Bytes
+                            | CodegenTy::TypeRef(_)
+                            | CodegenTy::Tuple(_)
+                            | CodegenTy::Array(_, _)
+                            | CodegenTy::Enum(_)
+                    );
+                if needs_copy {
+                    self.emit_cross_arena_store_deep_copy_ptr(
+                        val,
+                        &declared_ty,
+                        arena,
+                        &format!("{}.{}.fieldinit", type_name, fname),
+                    )?
+                } else {
+                    val
+                }
+            } else {
+                val
+            };
             let field_ptr = self
                 .builder
                 .build_struct_gep(
@@ -37560,14 +37689,98 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | CodegenTy::StringView
             | CodegenTy::LocusRef(_)
             | CodegenTy::Cell(_, _) => false,
-            // String/Bytes: slot holds a pointer; still need
-            // maybe_self_field_heap_copy to ensure the stored
-            // pointer is in self.__arena or static. There's no
-            // "existing struct" to mutate — the underlying String
-            // is heap-allocated and immutable.
+            // String/Bytes: slot holds a pointer. We have an
+            // "existing buffer" — see the in-place-assign branch
+            // below for the per-delta-leak fix.
             CodegenTy::String | CodegenTy::Bytes => false,
             _ => true,
         };
+
+        // 2026-05-22 PM: in-place String reassignment for the
+        // `self.X = String_value` field-assign hot path. Calls
+        // lotus_str_assign_in_place which reuses the old buffer
+        // when new fits — eliminates the per-delta leak class
+        // (fathom KrakenMdgw / SymbolBook's `self.last_venue_ts
+        // = venue_ts`). Only fires inside a method-with-scratch
+        // (the only context where `self.__arena` is the dest);
+        // outside (synthesized closure-eval bodies, etc.) the
+        // legacy maybe_self_field_heap_copy path stays unchanged.
+        if let CodegenTy::String = slot_ty {
+            if self.current_method_scratch.is_some() {
+                let cs = self
+                    .current_self
+                    .clone()
+                    .expect("scratch active implies current_self");
+                let info = self
+                    .user_loci
+                    .get(&cs.locus_name)
+                    .cloned()
+                    .expect("current_self points to a declared locus");
+                let ptr_t = self
+                    .context
+                    .ptr_type(AddressSpace::default());
+                let arena_field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        cs.self_ptr,
+                        info.arena_field_idx,
+                        "self.__arena.for_str_assign_ptr",
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?;
+                let dest_arena = self
+                    .builder
+                    .build_load(
+                        ptr_t,
+                        arena_field_ptr,
+                        "self.__arena.for_str_assign",
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .into_pointer_value();
+                let existing = self
+                    .builder
+                    .build_load(
+                        ptr_t,
+                        slot_ptr,
+                        "self_field.str.existing",
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .into_pointer_value();
+                let assign_fn = self
+                    .module
+                    .get_function("lotus_str_assign_in_place")
+                    .expect("lotus_str_assign_in_place declared");
+                let result = self
+                    .builder
+                    .build_call(
+                        assign_fn,
+                        &[
+                            dest_arena.into(),
+                            existing.into(),
+                            rhs.into_pointer_value().into(),
+                        ],
+                        "self_field.str.assign_in_place",
+                    )
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("lotus_str_assign_in_place returns ptr");
+                self.builder
+                    .build_store(slot_ptr, result)
+                    .map_err(|e| {
+                        CodegenError::LlvmEmit(e.to_string())
+                    })?;
+                return Ok(());
+            }
+        }
 
         if !compound {
             let value = self.maybe_self_field_heap_copy(rhs, slot_ty)?;
@@ -37874,7 +38087,34 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_load(ptr_t, slot, "method.caller_arena.load")
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
             .into_pointer_value();
-        self.emit_return_value_deep_copy(value, ty, dest_arena)
+        // 2026-05-22 PM (sret-style m49 follow-on): route through
+        // the same-arena-skip wrapper. Combined with
+        // `current_arena_override = caller_arena` set during
+        // return-expr lowering in `lower_return`, fresh aggregate
+        // literals at return position land directly in caller_arena
+        // (via current_arena_ptr's override path) and the contains
+        // check here passes them through unchanged — no second
+        // memcpy, no fresh alloc. For non-literal returns (aliases,
+        // self.field reads, let-bound transients in scratch), the
+        // contains check fails and the existing recursive deep-copy
+        // fires unchanged. Source of the SymbolBook leak class
+        // bisected from fathom's 2026-05-22 PM residency dump:
+        // sweep_buy() returned a SweepResult literal that lived in
+        // scratch (subregion of SymbolBook arena) and got memcpy'd
+        // into caller_arena at this boundary — both halves of the
+        // round-trip are now eliminated for the common literal case.
+        let payload_val = value.is_pointer_value();
+        if payload_val {
+            self.emit_cross_arena_store_deep_copy_ptr(
+                value, ty, dest_arena, "method.return",
+            )
+        } else {
+            // Struct-by-value returns (Interface fat-pointer) — the
+            // value is held in registers / a struct SSA, not an
+            // arena-resident pointer. Same-arena skip is N/A; fall
+            // through to the unconditional recursive deep-copy.
+            self.emit_return_value_deep_copy(value, ty, dest_arena)
+        }
     }
 
     /// Destroy the method-scratch subregion. Caller is responsible

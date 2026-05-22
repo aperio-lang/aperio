@@ -952,6 +952,43 @@ reclaim on a real-world long-running workload:
      repeated assigns to the same slot. Bounds locus arenas
      under any assign frequency.
 
+  7. **In-place String reassignment at `self.X = String_value`.**
+     `lotus_str_assign_in_place(arena, old, new)` reuses the
+     existing slot's buffer when `strlen(new) <= strlen(old)`:
+     memcpy new bytes + NUL into `old`'s buffer, return `old`
+     unchanged. Static-literal `old` falls through to
+     `lotus_str_clone` (`.rodata` isn't writable); same when
+     new is longer than old's buffer (the old buffer leaks like
+     before, but only on rare length-growth events rather than
+     every reassignment). The codegen emits the helper at every
+     `self.X = String_value` site inside a method-with-scratch.
+     Closes the per-update String-field-reassignment leak class
+     — fathom's per-delta `self.last_venue_ts = venue_ts`
+     pattern: SymbolBook arena dropped from ~+1-3 chunks per
+     book per 4 min to flat.
+
+  8. **m49 sret-pattern return-arena routing.** When a method-
+     with-scratch is about to return a heap-typed value, the
+     codegen sets `current_arena_override = caller_arena` for
+     the duration of the return-expression lowering. Fresh
+     allocations during that lowering (struct literals, nested
+     call results) route through `current_arena_ptr` which
+     honors the override, landing directly in caller storage
+     instead of the method's scratch subregion. The boundary
+     deep-copy in `emit_method_return_deep_copy` then contains-
+     checks the value via `emit_cross_arena_store_deep_copy_ptr`
+     and passes it through unchanged — no second memcpy.
+     `populate_user_type_fields` conditionally deep-copies each
+     heap field when the override is active (the
+     `BookSignalSnapshot { buys: let_bound_buy_res, ... }` alias-
+     field case anchors `buy_res` in caller_arena at field-init);
+     the populate gate flips on `current_arena_override.is_some
+     ()` so ordinary struct construction (`hashmap.set`'s Cell
+     argument, locus param defaults) stays on the pre-rework
+     path and downstream anchor same-arena skips remain intact.
+     Closes the SweepResult / BookSignalSnapshot return-value
+     leak class.
+
 **m49 closes the free-fn gap.** Every non-main free fn takes
 an implicit `__caller_arena: ptr` first param at the LLVM ABI.
 `main` keeps the program-wide `arena.global` it always had —

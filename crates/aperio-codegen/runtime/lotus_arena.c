@@ -734,7 +734,127 @@ static void lotus_chunk_pool_prefill_if_needed(void) {
     }
 }
 
-static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
+/* LOTUS_ARENA_LOG_CHUNK_ATTACH (2026-05-22 PM follow-on): logs
+ * EVERY chunk attachment to ANY arena — both fresh-malloc and
+ * per-thread-pool-recycled paths. The existing
+ * LOTUS_ARENA_LOG_BIG_CHUNKS path only fires on the malloc branch,
+ * so chunks claimed from the pool (which is the dominant source
+ * after the sret-pattern fix shifted method scratch destroys into
+ * the recycling lane) are invisible. Enable this when investigating
+ * "arena grew N chunks but the trace shows nothing" — set the value
+ * to a byte threshold (e.g., 4096) and every chunk >= that size
+ * gets a backtrace line. Shares the LOTUS_ARENA_LOG_BIG_MAX_EVENTS
+ * cap with the big-chunk logger. */
+static size_t lotus_arena_chunk_attach_threshold(void) {
+    static int initialized = 0;
+    static size_t threshold = 0;
+    if (!initialized) {
+        initialized = 1;
+        const char *env = getenv("LOTUS_ARENA_LOG_CHUNK_ATTACH");
+        if (env && env[0]) {
+            if (strcmp(env, "1") == 0
+                || strcmp(env, "on") == 0
+                || strcmp(env, "true") == 0
+                || strcmp(env, "yes") == 0)
+            {
+                threshold = 1;  /* log every chunk attachment */
+            } else {
+                char *end = NULL;
+                unsigned long long v = strtoull(env, &end, 10);
+                if (end != env && v > 0) {
+                    threshold = (size_t)v;
+                }
+            }
+        }
+    }
+    return threshold;
+}
+
+/* Resolve a human-readable label for an arena — walks the parent
+ * chain to find the root, then looks up the root's residency
+ * registry entry. Used by the chunk_attach logger so the trace
+ * tells you "this chunk went to <SymbolBook>" instead of just
+ * "a chunk was attached somewhere". Returns NULL when residency
+ * isn't enabled, the arena's root has no label, or the lookup
+ * misses (top-level arenas created via plain lotus_arena_create
+ * with no label). The caller substitutes a fallback string. */
+static const char *lotus_arena_resolve_label(struct lotus_arena *a) {
+    if (!a) return NULL;
+    /* cap_diag_name (set on g_bus_payload_arena + recpool slab)
+     * wins on any arena in the chain — it's the most specific
+     * label we have. Check from leaf up so a subregion's parent's
+     * label propagates naturally. */
+    struct lotus_arena *cur = a;
+    while (cur) {
+        if (cur->cap_diag_name) return cur->cap_diag_name;
+        cur = cur->parent;
+    }
+    /* Walk the residency registry for the root arena's label.
+     * The registry only holds top-level arenas, so resolve the
+     * root first. */
+    struct lotus_arena *root = a;
+    while (root->parent) root = root->parent;
+    if (!lotus_arena_residency_enabled()) return NULL;
+    pthread_mutex_lock(&g_arena_residency_lock);
+    const char *label = NULL;
+    for (lotus_arena_residency_entry_t *e = g_arena_residency_head;
+         e; e = e->next) {
+        if (e->arena == root) {
+            label = e->label;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_arena_residency_lock);
+    return label;
+}
+
+/* Like lotus_log_big_alloc_event but also prints the destination
+ * arena's resolved label AND a kind=root|sub indicator, so the
+ * trace consumer can attribute each chunk attach precisely:
+ *
+ *   kind=root  → chunk attached to the root (locus-lifetime) arena;
+ *                stays attached until the locus dissolves.
+ *                This is the leak class — every kind=root chunk_attach
+ *                grows the residency dump.
+ *   kind=sub   → chunk attached to a subregion (method scratch,
+ *                free-fn body, recpool slab); will be recycled to
+ *                the per-thread pool when the subregion destroys.
+ *                These dominate the trace by volume but don't grow
+ *                anything persistent.
+ *
+ * Filter `kind=root label=<your_arena>` to isolate the actual
+ * arena-growing call sites. The label resolution walks the
+ * subregion → root chain + the residency registry — only meaningful
+ * when LOTUS_ARENA_RESIDENCY=1 (no label registry otherwise). When
+ * the lookup misses, the line prints "label=<unknown>" so the
+ * trace still parses uniformly. */
+static void lotus_log_chunk_attach_event(struct lotus_arena *a,
+                                          const char *label_tag,
+                                          size_t cap) {
+    static _Atomic int seq = 0;
+    int n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed);
+    if (n >= lotus_arena_big_max_events()) return;
+    const char *arena_label = lotus_arena_resolve_label(a);
+    const char *kind = (a && a->parent) ? "sub" : "root";
+    fprintf(stderr,
+            "[%s #%d] arena=%p kind=%s label=%s cap=%zu bytes "
+            "(%.2f MiB)\n",
+            label_tag, n, (void *)a, kind,
+            arena_label ? arena_label : "<unknown>",
+            cap, (double)cap / (1024.0 * 1024.0));
+#if defined(__GLIBC__)
+    void *frames[12];
+    int got = backtrace(frames, 12);
+    if (got > 2) {
+        backtrace_symbols_fd(frames + 2, got - 2, fileno(stderr));
+    }
+#endif
+    fflush(stderr);
+}
+
+static lotus_arena_chunk_t *lotus_arena_new_chunk_for(
+    struct lotus_arena *target, size_t cap)
+{
     lotus_mark_thread_for_pool_dtor();
     lotus_chunk_pool_prefill_if_needed();
     /* Pool only the common-case default chunk size. Mixing
@@ -747,6 +867,11 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
         /* c->cap already == LOTUS_ARENA_CHUNK_BYTES; the pool
          * is invariant on that. */
         g_chunk_pool_hits++;
+        size_t attach_threshold = lotus_arena_chunk_attach_threshold();
+        if (attach_threshold > 0 && cap >= attach_threshold) {
+            lotus_log_chunk_attach_event(
+                target, "chunk_attach_pool", cap);
+        }
         return c;
     }
     if (cap == LOTUS_ARENA_CHUNK_BYTES) {
@@ -756,6 +881,16 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
     if (big_threshold > 0 && cap >= big_threshold) {
         lotus_arena_log_big_chunk(cap);
     }
+    size_t attach_threshold = lotus_arena_chunk_attach_threshold();
+    if (attach_threshold > 0 && cap >= attach_threshold
+        && (big_threshold == 0 || cap < big_threshold))
+    {
+        /* Only fire if the big-chunk logger didn't already
+         * cover this allocation — avoid double-logging the
+         * same chunk through both env vars. */
+        lotus_log_chunk_attach_event(
+            target, "chunk_attach_malloc", cap);
+    }
     lotus_arena_chunk_t *c =
         (lotus_arena_chunk_t *)malloc(sizeof(lotus_arena_chunk_t) + cap);
     if (!c) return NULL;
@@ -763,6 +898,13 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
     c->used = 0;
     c->cap  = cap;
     return c;
+}
+
+/* Backwards-compat shim for the slab-init path which doesn't have
+ * an arena_t at the call site. Logs without a target arena (label
+ * resolution will see the NULL and print "<unknown>"). */
+static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
+    return lotus_arena_new_chunk_for(NULL, cap);
 }
 
 /* Symmetric: return a chunk to the thread-local pool, or free
@@ -958,7 +1100,7 @@ void *lotus_arena_alloc(lotus_arena_t *a, size_t size, size_t align) {
             }
             return NULL;
         }
-        lotus_arena_chunk_t *fresh = lotus_arena_new_chunk(cap);
+        lotus_arena_chunk_t *fresh = lotus_arena_new_chunk_for(a, cap);
         if (!fresh) return NULL;
         a->chunk_byte_total += fresh->cap;
         fresh->next = c;
@@ -3024,6 +3166,65 @@ char *lotus_str_clone(lotus_arena_t *a, const char *s) {
     memcpy(out, s, n);
     out[n] = '\0';
     return out;
+}
+
+/* 2026-05-22 PM: in-place String reassignment for the
+ * `self.X = String_value` field-assign hot path. The motivating
+ * leak class (fathom KrakenMdgw / SymbolBook): every per-delta
+ * `self.last_venue_ts = venue_ts` clones venue_ts into self.__arena
+ * via lotus_str_clone — and the OLD self.last_venue_ts bytes are
+ * unreachable but unfreeable (arena allocators don't track per-
+ * allocation lifetimes). 18 events / 4 min × 64KB pool-chunk
+ * granularity = 1.15 MiB / 4 min across 3 books, the entire
+ * remaining structural drift after the sret + populate-rework
+ * series.
+ *
+ * Fix: when `old_ptr` is an arena-resident, NUL-terminated String
+ * we ourselves allocated, its buffer is exactly `strlen(old) + 1`
+ * bytes (lotus_str_clone / lotus_str_slice / lotus_str_concat /
+ * etc. all sit on that invariant — `lotus_arena_alloc(a, n + 1,
+ * 1)`). So `strlen(old)` is an upper bound on writable capacity.
+ * If the incoming String's length fits, memcpy + NUL-terminate
+ * directly onto `old`'s buffer and return `old` unchanged. The
+ * slot's pointer stays put; no new arena bytes consumed. When the
+ * new String is longer, fall back to lotus_str_clone (a fresh
+ * allocation in `a`); the old buffer leaks per the structural
+ * arena limitation, but the rate is bounded by how often the
+ * field genuinely grows in length rather than the per-update
+ * frequency.
+ *
+ * Static-literal skip: writing into a .rodata pointer would
+ * segfault. Detect via the same __executable_start / _edata
+ * boundary used elsewhere; fall back to clone. This also covers
+ * the locus-init default case (slot starts pointing at the empty-
+ * literal sentinel).
+ *
+ * Same-arena passthrough: when `new` is already in `a`, the
+ * caller has nothing to clone — but the old buffer would leak if
+ * we just returned `new`. Two cases:
+ *   - `new == old` (rebinding to itself): return old, no-op.
+ *   - `new != old` but both in a: copy new's content into old's
+ *     buffer if it fits (reuses old's slot), else fall back to
+ *     new (old leaks). Net: same number of bytes live as before. */
+char *lotus_str_assign_in_place(lotus_arena_t *a, char *old,
+                                 const char *new_s) {
+    if (!new_s) return NULL;
+    if (!old) return lotus_str_clone(a, new_s);
+    if (old == new_s) return old;
+    if (lotus_str_is_static_literal(old)) {
+        return lotus_str_clone(a, new_s);
+    }
+    /* old is an arena-owned NUL-terminated buffer. strlen(old)
+     * is its capacity (sans NUL). */
+    size_t old_len = strlen(old);
+    size_t new_len = strlen(new_s);
+    if (new_len <= old_len) {
+        memcpy(old, new_s, new_len);
+        old[new_len] = '\0';
+        return old;
+    }
+    /* New is longer than old's buffer — clone. */
+    return lotus_str_clone(a, new_s);
 }
 
 /* lotus_bytes_clone is defined further down (alongside the

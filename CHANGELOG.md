@@ -71,9 +71,49 @@ Sequence of commits:
   0.15 MiB/min → 0. See [`spec/memory.md` Phase-4 perf
   follow-on #6](./spec/memory.md).
 
+- **[codegen]** m49 sret-pattern return-arena routing —
+  method-with-scratch aggregate returns lower the return-
+  expression under `current_arena_override = caller_arena`,
+  so fresh allocations (struct literals, nested calls) land
+  directly in caller storage. `emit_method_return_deep_copy`
+  contains-checks via `emit_cross_arena_store_deep_copy_ptr`
+  and passes the value through unchanged. Closes the
+  SweepResult / BookSignalSnapshot return-value leak class.
+  `populate_user_type_fields` field-level deep-copy is gated
+  on `current_arena_override.is_some()` so ordinary struct
+  construction (hashmap.set's Cell arg, locus param defaults)
+  stays on the pre-rework path and downstream anchor same-
+  arena skips remain intact. See [`spec/memory.md` Phase-4
+  perf follow-on #8](./spec/memory.md).
+
+- **[runtime] [spec]** `LOTUS_ARENA_LOG_CHUNK_ATTACH=<N>` —
+  diagnostic env var that logs every chunk attachment (pool-
+  recycled AND fresh-malloc paths) with `arena=<ptr>
+  kind=<root|sub> label=<resolved>` so the destination arena
+  is attributable. Closed the diagnostic blind spot where
+  `LOTUS_ARENA_LOG_BIG_CHUNKS` (malloc-path only) missed pool-
+  recycled chunk attachments — those dominate the trace volume
+  once method scratch destroys recycle chunks via the per-
+  thread pool. Filter `kind=root label=<name>` to isolate
+  actual arena-growing callsites.
+
+- **[runtime] [codegen] [spec]** `lotus_str_assign_in_place(
+  arena, old, new)` — reuses the existing slot's buffer when
+  `strlen(new) <= strlen(old)`, falls back to `lotus_str_clone`
+  when old is static / null / too small. Wired into
+  `emit_self_field_inplace_assign` for `self.X = String_value`
+  inside a method-with-scratch. Closes the per-update String-
+  field-reassignment leak class — fathom's `self.last_venue_ts
+  = venue_ts` pattern: SymbolBook arena ~+1-3 chunks per book
+  per 4 min → flat. See [`spec/memory.md` Phase-4 perf
+  follow-on #7](./spec/memory.md).
+
 Session-cumulative result against fathom KrakenMdgw: 13-minute
 projected OOM → effectively unbounded (every long-lived arena
-flat across a 60s burn vs live Kraken).
+flat across a 60s burn vs live Kraken). Subsequent verification
+burns under live market data confirmed RSS slope dropped from
+0.79 → 0.195 MB/min mid-session, then to near-zero structural
+drift after the sret + String in-place fixes landed.
 
 ## 2026-05-21 — Phase-4 per-method scratch reclaim + chunk pool
 
