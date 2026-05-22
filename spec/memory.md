@@ -967,9 +967,10 @@ reclaim on a real-world long-running workload:
      reassignment). The codegen emits the right helper at every
      `self.X = String|Bytes` site inside a method-with-scratch.
      Closes the per-update heap-field-reassignment leak class
-     — fathom's per-delta `self.last_venue_ts = venue_ts`
-     pattern: SymbolBook arena dropped from ~+1-3 chunks per
-     book per 4 min to flat. Caveat (both helpers): the
+     — measured against a per-frame `self.last_ts = ts` pattern
+     in a long-running daemon: the receiver locus's arena
+     dropped from ~+1-3 chunks per instance per 4 min to flat.
+     Caveat (both helpers): the
      length-tracking field doubles as the capacity field, so a
      reduce-then-grow oscillation gradually loses available
      capacity and degrades toward "always clone"; bounded-

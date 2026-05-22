@@ -21,8 +21,8 @@ here as historical labels — the spec no longer carries them.
 
 ## 2026-05-22 — leak hunt + view ABI compaction + diagnostic harness
 
-Long-running daemon (fathom KrakenMdgw) hit a hard memory cap
-in ~13 minutes against live market data. Session goal: identify
+Long-running daemon (fathom mdgw) hit a hard memory cap
+in ~13 minutes under live upstream load. Session goal: identify
 and structurally close every locus-arena leak in the substrate.
 Sequence of commits:
 
@@ -53,7 +53,7 @@ Sequence of commits:
   IR; methods with multiple `return` statements leaked scratch
   on all-but-one return path. Save/restore the scratch state
   around the call in `lower_return` so every return emits its
-  own destroy. Validated against fathom: KrakenMdgw locus
+  own destroy. Validated against fathom: receiver locus
   arena 10 MiB/min → 0.
 - `f042806` **[codegen]** Anchor-in-place at
   `@form(hashmap).set` — drop the wasted outer-struct
@@ -106,10 +106,10 @@ Sequence of commits:
   small. Both wired into `emit_self_field_inplace_assign` for
   `self.X = String|Bytes` inside a method-with-scratch (dispatch
   is by slot type). Closes the per-update heap-field-
-  reassignment leak class — fathom's `self.last_venue_ts =
-  venue_ts` pattern: SymbolBook arena ~+1-3 chunks per book per
-  4 min → flat. See [`spec/memory.md` Phase-4 perf follow-on
-  #7](./spec/memory.md).
+  reassignment leak class — measured against a per-frame
+  `self.last_ts = ts` pattern in fathom's mdgw: receiver locus
+  arena ~+1-3 chunks per instance per 4 min → flat. See
+  [`spec/memory.md` Phase-4 perf follow-on #7](./spec/memory.md).
 
 - **[docs]** `agents/memory-patterns.md` — author-facing
   catalog of memory-shape patterns: which assignment / return /
@@ -117,14 +117,14 @@ Sequence of commits:
   vs. which require care. Mirrors `spec/memory.md`'s Phase-4
   follow-ons list, adds the "When NOT to worry" carve-outs,
   documents the diagnostic workflow that pinned fathom's
-  SymbolBook residual. Cross-linked from `AGENTS.md`.
+  per-instance arena residual. Cross-linked from `AGENTS.md`.
 
-Session-cumulative result against fathom KrakenMdgw: 13-minute
+Session-cumulative result against fathom mdgw: 13-minute
 projected OOM → effectively unbounded (every long-lived arena
-flat across a 60s burn vs live Kraken). Subsequent verification
-burns under live market data confirmed RSS slope dropped from
-0.79 → 0.195 MB/min mid-session, then to near-zero structural
-drift after the sret + String in-place fixes landed.
+flat across a 60s burn under live upstream load). Subsequent
+verification burns confirmed RSS slope dropped from 0.79 →
+0.195 MB/min mid-session, then to near-zero structural drift
+after the sret + String in-place fixes landed.
 
 ## 2026-05-21 — Phase-4 per-method scratch reclaim + chunk pool
 

@@ -44,7 +44,7 @@ Field types that are always free to assign regardless of frequency
 - **`Cell` types**: live inline in their container's storage; the
   container handles lifetime.
 - **String fields holding static literals** (e.g. `params { label:
-  String = "ws.kraken"; }`): `lotus_str_clone` short-circuits on
+  String = "ws.upstream"; }`): `lotus_str_clone` short-circuits on
   `.rodata` pointers via `lotus_str_is_static_literal`, so reads /
   returns / cross-arena copies of static-literal-initialized
   String fields are free.
@@ -162,8 +162,9 @@ old_len`. If the new value is *longer* than the existing slot's
 buffer, the substrate falls back to a fresh clone and the old
 buffer is unreachable but unfreeable.
 
-For fields with bounded length variance (e.g. Kraken timestamps —
-always ~30 chars; fixed-size frame headers; checksums), this is
+For fields with bounded length variance (e.g. wire-format
+timestamps — always ~30 chars; fixed-size frame headers;
+checksums), this is
 a non-issue: equal-or-shorter writes hit the memcpy path. For
 genuinely variable-length fields on hot paths, the substrate
 workaround is a `BytesBuilder` over a known-cap buffer + a

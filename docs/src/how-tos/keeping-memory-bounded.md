@@ -149,7 +149,7 @@ string-key on a hot path, pre-resolve at boot:
 ```aperio
 // At boot, in main():
 let c_ticks = reg.counter("ticks_total", lbl);
-KrakenMdgw { c_ticks: c_ticks, ... };
+Service { c_ticks: c_ticks, ... };
 
 // On the hot path:
 fn dispatch(m: ws::WsMessage) {
@@ -159,10 +159,10 @@ fn dispatch(m: ws::WsMessage) {
 
 The cached handle is constructed once; the per-call `.inc()` is
 a direct slot write. See
-[the leak-hunt writeup in fathom][leak-hunt] for the discovery
-context.
+[`agents/memory-patterns.md`][patterns] for the discovery context
+and the full catalog of substrate-closed leak shapes.
 
-[leak-hunt]: https://github.com/aperio-lang/fathom/blob/main/MEMORY-LEAK-HUNTING-GOTCHAS.md
+[patterns]: ../../../agents/memory-patterns.md
 
 ### Prefer substrate primitives over ASCII roundtrips
 
@@ -202,7 +202,7 @@ For diagnosing what's growing, the substrate exposes:
 See [the diagnostic workflow][diag] for how these compose to
 narrow down a leak.
 
-[diag]: https://github.com/aperio-lang/fathom/blob/main/MEMORY-LEAK-HUNTING-GOTCHAS.md#operational-primitives--diagnostics
+[diag]: ../../../agents/memory-patterns.md#operational-primitives--diagnostics
 
 ## Diagnostic workflow
 
@@ -223,9 +223,9 @@ narrow down a leak.
 
 ## Validated: Aperio holds the language-layer line
 
-A May 2026 long-running production service (fathom mdgw against
-the Kraken WS feed, 10 symbols, ~250 frames/sec, hot recv +
-dispatch + bus-publish loop) was instrumented with
+A May 2026 long-running production service (a market-data
+gateway against an upstream WS feed, 10 streams, ~250 frames/sec,
+hot recv + dispatch + bus-publish loop) was instrumented with
 `LOTUS_ARENA_RESIDENCY=1` +
 `LOTUS_ARENA_LOG_CHUNK_ATTACH=4096`. Over a 12-minute burn:
 
@@ -274,6 +274,7 @@ of that line you're on.
   storage classes
 - [Lifecycle & time](../concepts/lifecycle-time.md) — when
   arenas dissolve
-- The fathom leak-hunt writeup at
-  `~/code/fathom/MEMORY-LEAK-HUNTING-GOTCHAS.md` for the
-  longer-form story of how the language got tight in this area.
+- [`agents/memory-patterns.md`](../../../agents/memory-patterns.md)
+  — author-facing brief on hot-path memory shapes, mirrors the
+  substrate's Phase-4 perf follow-ons list with carve-outs for
+  "when not to worry."

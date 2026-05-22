@@ -37,11 +37,11 @@ For payloads where the real fields live inside a wrapper object
 `find_field_raw` returns the raw value-token substring:
 
 ```aperio
-let s = "{\"result\":{\"channel\":\"book\",\"symbol\":\"XBT/USD\"}}";
+let s = "{\"result\":{\"channel\":\"events\",\"name\":\"main\"}}";
 let inner = std::json::find_field_raw(s, "result");
-// inner == `{"channel":"book","symbol":"XBT/USD"}`
+// inner == `{"channel":"events","name":"main"}`
 let channel = std::json::find_string_field(inner, "channel");
-let symbol  = std::json::find_string_field(inner, "symbol");
+let name    = std::json::find_string_field(inner, "name");
 ```
 
 The walker is bracket-balanced over `{...}` and `[...]` (respects
