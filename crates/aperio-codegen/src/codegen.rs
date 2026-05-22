@@ -18657,30 +18657,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     op, fname_ident.name
                                 )));
                             }
-                            // Bus-arena reclaim follow-up (2026-05-21):
                             // `[T; N]` of a heap type stores POINTERS
                             // (per `llvm_basic_type`: TypeRef / Tuple
-                            // / Array / etc. all lower to `ptr`). With
-                            // Phase-4 method scratch active, a literal
-                            // built by the rhs (e.g. `Cell { ... }`)
-                            // lives in the per-call scratch — storing
-                            // its pointer into self.X[i] would dangle
-                            // on method exit. Deep-copy into the
-                            // locus's __arena via the same helper that
-                            // single-segment self.X = expr uses.
-                            // Surfaced 2026-05-21: fixed-cap arrays of
-                            // Decimal-bearing structs (`[Cell; 10]`
-                            // where Cell is `{Decimal, Decimal}`)
-                            // returned corrupted values from freed
-                            // scratch chunks after method exit.
-                            let rhs = self.maybe_self_field_heap_copy(
-                                rhs, &elem_ty,
+                            // / Array / etc. all lower to `ptr`). The
+                            // existing slot's pointer was allocated at
+                            // locus instantiation via the array's
+                            // default initializer (`[BookLevel { },
+                            // BookLevel { }, ...]` for fathom's case),
+                            // so by the time any method body assigns
+                            // to it the slot is non-null.
+                            //
+                            // In-place mutation: anchor rhs's heap
+                            // fields in self.__arena, memcpy rhs
+                            // bytes over the existing struct's bytes
+                            // at the slot's pointer. The pointer
+                            // itself doesn't change. Bounds
+                            // self.__arena growth for the SymbolBook
+                            // `self.bids[i] = BookLevel { p, q }`
+                            // pattern: 10 levels × 16 bytes × 3
+                            // symbols stays constant under any delta
+                            // rate. Pre-rework allocated a fresh
+                            // 32-byte BookLevel per indexed assign;
+                            // surfaced at ~0.21 MiB/min residual in
+                            // the post-f042806 fathom dump.
+                            self.emit_self_field_inplace_assign(
+                                slot_ptr, rhs, &elem_ty,
                             )?;
-                            self.builder
-                                .build_store(slot_ptr, rhs)
-                                .map_err(|e| {
-                                    CodegenError::LlvmEmit(e.to_string())
-                                })?;
                             return Ok(BlockEnd::Open);
                         }
                     }
@@ -18918,26 +18920,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     let (v, _) = self.lower_binop(bin_op, cur, rhs, &slot_ty)?;
                     v
                 };
-                // Bus-arena reclaim (2026-05-21): when the
-                // assignment target is a heap-typed `self.X`
-                // field, deep-copy the rhs into `self.__arena`.
-                // The method-scratch the rhs lives in is destroyed
-                // at method exit; without the copy the stored
-                // pointer would dangle on the next read.
-                // `maybe_self_field_heap_copy` short-circuits to
-                // identity for scalar slots and for non-method
-                // contexts, so this is cheap on the common path.
-                let new_val = if target.head.name == "self"
+                // `self.X = expr` for a heap-typed field gets the
+                // in-place anchor + memcpy treatment from
+                // emit_self_field_inplace_assign — bounds the
+                // locus's __arena under repeated assigns. Non-self
+                // targets (let-bound locals, etc.) go through the
+                // legacy store path; their storage is the alloca
+                // itself, not a pointer-to-arena-struct, so in-
+                // place mutation isn't the right shape.
+                if target.head.name == "self"
                     && target.tail.len() == 1
                     && matches!(target.tail[0], LValueSeg::Field(_))
                 {
-                    self.maybe_self_field_heap_copy(new_val, &slot_ty)?
+                    self.emit_self_field_inplace_assign(
+                        slot_ptr, new_val, &slot_ty,
+                    )?;
                 } else {
-                    new_val
-                };
-                self.builder
-                    .build_store(slot_ptr, new_val)
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    self.builder
+                        .build_store(slot_ptr, new_val)
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
                 Ok(BlockEnd::Open)
             }
             Stmt::If(if_stmt) => self.lower_if(if_stmt, scope),
@@ -37509,6 +37511,205 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ///   * the slot type is a scalar / view / locus-ref / cell;
     /// otherwise routes through `emit_return_value_deep_copy`
     /// targeting `self.__arena`.
+    /// In-place assign for a self-field slot whose existing storage
+    /// can be mutated. Used at `self.X = expr` and `self.X[i] = expr`
+    /// sites where the slot already holds a stable pointer to a
+    /// struct in `self.__arena` (typical: locus field with a default
+    /// `Struct { }` initializer, or array element of a fixed-size
+    /// array of structs with default-initialized elements — every
+    /// such slot is non-null by the time any method body runs).
+    ///
+    /// Pre-rework, both sites called `maybe_self_field_heap_copy` +
+    /// `build_store`. The helper allocated a fresh struct in
+    /// `self.__arena`, copied fields into it, returned the new
+    /// pointer; the store wrote that pointer over the slot's
+    /// existing pointer. The old struct became unreachable garbage
+    /// in `self.__arena`, accumulating ~sizeof(struct) bytes per
+    /// assign × per-frame rate (~50 B × 30 frames/sec for fathom's
+    /// WsClient.last_message; ~32 B × 30 deltas/sec × 3 levels for
+    /// SymbolBook's `self.bids[i] = BookLevel{...}`).
+    ///
+    /// In-place: anchor the rhs's heap fields in `self.__arena`
+    /// (via `emit_cross_arena_store_deep_copy`'s anchor-in-place
+    /// rewrite on the source struct), then memcpy the rhs's bytes
+    /// over the EXISTING struct's bytes at the slot's pointer. The
+    /// slot's pointer doesn't change — no `build_store` needed. Any
+    /// number of assigns to the same slot stays within the
+    /// originally-allocated struct's bytes; the only growth is per
+    /// heap-field deep-copy when the rhs's heap field has new
+    /// content (e.g., a fresh dynamic String).
+    fn emit_self_field_inplace_assign(
+        &mut self,
+        slot_ptr: PointerValue<'ctx>,
+        rhs: BasicValueEnum<'ctx>,
+        slot_ty: &CodegenTy,
+    ) -> Result<(), CodegenError> {
+        // Scalars + views + LocusRefs + Cells: store the value
+        // directly. No anchoring needed (the value's bytes live
+        // in the slot itself, or the slot holds a stable pointer
+        // to a long-lived locus).
+        let compound = match slot_ty {
+            CodegenTy::Int
+            | CodegenTy::Float
+            | CodegenTy::Bool
+            | CodegenTy::Decimal
+            | CodegenTy::Time
+            | CodegenTy::Duration
+            | CodegenTy::FnPtr { .. }
+            | CodegenTy::BytesView
+            | CodegenTy::StringView
+            | CodegenTy::LocusRef(_)
+            | CodegenTy::Cell(_, _) => false,
+            // String/Bytes: slot holds a pointer; still need
+            // maybe_self_field_heap_copy to ensure the stored
+            // pointer is in self.__arena or static. There's no
+            // "existing struct" to mutate — the underlying String
+            // is heap-allocated and immutable.
+            CodegenTy::String | CodegenTy::Bytes => false,
+            _ => true,
+        };
+
+        if !compound {
+            let value = self.maybe_self_field_heap_copy(rhs, slot_ty)?;
+            self.builder
+                .build_store(slot_ptr, value)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Without method scratch (e.g., a synthesized closure-eval
+        // body), the rhs is already in self.__arena or static
+        // — no anchoring needed. Preserve the legacy store-the-
+        // pointer behavior; mutating in place isn't a meaningful
+        // optimization in those contexts.
+        if self.current_method_scratch.is_none() {
+            self.builder
+                .build_store(slot_ptr, rhs)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            return Ok(());
+        }
+
+        // In-place compound mutation.
+        let cs = self
+            .current_self
+            .clone()
+            .expect("scratch active implies current_self");
+        let info = self
+            .user_loci
+            .get(&cs.locus_name)
+            .cloned()
+            .expect("current_self points to a declared locus");
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let arena_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                cs.self_ptr,
+                info.arena_field_idx,
+                "self.__arena.for_inplace_ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let dest_arena = self
+            .builder
+            .build_load(
+                ptr_t,
+                arena_field_ptr,
+                "self.__arena.for_inplace",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+
+        // Anchor rhs's heap fields in self.__arena. Same-arena
+        // skip and static-literal skip from 6a56d7c make this
+        // identity for the common RMW + literal-field patterns.
+        // For compound types, this rewrites rhs's struct fields
+        // in place; the returned pointer is rhs's own pointer.
+        let anchored = self.emit_cross_arena_store_deep_copy(
+            rhs,
+            slot_ty,
+            dest_arena,
+            "self_field_inplace",
+        )?;
+
+        // Existing struct pointer — slot is guaranteed non-null
+        // because every locus field has either a default or an
+        // instantiation-time value (typecheck-enforced), so by
+        // the time any method body runs the slot has been
+        // populated by lower_locus_instantiation's field init.
+        let existing_ptr = self
+            .builder
+            .build_load(ptr_t, slot_ptr, "self_field.existing")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+
+        let size = self.compound_storage_size(slot_ty)?;
+
+        self.emit_memcpy_call(
+            existing_ptr,
+            anchored.into_pointer_value(),
+            size,
+            "self_field_inplace.memcpy",
+        )?;
+
+        // No build_store — slot's pointer is unchanged.
+        Ok(())
+    }
+
+    /// Sizeof helper for compound types, used by the in-place
+    /// assign path's memcpy. Routes to the matching LLVM storage
+    /// type's `size_of()`. Rejects non-compound types loudly
+    /// (caller is expected to gate by `field_needs_anchor` or an
+    /// equivalent compound predicate).
+    fn compound_storage_size(
+        &self,
+        ty: &CodegenTy,
+    ) -> Result<IntValue<'ctx>, CodegenError> {
+        let size = match ty {
+            CodegenTy::TypeRef(name) => self
+                .user_types
+                .get(name)
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "compound_storage_size: unknown type `{}`",
+                        name
+                    ))
+                })?
+                .struct_ty
+                .size_of(),
+            CodegenTy::Tuple(elem_tys) => {
+                self.llvm_tuple_storage_type(elem_tys).size_of()
+            }
+            CodegenTy::Array(elem_ty, n) => {
+                self.llvm_array_storage_type(elem_ty, *n).size_of()
+            }
+            CodegenTy::Interface(_) => self.iface_fat_struct_ty().size_of(),
+            CodegenTy::Enum(name) => {
+                let info = self
+                    .user_enums
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "compound_storage_size: unknown enum `{}`",
+                            name
+                        ))
+                    })?;
+                self.enum_storage_struct(&info).size_of()
+            }
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "compound_storage_size: non-compound type {:?}",
+                    other
+                )));
+            }
+        };
+        size.ok_or_else(|| {
+            CodegenError::Unsupported(
+                "compound type has unknown size at codegen time".to_string(),
+            )
+        })
+    }
+
     fn maybe_self_field_heap_copy(
         &mut self,
         value: BasicValueEnum<'ctx>,
