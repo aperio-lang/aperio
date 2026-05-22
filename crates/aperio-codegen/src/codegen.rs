@@ -2666,10 +2666,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module
             .add_function("lotus_str_clone", str_clone_ty, None);
         // declare ptr @lotus_str_assign_in_place(ptr arena, ptr old, ptr new)
-        // — used at the `self.X = String` field-assign site to
+        // declare ptr @lotus_bytes_assign_in_place(ptr arena, ptr old, ptr new)
+        // — used at the `self.X = String|Bytes` field-assign site to
         // reuse the old buffer when new fits. Closes the leak
-        // class for per-delta String field reassignment without
-        // changing the String ABI. See lotus_arena.c for the
+        // class for per-update heap-field reassignment without
+        // changing the String/Bytes ABI. See lotus_arena.c for the
         // structural details.
         let str_assign_inplace_ty = ptr_t.fn_type(
             &[ptr_t.into(), ptr_t.into(), ptr_t.into()],
@@ -2677,6 +2678,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         );
         self.module.add_function(
             "lotus_str_assign_in_place",
+            str_assign_inplace_ty,
+            None,
+        );
+        self.module.add_function(
+            "lotus_bytes_assign_in_place",
             str_assign_inplace_ty,
             None,
         );
@@ -37696,16 +37702,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             _ => true,
         };
 
-        // 2026-05-22 PM: in-place String reassignment for the
-        // `self.X = String_value` field-assign hot path. Calls
-        // lotus_str_assign_in_place which reuses the old buffer
-        // when new fits — eliminates the per-delta leak class
-        // (fathom KrakenMdgw / SymbolBook's `self.last_venue_ts
-        // = venue_ts`). Only fires inside a method-with-scratch
-        // (the only context where `self.__arena` is the dest);
-        // outside (synthesized closure-eval bodies, etc.) the
-        // legacy maybe_self_field_heap_copy path stays unchanged.
-        if let CodegenTy::String = slot_ty {
+        // 2026-05-22 PM: in-place String/Bytes reassignment for
+        // the `self.X = heap_value` field-assign hot path. Calls
+        // lotus_str_assign_in_place / lotus_bytes_assign_in_place
+        // which reuse the old buffer when new fits — eliminates
+        // the per-update leak class (fathom KrakenMdgw / SymbolBook's
+        // `self.last_venue_ts = venue_ts`). Only fires inside a
+        // method-with-scratch (the only context where `self.__arena`
+        // is the dest); outside (synthesized closure-eval bodies,
+        // etc.) the legacy maybe_self_field_heap_copy path stays
+        // unchanged.
+        let inplace_helper_name: Option<&'static str> = match slot_ty {
+            CodegenTy::String => Some("lotus_str_assign_in_place"),
+            CodegenTy::Bytes => Some("lotus_bytes_assign_in_place"),
+            _ => None,
+        };
+        if let Some(helper_name) = inplace_helper_name {
             if self.current_method_scratch.is_some() {
                 let cs = self
                     .current_self
@@ -37725,7 +37737,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         info.struct_ty,
                         cs.self_ptr,
                         info.arena_field_idx,
-                        "self.__arena.for_str_assign_ptr",
+                        "self.__arena.for_heap_assign_ptr",
                     )
                     .map_err(|e| {
                         CodegenError::LlvmEmit(e.to_string())
@@ -37735,7 +37747,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_load(
                         ptr_t,
                         arena_field_ptr,
-                        "self.__arena.for_str_assign",
+                        "self.__arena.for_heap_assign",
                     )
                     .map_err(|e| {
                         CodegenError::LlvmEmit(e.to_string())
@@ -37746,7 +37758,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .build_load(
                         ptr_t,
                         slot_ptr,
-                        "self_field.str.existing",
+                        "self_field.heap.existing",
                     )
                     .map_err(|e| {
                         CodegenError::LlvmEmit(e.to_string())
@@ -37754,8 +37766,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .into_pointer_value();
                 let assign_fn = self
                     .module
-                    .get_function("lotus_str_assign_in_place")
-                    .expect("lotus_str_assign_in_place declared");
+                    .get_function(helper_name)
+                    .expect("in-place assign helper declared");
                 let result = self
                     .builder
                     .build_call(
@@ -37765,14 +37777,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             existing.into(),
                             rhs.into_pointer_value().into(),
                         ],
-                        "self_field.str.assign_in_place",
+                        "self_field.heap.assign_in_place",
                     )
                     .map_err(|e| {
                         CodegenError::LlvmEmit(e.to_string())
                     })?
                     .try_as_basic_value()
                     .left()
-                    .expect("lotus_str_assign_in_place returns ptr");
+                    .expect("assign_in_place helper returns ptr");
                 self.builder
                     .build_store(slot_ptr, result)
                     .map_err(|e| {

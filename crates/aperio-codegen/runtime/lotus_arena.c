@@ -3414,6 +3414,53 @@ void *lotus_bytes_clone(lotus_arena_t *a, const void *src) {
     return blob;
 }
 
+/* 2026-05-22 PM: in-place Bytes reassignment, the Bytes companion
+ * to lotus_str_assign_in_place. Same shape: at `self.X = Bytes_value`
+ * sites, reuse the existing slot's buffer when the new payload fits
+ * inside it. Closes the gotcha-#5-Bytes-companion case so the
+ * substrate's "self.X = heap_value" leak class is symmetric across
+ * String and Bytes.
+ *
+ * Bytes layout is `[int64_t len][len bytes payload]`; the buffer's
+ * physical size is `sizeof(int64_t) + len`. We use the prefix value
+ * as both the logical length AND the available capacity (no
+ * separate capacity field in the v0 representation). After an
+ * in-place reduce, the prefix is updated to `new_len`; subsequent
+ * assigns compare against the (now-smaller) prefix, so a field
+ * whose values oscillate up and down across hot-path calls will
+ * degrade toward "always clone" as the prefix shrinks. For bounded-
+ * variance fields (the typical case — fixed-size frame headers,
+ * checksums, etc.) the prefix stays constant and the in-place
+ * path holds. Spec callout in spec/memory.md Phase-4 perf follow-
+ * on #7.
+ *
+ * Static-literal skip + null-old skip + same-pointer skip mirror
+ * lotus_str_assign_in_place's logic. */
+void *lotus_bytes_assign_in_place(lotus_arena_t *a, void *old,
+                                   const void *new_b) {
+    if (!new_b) return NULL;
+    if (!old) return lotus_bytes_clone(a, new_b);
+    if (old == new_b) return old;
+    if (lotus_str_is_static_literal((const char *)old)) {
+        return lotus_bytes_clone(a, new_b);
+    }
+    int64_t old_cap = lotus_bytes_len(old);
+    int64_t new_len = lotus_bytes_len(new_b);
+    if (new_len < 0) new_len = 0;
+    if (old_cap < 0) old_cap = 0;
+    if (new_len <= old_cap) {
+        *(int64_t *)old = new_len;
+        if (new_len > 0) {
+            memcpy(
+                (char *)old + sizeof(int64_t),
+                (const char *)new_b + sizeof(int64_t),
+                (size_t)new_len);
+        }
+        return old;
+    }
+    return lotus_bytes_clone(a, new_b);
+}
+
 int64_t lotus_str_index_of(const char *s, const char *sub) {
     if (!s || !sub) return -1;
     if (*sub == '\0') return 0;

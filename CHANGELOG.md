@@ -98,15 +98,26 @@ Sequence of commits:
   actual arena-growing callsites.
 
 - **[runtime] [codegen] [spec]** `lotus_str_assign_in_place(
-  arena, old, new)` — reuses the existing slot's buffer when
-  `strlen(new) <= strlen(old)`, falls back to `lotus_str_clone`
-  when old is static / null / too small. Wired into
-  `emit_self_field_inplace_assign` for `self.X = String_value`
-  inside a method-with-scratch. Closes the per-update String-
-  field-reassignment leak class — fathom's `self.last_venue_ts
-  = venue_ts` pattern: SymbolBook arena ~+1-3 chunks per book
-  per 4 min → flat. See [`spec/memory.md` Phase-4 perf
-  follow-on #7](./spec/memory.md).
+  arena, old, new)` + `lotus_bytes_assign_in_place(arena, old,
+  new)` — reuse the existing slot's buffer when the new value
+  fits (`strlen(new) <= strlen(old)` for String; `new_len <=
+  old_cap` against the Bytes header). Fall back to the
+  respective clone helper when old is static / null / too
+  small. Both wired into `emit_self_field_inplace_assign` for
+  `self.X = String|Bytes` inside a method-with-scratch (dispatch
+  is by slot type). Closes the per-update heap-field-
+  reassignment leak class — fathom's `self.last_venue_ts =
+  venue_ts` pattern: SymbolBook arena ~+1-3 chunks per book per
+  4 min → flat. See [`spec/memory.md` Phase-4 perf follow-on
+  #7](./spec/memory.md).
+
+- **[docs]** `agents/memory-patterns.md` — author-facing
+  catalog of memory-shape patterns: which assignment / return /
+  lookup shapes the substrate makes allocation-free automatically
+  vs. which require care. Mirrors `spec/memory.md`'s Phase-4
+  follow-ons list, adds the "When NOT to worry" carve-outs,
+  documents the diagnostic workflow that pinned fathom's
+  SymbolBook residual. Cross-linked from `AGENTS.md`.
 
 Session-cumulative result against fathom KrakenMdgw: 13-minute
 projected OOM → effectively unbounded (every long-lived arena

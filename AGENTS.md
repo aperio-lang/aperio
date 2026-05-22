@@ -214,6 +214,19 @@ surprises:
    for the native binary.
 5. Iterate.
 
+## Hot-path memory patterns
+
+Before writing code that runs many times per second (per-frame
+handlers, tight loops, bus dispatch hot paths), read
+[`agents/memory-patterns.md`](./agents/memory-patterns.md). It
+catalogs which assignment / return / lookup shapes the substrate
+makes allocation-free automatically and which require care from
+the author. The arena allocator doesn't free per-allocation, so
+patterns that look innocent at the call site can leak into a
+locus's lifetime arena — but the substrate closes more of those
+shapes than you'd expect, and the file's "When NOT to worry"
+section preempts overcautious code.
+
 ## Inline structural failure
 
 For "catch a value error in a locus method and shut this locus

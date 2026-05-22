@@ -952,20 +952,28 @@ reclaim on a real-world long-running workload:
      repeated assigns to the same slot. Bounds locus arenas
      under any assign frequency.
 
-  7. **In-place String reassignment at `self.X = String_value`.**
-     `lotus_str_assign_in_place(arena, old, new)` reuses the
-     existing slot's buffer when `strlen(new) <= strlen(old)`:
-     memcpy new bytes + NUL into `old`'s buffer, return `old`
-     unchanged. Static-literal `old` falls through to
-     `lotus_str_clone` (`.rodata` isn't writable); same when
-     new is longer than old's buffer (the old buffer leaks like
-     before, but only on rare length-growth events rather than
-     every reassignment). The codegen emits the helper at every
-     `self.X = String_value` site inside a method-with-scratch.
-     Closes the per-update String-field-reassignment leak class
+  7. **In-place String / Bytes reassignment at `self.X =
+     heap_value`.** `lotus_str_assign_in_place(arena, old, new)`
+     reuses the existing slot's buffer when `strlen(new) <=
+     strlen(old)`: memcpy new bytes + NUL into `old`'s buffer,
+     return `old` unchanged. `lotus_bytes_assign_in_place` is
+     the Bytes companion — same shape against the `[int64 len]
+     [payload]` Bytes header; when `new_len <= old_cap` it
+     updates the prefix and memcpys the payload in place.
+     Static-literal `old` falls through to the clone path
+     (`.rodata` isn't writable); same when new is longer than
+     old's buffer (the old buffer leaks like before, but only
+     on rare length-growth events rather than every
+     reassignment). The codegen emits the right helper at every
+     `self.X = String|Bytes` site inside a method-with-scratch.
+     Closes the per-update heap-field-reassignment leak class
      — fathom's per-delta `self.last_venue_ts = venue_ts`
      pattern: SymbolBook arena dropped from ~+1-3 chunks per
-     book per 4 min to flat.
+     book per 4 min to flat. Caveat (both helpers): the
+     length-tracking field doubles as the capacity field, so a
+     reduce-then-grow oscillation gradually loses available
+     capacity and degrades toward "always clone"; bounded-
+     variance fields keep the in-place path indefinitely.
 
   8. **m49 sret-pattern return-arena routing.** When a method-
      with-scratch is about to return a heap-typed value, the
