@@ -185,14 +185,33 @@ type ImportRenames = Vec<(Vec<String>, String)>;
 /// filesystem root (standalone-shipped binaries hit this — they
 /// can still use entry-relative imports, just not the
 /// workspace-fallback path).
+/// Walk up from `start` looking for a workspace anchor. Aperio
+/// repos are anchored by `aperio.toml`; lotus-lang's own dev tree
+/// is also a cargo workspace, so `Cargo.toml` works as a fallback
+/// anchor for compiler-side development. The first one found
+/// wins. The result is the directory containing the anchor.
+///
+/// 2026-05-22: anchor used as the basis for path-based mangling
+/// (`lib_canonical_id`). Two consumers in the same workspace
+/// importing the same lib produce identical mangled names
+/// because they compute the lib's path relative to the same
+/// root.
 fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = if start.is_file() {
-        start.parent()?.to_path_buf()
+    // Canonicalize first so the walk-up traverses real ancestor
+    // directories regardless of whether `start` came in relative
+    // (e.g., `aperio build apps/a/main.ap` from the repo root).
+    // Without this, relative paths walk `apps/a/main.ap` →
+    // `apps/a` → `apps` → "" and never reach the actual
+    // workspace root containing the aperio.toml.
+    let canon = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    let mut cur = if canon.is_file() {
+        canon.parent()?.to_path_buf()
     } else {
-        start.to_path_buf()
+        canon
     };
     loop {
-        if cur.join("Cargo.toml").is_file() {
+        if cur.join("aperio.toml").is_file() || cur.join("Cargo.toml").is_file()
+        {
             return Some(cur);
         }
         cur = match cur.parent() {
@@ -214,6 +233,85 @@ enum ImportTarget {
 /// Try the three resolution strategies in order: entry-relative
 /// single file, entry-relative directory, workspace-root directory.
 /// Returns `None` if none of them hit.
+/// Stable, sanitized identifier for an imported lib seed. Used
+/// as the mangler's namespace key so two apps importing the same
+/// lib produce identical mangled symbols (cross-app DTO contracts
+/// become symbol-identical without any annotation or config flag).
+///
+/// Identity basis:
+///   - Workspace-root-relative path when a workspace root is in
+///     scope (`<repo>/aperio.toml` found by `find_workspace_root`).
+///     Two apps in the same monorepo importing the same lib see
+///     the same relative path → same id.
+///   - File-name fallback when no workspace root is available
+///     (single-file builds outside any toml-rooted repo). Less
+///     collision-safe but the only stable thing visible.
+///
+/// All non-identifier characters in the path collapse to `_` so
+/// the result is a valid C / LLVM symbol component.
+fn lib_canonical_id(target: &ImportTarget, workspace_root: Option<&Path>) -> String {
+    let path = match target {
+        ImportTarget::SingleFile(p) => p.clone(),
+        ImportTarget::Directory(d) => d.clone(),
+    };
+    let canon = path.canonicalize().unwrap_or(path);
+    let basis: PathBuf = if let Some(root) = workspace_root {
+        let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        canon
+            .strip_prefix(&root_canon)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| {
+                // Lib lives outside the workspace root — fall
+                // back to its file name so we still get SOMETHING
+                // stable for the mangler. Two such libs at
+                // different paths but sharing a basename would
+                // collide; an explicit out-of-workspace import is
+                // unusual enough that we accept this.
+                canon
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| canon.clone())
+            })
+    } else {
+        canon
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| canon.clone())
+    };
+    // Single-file imports keep the `.ap` suffix in the path which
+    // would sanitize to `_ap` — strip it for readability.
+    let basis_str = basis.to_string_lossy();
+    let basis_str = basis_str.strip_suffix(".ap").unwrap_or(&basis_str);
+    sanitize_identifier(basis_str)
+}
+
+fn sanitize_identifier(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    // Collapse runs of underscores so deeply-nested paths don't
+    // produce eye-watering `___` sequences in symbol names.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut prev_underscore = false;
+    for ch in out.chars() {
+        if ch == '_' {
+            if !prev_underscore {
+                collapsed.push('_');
+            }
+            prev_underscore = true;
+        } else {
+            collapsed.push(ch);
+            prev_underscore = false;
+        }
+    }
+    collapsed.trim_matches('_').to_string()
+}
+
 fn resolve_import(
     importer_dir: &Path,
     workspace_root: Option<&Path>,
@@ -445,8 +543,16 @@ fn resolve_imports(
         if trace {
             eprintln!("[import]     build_seed_renames start (n_files={})", parsed_files.len());
         }
+        // Compute a stable, sanitized identifier for this lib
+        // derived from the canonical path of its directory (or
+        // file). Same lib → same id → same mangled names across
+        // importers. The user-chosen `alias` is still used as
+        // the call-site reference (`alias::Name`) in the path-
+        // rename table below, but the mangled symbols themselves
+        // come from the path identity.
+        let lib_id = lib_canonical_id(&target, workspace_root);
         let seed_renames =
-            aperio_codegen::mangle::build_seed_renames(&stem_prog_refs, &alias);
+            aperio_codegen::mangle::build_seed_renames(&stem_prog_refs, &lib_id);
         if trace {
             eprintln!("[import]     build_seed_renames done (n={})", seed_renames.len());
         }

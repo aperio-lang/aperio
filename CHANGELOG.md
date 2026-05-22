@@ -169,6 +169,40 @@ after the sret + String in-place fixes landed.
   `.c` file end-to-end. See [`spec/ffi.md`](./spec/ffi.md) for
   the canonical contract.
 
+- **[codegen] [cli] [spec]** Path-based mangler for cross-seed
+  imports. The mangler used to embed the importer's chosen
+  alias in symbol names (`__lib_<alias>_<stem>_<name>`), which
+  meant two apps importing the same shared seed under different
+  aliases produced different symbols — a real sharp edge for
+  DTO seeds exchanged on a bus, where the wire bytes match but
+  the in-language types diverged. Switched to path-based
+  identity: the mangler uses a stable `<lib_id>` derived from
+  the lib's canonical path relative to the workspace root,
+  yielding `__lib_<lib_id>_<stem>_<name>`. Two apps importing
+  the same lib now see symbol-identical types regardless of
+  alias.
+
+  `find_workspace_root` now anchors on `aperio.toml` (the
+  natural Aperio repo manifest) in addition to `Cargo.toml` —
+  previously it only walked up looking for cargo workspaces,
+  which broke path-relative computation for standalone Aperio
+  repos. Canonicalizes the starting path first so relative
+  entries (`aperio build apps/a/main.ap` from the repo root)
+  walk real ancestor directories.
+
+  Collision avoidance preserved: different libs live at
+  different paths, get different `<lib_id>`s. Importer's alias
+  is still load-bearing at the call-site reference layer
+  (`alias::Name` resolves via the path-rename table); only the
+  symbol-namespace key changed.
+
+  Updated: spec/projects.md (the canonical mangling-scheme
+  description), spec/semantics.md (the cross-seed-import
+  walkthrough), spec/styleguide.md + spec/design-rationale.md
+  (referenced shapes), plus the three_hop_import test which
+  explicitly defended the OLD invariant — now defends the new
+  one.
+
 - `018f926` **[codegen] [build] [docs] [spec]** Stages 2 + 3
   of the FFI mechanism:
 

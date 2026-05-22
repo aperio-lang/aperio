@@ -1883,13 +1883,18 @@ Resolution order is three-step (first hit wins):
 1. `<importer-dir>/<path>.ap` — single-file lib.
 2. `<importer-dir>/<path>/` — directory bundle.
 3. `<workspace-root>/<path>/` — workspace fallback (workspace
-   root = upward `Cargo.toml` search).
+   root = upward `aperio.toml` / `Cargo.toml` search).
 
 Library decls are auto-mangled at parse-time with prefix
-`__lib_<alias>_<file_stem>_<name>` and registered into a
-per-build path-rename table parallel to the static
-`STDLIB_PATH_RENAMES` table. The user never writes the mangled
-form; `alias::Name` resolves through the table at codegen.
+`__lib_<lib_id>_<file_stem>_<name>` (where `<lib_id>` is a
+stable, path-derived identifier for the lib — workspace-root-
+relative when known, file-name fallback otherwise) and
+registered into a per-build path-rename table parallel to the
+static `STDLIB_PATH_RENAMES` table. The user never writes the
+mangled form; `alias::Name` resolves through the table at
+codegen. Two apps importing the same lib produce the same
+`<lib_id>` regardless of which aliases they chose, so DTO seeds
+on a bus have symbol-identical types across consumers.
 
 **Why.** F.19 (per-directory seed model) fixed the
 single-file-app-monolith friction at the intra-seed layer.

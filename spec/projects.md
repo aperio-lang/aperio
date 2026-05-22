@@ -198,18 +198,27 @@ flat prefix so they never collide with the importer's symbols.
 The mangled form is:
 
 ```
-__lib_<alias>_<file_stem>_<name>
+__lib_<lib_id>_<file_stem>_<name>
 ```
 
-- **`<alias>`** is the importer-supplied namespace.
+- **`<lib_id>`** is a stable, sanitized identifier for the lib
+  derived from its canonical path relative to the workspace
+  root (the nearest ancestor directory containing `aperio.toml`
+  or `Cargo.toml`). Two consumers importing the same lib
+  produce the same `lib_id` regardless of which alias each
+  consumer chose. Non-identifier characters in the path collapse
+  to `_`; runs of underscores collapse to one.
 - **`<file_stem>`** is the basename of the source file the decl
   lives in, sans `.ap`. So two files in the same library can
   share a decl name without colliding.
 - **`<name>`** is the original decl name as written in source.
 
-Example: `lib-toy/greet.ap` declaring `locus Greeter { ... }`,
-imported as `import "lib-toy" as toy;`, becomes
-`__lib_toy_greet_Greeter` in the merged program.
+Example: `<repo>/shared/messages/messages.ap` declaring `type
+Order { ... }`, imported by app A as `msgs` and by app B as `m`,
+both produce `__lib_shared_messages_messages_Order` in the
+merged program. The shared identity is the natural shape for
+DTO seeds exchanged on a bus — both apps see Order as
+symbol-identical, and the wire bytes match by construction.
 
 Mangling is recursive: every reference to an imported decl
 inside the imported seed itself — bare names in fn bodies,
@@ -223,17 +232,30 @@ lexical scope rules; the mangler tracks scope so a local named
 
 The user never writes the mangled form. Their import-site
 references go through a per-build path-rename table that maps
-`<alias>::<Name>` → `__lib_<alias>_<stem>_<Name>`, analogous to
+`<alias>::<Name>` → `__lib_<lib_id>_<stem>_<Name>`, analogous to
 the static `STDLIB_PATH_RENAMES` and `MOA_PATH_RENAMES` tables.
 The codegen's `Cx::mangled_for_path` method consults all three
 tables in order: static stdlib, static moa, per-build imports.
+The `<alias>` is the importer's local namespace choice (used
+only at the call-site reference layer); the `<lib_id>` is the
+lib's canonical identity.
+
+Collision avoidance: two different libs live at different paths,
+get different `<lib_id>`s, never collide regardless of what
+aliases their importers picked.
+
+`<lib_id>` fallback when no workspace root is in scope (e.g., a
+one-off `aperio build foo.ap` outside any toml-rooted repo):
+the lib's directory base name (or file stem for single-file
+imports), sanitized. Less collision-safe but the only stable
+thing available; rare in practice.
 
 The mangling shape mirrors the existing hand-spelled
 `__StdLangMorpheme` / `__MoaBraidId` prefixes the bundled
 stdlib and moa seeds carry; cross-seed imports extend the same
 discipline automatically.
 
-### Per-importer scoped imports (A4, 2026-05-17)
+### Scoped imports (A4, 2026-05-17)
 
 If library A imports library B, B's decls become reachable
 **inside A's body only** under the alias A chose for B. A's own
@@ -250,11 +272,14 @@ internal helper libs without forcing every consumer to vendor
 them).
 
 **No re-exports.** B's decls are not visible to A's importers
-unless they declare their own dependency on B. Mangled prefixes
-embed the importer's alias (`__lib_<alias>_<stem>_<name>`), so a
-util library reached through two different importers ships
-twice in the binary — no dedup, no shared identity across paths,
-just per-importer namespacing.
+unless they declare their own dependency on B. The `<lib_id>`
+in B's mangled prefix is derived from B's canonical path, NOT
+from any importer's alias — so a util library reached through
+two different importers gets ONE shared identity in the merged
+program (path-deduplicated by canonical path in the visited
+set). 2026-05-22 changed this from the original per-importer
+mangling, removing the "DTO seed across two apps" sharp edge
+where the same source produced different symbols.
 
 **Cycles.** The CLI's canonical-path `visited` set bounds the
 walk; a lib that imports itself or two libs that mutually import

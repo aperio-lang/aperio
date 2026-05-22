@@ -1261,10 +1261,14 @@ References to library decls go through the alias as
 1. **Parse / merge.** The CLI resolves each import's path (per
    `spec/projects.md` "Resolution order"), parses every `.ap`
    file in the resolved target, applies the auto-mangler with
-   the user's alias + each file's stem, and merges the mangled
-   items into the importing program's item list. A per-build
-   path-rename table is built mapping `["<alias>", "<Name>"]`
-   to `__lib_<alias>_<stem>_<Name>`.
+   a stable path-derived `<lib_id>` + each file's stem, and
+   merges the mangled items into the importing program's item
+   list. A per-build path-rename table is built mapping
+   `["<alias>", "<Name>"]` to `__lib_<lib_id>_<stem>_<Name>` —
+   the `<alias>` is the importer's local namespace choice; the
+   `<lib_id>` is the lib's canonical path identity, so two
+   consumers importing the same lib under different aliases see
+   identical mangled symbols.
 
 2. **Codegen lookup.** Codegen's qualified-name resolution
    consults three tables in order — static `STDLIB_PATH_RENAMES`,
@@ -1279,7 +1283,7 @@ the same mangled symbol. The mangler builds a unified rename
 map across every file in the imported library before
 rewriting, so `greet.ap`'s reference to a `Formatted` type
 declared in `format.ap` rewrites to the same
-`__lib_<alias>_format_Formatted` symbol that `format.ap`'s
+`__lib_<lib_id>_format_Formatted` symbol that `format.ap`'s
 decl ends up at.
 
 Local bindings (`let`, `let mut`, fn params, lifecycle params,

@@ -78,14 +78,15 @@ fn three_hop_app_builds_and_runs() {
 }
 
 #[test]
-fn three_hop_uses_per_importer_mangled_prefix() {
-    // Defensive: the mangled symbol for util's `Box` carries the
-    // alias `u` (the middle lib's chosen alias) — confirming that
-    // transitive resolution uses per-importer mangling, not a
-    // workspace-wide dedup. We grep the verbose build output via
-    // a side-channel: build with debug logging if available;
-    // otherwise just sanity-check the build succeeded and the
-    // resulting binary embeds either prefix.
+fn three_hop_uses_path_based_mangled_prefix() {
+    // 2026-05-22: the mangler switched from alias-based to path-
+    // based identity. Two consumers importing the same lib under
+    // different aliases now produce identical mangled symbols
+    // (which is the natural shape for shared DTOs on a bus). This
+    // test confirms transitive resolution honors the new
+    // invariant: util's `make_box` lives in the binary under a
+    // path-derived prefix, NOT under the middle lib's chosen
+    // `u` alias.
     let app_dir = fixtures_dir().join("three-hop-app");
     let built_bin = app_dir.join("three-hop-app");
     let _ = std::fs::remove_file(&built_bin);
@@ -98,22 +99,37 @@ fn three_hop_uses_per_importer_mangled_prefix() {
     assert!(out.status.success(), "build failed: {:?}", out);
 
     let bin_bytes = std::fs::read(&built_bin).expect("read binary");
-    // The util lib's `make_box` fn lives in the binary under the
-    // mangled name `__lib_u_box_make_box` — the `u` alias is the
-    // one mid chose for its `import "..." as u;`, proving the
-    // transitive resolution kept mid's importer-scoped namespace
-    // rather than collapsing onto a workspace-wide alias. Fn
-    // symbols survive linking; type names don't always become
-    // ELF symbols, so we key off a fn.
-    let needle = b"__lib_u_box_make_box";
-    let hit = bin_bytes
-        .windows(needle.len())
-        .any(|w| w == needle);
+    // The util lib lives at `<repo>/crates/aperio-cli/tests/
+    // fixtures/lib-util/`. With path-based mangling, the
+    // workspace-root-relative path becomes the lib id, sanitized
+    // to `crates_aperio_cli_tests_fixtures_lib_util`. The file
+    // stem is `box`. So make_box lands as
+    // `__lib_crates_aperio_cli_tests_fixtures_lib_util_box_make_box`.
+    //
+    // We don't pin the full string (the lotus-lang workspace
+    // structure can shift) — just check the path-based shape:
+    // the prefix is `__lib_` + path segments + `_box_make_box`,
+    // and explicitly NOT the old `__lib_u_box_make_box`.
+    let path_needle = b"_lib_util_box_make_box";
+    let path_hit = bin_bytes
+        .windows(path_needle.len())
+        .any(|w| w == path_needle);
     assert!(
-        hit,
-        "expected mangled fn `{}` in binary — \
-         transitive lib resolution should mangle with mid's alias",
-        std::str::from_utf8(needle).unwrap()
+        path_hit,
+        "expected path-derived mangled fn for util's make_box; \
+         needle `{}` not found in binary",
+        std::str::from_utf8(path_needle).unwrap()
+    );
+
+    let old_alias_needle = b"__lib_u_box_make_box";
+    let alias_hit = bin_bytes
+        .windows(old_alias_needle.len())
+        .any(|w| w == old_alias_needle);
+    assert!(
+        !alias_hit,
+        "found old alias-based mangling `{}` in binary — the \
+         mangler should be using path-based identity",
+        std::str::from_utf8(old_alias_needle).unwrap()
     );
 
     let _ = std::fs::remove_file(&built_bin);

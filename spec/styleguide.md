@@ -406,11 +406,12 @@ Two additional rules apply:
   Avoid embedding the library name in decl names.
 
 The full mangled symbol the compiler emits
-(`__lib_<alias>_<file_stem>_<name>`) is never user-visible
-unless you read disassembly; library authors don't need to
-think about it. See `spec/projects.md` for the mangling
-scheme + the per-directory seed model that imported libraries
-build on.
+(`__lib_<lib_id>_<file_stem>_<name>`, where `<lib_id>` is a
+path-derived identifier stable across all consumers) is never
+user-visible unless you read disassembly; library authors
+don't need to think about it. See `spec/projects.md` for the
+mangling scheme + the per-directory seed model that imported
+libraries build on.
 
 ## Composition patterns
 

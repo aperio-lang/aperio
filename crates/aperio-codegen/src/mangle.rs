@@ -63,9 +63,24 @@ pub fn mangle_program(prog: &mut Program, alias: &str, file_stem: &str) {
 /// stem becomes part of the mangled prefix for that file's own
 /// decls, while use-sites of any name in the seed resolve through
 /// the shared map regardless of which file the use-site lives in.
+/// Build the rename map for one imported lib seed. `lib_id` is
+/// a stable, sanitized identifier for the lib — derived from the
+/// canonical path of the lib's directory (workspace-root-relative
+/// when known), NOT the importer's chosen alias. Same lib →
+/// same `lib_id` → same mangled names across consumers, so a DTO
+/// seed imported by two apps produces symbol-identical types
+/// (which is the natural shape for shared contracts on a bus).
+///
+/// 2026-05-22: switched from alias-based mangling (which was
+/// per-importer and broke cross-app type identity for shared
+/// seeds) to path-based mangling. Collision avoidance is
+/// preserved (two different libs live at different paths and get
+/// different `lib_id`s). The importer's alias is still used at
+/// the path-rename table level so call-site references
+/// `alias::Name` resolve correctly.
 pub fn build_seed_renames(
     programs: &[(String, &Program)],
-    alias: &str,
+    lib_id: &str,
 ) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
     for (stem, prog) in programs {
@@ -88,7 +103,7 @@ pub fn build_seed_renames(
                 }
             }
             if let Some(n) = top_decl_name(item) {
-                out.insert(n.to_string(), mangled(alias, stem, n));
+                out.insert(n.to_string(), mangled(lib_id, stem, n));
             }
         }
     }
@@ -113,8 +128,8 @@ pub fn mangle_with_renames(prog: &mut Program, renames: &HashMap<String, String>
     }
 }
 
-fn mangled(alias: &str, file_stem: &str, name: &str) -> String {
-    format!("__lib_{}_{}_{}", alias, file_stem, name)
+fn mangled(lib_id: &str, file_stem: &str, name: &str) -> String {
+    format!("__lib_{}_{}_{}", lib_id, file_stem, name)
 }
 
 fn top_decl_name(d: &TopDecl) -> Option<&str> {
