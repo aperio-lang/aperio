@@ -84,8 +84,18 @@ dissolve        on_failure
 ### Mode keywords
 
 ```
-mode            bulk            harmonic        resolution
+bulk            harmonic        resolution
 ```
+
+`mode` is a **contextual keyword** (2026-05-22): recognized only
+at locus-member position (as the leading token of a `mode_decl`
+production in `grammar.ebnf` § 11). Outside that position it
+lexes as an ordinary Ident, so `cam.mode: Int` and similar
+param/field uses are admissible — relevant for raylib-style
+bindings where `mode` is a natural API name. Same F.10-style
+narrowing as `bindings`, `birth_check`, `pool`, `heap`.
+`bulk` / `harmonic` / `resolution` remain reserved (they sit in
+member-name position via `try_keyword_as_name`).
 
 ### Projection-class keywords
 

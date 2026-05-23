@@ -19,7 +19,7 @@ here as historical labels — the spec no longer carries them.
 
 ---
 
-## 2026-05-22 — leak hunt + view ABI compaction + diagnostic harness + user-extensible FFI
+## 2026-05-22 — leak hunt + view ABI compaction + diagnostic harness + user-extensible FFI + path-based DTO identity + iris/fathom friction sweep
 
 Long-running daemon (fathom mdgw) hit a hard memory cap
 in ~13 minutes under live upstream load. Session goal: identify
@@ -235,6 +235,134 @@ after the sret + String in-place fixes landed.
   note `project_sqlite_deferred_to_pond` becomes unblocked —
   sqlite + curl + SDL + ffmpeg etc. all bind through the same
   mechanism with zero compiler-side change.
+
+- `773c4b8` **[codegen] [spec]** Path-based mangler identity
+  for cross-seed imports. The mangler used to embed the
+  importer's chosen alias in symbol names
+  (`__lib_<alias>_<stem>_<name>`), so two apps importing the
+  same shared seed under different aliases produced different
+  symbols. Broke the DTO-on-a-bus pattern (wire bytes matched
+  but in-language types diverged) and made a single binary's
+  multi-alias-import of the same source carry two distinct
+  type identities.
+
+  Switched to `__lib_<lib_id>_<stem>_<name>` where `<lib_id>` is
+  the lib's canonical path relative to the workspace root
+  (sanitized to identifier chars, runs of `_` collapsed). Two
+  consumers see identical mangled symbols regardless of alias.
+  The alias is still load-bearing at the call-site reference
+  layer (`alias::Name` resolves through the per-build path-
+  rename table); only the symbol namespace key changed.
+
+  `find_workspace_root` now anchors on `aperio.toml` (the
+  natural manifest) in addition to `Cargo.toml`; canonicalizes
+  the starting path so relative entries
+  (`aperio build apps/a/main.ap`) walk real ancestor dirs
+  instead of stopping at "" / "." after a few `parent()` calls.
+
+  Spec catch-up: `spec/projects.md` (canonical mangling
+  description), `spec/semantics.md` (cross-seed-import
+  walkthrough), `spec/styleguide.md` + `spec/design-rationale.md`
+  (referenced shapes). The `three_hop_import` test inverted —
+  asserts the path-derived symbol present + the old alias-based
+  symbol absent.
+
+- `1c3146f` **[docs] [spec]** Surface the FFI mechanism +
+  path-based DTO identity in user-facing docs. The FFI work
+  (a5f71c7 / 018f926) and the mangler change (773c4b8) shipped
+  but the docs hadn't caught up.
+
+  * `docs/src/how-tos/ffi-bindings.md` (new) — "Bind a C
+    library" walks the minimum end-to-end (3-file doubler lib)
+    and points readers at `spec/ffi.md` +
+    `agents/binding-packages.md` for the full contract. Listed
+    in `SUMMARY.md`.
+  * `docs/src/how-tos/multi-binary-bus.md` — callout in the
+    shared-seed section noting type identity is path-based, so
+    two binaries importing the same DTO seed under different
+    aliases still see identical symbols (the property that
+    makes the shared-DTO pattern work on the bus).
+  * `docs/src/reference/stdlib.md` — top-of-page hook
+    explaining that `std::*` is the bundled stdlib; the FFI
+    mechanism is the alternative for non-stdlib C bindings.
+  * `docs/src/reference/language.md` — new "Foreign-function
+    interface" section in the reference index pointing at the
+    canonical sources.
+  * `spec/packages.md` — flipped "Don't include `aperio.toml`
+    in a library" to "include it when (and only when) the lib
+    declares `@ffi` bindings." Transitive `[deps]` resolution
+    is still NOT in v1; that part of the old guidance stands.
+
+- `962a745` **[codegen]** `emit_set_caller_arena` before
+  `std::io::stdin::read_line` (iris F.5).
+  `lower_std_io_stdin_read_line` direct-called the C-side
+  `lotus_stdin_read_line` WITHOUT emitting the standard
+  `lotus_set_caller_arena` prologue that every other String-
+  returning stdlib primitive emits.
+
+  Without the prologue, the C-side `lotus_bus_payload_arena_
+  alloc` (which routes through the caller_arena TLS when set)
+  read whatever stale value the last nested call left
+  behind. In a long-lived method body that loops on
+  `stdin::read_line` interleaved with helper calls (iris's
+  MCP stdio loop), the second iteration's read landed in a
+  destroyed sub-region from the previous handle's scratch
+  and segfaulted in `lotus_arena_alloc`.
+
+  One-line fix: emit the prologue. Matches `str_lower` /
+  `str_upper` / `trim` / `pad_left` etc., all of which already
+  emit it. iris's `--mcp` mode now handles arbitrary-length
+  multi-request streams instead of being bounded to single-
+  shot per process.
+
+- `e75d2ef` **[codegen] [lang] [spec] [ci]** Five-item friction
+  sweep from the iris + fathom backlog catalogued in
+  `project_session_handoff_2026_05_22_evening.md`, plus the CI
+  race on the new path-based mangler test.
+
+  F.1 — top-level `const X: T = EXPR;` accepts non-literal
+  initializers. Struct literals + arithmetic + any
+  representable expression are stored in a parallel
+  `user_const_exprs: BTreeMap<String, (Expr, TypeExpr)>` and
+  re-lowered through `lower_expr` at each use site (same
+  lifetime as inlining by hand). Intra-seed (bare `X`) and
+  cross-seed (`lib::X`) reads both honor it.
+
+  F.2 — `mode` is now a **contextual keyword** (same shape as
+  `bindings` / `birth_check` / `pool` / `heap`): lexes as Ident,
+  recognized as a member-introducer at locus-member position
+  only. Frees the name for params/fields (raylib bindings:
+  `cam.mode: Int`). Spec catch-up in `spec/tokens.md`
+  (moved out of the hard-keyword list) and `spec/grammar.ebnf`
+  (dropped `| "mode"` from `member_name` — now covered by
+  `IDENTIFIER`).
+
+  F.3 — `aperio build .` produces `<dirname>/<dirname>` instead
+  of `<dirname>/main`. `Path::file_name()` returns None for `.`,
+  so the dir-build path fell through to the `"main"` fallback;
+  added a canonicalize-then-file_name fallback to recover the
+  actual directory basename.
+
+  L.1 + L.2 — generic lvalue walker. New
+  `resolve_lvalue_chain` + `finish_lvalue_assign` helpers walk
+  arbitrary-depth tails (Field / Index segments) with step-into
+  for `TypeRef` / `LocusRef` / `Cell<TypeRef>` pointers and
+  `Array` slots. Closes the codegen-v0 errors "assignment
+  target with N segment(s) not yet supported" and "non-self
+  field/index assignment target." Self-rooted heap-typed slots
+  reached through deeper paths route through
+  `emit_self_field_inplace_assign` for the same anchor + memcpy
+  treatment the 1-segment fast path has. Existing fast paths
+  (1-seg self.X, 2-seg self.X[i], local=v, Cell.field=v,
+  arr[i]=v) are untouched — the walker is invoked only from
+  the fallback branches that previously errored.
+
+  CI — `.config/nextest.toml` adds a `shared-fixture-dir`
+  test-group with `max-threads = 1` filtered to
+  `binary(three_hop_import)`. The two tests in that file race
+  on the same on-disk fixture binary; serializing just that
+  binary is the lightest correct fix. Other tests stay fully
+  parallel.
 
 ## 2026-05-21 — Phase-4 per-method scratch reclaim + chunk pool
 

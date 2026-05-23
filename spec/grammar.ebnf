@@ -712,7 +712,6 @@ member_name       = IDENTIFIER
                   | "contract"
                   | "bus"
                   | "capacity"
-                  | "mode"
                   | "tier"
                   | "projection"
                   | "perspective"
