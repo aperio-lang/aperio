@@ -20,7 +20,7 @@
 //! is bidirectionally compatible — milestone 2 does not error
 //! on these. Milestone 3 will tighten.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aperio_syntax::ast::*;
 use aperio_syntax::{Diag, Span};
@@ -938,11 +938,137 @@ impl<'a> Checker<'a> {
             self.check_contract_compatibility(info);
         }
 
+        // F.31 (2026-05-23): validate the `placement { }` block
+        // when present. The parser already enforced "main-only"
+        // and required-Ident keys; here we check that each entry
+        // references an actual main-locus `params` field whose
+        // type is a locus. Pinned-restrictions (no accept(),
+        // no closures) are checked at codegen time when
+        // placement → runtime wiring fires.
+        let placement_blocks: Vec<_> = decl
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                LocusMember::Placement(pb) => Some(pb),
+                _ => None,
+            })
+            .collect();
+        if placement_blocks.len() > 1 {
+            self.diags.push(Diag::ty(
+                placement_blocks[1].span,
+                format!(
+                    "locus `{}` declares multiple `placement {{ }}` blocks; \
+                     at most one is permitted",
+                    info.name
+                ),
+            ));
+        }
+        if let Some(pb) = placement_blocks.first() {
+            self.check_placement_block(info, pb);
+        }
+
         for member in &decl.members {
             self.check_locus_member(member);
         }
 
         self.current_locus = prev;
+    }
+
+    /// F.31: validate a `placement { field: spec; }` block on
+    /// `main locus`. Each entry must:
+    ///   1. Reference a declared `params` field on this locus
+    ///      (the parser only enforces "main-only" and Ident
+    ///      keying).
+    ///   2. The referenced field must be a locus type —
+    ///      placement applies only to locus instances, not
+    ///      primitives or structs.
+    ///   3. No duplicate field keys.
+    ///
+    /// Pinned-class restrictions (no `accept()`, no closures
+    /// on a locus placed `pinned`) move to placement-time
+    /// enforcement in Phase 3 codegen; the spec lock is here
+    /// but the typecheck implementation is deferred until
+    /// codegen reads placement.
+    fn check_placement_block(
+        &mut self,
+        info: &crate::symbol::LocusInfo,
+        pb: &aperio_syntax::ast::PlacementBlock,
+    ) {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for entry in &pb.entries {
+            // (3) duplicate check
+            if !seen.insert(entry.field.name.clone()) {
+                self.diags.push(Diag::ty(
+                    entry.span,
+                    format!(
+                        "placement entry: duplicate field `{}` (each \
+                         field may have at most one placement spec)",
+                        entry.field.name
+                    ),
+                ));
+                continue;
+            }
+            // (1) field exists in this locus's params
+            let param = info
+                .params
+                .iter()
+                .find(|p| p.name == entry.field.name);
+            let param = match param {
+                Some(p) => p,
+                None => {
+                    self.diags.push(Diag::ty(
+                        entry.field.span,
+                        format!(
+                            "placement entry: field `{}` is not declared in \
+                             locus `{}`'s params block",
+                            entry.field.name, info.name
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            // (2) field's type must be a locus type. `Ty::Named(L)`
+            // where L resolves to a `TopSymbol::Locus`. Unknown
+            // is permissive (cross-seed or stdlib loci resolve to
+            // Unknown — match the existing assignable_from rule).
+            match &param.ty {
+                Ty::Named(name) => {
+                    let is_locus = matches!(
+                        self.top.lookup(name),
+                        Some(TopSymbol::Locus(_))
+                    );
+                    let is_unknown_external = !self.top.symbols.contains_key(name);
+                    if !is_locus && !is_unknown_external {
+                        self.diags.push(Diag::ty(
+                            entry.field.span,
+                            format!(
+                                "placement entry: field `{}` has type `{}` \
+                                 which is not a locus type; placement applies \
+                                 only to locus instances",
+                                entry.field.name,
+                                param.ty.display()
+                            ),
+                        ));
+                    }
+                }
+                Ty::Unknown => {
+                    // Cross-seed / stdlib locus — be permissive,
+                    // matching assignable_from's Unknown rule.
+                }
+                other => {
+                    self.diags.push(Diag::ty(
+                        entry.field.span,
+                        format!(
+                            "placement entry: field `{}` has type `{}` \
+                             which is not a locus type; placement applies \
+                             only to locus instances",
+                            entry.field.name,
+                            other.display()
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     /// v1.x-FORM-1: verify a `@form(<name>)` annotation's
