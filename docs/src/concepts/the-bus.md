@@ -181,7 +181,7 @@ itself, you write the adapter as an ordinary locus. The
 contract is a single method:
 
 ```aperio
-locus MyAdapter : schedule pinned {
+locus MyAdapter {
     params {
         url: String = "nats://localhost:4222";
     }
@@ -192,22 +192,33 @@ locus MyAdapter : schedule pinned {
         // ship one outbound payload via your protocol
     }
     run() {
-        // pinned recv loop — for inbound, call
+        // recv loop on the adapter's dedicated thread.
+        // For inbound, call
         // std::bus::__local_dispatch(subject, bytes) once
-        // you've received and identified a payload
+        // you've received and identified a payload.
     }
     dissolve() {
         // close the connection
     }
 }
+
+main locus App {
+    bindings {
+        Tick: MyAdapter { url: "nats://prod:4222" };
+    }
+}
 ```
 
-The `: schedule pinned` annotation gives the adapter its own
-pthread so `run()` can block on a recv loop without holding up
-the cooperative scheduler. `send` runs synchronously in the
-publisher's thread; `__local_dispatch` looks up the subject's
-serializer to convert wire-bytes into the in-memory payload
-shape, then fans into local subscribers.
+Adapters instantiated inline in a `bindings { }` entry get
+their own OS thread implicitly — the substrate places them
+pinned-equivalent so `run()` can block on a recv loop without
+holding up any cooperative pool. They are not main-locus
+`params` fields and so don't appear in `placement { }`;
+F.31's `placement { }` block governs only the placement of
+main-locus `params` field loci. `send` runs synchronously in
+the publisher's thread; `__local_dispatch` looks up the
+subject's serializer to convert wire-bytes into the in-memory
+payload shape, then fans into local subscribers.
 
 The substrate stays neutral on protocol semantics — reliability
 guarantees, ordering, retries, backpressure, fan-in policy all
@@ -261,16 +272,19 @@ code doesn't change.
 
 ## Cross-thread bus semantics
 
-Most loci default to `: schedule cooperative` and share a
-single scheduler thread. Bus dispatch between cooperative
-subscribers is a fast in-process enqueue.
+Most loci default to `cooperative(pool = main)` placement and
+share the main OS thread. Bus dispatch between cooperative
+subscribers on the same pool is a fast in-process enqueue.
 
-A locus annotated `: schedule pinned` owns its own OS thread.
-Bus traffic to or from a pinned locus crosses a thread
-boundary via a lock-protected mailbox. The semantics are
-identical from the user's view — `Topic <- payload;` still
-works the same way — but the substrate adapts. Schedule
-classes are covered in [Lifecycle & time](./lifecycle-time.md).
+A locus placed `pinned` (in `main`'s `placement { }` block)
+owns its own OS thread. Bus traffic to or from a pinned locus
+crosses a thread boundary via a lock-protected mailbox. With
+multiple cooperative pools (`cooperative(pool = io)`), bus
+traffic across pools follows the same condvar+memcpy
+machinery. The semantics are identical from the user's view —
+`Topic <- payload;` still works the same way — but the
+substrate adapts. Placement is covered in
+[Lifecycle & time](./lifecycle-time.md).
 
 ## Next
 

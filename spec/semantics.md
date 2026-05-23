@@ -755,6 +755,144 @@ Out of scope for v1 (fall through to bus dispatch unchanged):
 A bound topic is never optimized: the binding may publish to
 remote subscribers that aren't visible at compile time.
 
+## Placement block (F.31)
+
+The `placement { }` block on `main locus` controls per-locus
+thread placement, parallel to `bindings { }` for bus topology.
+Placement is a deployment seam — same library, different
+placement entries, different binary behavior. See
+`spec/design-rationale.md` § F.31 for the intrinsic-vs-
+deployment axis the block sits on, and `spec/runtime.md` §
+"Placement classes" for the runtime semantics.
+
+### Syntax
+
+```aperio
+main locus App {
+    params {
+        gateway_kraken:   Gateway = Gateway { venue: "kraken" };
+        gateway_coinbase: Gateway = Gateway { venue: "coinbase" };
+        metrics:          MetricsServer = MetricsServer { port: 9100 };
+        ui:               Renderer = Renderer { };
+    }
+    placement {
+        gateway_kraken:   pinned(core = 1);
+        gateway_coinbase: pinned(core = 2);
+        metrics:          cooperative(pool = io);
+        ui:               cooperative(pool = render);
+        // unspecified main-locus params → cooperative(pool = main)
+    }
+}
+```
+
+### Type-check rules
+
+1. **`placement { }` is `main locus` only.** Any other locus
+   declaring `placement { }` is a parse error (same shape as
+   `bindings { }`).
+2. **Keys reference main-locus `params` field names.** The key
+   on the left of each `placement_entry` must match a declared
+   `params` field on the enclosing `main locus`. Unknown
+   field name → typecheck error pointing at the params block.
+3. **Field values are locus types.** A placement entry on a
+   non-locus field (`port: Int`, `host: String`) is a typecheck
+   error — placement applies only to locus instances.
+4. **At most one placement entry per field.** Duplicate keys
+   are a parse error.
+5. **Pool names use snake_case Idents.** The set of pool names
+   is inferred from `cooperative(pool = X)` references across
+   all placement entries in the bundle. Pool `main` is always
+   available; it refers to the program's main OS thread.
+6. **Locus-pinning compatibility.** A locus placed `pinned` is
+   subject to the existing pinned-class restrictions (no
+   `accept(c: Child)` accept-method, no `closure` declarations
+   in v1). These restrictions move from the locus declaration
+   site (pre-F.31) to the placement site: the typechecker walks
+   each placement entry and applies the relevant restriction to
+   the named locus type. A locus that uses neither feature can
+   be placed either cooperative or pinned at the deployment's
+   discretion.
+
+### Single-threaded-method invariant
+
+A locus's methods may be invoked only on the OS thread that
+owns the locus's placement's pool. This is enforced at
+typecheck via a static call-graph walk starting from each
+top-level placement entry:
+
+1. Seed each placement entry with its pool: `gateway_kraken`
+   → pinned (own thread), `metrics` → cooperative pool `io`,
+   etc.
+2. For each method call expression `recv.foo(args)`, determine
+   the receiver's pool from the receiver's static type and the
+   surrounding pool context.
+3. Cross-pool direct method calls are rejected with a focused
+   diagnostic naming both pools and pointing at the
+   `placement { }` entries that picked them.
+4. Bus publishes (`Topic <- payload;` / `"subj" <- payload;`)
+   are unrestricted — they route through the substrate's
+   cross-thread dispatch machinery (the existing m28b
+   condvar+memcpy mailbox path generalized to cooperative
+   pools).
+
+This invariant is the substrate enforcement that makes M:N
+safe. Without it, multi-pool deployments would silently race
+on locus arenas (which are unsynchronized bump allocators by
+design).
+
+### Nested instantiation
+
+Loci instantiated nested in another locus's body (`birth` /
+`run` / lifecycle methods, let-bound children, or `params`
+fields of non-`main` loci) inherit their containing tower's
+pool by construction:
+
+```aperio
+main locus App {
+    params {
+        gw: Gateway = Gateway { };
+    }
+    placement {
+        gw: pinned(core = 1);
+    }
+}
+
+locus Gateway {
+    params {
+        // Cache instantiated nested in Gateway's params —
+        // inherits Gateway's pool (the pinned thread). No
+        // placement entry is permitted on `cache` at any
+        // main locus.
+        cache: Cache = Cache { };
+    }
+}
+```
+
+Placement entries on nested fields are a typecheck error —
+placement is a top-level main-locus surface only. To run a
+nested locus on a different pool, hoist it to a main-locus
+sibling.
+
+### Default placement
+
+Main-locus `params` fields with no explicit `placement { }`
+entry default to `cooperative(pool = main)`. The pre-F.31
+shape (`: schedule cooperative` on every cooperative locus
+declaration, with a single shared main thread) is exactly the
+behavior a program without any `placement { }` block
+receives. Existing programs that don't declare placement see
+no observable change.
+
+### Pool inference
+
+The set of cooperative pools is the union of `X` values
+appearing in `cooperative(pool = X)` references across all
+placement entries, plus the implicit `main` pool. The runtime
+spawns one OS worker thread per inferred pool name beyond
+`main`. No `threads { }` declaration block at v1 — pools are
+named purely by use site, and the runtime materializes them
+on demand at startup.
+
 ## Bus subscription dispatch
 
 A `bus { subscribe SUBJECT as HANDLER of type T; }` declaration

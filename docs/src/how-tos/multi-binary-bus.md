@@ -224,14 +224,14 @@ adapter path. Protocol-layer transports are user loci that
 satisfy `__StdBusAdapter`:
 
 ```aperio
-locus MyNatsAdapter : schedule pinned {
+locus MyNatsAdapter {
     params { url: String = "nats://localhost:4222"; }
     birth() { /* open connection */ }
     fn send(subject: String, bytes: Bytes) {
         /* publish via your protocol */
     }
     run() {
-        /* recv loop on the pinned thread.
+        /* recv loop on the adapter's own thread.
          * For each inbound message, call
          * std::bus::__local_dispatch(subject, bytes);
          * the runtime looks up the subject's deserializer and
@@ -244,6 +244,13 @@ main locus App {
     bindings { Tick: MyNatsAdapter { url: "nats://prod:4222" }; }
 }
 ```
+
+Adapters instantiated inline in a `bindings { }` entry get
+their own OS thread implicitly — they're not a main-locus
+`params` field, so they don't appear in `placement { }`, but
+their run-loops need a dedicated thread by construction. The
+substrate places them pinned-equivalent regardless of any
+explicit placement.
 
 The application-code shape (publishers, subscribers, handlers)
 is identical to the `unix(...)` case. Only the binding line

@@ -122,8 +122,12 @@ Filter these reflexes before they cost you time.
   top-level decl in a seed (one directory) is visible to every
   file in that seed. Decompose by concern, not visibility.
 - **No `async` / `await`.** Concurrency comes from loci + the
-  bus + schedule classes (`: schedule cooperative` /
-  `: schedule pinned(core = N)`).
+  bus + per-locus thread *placement* declared in `main`'s
+  `placement { }` block (F.31): `placement { gateway:
+  pinned(core = 1); metrics: cooperative(pool = io); }`.
+  Placement is a deployment seam on `main` only — never on
+  the locus declaration. Unspecified main-locus params default
+  to `cooperative(pool = main)`.
 - **No `trait` / `impl` blocks.** There's `interface I { ... }`
   with structural satisfaction — any locus whose method set is
   a superset satisfies `I`. No `impl I for L`.

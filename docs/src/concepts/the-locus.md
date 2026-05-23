@@ -15,8 +15,9 @@ are required; you opt in to the ones you need.
 
 ```aperio
 @form(vec)                              // optional: form lowering
-locus Matchmaker : projection chunked,  // optional: annotations
-                   schedule cooperative {
+locus Matchmaker : projection chunked { // optional: annotations
+                                        // (schedule moved to main's
+                                        //  placement block, F.31)
 
     params {                            // declared state
         target_size: Int = 4;

@@ -2653,6 +2653,202 @@ struct alloca that the existing arena routing already covers.
 Read-time cost is a one-load epoch check plus a recompute of
 `buf - 8` (Bytes) or `buf` (Str) from the builder pointer.
 
+### F.31 Deployment seams live at main; intrinsic shapes live on the locus
+
+Aperio's substrate-discipline annotations sort into two
+families. The split is load-bearing and was implicit before
+this commitment; F.31 names it.
+
+**Intrinsic shapes** describe what a locus *is*. They live on
+the locus declaration, survive across deployments, and compose
+through nesting (a child locus inside a parent has its own
+intrinsic shape independent of where the parent runs):
+
+- `capacity { pool X of T; heap Y of T; }` — F.22 storage
+  discipline.
+- `@form(vec | hashmap | ring_buffer)` — application-layer
+  container shape.
+- `: projection rich | chunked | recognition` — F.2
+  perspective-resolution commitment.
+- `: tier N` — structural depth in the lotus tower.
+
+**Deployment seams** describe how a locus is wired into a
+specific binary. They live in `main`-only blocks, vary across
+deployments of the same library, and do not nest (only top-
+level `main locus` declarations carry deployment blocks;
+nested loci inherit their deployment context from the
+containing tower position):
+
+- `bindings { Topic: transport; }` — per-topic transport
+  binding (Phase 2 of the topic system).
+- `placement { field: pool_spec; }` — per-locus thread
+  placement (this commitment).
+
+**The diagnostic test.** When deciding whether a new
+substrate annotation belongs on the locus or in `main`, ask:
+*can a library author commit to this without knowing the
+binary's deployment context?* If yes, it's intrinsic — a
+property of the locus's identity. If no, it's a deployment
+seam — a property the binary picks.
+
+A useful corollary: anything that takes "main-only" cleanly
+is a deployment seam; anything that struggles with the
+main-only restriction is intrinsic. The proposed
+`@form(scheduler)` annotation flunks this test — `@form(...)`
+annotations are expected to work on any locus declaration,
+so a main-only `@form(scheduler)` would be a form lying about
+its category. The correct shape is a parallel deployment
+block, not a form annotation.
+
+### F.31a Placement-at-main + M:N cooperative pools
+
+Schedule is a deployment concern: a `std::http::Server`
+should not bake "cooperative" into its locus identity because
+a consumer binary may want it pinned. F.31 makes this
+explicit; the v1 surface follows from it.
+
+**Surface.** Schedule annotations are removed from
+`locus_annotation`. A new `placement { }` block on `main
+locus` carries per-locus placement specifications:
+
+```aperio
+main locus App {
+    params {
+        gateway_kraken:   Gateway = Gateway { venue: "kraken" };
+        gateway_coinbase: Gateway = Gateway { venue: "coinbase" };
+        metrics:          MetricsServer = MetricsServer { port: 9100 };
+        ui:               Renderer = Renderer { };
+    }
+    placement {
+        gateway_kraken:   pinned(core = 1);
+        gateway_coinbase: pinned(core = 2);
+        metrics:          cooperative(pool = io);
+        ui:               cooperative(pool = render);
+        // unspecified main-locus params → cooperative(pool = main)
+    }
+    bindings {
+        // ... per-topic transport bindings, unchanged
+    }
+}
+```
+
+**Keying rule.** Placement entries key on main-locus `params`
+field names (snake_case), not on locus type names. This lets
+two siblings of the same locus type take different placements
+— exactly the parallelism case that prompted the change
+(per-venue gateways on distinct cores).
+
+**Pool inference rule.** The set of cooperative pools is
+inferred from `cooperative(pool = X)` references in the
+`placement` block. The compiler spawns one OS worker thread
+per inferred pool name (plus the existing main thread, which
+is always pool `main`). No `threads { }` declaration block at
+v1 — when per-pool attributes (priority, affinity, realtime
+hint) become useful, the block lands then as a typed
+extension.
+
+**Nested-instantiation rule.** Placement entries apply only
+to top-level `main locus` `params` fields. Loci instantiated
+nested in another locus's body (in `birth` / `run` / lifecycle
+methods, or as let-bound children) inherit the parent's pool.
+The single-threaded-method invariant (below) makes this
+inheritance a hard rule, not a default.
+
+**Single-threaded-method invariant.** A locus's methods may
+be invoked only on the OS thread that owns its placement's
+pool. Cross-pool method calls and lateral field accesses go
+through the bus's existing copy-and-condvar dispatch
+machinery, which already crosses thread boundaries safely.
+The typechecker walks the static call graph from each
+top-level placement entry, propagates pool ownership through
+method receivers, and rejects calls that cross pools without
+going through the bus. This is the substrate enforcement that
+makes M:N safe — without it, multi-pool deployments would
+silently race on locus arenas (which are unsynchronized
+bump allocators).
+
+**M:N cooperative pools.** Each cooperative pool is one OS
+worker thread running its own `lotus_bus_queue_drain` loop
+against its own per-pool queue. Cross-pool bus dispatch:
+publisher enqueues on the subscriber's pool's queue via the
+existing inline-payload-copy machinery (m28b stage 1); the
+broadcast wakes the subscriber pool's drain thread. The
+condvar+memcpy substrate that handles cooperative→pinned
+today extends naturally to cooperative→cooperative across
+pools.
+
+**Bimodality revisited.** The pre-F.31 bimodality argument
+("cooperative or pinned, no third class") lived at the locus
+declaration site. Under F.31 it moves to the placement entry
+site — a placement is still bimodal (`pinned` or `cooperative
+(pool = X)`), but the locus itself doesn't carry that choice.
+This is a strict generalization: pre-F.31 deployments expose
+exactly the prior shape (one main thread + per-pinned-locus
+threads) by writing the same `placement { }` entries that
+were previously `: schedule` annotations.
+
+**Considered and rejected.**
+
+- *`@form(scheduler.X)` on `main locus`.* Tempting because of
+  the family resemblance to existing form lowerings, but
+  fails the F.31 intrinsic/deployment test — `@form(...)`
+  annotations are expected to work anywhere a locus can be
+  declared, and a main-only form would be the mechanism
+  lying about its category. The bindings parallel is the
+  right precedent.
+- *Type-level placement keying (`Gateway: pinned`).*
+  Initially looked symmetric to `bindings { Topic: ... }`
+  but fails the per-venue-gateway case: two `Gateway`
+  siblings need distinct placements. The structural reason:
+  topics are global channels (one declaration, fan-out
+  subscribers); loci are instances (each is its own running
+  entity). The keying surfaces follow.
+- *Pre-declared `threads { pool main; pool io; }` block.*
+  Adds typo safety + future per-pool attribute space, but
+  redundant at v1 when pools have no attributes. Lands when
+  per-pool attributes earn it.
+- *Per-pool work-stealing.* Each pool is one OS thread at
+  v1 (M:1 within a pool; N pools across). Work-stealing
+  inside a pool (multiple threads consuming one pool's
+  queue) is a v2+ concern — the v1 design preserves the
+  per-arena single-threaded invariant by construction.
+
+**Friction items this closes.**
+
+- `spec/runtime.md` § "Long-running cooperative children
+  block parent run()" (Item D) — closed. Parent and child
+  can sit in different placement entries with distinct
+  pools; their `run()`s no longer serialize.
+- fathom #6 ("`std::http::Server` as child blocks parent")
+  — closed by the same mechanism.
+- fathom's general "sibling-in-main pattern" workaround
+  becomes the canonical shape rather than a friction
+  routing.
+
+**Still open.**
+
+- Cross-pool mailbox drain for the cooperative-publisher →
+  pinned-subscriber path (`spec/runtime.md` Item B / fathom
+  #4) is orthogonal. The placement substrate doesn't fix
+  the missing condvar drain on that path; that's its own
+  runtime bug.
+
+**Adapter placement interaction.** Adapter loci instantiated
+inline in a `bindings { Topic: AdapterLocus { ... }; }` entry
+are NOT main-locus `params` fields, so they receive no
+`placement { }` entry. Their `run()` recv-loops need a
+dedicated thread by construction; the substrate places them
+**pinned-equivalent implicitly** (same m90 routing + pthread
+spawn that pre-F.31 fired via the adapter's
+`: schedule pinned` annotation). The annotation is gone but
+the behavior is preserved automatically because the bindings-
+inline shape unambiguously signals "this is a transport
+adapter with a recv loop." If a future workload needs adapter
+placement on a cooperative pool, the binding grammar can
+extend to reference a main-locus field by name (a v2
+extension); v1 keeps the inline form with implicit pinned
+placement.
+
 ## 16. What's deferred
 
 The grammar in v0 does **not** specify:

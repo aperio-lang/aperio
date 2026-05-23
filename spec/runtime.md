@@ -178,43 +178,93 @@ Specifically:
   schedulers, the failure is delivered as a typed bus message
   to the parent's scheduler, which dispatches to `on_failure`.
 
-### Schedule classes (per-locus execution strategy)
+### Placement classes (per-locus execution strategy)
 
 Just as **projection class** governs a locus's memory strategy,
-**schedule class** governs its execution strategy.
-Substrate-invariance applied to time the way projection class
-applies it to space — but kept honestly **bimodal**: either you
-share a scheduler thread or you own one. There is no third
-position.
+**placement class** governs its execution strategy. Placement
+is a *deployment seam*, not an intrinsic property of the locus
+(see `spec/design-rationale.md` § F.31). Placement entries
+live in a `placement { }` block on `main locus` only, parallel
+to `bindings { }` for bus topology:
 
-Annotation:
+```aperio
+main locus App {
+    params {
+        gateway_kraken:   Gateway = Gateway { venue: "kraken" };
+        gateway_coinbase: Gateway = Gateway { venue: "coinbase" };
+        metrics:          MetricsServer = MetricsServer { port: 9100 };
+        ui:               Renderer = Renderer { };
+    }
+    placement {
+        gateway_kraken:   pinned(core = 1);
+        gateway_coinbase: pinned(core = 2);
+        metrics:          cooperative(pool = io);
+        ui:               cooperative(pool = render);
+        // unspecified main-locus params → cooperative(pool = main)
+    }
+}
+```
 
-```
-locus Fitter          : schedule cooperative { ... }   // default
-locus DataIngest      : schedule pinned      { ... }
-```
+Placement remains honestly **bimodal**: either a locus shares
+a cooperative pool (an OS thread running a cooperative drain
+loop) or it owns its own OS thread. There is no third position.
 
 | Class | Yield discipline | Resource |
 |---|---|---|
-| **Cooperative** (default) | Yields between substrate cells (handler exit, lifecycle transition, bus dispatch, `time::sleep`, explicit `yield`). `time::sleep` folds in `lotus_bus_queue_drain` after `clock_nanosleep` returns so cells posted by other threads deliver mid-loop; see "`time::sleep` drain semantics" below. Handler bodies are atomic. | Shares a scheduler thread with other cooperative loci. |
-| **Pinned** | No yield to siblings; owns its scheduler. Bus events to/from cross thread boundaries via formal mailbox post. | Dedicated OS thread, optionally pinned to a CPU core. |
+| **`cooperative(pool = X)`** (default for unspecified main-locus params, with `X = main`) | Yields between substrate cells (handler exit, lifecycle transition, bus dispatch, `time::sleep`, explicit `yield`). `time::sleep` folds in `lotus_bus_queue_drain` for the locus's pool after `clock_nanosleep` returns so cells posted by other threads deliver mid-loop. Handler bodies are atomic. | Shares pool `X`'s OS thread with other cooperative loci placed on the same pool. |
+| **`pinned`** / **`pinned(core = N)`** | No yield to siblings; owns its OS thread. Bus events to/from cross-thread boundaries via formal mailbox post. | Dedicated OS thread, optionally pinned to CPU core `N`. |
+
+**Pool inference rule.** The cooperative pool set is inferred
+from `cooperative(pool = X)` references in the `placement { }`
+block. The runtime spawns one OS worker thread per inferred
+pool name beyond `main` (which is always the program's main
+thread). No separate `threads { }` declaration block at v1 —
+when per-pool attributes (priority, affinity, realtime hint)
+become useful, the block lands then as a typed extension. Pool
+`main` exists in every program regardless of whether
+`placement { }` references it.
+
+**Nested-instantiation inheritance.** Placement entries apply
+only to top-level `main locus` `params` fields. Loci
+instantiated nested in another locus's body (in `birth` /
+`run` / lifecycle methods, or as let-bound children) inherit
+the parent's pool. There is no way to spell "this nested child
+runs on a different pool than its parent" — that would require
+the nested-instantiation expression to carry placement, which
+would re-mix the deployment and intrinsic layers F.31 separates.
+
+**Single-threaded-method invariant.** A locus's methods may
+be invoked only on the OS thread that owns its placement's
+pool. Cross-pool method calls and lateral field accesses go
+through the bus's existing copy-and-condvar dispatch
+machinery, which already crosses thread boundaries safely.
+The typechecker walks the static call graph from each
+top-level placement entry, propagates pool ownership through
+method receivers, and rejects calls that cross pools without
+going through the bus. This is the substrate enforcement that
+makes M:N safe — without it, multi-pool deployments would
+silently race on locus arenas (which are unsynchronized bump
+allocators).
 
 #### Why no "greedy" class
 
-A natural temptation is to want a third option: "shares the
-scheduler thread but doesn't yield." That would be a bimodality
+A natural temptation is to want a third option: "shares a
+pool's thread but doesn't yield." That would be a bimodality
 violation. Cooperative already guarantees handler-level
 atomicity — no preemption within a substrate cell — so the only
 thing such a class could add over cooperative is "don't yield
 *between* cells either." But that means leaving the shared
-scheduler entirely. The place you go when you leave is your own
+pool entirely. The place you go when you leave is your own
 thread. That's pinned.
 
 Latency-critical work, or anything that genuinely shouldn't
-share with siblings, is signaling that it belongs in a *deeper
-layer of the lotus* — its own thread, formal cross-boundary
-posts, fewer neighbors. That's a layering decision, not a third
-scheduling regime. Two classes, no third position, by design.
+share with neighbors on its pool, is signaling that it belongs
+on its own pool (placed `cooperative(pool = some_quiet_pool)`)
+or on its own thread (placed `pinned`). The first option is
+new in F.31: pools partition the cooperative substrate so
+"shouldn't share with siblings" no longer forces pinned — but
+the underlying bimodality (cooperative-pool vs pinned-thread)
+holds.
 
 #### `time::sleep` drain semantics
 
@@ -258,70 +308,104 @@ flows (unix / shm_ring transport with their own reader
 threads) work fine because their dispatch path lands in
 `g_bus_queue` and benefits from the sleep-folded drain above.
 
-#### Long-running cooperative children block parent run() (D)
+#### Long-running cooperative children: placement closes Item D
 
-When a locus declares another locus as a `params` field —
-`metrics_server: std::http::Server = ...` — the child's full
-lifecycle (`birth → run → drain → dissolve`) runs synchronously
-inside the parent's birth-time instantiation chain. Cooperative
-children block: a child Server with `max_accepts: -1` enters its
-accept loop and never returns, so the parent's run() never
-starts. Documented as item D ("`std::
-http::Server` as child of a parent with non-trivial `run()`
-blocks parent").
+Pre-F.31, declaring a long-running cooperative child as a
+`params` field (`metrics_server: std::http::Server = ...`)
+serialized parent and child onto the main thread: the child's
+`run()` body never returned, so the parent's `run()` never
+started. The workaround was the **sibling-in-main pattern** —
+hoisting the child to a top-level `main locus` param so it
+ran "alongside" the parent rather than "inside" it.
 
-This is a consequence of the cooperative scheduler's serialized
-model, not a bug: cooperative siblings can't run concurrently
-within one scheduler. The shipped resolutions:
+Under F.31 the sibling-in-main pattern IS the canonical
+shape, and it composes cleanly because `placement { }` lets
+each sibling pick its own pool:
 
-  1. **Sibling-in-main pattern** — declare long-running co-
-     resident loci as siblings in `main` rather than as one's
-     child. Cooperative + pinned siblings coexist there (the
-     pinned one runs on its own thread). To shut them down
-     gracefully when one finishes (e.g. a pinned gateway exits its
-     duration_s), call `metrics_server.shutdown()` from the
-     finishing locus's thread — the C-iii interruptible-accept
-     work makes this the supported pattern.
+```aperio
+main locus App {
+    params {
+        gateway:  Gateway              = Gateway { };
+        metrics:  std::http::Server    = std::http::Server { port: 9100 };
+    }
+    placement {
+        gateway:  pinned(core = 1);
+        metrics:  cooperative(pool = io);
+    }
+}
+```
 
-  2. **Pin the child** — declare the child as `: schedule
-     pinned` so its run() spawns its own thread and returns
-     immediately to the parent. Works when you own the child
-     locus's declaration; the std:: surface ships cooperative
-     by default and overriding requires a wrapper locus that
-     re-instantiates the cooperative child inside its own
-     pinned run() body. Practical for one-off cases; not
-     ergonomic enough to recommend broadly.
+Parent's `run()` no longer serializes against `metrics`'s
+accept loop — they sit on different OS threads. To shut down
+gracefully when one finishes (e.g. a duration-bounded gateway
+exits), call `metrics.shutdown()` from the finishing locus's
+thread; the C-iii interruptible-accept work makes this the
+supported pattern.
 
-A substrate change that dispatches cooperative children's run()
-asynchronously (parent's run() starts immediately after the
-child's birth() returns) would tighten this. Deferred — the
-sibling-with-shutdown pattern covers the production case after C-iii.
+The nested-as-child shape (long-running cooperative locus as
+a `params` field of a non-`main` locus) remains structurally
+serialized — that's a consequence of the nested-instantiation
+inheritance rule (children share their parent's pool by
+construction). Nested long-running children are an antipattern
+under F.31: hoist to main-locus siblings.
 
 (Compare: rich / chunked / recognition projection classes are
 genuinely three-way because N≈10, N≈30, and N≈300 are
 different cost regimes at scale — memory has more genuine
-intermediate ground than time does.)
+intermediate ground than time does. Placement, even with M:N
+pool partitioning, stays bimodal.)
 
 #### Cross-class bus semantics
 
-- **Cooperative → cooperative on same scheduler**: handler
-  enqueues; runs at the next substrate cell on the subscriber's
-  scheduler. Sender never blocks on receiver.
-- **Any → pinned**: cross-thread post via lock-protected
-  mailbox. Sender never blocks.
-- **Pinned → any**: same — cross-thread post; pinned doesn't
+- **Cooperative → cooperative, same pool**: handler enqueues
+  on the pool's queue; runs at the next substrate cell on
+  that pool's drain loop. Sender never blocks.
+- **Cooperative → cooperative, different pools**: cross-thread
+  post via the destination pool's queue; the destination pool's
+  drain thread wakes on the condvar broadcast (same machinery
+  as the cooperative→pinned path). Sender never blocks.
+- **Any → pinned**: cross-thread post via the pinned locus's
+  lock-protected mailbox. Sender never blocks.
+- **Pinned → any**: cross-thread post; pinned publisher doesn't
   block waiting for delivery acknowledgement.
 
-#### Implementation status (m26 + m27 + m28a + m28b + m28c)
+#### Implementation status (m26 + m27 + m28a + m28b + m28c; F.31 pending)
 
 m25 wired the annotation through parse / typecheck / codegen.
 **m26 ships cooperative semantics; m27 ships pinned threads
 (run-only); m28a lifts pinned to full lifecycle; m28b lights up
 cross-thread bus mailboxes — pinned loci can subscribe and
 publish, with cells routed across threads via per-locus
-mailboxes; m28c adds optional `: schedule pinned(core = N)`
-syntax for explicit CPU-core affinity via
+mailboxes; m28c adds optional CPU-core affinity via
 `pthread_setaffinity_np`.**
+
+**F.31 (2026-05-23, spec landed; substrate work pending):**
+the placement-at-main surface and M:N cooperative pools. The
+per-locus `: schedule` annotation is removed; the placement
+choice moves to a `placement { }` block on `main locus`.
+Cooperative subscribers can be partitioned across N pools
+(N OS threads, each running its own
+`lotus_bus_queue_drain` loop against its own per-pool queue);
+cross-pool dispatch reuses the m28b condvar+memcpy machinery.
+The single-threaded-method invariant — a locus's methods may
+be invoked only from its pool's thread or via the bus — lands
+as a typecheck rule. Substrate work descends from the spec.
+
+**Adapter loci instantiated inline in `bindings { Topic:
+AdapterLocus { ... }; }` are NOT main-locus `params` fields**
+and so receive no `placement { }` entry. Their `run()` recv-
+loops need a dedicated thread by construction; the substrate
+places them pinned-equivalent implicitly (same m90 routing +
+pthread spawn that pre-F.31 fired via the adapter's
+`: schedule pinned` annotation). The annotation goes away but
+the behavior is preserved automatically — the bindings-inline
+shape unambiguously signals "transport adapter with a recv
+loop."
+
+The implementation notes below describe pre-F.31 shapes (m25
+through m28c). They remain accurate for the cooperative-only-
+on-main-pool case, which is the v1-compatible default when
+no `placement { }` block is declared.
 
 **m26 (cooperative):** Each `<-` enqueues `(handler, self,
 payload_copy)` cells onto a program-wide FIFO queue

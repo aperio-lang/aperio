@@ -99,42 +99,77 @@ was the `Greeter` from
 [Your first locus](../getting-started/first-locus.md). The
 compiler fills in the rest.
 
-## Schedule classes
+## Placement (F.31)
 
 The lifecycle methods of multiple loci execute under a
-**scheduler**. Aperio commits to a bimodal scheduling model:
+**scheduler**. Aperio commits to a bimodal model — cooperative
+pools (shared OS threads) and pinned threads (one OS thread
+per locus) — with placement declared at `main locus` rather
+than on the locus itself:
 
 ```aperio
-locus Matchmaker : schedule cooperative { ... }   // default
-locus DataIngest : schedule pinned      { ... }
-locus Bursty     : schedule pinned(core = 3) { ... }
+main locus App {
+    params {
+        matchmaker:  Matchmaker   = Matchmaker { };
+        ingest:      DataIngest   = DataIngest { };
+        bursty:      Bursty       = Bursty { };
+    }
+    placement {
+        matchmaker:  cooperative(pool = main);
+        ingest:      pinned;
+        bursty:      pinned(core = 3);
+    }
+}
 ```
 
 Two classes, with no third option:
 
-- **`cooperative`** (default) — Shares a scheduler thread
-  with other cooperative loci. Yields at substrate-cell
-  boundaries: between handler invocations, between lifecycle
-  transitions, on bus dispatch, on `time::sleep`, on explicit
-  `yield`. Handler bodies are *atomic* — no preemption inside
-  one.
+- **`cooperative(pool = X)`** — Shares pool `X`'s OS thread
+  with other cooperative loci placed on the same pool. Yields
+  at substrate-cell boundaries: between handler invocations,
+  between lifecycle transitions, on bus dispatch, on
+  `time::sleep`, on explicit `yield`. Handler bodies are
+  *atomic* — no preemption inside one. Default for any
+  main-locus `params` field not mentioned in `placement { }`,
+  with pool `main` (the program's main OS thread).
 - **`pinned`** — Owns its own OS thread. No yielding to
-  siblings inside the same scheduler; the locus runs as long
-  as it has work and the OS thread runs it. Cross-thread bus
-  traffic crosses through a per-locus lock-protected mailbox.
-  Optionally CPU-affinitized via `pinned(core = N)`.
+  siblings; the locus runs as long as it has work and the OS
+  thread runs it. Cross-thread bus traffic crosses through a
+  per-locus lock-protected mailbox. Optionally CPU-affinitized
+  via `pinned(core = N)`.
 
-There is **no greedy or third class**. A locus that "shares
-the scheduler thread but doesn't yield between handlers" would
-be a structural compromise — cooperative already guarantees
-handler-atomicity, so the only additional thing it could do
-is *refuse to yield between cells*, which means "I don't
-share." That's what `pinned` is.
+There is **no greedy or third class**. A locus that "shares a
+pool's thread but doesn't yield between handlers" would be a
+structural compromise — cooperative already guarantees handler-
+atomicity, so the only additional thing it could do is *refuse
+to yield between cells*, which means "I don't share." That's
+what `pinned` is. (If you want to isolate a cooperative locus
+from siblings without dedicating it a full thread, place it on
+its own quiet pool: `cooperative(pool = quiet)`.)
 
-The rule of thumb: cooperative is the default for almost
-everything; pinned is for latency-critical work that genuinely
-shouldn't share the scheduler thread (real-time data ingest,
-high-frequency tick handling).
+**Placement keys on main-locus `params` field names**, not
+locus type names. This lets two siblings of the same locus
+type sit on different pools — exactly the parallelism case
+(per-venue gateways pinned to distinct cores, etc.).
+
+**Nested loci inherit their parent's pool.** Placement entries
+apply only to top-level `main locus` `params` fields. A locus
+instantiated inside another locus's body shares its parent's
+pool. To run a nested locus on a different pool, hoist it to
+a main-locus sibling.
+
+**Cooperative pool inference.** Pool names appear only in
+`cooperative(pool = X)` references in the `placement { }`
+block. The runtime spawns one OS worker per inferred pool name
+beyond `main`. No `threads { }` declaration block at v1 —
+pools are named purely by use site.
+
+The rule of thumb: cooperative-on-main is the default for
+almost everything; pinned is for latency-critical work that
+genuinely shouldn't share a pool thread (real-time data
+ingest, high-frequency tick handling); separate cooperative
+pools are for partitioning long-running siblings that would
+otherwise serialize on the same thread.
 
 A worked example of two pinned loci publishing to a
 cooperative aggregator — including how the bus crosses

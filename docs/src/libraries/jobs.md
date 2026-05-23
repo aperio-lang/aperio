@@ -75,12 +75,15 @@ locus Pool {
     }
 }
 
-locus Worker : schedule pinned {
+locus Worker {
     params { worker_id: Int; db_path; table;
              max_jobs: Int; simulate: Bool;
              handler: fn(Job) -> JobResult; }
     run() { /* dequeue → invoke → ack/fail loop */ }
 }
+// Workers are placed pinned at deployment time via the
+// consuming app's main locus `placement { }` block (F.31),
+// e.g. `placement { worker_0: pinned(core = 1); }`.
 ```
 
 ### Deviations from CONTRACTS.md (all logged in FRICTION.md)

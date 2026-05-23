@@ -489,6 +489,59 @@ Specifically:
 This makes the framework's vertical-only commitment a
 type-system invariant, not just a convention.
 
+## Single-threaded-method invariant (F.31)
+
+A locus's methods may be invoked only on the OS thread that
+owns the locus's placement's pool. Cross-pool direct calls
+are typecheck errors; cross-pool coordination goes through
+the bus.
+
+The invariant is enforced via a static call-graph walk seeded
+from the `main locus`'s `placement { }` entries:
+
+1. Each main-locus `params` field has a pool — explicit
+   (`placement { field: cooperative(pool = X); }` or
+   `placement { field: pinned; }`) or default
+   (`cooperative(pool = main)`).
+2. Each nested locus inherits its containing tower's pool
+   (see `spec/semantics.md` § "Nested instantiation"). Methods
+   on a nested locus run on the parent's pool's thread.
+3. For each method-call expression `recv.foo(args)`, the
+   typechecker determines `recv`'s pool from its static type
+   and the surrounding pool context.
+4. If `recv`'s pool differs from the caller's pool, the call
+   is rejected with a diagnostic naming both pools and
+   pointing at the `placement { }` entries that picked them.
+5. Bus sends (`Topic <- v;` / `"subj" <- v;`) are unrestricted
+   — the runtime's cross-thread dispatch (m28b condvar+memcpy)
+   handles the boundary safely.
+
+The invariant is the substrate enforcement that makes M:N
+cooperative pools safe. Without it, multi-pool deployments
+would silently race on locus arenas (unsynchronized bump
+allocators by design). The typecheck happens once per main
+locus (the placement-bearing locus is unique per binary), so
+the rule applies at binary compile time rather than at every
+library typecheck.
+
+**Interaction with `LocusRef` borrows.** A locus param of
+type `LocusRef(L)` carries a borrow of an `L` — but the
+borrow's pool is the locus's own placement, not the borrower's
+placement. So `self.db.query(...)` where `self.db: DB` and
+the `DB` instance is on pool `db_pool` is a cross-pool call
+from any non-`db_pool` thread, and routed through the bus.
+This is the "vertical-only flow" rule generalized to
+cooperative pools: cross-pool access is the same shape as
+sibling access — bus only.
+
+**Interaction with builtins / stdlib.** Free functions and
+stdlib path-calls (`std::io::fs::read_file`, `std::str::*`,
+etc.) are pool-neutral — they run on whichever thread calls
+them. Their arena routing through `lotus_current_caller_arena`
+TLS handles the per-thread isolation. The single-threaded-
+method invariant applies only to locus member functions,
+which are what carry per-locus arena state.
+
 ## Closure-test typing
 
 A `closure name { left ~~ right within tolerance; ... }`

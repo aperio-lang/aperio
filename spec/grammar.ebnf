@@ -103,10 +103,12 @@ locus_decl        = [ form_annotation ] , [ "main" ] , "locus" , IDENTIFIER ,
                     [ locus_annotations ] ,
                     "{" , { locus_member } , "}" ;
 
+(* F.31 (2026-05-23): `schedule` removed from locus_annotation.
+   Placement is a deployment seam; it lives in a `placement { }`
+   block on `main` only. See `placement_block` below. *)
 locus_annotations = ":" , locus_annotation , { "," , locus_annotation } ;
 locus_annotation  = "tier" , INT_LIT
                   | "projection" , projection_class
-                  | "schedule" , schedule_class
                   ;
 projection_class  = "rich"
                   | "chunked"
@@ -117,8 +119,6 @@ recognition_sub_mode = "fixed_cell"
                      | "shared_slab"
                      | "spillover"
                      | "summary_only" ;
-schedule_class    = "cooperative"
-                  | "pinned" , [ "(" , "core" , "=" , INT_LIT , ")" ] ;
 
 locus_member      = params_block
                   | contract_block
@@ -132,6 +132,7 @@ locus_member      = params_block
                   | const_decl
                   | type_decl
                   | bindings_block
+                  | placement_block
                   | birth_check_decl
                   ;
 
@@ -197,6 +198,30 @@ binding_constraint = "intra_process"
                    | "intra_machine"
                    | "cross_machine"
                    | "zero_copy" ;
+
+(* F.31 (2026-05-23): per-locus thread placement. Only legal
+   inside a `main` locus. The same library deploys differently
+   in different binaries by varying the placement entries —
+   `placement` is the deployment seam for thread topology,
+   parallel to `bindings` for bus transport topology.
+
+   Keys are main-locus `params` field names (snake_case), NOT
+   locus type names. This lets two siblings of the same locus
+   type take distinct placements (per-venue gateways pinned to
+   different cores, etc.).
+
+   Pool set is INFERRED from `cooperative(pool = X)` references:
+   no separate `threads { }` declaration block at v1. Pool `main`
+   is the always-available default (the main OS thread).
+
+   Unspecified main-locus `params` fields default to
+   `cooperative(pool = main)`. Loci instantiated nested below
+   main inherit their parent's pool — placement entries apply
+   only at the top-level main-locus surface. *)
+placement_block   = "placement" , "{" , { placement_entry } , "}" ;
+placement_entry   = IDENTIFIER , ":" , placement_spec , ";" ;
+placement_spec    = "cooperative" , [ "(" , "pool" , "=" , IDENTIFIER , ")" ]
+                  | "pinned" , [ "(" , "core" , "=" , INT_LIT , ")" ] ;
 
 
 (* === 3. Params block =========================================== *)
