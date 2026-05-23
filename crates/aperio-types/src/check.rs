@@ -1441,6 +1441,12 @@ impl<'a> Checker<'a> {
                 // Bindings are checked by a separate top-level pass
                 // (validate_bindings); nothing to do here.
             }
+            LocusMember::Placement(_) => {
+                // F.31: placement entries are validated by a
+                // dedicated top-level pass (Phase 2 — pending).
+                // The parser already enforces "main-only" so the
+                // block's syntactic shape is OK here.
+            }
             LocusMember::Lifecycle(lc) => {
                 self.in_lifecycle = true;
                 self.locals.push();

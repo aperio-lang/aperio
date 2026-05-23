@@ -306,6 +306,14 @@ impl<'a> Mangler<'a> {
                     self.rewrite_ident(&mut entry.topic.name);
                 }
             }
+            LocusMember::Placement(pb) => {
+                // F.31: placement entries key on main-locus params
+                // field names. Field names are local to the main
+                // locus — no cross-seed mangling applies here. Pool
+                // names (inside cooperative(pool = X)) are also
+                // local. Walk does nothing in v1.
+                let _ = pb;
+            }
             LocusMember::BirthCheck(bc) => {
                 // F.27 v2: walk the cond + payload exprs so any
                 // generic substitution touches references inside

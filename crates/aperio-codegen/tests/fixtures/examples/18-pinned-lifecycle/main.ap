@@ -21,8 +21,13 @@
 // fully-featured for self-contained loci. Cross-thread bus
 // (the thing that lets a pinned locus talk to the rest of the
 // program) lands in m28b.
+//
+// F.31 (2026-05-23): placement moved from locus annotation
+// (`: schedule pinned`) to a `placement { }` block on `main
+// locus`. The locus body is deployment-neutral; the binary
+// picks pinned via the `placement` entry below.
 
-locus PinnedJob : schedule pinned {
+locus PinnedJob {
     birth() {
         println("pinned.birth: setting up on the pinned thread");
     }
@@ -39,7 +44,18 @@ locus PinnedJob : schedule pinned {
     }
 }
 
+main locus PinnedJobApp {
+    params {
+        job: PinnedJob = PinnedJob { };
+    }
+    placement {
+        job: pinned;
+    }
+    run() {
+        println("main: spawned PinnedJob; will join at scope exit");
+    }
+}
+
 fn main() {
-    PinnedJob { };
-    println("main: spawned PinnedJob; will join at scope exit");
+    PinnedJobApp { };
 }

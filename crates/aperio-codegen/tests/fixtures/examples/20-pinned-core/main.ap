@@ -19,23 +19,41 @@
 // affinity call lacks permission, the runtime silently falls
 // back to ordinary OS scheduling. Better than refusing to run
 // the binary outright.
+//
+// F.31 (2026-05-23): pinned + core affinity moved from a
+// per-locus annotation (`: schedule pinned(core = N)`) to a
+// placement entry on `main locus` — `placement { worker_X:
+// pinned(core = N); }`. The library locus stays deployment-
+// neutral; main picks the core.
 
-locus CoreZeroWorker : schedule pinned(core = 0) {
+locus CoreZeroWorker {
     run() {
         std::time::sleep(20ms);
         println("worker: ran on core 0 (or fallback if unavailable)");
     }
 }
 
-locus CoreOneWorker : schedule pinned(core = 1) {
+locus CoreOneWorker {
     run() {
         std::time::sleep(20ms);
         println("worker: ran on core 1 (or fallback if unavailable)");
     }
 }
 
+main locus CoreWorkersApp {
+    params {
+        worker_0: CoreZeroWorker = CoreZeroWorker { };
+        worker_1: CoreOneWorker  = CoreOneWorker  { };
+    }
+    placement {
+        worker_0: pinned(core = 0);
+        worker_1: pinned(core = 1);
+    }
+    run() {
+        println("main: spawned two pinned workers on different cores");
+    }
+}
+
 fn main() {
-    CoreZeroWorker { };
-    CoreOneWorker { };
-    println("main: spawned two pinned workers on different cores");
+    CoreWorkersApp { };
 }

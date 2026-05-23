@@ -9161,6 +9161,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | LocusMember::Closure(_)
             | LocusMember::Type(_)
             | LocusMember::Bindings(_)
+            | LocusMember::Placement(_)
             | LocusMember::BirthCheck(_) => {}
             LocusMember::Capacity(_) => {
                 // F.22 slot cell types are concrete in v1; no
@@ -9427,14 +9428,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // sync-everywhere semantics LOCKED IN as their design
         // choice (rather than incidental) can write
         // `: schedule greedy` explicitly.
-        let schedule_class: ScheduleClass = l
-            .annotations
-            .iter()
-            .find_map(|a| match a {
-                LocusAnnotation::Schedule(sc) => Some(*sc),
-                _ => None,
-            })
-            .unwrap_or(ScheduleClass::Cooperative);
+        // F.31 (2026-05-23): per-locus schedule annotation is
+        // removed. The locus's default placement is Cooperative;
+        // Phase 3 of the F.31 substrate work (pending) reads the
+        // main locus's `placement { }` block and overrides this
+        // per main-locus params field. Until that lands, every
+        // locus defaults to Cooperative — equivalent to today's
+        // unannotated behavior. Pinned-via-placement requires
+        // Phase 3.
+        let schedule_class: ScheduleClass = ScheduleClass::Cooperative;
 
         // Each locus param must have either a literal default or
         // a typed default expression evaluable at instantiation
@@ -10264,12 +10266,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     // Params handled in pass A1; contracts are a
                     // typecheck-only feature with no codegen ABI.
                 }
-                LocusMember::Bindings(_) | LocusMember::BirthCheck(_) => {
-                    // Bindings emitted by main-locus prelude pass;
-                    // birth_check clauses are emitted inline at
-                    // instantiation (see lower_locus_instantiation's
-                    // F.27 v2 block). Neither contributes to the
-                    // method table.
+                LocusMember::Bindings(_)
+                | LocusMember::Placement(_)
+                | LocusMember::BirthCheck(_) => {
+                    // Bindings + placement emitted by main-locus
+                    // prelude pass; birth_check clauses are emitted
+                    // inline at instantiation (see
+                    // lower_locus_instantiation's F.27 v2 block).
+                    // None contributes to the method table.
                 }
                 LocusMember::Lifecycle(lc) => {
                     if lc.ret.is_some() {

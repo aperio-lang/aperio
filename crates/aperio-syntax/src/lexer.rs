@@ -105,17 +105,24 @@ pub enum TokenKind {
     Chunked,
     Recognition,
 
-    // Keywords — schedule class (m25). Per The Design / lotus,
-    // schedule class is to execution what projection class is to
-    // memory: same source, two runtime shapes. Cooperative is the
-    // default (BEAM-shape; shared scheduler thread; yields between
-    // substrate cells; handler-atomic). Pinned owns its own
-    // thread, optionally pinned to a CPU core. Two classes only,
-    // per bimodality — anything in-between is a layering choice
-    // about how deep the locus sits, not a third scheduling regime.
-    Schedule,
-    Cooperative,
-    Pinned,
+    // Keywords — placement classes (F.31, 2026-05-23).
+    //
+    // Placement is bimodal: cooperative (shared pool thread) or
+    // pinned (own OS thread). The keywords appear inside the
+    // `placement { field: SPEC; }` block on `main locus`.
+    //
+    // `placement`, `cooperative`, `pinned`, `pool`, `core` are
+    // all contextual idents — they lex as Ident and the parser
+    // recognizes them positionally inside the placement block.
+    // This frees the identifiers for use as fn / var / field
+    // names outside placement contexts. Same F.10-style
+    // narrowing the closure / mode keyword families use.
+    //
+    // Pre-F.31 surface had a per-locus `: schedule X` annotation
+    // with TokenKind::Schedule + TokenKind::Cooperative +
+    // TokenKind::Pinned. F.31 removed that surface; the tokens
+    // are gone. Existing source using `: schedule ...` is now a
+    // parse error (intentional — schedule moved to main).
 
     // Keywords — closure
     //
@@ -481,10 +488,11 @@ impl<'a> Lexer<'a> {
             "chunked" => TokenKind::Chunked,
             "recognition" => TokenKind::Recognition,
 
-            // Schedule class (m25)
-            "schedule" => TokenKind::Schedule,
-            "cooperative" => TokenKind::Cooperative,
-            "pinned" => TokenKind::Pinned,
+            // Placement keywords (F.31) are all contextual idents:
+            // `placement`, `cooperative`, `pinned`, `pool`, `core`
+            // lex as Ident and the parser recognizes them inside
+            // the placement block on `main locus`. Frees them for
+            // ordinary identifier use outside that context.
 
             // Closure. `approx` and `within` deliberately
             // omitted — they lex as Ident and are recognized

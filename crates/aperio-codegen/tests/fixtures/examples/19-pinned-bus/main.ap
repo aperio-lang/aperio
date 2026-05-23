@@ -27,12 +27,15 @@
 // exits. Main joins the pthread before destroying the
 // pinned arena.
 
+// F.31 (2026-05-23): pinned placement moved from a per-locus
+// annotation to a `placement { }` block on `main locus`.
+
 type Tick {
     n: Int;
     label: String;
 }
 
-locus PinnedSubscriber : schedule pinned {
+locus PinnedSubscriber {
     bus {
         subscribe "tick" as on_tick of type Tick;
     }
@@ -62,18 +65,28 @@ locus Publisher {
     }
 }
 
+main locus PinnedBusApp {
+    params {
+        sub: PinnedSubscriber = PinnedSubscriber { };
+        pub: Publisher        = Publisher        { };
+    }
+    placement {
+        sub: pinned;
+    }
+    run() {
+        // Give the pinned thread a moment to drain the mailbox
+        // BEFORE main returns (the deferred-dissolve flush
+        // will signal shutdown). Without this, the shutdown
+        // signal can race past unprocessed cells (we still
+        // drain them — pending cells flush before the loop
+        // returns 0 — but a tiny sleep here makes the output
+        // ordering deterministic vs main's println).
+        std::time::sleep(20ms);
+
+        println("main: returning; pinned subscriber will drain + dissolve");
+    }
+}
+
 fn main() {
-    PinnedSubscriber { };
-    Publisher { };
-
-    // Give the pinned thread a moment to drain the mailbox
-    // BEFORE main returns (the deferred-dissolve flush will
-    // signal shutdown). Without this, the shutdown signal
-    // can race past unprocessed cells (we still drain
-    // them — pending cells flush before the loop returns 0
-    // — but a tiny sleep here makes the output ordering
-    // deterministic vs main's println).
-    std::time::sleep(20ms);
-
-    println("main: returning; pinned subscriber will drain + dissolve");
+    PinnedBusApp { };
 }

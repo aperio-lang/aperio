@@ -22,7 +22,10 @@
 // a stream.
 
 
-locus Heartbeat : schedule pinned {
+// F.31 (2026-05-23): pinned placement moved from the locus
+// annotation to a placement entry on main locus.
+
+locus Heartbeat {
     params {
         magic: Int = 0;
     }
@@ -43,9 +46,13 @@ locus Heartbeat : schedule pinned {
     }
 }
 
-locus Coordinator {
+main locus Coordinator {
     params {
         post_run_fires: Int = 0;
+        heartbeat: Heartbeat = Heartbeat { };
+    }
+    placement {
+        heartbeat: pinned;
     }
 
     on_failure(h: Heartbeat, err: ClosureViolation) {
@@ -55,12 +62,11 @@ locus Coordinator {
     }
 
     run() {
-        Heartbeat { };
-        // Coordinator.run() returns immediately. The pinned
-        // thread is now sleeping inside Heartbeat.run(); the
-        // deferred-dissolve flush at scope exit pthread_joins it.
-        // During that join window, post-run fires the duration
-        // wrapper, the closure violates, on_failure routes here.
+        // Heartbeat runs on its own pthread (placed pinned
+        // above). The deferred-dissolve flush at scope exit
+        // pthread_joins it; during that join window, post-run
+        // fires the duration wrapper, the closure violates,
+        // on_failure routes here.
     }
 }
 

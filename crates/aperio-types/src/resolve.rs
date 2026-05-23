@@ -521,9 +521,15 @@ fn register_locus(
         match ann {
             LocusAnnotation::Tier(n) => annotations.tier = Some(*n),
             LocusAnnotation::Projection(p) => annotations.projection = Some(*p),
-            LocusAnnotation::Schedule(s) => annotations.schedule = Some(*s),
         }
     }
+    // F.31 (2026-05-23): per-locus schedule annotation gone.
+    // Placement is read from main's `placement { }` block at
+    // codegen time and applied per-instance. `annotations.schedule`
+    // stays in the symbol shape for Phase 1 transitional purposes
+    // and defaults to None — Phase 3 codegen reads placement
+    // instead.
+    let _ = &annotations;
 
     // v1.x-3: surface the "v1.x pending" rejection for the two
     // sub-modes we parse + typecheck but haven't shipped a runtime

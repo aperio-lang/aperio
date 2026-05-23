@@ -178,7 +178,9 @@ pub struct FormArg {
 pub enum LocusAnnotation {
     Tier(i64),
     Projection(ProjectionClass),
-    Schedule(ScheduleClass),
+    // F.31 (2026-05-23): schedule annotation removed from the
+    // locus declaration site. Placement is a deployment seam;
+    // see PlacementBlock + LocusMember::Placement.
 }
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -283,6 +285,12 @@ pub enum LocusMember {
     /// topic to a concrete transport, marking that topic as
     /// external for the closed-world topology classification.
     Bindings(BindingsBlock),
+    /// F.31 (2026-05-23): `placement { field: spec; }` block.
+    /// Valid only inside `main locus`. Each entry picks the
+    /// thread placement for a main-locus `params` field. Same
+    /// deployment-seam shape as `bindings { }` — schedule was
+    /// moved from a per-locus annotation to a main-only block.
+    Placement(PlacementBlock),
     /// F.27 v2 (2026-05-20): `birth_check { EXPR } -> violate
     /// NAME;` synthesis hook. After birth() completes (and birth-
     /// epoch closures fire), each declared birth_check expression
@@ -318,6 +326,45 @@ pub struct BirthCheckDecl {
     /// `violate NAME(payload)` syntax in fn bodies.
     pub payload: Option<Expr>,
     pub span: Span,
+}
+
+/// F.31 (2026-05-23): per-locus thread placement inside `main
+/// locus`. Parallel to `BindingsBlock` for bus topology —
+/// both are deployment seams. Each entry picks the placement
+/// for one main-locus `params` field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementBlock {
+    pub entries: Vec<PlacementEntry>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementEntry {
+    /// Main-locus `params` field name being placed. Must be a
+    /// snake_case Ident matching a declared params field of the
+    /// enclosing main locus. Per F.31 the placement keys on
+    /// field name (instance-level), not on locus type name,
+    /// so two siblings of the same locus type can take distinct
+    /// placements.
+    pub field: Ident,
+    pub spec: PlacementSpec,
+    pub span: Span,
+}
+
+/// F.31: per-entry thread placement specification.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementSpec {
+    /// `cooperative` or `cooperative(pool = X)`. The locus shares
+    /// pool `X`'s OS thread with other cooperative loci placed
+    /// on the same pool. `None` means pool `main` (the program's
+    /// main OS thread) — equivalent to writing
+    /// `cooperative(pool = main)`.
+    Cooperative { pool: Option<Ident> },
+    /// `pinned` or `pinned(core = N)`. The locus owns its own
+    /// OS thread; `Some(n)` asks the runtime to
+    /// `pthread_setaffinity_np` the spawned thread to logical
+    /// CPU `n`.
+    Pinned { core: Option<i64> },
 }
 
 /// Phase 2: per-topic transport binding inside `main locus`.

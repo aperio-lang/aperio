@@ -30,14 +30,19 @@
 // v0 scope: pinned loci can declare ONLY run() — no bus, no
 // other lifecycle methods. Full pinned lifecycle + cross-
 // thread bus mailbox land in m28.
+//
+// F.31 (2026-05-23): placement (cooperative vs pinned) moved
+// from a per-locus annotation to a `placement { }` block on
+// `main locus`. The library locus stays deployment-neutral;
+// the binary's main picks the placement per instance.
 
-locus CooperativeWorker : schedule cooperative {
+locus CooperativeWorker {
     run() {
         println("cooperative: shared thread, handler-atomic");
     }
 }
 
-locus PinnedWorker : schedule pinned {
+locus PinnedWorker {
     run() {
         // Sleep so the main-thread println races us and lands
         // first deterministically. Without this, the print
@@ -48,8 +53,20 @@ locus PinnedWorker : schedule pinned {
     }
 }
 
+main locus ScheduleClassesApp {
+    params {
+        pinned_w: PinnedWorker     = PinnedWorker { };
+        coop_w:   CooperativeWorker = CooperativeWorker { };
+    }
+    placement {
+        pinned_w: pinned;
+        // coop_w left unspecified → cooperative(pool = main)
+    }
+    run() {
+        println("main: spawned both; will join pinned at scope exit");
+    }
+}
+
 fn main() {
-    PinnedWorker { };
-    CooperativeWorker { };
-    println("main: spawned both; will join pinned at scope exit");
+    ScheduleClassesApp { };
 }

@@ -646,8 +646,10 @@ impl Parser {
             members.push(self.parse_locus_member()?);
         }
         let close = self.expect(TokenKind::RBrace, "}")?;
-        // Reject `bindings { }` blocks in non-main loci at parse
-        // time so the diagnostic cites the bindings span directly.
+        // Reject `bindings { }` and `placement { }` blocks in
+        // non-main loci at parse time so the diagnostic cites the
+        // offending span directly. Both are deployment seams (per
+        // F.31) and live at main only.
         if !is_main {
             for m in &members {
                 if let LocusMember::Bindings(bb) = m {
@@ -655,6 +657,17 @@ impl Parser {
                         bb.span,
                         format!(
                             "`bindings` block is only valid inside `main \
+                             locus`; locus `{}` is not declared with the \
+                             `main` modifier",
+                            name.name
+                        ),
+                    ));
+                }
+                if let LocusMember::Placement(pb) = m {
+                    return Err(Diag::parse(
+                        pb.span,
+                        format!(
+                            "`placement` block is only valid inside `main \
                              locus`; locus `{}` is not declared with the \
                              `main` modifier",
                             name.name
@@ -735,87 +748,11 @@ impl Parser {
                 };
                 Ok(LocusAnnotation::Projection(class))
             }
-            TokenKind::Schedule => {
-                self.bump();
-                let class = match self.peek() {
-                    TokenKind::Cooperative => {
-                        self.bump();
-                        ScheduleClass::Cooperative
-                    }
-                    TokenKind::Pinned => {
-                        self.bump();
-                        // Optional `(core = N)` attribute. Expect
-                        // exactly that one shape for v0; future
-                        // attributes (priority, scheduler policy,
-                        // etc.) plug in here.
-                        let core = if matches!(self.peek(), TokenKind::LParen) {
-                            self.bump();
-                            let attr_tok = self.peek_token();
-                            let attr_name = match self.peek() {
-                                TokenKind::Ident(s) => s.clone(),
-                                other => {
-                                    return Err(Diag::parse(
-                                        attr_tok.span,
-                                        format!(
-                                            "expected `core` inside `pinned(...)`, got {:?}",
-                                            other
-                                        ),
-                                    ));
-                                }
-                            };
-                            if attr_name != "core" {
-                                return Err(Diag::parse(
-                                    attr_tok.span,
-                                    format!(
-                                        "unknown pinned attribute `{}`; only `core` \
-                                         is recognized in v0",
-                                        attr_name
-                                    ),
-                                ));
-                            }
-                            self.bump();
-                            self.expect(TokenKind::Eq, "expected `=` after `core`")?;
-                            let n_tok = self.peek_token();
-                            let n = match self.peek() {
-                                TokenKind::IntLit(v) => *v,
-                                other => {
-                                    return Err(Diag::parse(
-                                        n_tok.span,
-                                        format!(
-                                            "expected integer CPU index after `core =`, got {:?}",
-                                            other
-                                        ),
-                                    ));
-                                }
-                            };
-                            self.bump();
-                            self.expect(
-                                TokenKind::RParen,
-                                "expected `)` after pinned(core = N)",
-                            )?;
-                            Some(n)
-                        } else {
-                            None
-                        };
-                        ScheduleClass::Pinned(core)
-                    }
-                    other => {
-                        return Err(Diag::parse(
-                            self.peek_token().span,
-                            format!(
-                                "expected schedule class \
-                                 (cooperative | pinned), got {:?}",
-                                other
-                            ),
-                        ));
-                    }
-                };
-                Ok(LocusAnnotation::Schedule(class))
-            }
             other => Err(Diag::parse(
                 self.peek_token().span,
                 format!(
-                    "expected tier / projection / schedule annotation, got {:?}",
+                    "expected tier / projection annotation, got {:?}. \
+                     (Schedule moved to main's `placement {{ }}` block in F.31.)",
                     other
                 ),
             )),
@@ -961,6 +898,13 @@ impl Parser {
             TokenKind::Ident(s) if s == "bindings" => {
                 self.parse_bindings_block().map(LocusMember::Bindings)
             }
+            // F.31 contextual keyword — `placement { ... }`.
+            // Lexes as Ident; recognized as a member-introducer
+            // here. The "must be inside `main locus`" check
+            // fires in `parse_locus_decl` (parallel to bindings).
+            TokenKind::Ident(s) if s == "placement" => {
+                self.parse_placement_block().map(LocusMember::Placement)
+            }
             // F.27 v2 contextual keyword — `birth_check { EXPR }
             // -> violate NAME;`. Lexes as Ident; recognized here.
             TokenKind::Ident(s) if s == "birth_check" => {
@@ -1052,6 +996,154 @@ impl Parser {
             entries,
             span: kw_tok.span.merge(close.span),
         })
+    }
+
+    /// F.31 (2026-05-23): parse a `placement { field: SPEC; }`
+    /// block. Caller has the `placement` ident as `peek()`.
+    /// The "must be inside main locus" check fires later in
+    /// `parse_locus_decl` (parallel to `bindings`).
+    fn parse_placement_block(&mut self) -> Result<PlacementBlock, Diag> {
+        let kw_tok = self.peek_token().clone();
+        self.bump(); // consume `placement` ident
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut entries = Vec::new();
+        while !matches!(self.peek(), TokenKind::RBrace) {
+            let field = self.expect_ident("field name")?;
+            self.expect(TokenKind::Colon, ":")?;
+            let spec = self.parse_placement_spec()?;
+            let semi = self.expect(TokenKind::Semi, ";")?;
+            entries.push(PlacementEntry {
+                field: field.clone(),
+                spec,
+                span: field.span.merge(semi.span),
+            });
+        }
+        let close = self.expect(TokenKind::RBrace, "}")?;
+        Ok(PlacementBlock {
+            entries,
+            span: kw_tok.span.merge(close.span),
+        })
+    }
+
+    /// F.31: parse one placement spec — `cooperative` /
+    /// `cooperative(pool = X)` / `pinned` / `pinned(core = N)`.
+    /// Both head keywords are contextual Idents.
+    fn parse_placement_spec(&mut self) -> Result<PlacementSpec, Diag> {
+        let head_tok = self.peek_token().clone();
+        let head = match &head_tok.kind {
+            TokenKind::Ident(s) => s.clone(),
+            other => {
+                return Err(Diag::parse(
+                    head_tok.span,
+                    format!(
+                        "expected placement spec (`cooperative` or `pinned`), \
+                         got {:?}",
+                        other
+                    ),
+                ));
+            }
+        };
+        self.bump();
+        match head.as_str() {
+            "cooperative" => {
+                let pool = if matches!(self.peek(), TokenKind::LParen) {
+                    self.bump();
+                    let kw_tok = self.peek_token().clone();
+                    let kw = match &kw_tok.kind {
+                        TokenKind::Ident(s) => s.clone(),
+                        other => {
+                            return Err(Diag::parse(
+                                kw_tok.span,
+                                format!(
+                                    "expected `pool` inside `cooperative(...)`, got {:?}",
+                                    other
+                                ),
+                            ));
+                        }
+                    };
+                    if kw != "pool" {
+                        return Err(Diag::parse(
+                            kw_tok.span,
+                            format!(
+                                "unknown cooperative attribute `{}`; only `pool` \
+                                 is recognized",
+                                kw
+                            ),
+                        ));
+                    }
+                    self.bump();
+                    self.expect(TokenKind::Eq, "expected `=` after `pool`")?;
+                    let name = self.expect_ident("pool name")?;
+                    self.expect(
+                        TokenKind::RParen,
+                        "expected `)` after cooperative(pool = X)",
+                    )?;
+                    Some(name)
+                } else {
+                    None
+                };
+                Ok(PlacementSpec::Cooperative { pool })
+            }
+            "pinned" => {
+                let core = if matches!(self.peek(), TokenKind::LParen) {
+                    self.bump();
+                    let kw_tok = self.peek_token().clone();
+                    let kw = match &kw_tok.kind {
+                        TokenKind::Ident(s) => s.clone(),
+                        other => {
+                            return Err(Diag::parse(
+                                kw_tok.span,
+                                format!(
+                                    "expected `core` inside `pinned(...)`, got {:?}",
+                                    other
+                                ),
+                            ));
+                        }
+                    };
+                    if kw != "core" {
+                        return Err(Diag::parse(
+                            kw_tok.span,
+                            format!(
+                                "unknown pinned attribute `{}`; only `core` \
+                                 is recognized",
+                                kw
+                            ),
+                        ));
+                    }
+                    self.bump();
+                    self.expect(TokenKind::Eq, "expected `=` after `core`")?;
+                    let n_tok = self.peek_token().clone();
+                    let n = match &n_tok.kind {
+                        TokenKind::IntLit(v) => *v,
+                        other => {
+                            return Err(Diag::parse(
+                                n_tok.span,
+                                format!(
+                                    "expected integer CPU index after `core =`, got {:?}",
+                                    other
+                                ),
+                            ));
+                        }
+                    };
+                    self.bump();
+                    self.expect(
+                        TokenKind::RParen,
+                        "expected `)` after pinned(core = N)",
+                    )?;
+                    Some(n)
+                } else {
+                    None
+                };
+                Ok(PlacementSpec::Pinned { core })
+            }
+            other => Err(Diag::parse(
+                head_tok.span,
+                format!(
+                    "expected `cooperative` or `pinned` as placement spec, got `{}`",
+                    other
+                ),
+            )),
+        }
     }
 
     /// Form K (2026-05-20): the optional `where <c>, <c>, ...`
@@ -4942,5 +5034,169 @@ main locus App {
             }
             other => panic!("expected Adapter transport, got {:?}", other),
         }
+    }
+
+    // F.31 (2026-05-23): placement block parser tests.
+
+    fn placement_block_of(prog: &Program) -> &PlacementBlock {
+        let locus = prog
+            .items
+            .iter()
+            .find_map(|it| match it {
+                TopDecl::Locus(l) if l.is_main => Some(l),
+                _ => None,
+            })
+            .expect("main locus");
+        locus
+            .members
+            .iter()
+            .find_map(|m| match m {
+                LocusMember::Placement(p) => Some(p),
+                _ => None,
+            })
+            .expect("placement block")
+    }
+
+    #[test]
+    fn parse_placement_pinned_bare() {
+        let src = r#"
+locus Job { run() { } }
+
+main locus App {
+    params { job: Job = Job { }; }
+    placement { job: pinned; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let pb = placement_block_of(&prog);
+        assert_eq!(pb.entries.len(), 1);
+        assert_eq!(pb.entries[0].field.name, "job");
+        match &pb.entries[0].spec {
+            PlacementSpec::Pinned { core: None } => {}
+            other => panic!("expected Pinned{{ core: None }}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_placement_pinned_with_core() {
+        let src = r#"
+locus Worker { run() { } }
+
+main locus App {
+    params { w: Worker = Worker { }; }
+    placement { w: pinned(core = 3); }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let pb = placement_block_of(&prog);
+        match &pb.entries[0].spec {
+            PlacementSpec::Pinned { core: Some(3) } => {}
+            other => panic!("expected Pinned{{ core: Some(3) }}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_placement_cooperative_bare() {
+        let src = r#"
+locus Worker { run() { } }
+
+main locus App {
+    params { w: Worker = Worker { }; }
+    placement { w: cooperative; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let pb = placement_block_of(&prog);
+        match &pb.entries[0].spec {
+            PlacementSpec::Cooperative { pool: None } => {}
+            other => panic!(
+                "expected Cooperative{{ pool: None }}, got {:?}", other
+            ),
+        }
+    }
+
+    #[test]
+    fn parse_placement_cooperative_with_pool() {
+        let src = r#"
+locus Worker { run() { } }
+
+main locus App {
+    params { w: Worker = Worker { }; }
+    placement { w: cooperative(pool = io); }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let pb = placement_block_of(&prog);
+        match &pb.entries[0].spec {
+            PlacementSpec::Cooperative { pool: Some(p) } => {
+                assert_eq!(p.name, "io");
+            }
+            other => panic!(
+                "expected Cooperative{{ pool: Some(io) }}, got {:?}", other
+            ),
+        }
+    }
+
+    #[test]
+    fn parse_placement_multiple_entries() {
+        let src = r#"
+locus A { run() { } }
+locus B { run() { } }
+locus C { run() { } }
+
+main locus App {
+    params {
+        a: A = A { };
+        b: B = B { };
+        c: C = C { };
+    }
+    placement {
+        a: pinned(core = 1);
+        b: pinned(core = 2);
+        c: cooperative(pool = io);
+    }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let pb = placement_block_of(&prog);
+        assert_eq!(pb.entries.len(), 3);
+        assert_eq!(pb.entries[0].field.name, "a");
+        assert_eq!(pb.entries[1].field.name, "b");
+        assert_eq!(pb.entries[2].field.name, "c");
+    }
+
+    #[test]
+    fn parse_placement_outside_main_rejected() {
+        let src = r#"
+locus NotMain {
+    placement { x: pinned; }
+}
+"#;
+        let err = parse_str(src).expect_err("should reject");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("placement") && msg.contains("main"),
+            "expected diagnostic about placement being main-only; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_old_schedule_annotation_rejected() {
+        // F.31: `: schedule pinned` is no longer accepted on
+        // a locus declaration. Diag should hint at the new
+        // placement-block shape.
+        let src = r#"
+locus Old : schedule pinned {
+    run() { }
+}
+"#;
+        let err = parse_str(src).expect_err("should reject");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("placement") || msg.contains("F.31"),
+            "expected diag to mention placement / F.31 migration; got: {}",
+            msg
+        );
     }
 }
