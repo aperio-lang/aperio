@@ -26,6 +26,13 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Re-pushing the same tag (common during a stabilization push)
+# auto-cancels the in-flight run so a fresh one isn't stuck
+# behind it in the scarce macos-13 runner queue.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write          # creating releases + uploading assets
 
