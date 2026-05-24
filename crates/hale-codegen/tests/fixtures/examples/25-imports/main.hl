@@ -1,0 +1,27 @@
+// 25-imports — multi-file Hale project under the F.19 per-
+// directory seed model.
+//
+// Three files in this directory:
+//   - types.hl       — `type Trade` definition
+//   - notional.hl    — `fn notional(Trade) -> Decimal` helper
+//   - main.hl        — this file, with `fn main()` driving it
+//
+// F.19 (shipped 2026-05-11) collapses the old per-file `import`
+// shape: every `.hl` file in the directory is part of one seed,
+// every top-level decl is visible to every other file in the
+// same directory in one shared scope. Same shape Go gets from
+// per-package visibility. Build via `hale build examples/
+// 25-imports` (directory target); the binary lands at
+// `examples/25-imports/25-imports`. Cross-seed imports (one
+// directory reaching into another) are still deferred.
+//
+// Per The Design / Hale, multi-file projects are organisational
+// — the framework's coordination primitives don't change shape
+// because a type lives in a sibling file. The bus and the
+// region allocator stay one unit; what's different is just
+// where the source TEXT lives.
+
+fn main() {
+    let t = Trade { symbol: "GOOG", price: 170.5d, qty: 100.0d };
+    println(t.symbol, " notional = ", notional(t));
+}

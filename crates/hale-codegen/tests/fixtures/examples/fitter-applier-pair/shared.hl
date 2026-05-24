@@ -1,0 +1,51 @@
+// shared.hl — types compiled into both fitter and applier
+// binaries.
+//
+// Per F.14 (three-way interface) and the fitter/applier split:
+// both binaries compile from the same source for these types,
+// guaranteeing schema agreement at the type level. The bus
+// carries only parameter-bundle values; no separate
+// serialization protocol is needed because the schema is the
+// source.
+
+type Observation {
+    value_low: Decimal;
+    value_high: Decimal;
+    timestamp: Time;
+}
+
+type Kernel {
+    scale: Decimal;
+    valid_after: Time;
+    perspective_id: Int;
+}
+
+type Action {
+    kind: String;            // "primary" or "secondary"
+    magnitude: Decimal;
+    quantity: Decimal;
+    action_id: Int;
+}
+
+type Receipt {
+    action_id: Int;
+    receipt_value: Decimal;
+    receipt_count: Decimal;
+}
+
+// A serializable parameter bundle within the shared schema.
+// stable_when says: only ship when at least three independent
+// perspectives have validated the kernel (multi-perspective
+// stability commit-rule from the ancient texts).
+perspective KernelPerspective {
+    params {
+        kernel: Kernel;
+        validation_count: Int = 0;
+    }
+
+    stable_when {
+        return self.validation_count >= 3;
+    }
+
+    serialize_as Kernel;
+}

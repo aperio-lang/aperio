@@ -1,0 +1,20 @@
+// lib-toy/greet.hl — a namespace lotus, exported.
+//
+// Fixture for v1.x-IMPORT PR3 cross-seed end-to-end test. The
+// `format(...)` method returns a `Formatted` value declared in
+// `format.hl` — an intra-seed cross-file reference. The
+// mangler's unified rename map for the lib must rewrite the
+// reference in this file to the `__lib_toy_format_Formatted`
+// name produced when format.hl's decls were mangled.
+
+locus Greeter {
+    params {
+        prefix: String = "hello";
+    }
+    fn format(name: String) -> Formatted {
+        return Formatted {
+            head: self.prefix,
+            body: name,
+        };
+    }
+}

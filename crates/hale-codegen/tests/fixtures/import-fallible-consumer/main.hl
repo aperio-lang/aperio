@@ -1,0 +1,14 @@
+// Consumer for the cross-seed `or` on Path callees test (#66).
+// The agent's natural shape — `alias::fn(args) or raise` /
+// `alias::fn(args) or fallback` — must codegen.
+
+import "../lib-fallible" as lp;
+
+fn main() {
+    let a = lp::parse_digit("4") or raise;
+    println("a=", a);
+
+    // Substitute path — fallback expression replaces the error.
+    let b = lp::parse_digit("nope") or 99;
+    println("b=", b);
+}

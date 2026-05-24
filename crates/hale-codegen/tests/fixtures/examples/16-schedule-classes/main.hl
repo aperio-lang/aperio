@@ -1,0 +1,72 @@
+// 16-schedule-classes — explicit schedule annotations.
+//
+// Per The Design / lotus, schedule class is to execution what
+// projection class is to memory: same source, two runtime shapes,
+// kept honestly bimodal.
+//
+//   Cooperative — shared scheduler thread; yields between
+//                 substrate cells (handler exits, lifecycle
+//                 transitions, bus dispatches). Handler bodies
+//                 are atomic. Default.
+//
+//   Pinned     — owns its own OS thread, optionally a CPU core.
+//                Bus events to/from it cross thread boundaries
+//                via formal mailbox post. For latency-critical
+//                paths or work in deeper layers of the lotus.
+//
+// No third "greedy" class: cooperative already guarantees
+// handler-atomicity, so the only thing greedy could add was
+// "don't yield BETWEEN cells either" — which is leaving the
+// cooperative scheduler entirely. The place you go when you
+// leave is your own thread. That's pinned.
+//
+// m27 ships pinned threads (this example actually demonstrates
+// the new substrate): PinnedWorker spawns a pthread at
+// instantiation; its run() body executes on that thread; main
+// thread continues; main joins the pinned thread at scope exit.
+// The 50ms sleep on the pinned thread + main-thread println
+// makes the ordering deterministic.
+//
+// v0 scope: pinned loci can declare ONLY run() — no bus, no
+// other lifecycle methods. Full pinned lifecycle + cross-
+// thread bus mailbox land in m28.
+//
+// F.31 (2026-05-23): placement (cooperative vs pinned) moved
+// from a per-locus annotation to a `placement { }` block on
+// `main locus`. The library locus stays deployment-neutral;
+// the binary's main picks the placement per instance.
+
+locus CooperativeWorker {
+    run() {
+        println("cooperative: shared thread, handler-atomic");
+    }
+}
+
+locus PinnedWorker {
+    run() {
+        // Sleep so the main-thread println races us and lands
+        // first deterministically. Without this, the print
+        // order would be non-deterministic — pinned really
+        // runs in parallel.
+        std::time::sleep(50ms);
+        println("pinned: ran on its own pthread");
+    }
+}
+
+main locus ScheduleClassesApp {
+    params {
+        pinned_w: PinnedWorker     = PinnedWorker { };
+        coop_w:   CooperativeWorker = CooperativeWorker { };
+    }
+    placement {
+        pinned_w: pinned;
+        // coop_w left unspecified → cooperative(pool = main)
+    }
+    run() {
+        println("main: spawned both; will join pinned at scope exit");
+    }
+}
+
+fn main() {
+    ScheduleClassesApp { };
+}

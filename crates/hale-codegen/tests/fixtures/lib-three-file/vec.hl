@@ -1,0 +1,4 @@
+@form(vec)
+locus IntVec {
+    capacity { heap items of Int; }
+}

@@ -1,0 +1,4 @@
+// lib-three-file/c.hl — references both A and B; declares a fn.
+fn render(b: Beta) -> String {
+    return b.inner.label + ":" + b.counter;
+}

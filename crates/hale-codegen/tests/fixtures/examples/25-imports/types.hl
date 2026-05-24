@@ -1,0 +1,10 @@
+// types.hl — typed records shared across files in this
+// directory. F.19 per-directory seed model: every `.hl` file
+// in this dir is in one shared scope, so `Trade` is visible
+// to main.hl and notional.hl without any `import` statement.
+
+type Trade {
+    symbol: String;
+    price:  Decimal;
+    qty:    Decimal;
+}

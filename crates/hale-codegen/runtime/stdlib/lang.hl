@@ -1,0 +1,727 @@
+// Hale stdlib — std::lang.
+//
+// Language-agnostic AST query interface. Encapsulates per-
+// language tree-sitter node-kind strings + extraction
+// heuristics so source-walking tools can be written agnostically
+// over languages. Isolating per-language knowledge behind one
+// type lets consumers compose against a stable API.
+//
+// **v0 scope.** Only Go is wired. New languages slot in by:
+//   1. Adding a `parse_<lang>` to `std::ts` (m96-followup).
+//   2. Adding flavor arms to each method below.
+//
+// **Future direction.** When Hale ships traits / interfaces,
+// `Lang` becomes a trait with per-language impls (`GoLang`,
+// `RustLang`, ...). Until then, the single-locus + flavor-
+// switch pattern is the cleanest available shape: extractors
+// see one type, language-specific knowledge stays internal.
+//
+// Use site:
+//   let lang = std::lang::Lang { flavor: "go" };
+//   let tree = lang.parse(src);
+//   let root = std::ts::root_node(tree);
+//   if lang.is_fn_decl(root) { ... }
+//
+// Tree handles + node handles still come from `std::ts::*`
+// directly — those are language-agnostic substrate. Only
+// CLASSIFICATION + NAME EXTRACTION go through `Lang`.
+
+locus __StdLangLang {
+    params {
+        // Per-language flavor. v0: "go". Future: "rust",
+        // "python", "ts", etc. Methods dispatch on this.
+        flavor: String = "go";
+    }
+
+    // ---- Parsing ----
+
+    // Parse source into a tree handle. Routes to the right
+    // `std::ts::parse_*` based on flavor. Returns 0 on
+    // unsupported flavor or parse failure.
+    fn parse(src: String) -> Int {
+        if self.flavor == "go" {
+            return std::ts::parse_go(src);
+        }
+        return 0;
+    }
+
+    // ---- Node-kind classifiers ----
+    //
+    // Each `is_X(node)` answers "is this node of category X in
+    // the active flavor's grammar?" Tree-sitter kind names vary
+    // per-grammar (Go's `function_declaration` ↔ Rust's
+    // `function_item` ↔ Python's `function_definition`) — this
+    // is exactly the friction we're isolating.
+
+    fn is_package_clause(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "package_clause"; }
+        return false;
+    }
+
+    fn is_import_decl(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "import_declaration"; }
+        return false;
+    }
+
+    fn is_fn_decl(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "function_declaration"; }
+        return false;
+    }
+
+    fn is_type_decl(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "type_declaration"; }
+        return false;
+    }
+
+    fn is_type_spec(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "type_spec"; }
+        return false;
+    }
+
+    fn is_string_literal(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "interpreted_string_literal"; }
+        return false;
+    }
+
+    // Concurrent-spawn statement. Go: `go_statement`. Rust:
+    // would be `tokio::spawn(...)` / `thread::spawn(...)` call
+    // expressions — needs different detection. Python: an
+    // `await` over an `asyncio.create_task` call. Each flavor
+    // wires its own equivalent.
+    fn is_concurrent_spawn(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" { return k == "go_statement"; }
+        return false;
+    }
+
+    // Long-running loop heuristic. Go: a `for_statement` whose
+    // first named child is `block` (no condition / range_clause).
+    // Other flavors have analogous shapes (`loop {}` in Rust,
+    // `while True:` in Python).
+    fn is_infinite_loop(node: Int) -> Bool {
+        let k = std::ts::node_kind(node);
+        if self.flavor == "go" {
+            if k != "for_statement" { return false; }
+            let n = std::ts::node_named_child_count(node);
+            if n == 0 { return false; }
+            let first = std::ts::node_named_child(node, 0);
+            return std::ts::node_kind(first) == "block";
+        }
+        return false;
+    }
+
+    // ---- Name / text extractors ----
+    //
+    // Each `extract_X(node)` reads the relevant text from a
+    // classified node. Returns "?" for misses (defensive — the
+    // extractor's caller should already have verified the
+    // classification via `is_X` before calling here).
+
+    fn extract_fn_name(fn_decl: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(fn_decl);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(fn_decl, i);
+                if std::ts::node_kind(c) == "identifier" {
+                    return std::ts::node_text(c);
+                }
+                i = i + 1;
+            }
+        }
+        return "?";
+    }
+
+    fn extract_type_name(type_spec: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(type_spec);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(type_spec, i);
+                if std::ts::node_kind(c) == "type_identifier" {
+                    return std::ts::node_text(c);
+                }
+                i = i + 1;
+            }
+        }
+        return "?";
+    }
+
+    fn extract_package_name(pkg_clause: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(pkg_clause);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(pkg_clause, i);
+                if std::ts::node_kind(c) == "package_identifier" {
+                    return std::ts::node_text(c);
+                }
+                i = i + 1;
+            }
+        }
+        return "?";
+    }
+
+    // Strip surrounding quotes from a string-literal text.
+    // Go: "fmt" → fmt; Rust: same; Python: handles both
+    // 'foo' and "foo" — needs flavor branching at v1. v0 is
+    // language-agnostic since both supported flavors use ".
+    fn strip_string_quotes(raw: String) -> String {
+        let n = len(raw);
+        if n < 2 { return ""; }
+        return raw[1..n-1];
+    }
+
+    // ---- Heuristics ----
+
+    // HTTP-handler shape detection. v0 uses param-substring
+    // match. Each flavor has its own framework idiom:
+    //   Go:     (w http.ResponseWriter, r *http.Request)
+    //   Rust:   axum / actix per-extractor types
+    //   Python: Flask `request` global; FastAPI Depends()
+    fn is_http_handler(fn_decl: Int) -> Bool {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(fn_decl);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(fn_decl, i);
+                if std::ts::node_kind(c) == "parameter_list" {
+                    let txt = std::ts::node_text(c);
+                    return std::str::index_of(txt, "ResponseWriter") >= 0
+                        && std::str::index_of(txt, "Request") >= 0;
+                }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // Extract the target fn name from a named concurrent spawn,
+    // or "" for anonymous spawns / unsupported shapes. For Go's
+    // `go someFn()` this returns "someFn"; for `go obj.Method()`
+    // returns "" (selector, not a bare identifier we can
+    // cross-reference); for `go func(){...}()` returns "" (no
+    // named target).
+    fn extract_spawn_target(spawn_stmt: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(spawn_stmt);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(spawn_stmt, i);
+                if std::ts::node_kind(c) == "call_expression" {
+                    let cn = std::ts::node_named_child_count(c);
+                    if cn > 0 {
+                        let f = std::ts::node_named_child(c, 0);
+                        if std::ts::node_kind(f) == "identifier" {
+                            return std::ts::node_text(f);
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return "";
+    }
+
+    // Anonymous-vs-named spawn distinction.
+    //
+    //   "anonymous" — `go func() { ... }()` (Go),
+    //                 `tokio::spawn(async move { ... })` (Rust)
+    //   "named"     — `go someFunc()` / `tokio::spawn(someFn())`
+    //
+    // Returned as a String so the extractor's tagged
+    // accumulator can include it verbatim in the JSON output.
+    fn spawn_kind(spawn_stmt: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(spawn_stmt);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(spawn_stmt, i);
+                if std::ts::node_kind(c) == "call_expression" {
+                    let cn = std::ts::node_named_child_count(c);
+                    if cn > 0 {
+                        let f = std::ts::node_named_child(c, 0);
+                        if std::ts::node_kind(f) == "func_literal" {
+                            return "anonymous";
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            return "named";
+        }
+        return "named";
+    }
+
+    // True if `node` is a call expression. The entrypoint-mode
+    // call walker uses this to enumerate every call site inside
+    // a fn body for the outward tower.
+    fn is_call_expression(node: Int) -> Bool {
+        if self.flavor == "go" {
+            return std::ts::node_kind(node) == "call_expression";
+        }
+        return false;
+    }
+
+    // Extract the callee name from a `call_expression`. Two shapes:
+    //   - bare identifier:        `foo(args)`        → "foo"
+    //   - selector expression:    `pkg.Bar(args)`    → "Bar"
+    //     (only the right-hand side; v0 doesn't resolve
+    //     `pkg` against the import list)
+    // Returns "" for anything else (func-literal callees, type
+    // assertions used as calls, etc.).
+    fn extract_call_name(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            if n == 0 { return ""; }
+            let f = std::ts::node_named_child(call_node, 0);
+            let k = std::ts::node_kind(f);
+            if k == "identifier" {
+                return std::ts::node_text(f);
+            }
+            if k == "selector_expression" {
+                // Selector right-hand-side is a field_identifier
+                // — that's the method/function name. Walk children
+                // and pick the first field_identifier.
+                let fn_count = std::ts::node_named_child_count(f);
+                let mut i = 0;
+                while i < fn_count {
+                    let c = std::ts::node_named_child(f, i);
+                    if std::ts::node_kind(c) == "field_identifier" {
+                        return std::ts::node_text(c);
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        return "";
+    }
+
+    // Extract the receiver expression text from a
+    // `call_expression` whose callee is a selector. Returns
+    // "" for direct calls (`foo(args)`); returns the operand
+    // text for selector calls (`pkg.Bar(args)` → "pkg",
+    // `pkg.Sub.Bar(args)` → "pkg.Sub").
+    //
+    // Paired with `extract_call_name`: the receiver carries the
+    // semantic context the bare name has lost. Useful for
+    // distinguishing package calls (lower-case receiver matching
+    // the file's imports → stdlib / external), method calls on
+    // local vars, and direct user-fn calls — without inventing
+    // heuristics on the bare name.
+    fn extract_call_receiver(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            if n == 0 { return ""; }
+            let f = std::ts::node_named_child(call_node, 0);
+            let k = std::ts::node_kind(f);
+            if k == "selector_expression" {
+                let opn = std::ts::node_named_child_count(f);
+                if opn > 0 {
+                    let operand = std::ts::node_named_child(f, 0);
+                    return std::ts::node_text(operand);
+                }
+            }
+        }
+        return "";
+    }
+
+    // Recognize per-flavor language builtins — `len`, `make`,
+    // `panic`, etc. for Go. Useful for call-classification
+    // pipelines that need to distinguish builtin calls from
+    // user-defined fns, package calls, or method calls.
+    //
+    // Maintained as a flat per-flavor table. Per-language facts
+    // (which names are builtins) belong on Lang; domain
+    // vocabulary (which morphemes map to which motion) belongs
+    // on Morpheme.
+    fn is_builtin(name: String) -> Bool {
+        if self.flavor == "go" {
+            if name == "append"  { return true; }
+            if name == "cap"     { return true; }
+            if name == "clear"   { return true; }
+            if name == "close"   { return true; }
+            if name == "complex" { return true; }
+            if name == "copy"    { return true; }
+            if name == "delete"  { return true; }
+            if name == "imag"    { return true; }
+            if name == "len"     { return true; }
+            if name == "make"    { return true; }
+            if name == "max"     { return true; }
+            if name == "min"     { return true; }
+            if name == "new"     { return true; }
+            if name == "panic"   { return true; }
+            if name == "print"   { return true; }
+            if name == "println" { return true; }
+            if name == "real"    { return true; }
+            if name == "recover" { return true; }
+        }
+        return false;
+    }
+
+    // Function with this name should be classified as the root
+    // locus's `main` lifecycle method. Go: "main". Rust:
+    // "main". Python: convention-based (`__main__`-guarded).
+    fn is_main_fn(fn_decl: Int) -> Bool {
+        return self.extract_fn_name(fn_decl) == "main";
+    }
+
+    // Function with this name should be classified as a
+    // `birth()` body for the root locus. Go: "init" (per-
+    // package init). Rust: no direct equivalent; might map to
+    // `lazy_static!` initializers or `ctor`-attributed fns.
+    // Python: module-level top-level statements.
+    fn is_init_fn(fn_decl: Int) -> Bool {
+        if self.flavor == "go" {
+            return self.extract_fn_name(fn_decl) == "init";
+        }
+        return false;
+    }
+
+    // ---- HTTP handler registration detection ----
+    //
+    // Recognizes calls like `mux.HandleFunc("/path", fn)` or
+    // `http.HandleFunc("/path", fn)` — the wiring that connects
+    // an HTTP route to a handler function. Used by the
+    // operational extractor / onboard report to enrich handler
+    // entries with their subjects (path-derived bus subject in
+    // Hale terms).
+    //
+    // v0 covers the stdlib-net/http patterns. Per-framework
+    // routers (chi, echo, gin, gorilla/mux v2) have analogous
+    // shapes (`r.Get`, `e.GET`, `app.Get`, `r.HandleFunc`) —
+    // future flavors / extensions can recognize them.
+
+    fn is_handler_registration(node: Int) -> Bool {
+        if self.flavor == "go" {
+            let k = std::ts::node_kind(node);
+            if k != "call_expression" { return false; }
+            let n = std::ts::node_named_child_count(node);
+            if n < 2 { return false; }
+            let fn_part = std::ts::node_named_child(node, 0);
+            if std::ts::node_kind(fn_part) != "selector_expression" {
+                return false;
+            }
+            // Find the selector's field_identifier (the method
+            // name on the receiver). Match on canonical handler-
+            // registration method names.
+            let fcn = std::ts::node_named_child_count(fn_part);
+            let mut i = 0;
+            while i < fcn {
+                let c = std::ts::node_named_child(fn_part, i);
+                if std::ts::node_kind(c) == "field_identifier" {
+                    let name = std::ts::node_text(c);
+                    if name == "HandleFunc" || name == "Handle" {
+                        return true;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return false;
+    }
+
+    // Extract the route string (with quotes stripped) from a
+    // handler-registration call. Returns "" on miss.
+    fn extract_handler_route(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(call_node, i);
+                if std::ts::node_kind(c) == "argument_list" {
+                    let an = std::ts::node_named_child_count(c);
+                    if an >= 1 {
+                        let arg0 = std::ts::node_named_child(c, 0);
+                        if std::ts::node_kind(arg0) == "interpreted_string_literal" {
+                            return self.strip_string_quotes(std::ts::node_text(arg0));
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return "";
+    }
+
+    // Extract the target handler fn name from a handler-
+    // registration call. Returns "" if the second arg isn't a
+    // bare identifier (e.g. an inline func_literal — those
+    // don't bind to a named fn we can cross-reference).
+    fn extract_handler_target(call_node: Int) -> String {
+        if self.flavor == "go" {
+            let n = std::ts::node_named_child_count(call_node);
+            let mut i = 0;
+            while i < n {
+                let c = std::ts::node_named_child(call_node, i);
+                if std::ts::node_kind(c) == "argument_list" {
+                    let an = std::ts::node_named_child_count(c);
+                    if an >= 2 {
+                        let arg1 = std::ts::node_named_child(c, 1);
+                        if std::ts::node_kind(arg1) == "identifier" {
+                            return std::ts::node_text(arg1);
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return "";
+    }
+}
+
+// std::lang::Morpheme — noun→motion rewriter.
+//
+// **Seed-only.** The lookup table holds 15 universally-clear
+// entity-noun mappings (Cache → remembering, Repository →
+// carrying, ...). We deliberately do NOT exhaustively curate
+// per-language vocabulary. The intended use is as a fallback
+// for the universally-clear cases; consumers that need richer
+// vocabulary supply their own lookups (typically per-codebase,
+// possibly via an LLM that reads source).
+//
+// **Three categorical shapes** (per the design note):
+//   - Agent noun  (-er/-or/-ar suffix on a verb stem) → motion
+//     by suffix rule.
+//   - Entity noun (named for the flow it enables) → motion
+//     by lookup table.
+//   - Shape noun  (pure data, no flow) → no motion; the agent
+//     classifies these as types, not loci.
+//
+// **Min-stem-6 guard** prevents the suffix rule from
+// fabricating motions for short non-verb-stem nouns
+// ("Order" → "ording" is wrong; "User" → "using" is wrong).
+// Honesty about uncertainty preserves the recognition.
+locus __StdLangMorpheme {
+    params {
+        // Per-language flavor. v0: "go". Other flavors share
+        // the rules; only the lookup-table seed varies.
+        flavor: String = "go";
+
+        // Per-codebase overrides — multi-line raw text from a
+        // `.hale-overrides` file (or equivalent). Each
+        // non-blank, non-comment line is `Morpheme: motion-form`
+        // (whitespace around `:` is tolerated; lines starting
+        // with `#` are comments).
+        //
+        // Closes the agentic feedback loop: an LLM driving the
+        // onboarding session resolves <unknown:X> markers by
+        // reading source, writes its decisions to a per-codebase
+        // overrides file, and re-runs. The seed lookup stays
+        // universal; per-codebase vocabulary lives next to the
+        // codebase. Per
+        // notes/onboarding-shape-rules.md.
+        overrides: String = "";
+    }
+
+    fn is_upper(c: String) -> Bool {
+        return std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) >= 0;
+    }
+
+    fn to_lower(s: String) -> String {
+        let n = len(s);
+        let mut out = "";
+        let mut i = 0;
+        while i < n {
+            let c = s[i..i+1];
+            let idx = std::str::index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c);
+            if idx >= 0 {
+                out = out + "abcdefghijklmnopqrstuvwxyz"[idx..idx+1];
+            } else {
+                out = out + c;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn ends_with(s: String, suffix: String) -> Bool {
+        let sl = len(s);
+        let xl = len(suffix);
+        if sl < xl { return false; }
+        return s[sl-xl..sl] == suffix;
+    }
+
+    // Trim ASCII whitespace from both ends of `s`. Routes through
+    // the std::str::trim C-runtime primitive (added in the v1.x
+    // stdlib followup batch) — the local open-coded loop is gone.
+    fn trim(s: String) -> String {
+        return std::str::trim(s);
+    }
+
+    // Look up `m` in the per-codebase overrides text. Returns
+    // "" on miss (caller falls through to seed / suffix rule /
+    // unknown). Format: one entry per line, "Morpheme: motion-form"
+    // with whitespace tolerance; "#" starts a line comment;
+    // blank lines skip.
+    fn lookup_in_overrides(m: String) -> String {
+        if len(self.overrides) == 0 { return ""; }
+        let total = len(self.overrides);
+        let mut from = 0;
+        while from < total {
+            let rest = self.overrides[from..total];
+            let nl = std::str::index_of(rest, "\n");
+            let mut line = "";
+            if nl < 0 { line = rest; from = total; }
+            else { line = rest[0..nl]; from = from + nl + 1; }
+            let trimmed = self.trim(line);
+            if len(trimmed) == 0 { continue; }
+            if trimmed[0..1] == "#" { continue; }
+            let colon = std::str::index_of(trimmed, ":");
+            if colon < 0 { continue; }
+            let key = self.trim(trimmed[0..colon]);
+            if key == m {
+                let val = self.trim(trimmed[colon+1..len(trimmed)]);
+                return val;
+            }
+        }
+        return "";
+    }
+
+    // The seed lookup table. Universal entity-noun mappings —
+    // these are agreed-upon across most languages and codebases.
+    // Per-codebase additions go through `overrides` (param), not
+    // here.
+    fn lookup_morpheme(m: String) -> String {
+        // Per-codebase overrides win over the seed. Lets agents
+        // resolve <unknown:X> markers per-codebase without
+        // contaminating the universal vocabulary.
+        let from_overrides = self.lookup_in_overrides(m);
+        if len(from_overrides) > 0 { return from_overrides; }
+
+        // The seed is currently flavor-independent — these
+        // entity nouns are common across Go, Rust, Python,
+        // and TypeScript codebases. Per-flavor specialization
+        // would gate on `self.flavor == "..."` but isn't
+        // needed at v0.
+        if m == "Controller" { return "controlling"; }
+        if m == "Processor"  { return "processing"; }
+        if m == "Manager"    { return "managing"; }
+        if m == "Handler"    { return "handling"; }
+        if m == "Listener"   { return "listening"; }
+        if m == "Validator"  { return "checking"; }
+        if m == "Builder"    { return "building"; }
+        if m == "Parser"     { return "parsing"; }
+        if m == "Repository" { return "carrying"; }
+        if m == "Cache"      { return "remembering"; }
+        if m == "Bus"        { return "routing"; }
+        if m == "Queue"      { return "queuing"; }
+        if m == "Pool"       { return "pooling"; }
+        if m == "Pipeline"   { return "flowing"; }
+        if m == "Service"    { return "serving"; }
+        return "";
+    }
+
+    // Convenience forwarder — `is_builtin` is a language fact,
+    // not domain vocabulary, and lives on `Lang`. This shim
+    // saves callers a separate Lang construction when they
+    // already hold a Morpheme.
+    fn is_builtin(name: String) -> Bool {
+        let l = std::lang::Lang { flavor: self.flavor };
+        return l.is_builtin(name);
+    }
+
+    // Agent-noun suffix rule with min-stem guard. See the design
+    // note for why min-morpheme-6 (= min-stem-4) is the right
+    // threshold.
+    fn suffix_rule(m: String) -> String {
+        let n = len(m);
+        if n < 6 { return ""; }
+        if self.ends_with(m, "er") {
+            return self.to_lower(m[0..n-2]) + "ing";
+        }
+        if self.ends_with(m, "or") {
+            return self.to_lower(m[0..n-2]) + "ing";
+        }
+        if self.ends_with(m, "ar") {
+            return self.to_lower(m[0..n-2]) + "ing";
+        }
+        return "";
+    }
+
+    // One morpheme → its motion form. Lookup wins over suffix;
+    // both failing yields the explicit `<unknown:X>` marker.
+    // **The unknown marker is the agent's prompt.** It says
+    // "read this name's defining file and propose a motion form
+    // (or reclassify as a shape noun)."
+    fn morpheme_to_motion(m: String) -> String {
+        let hit = self.lookup_morpheme(m);
+        if len(hit) > 0 { return hit; }
+        let suf = self.suffix_rule(m);
+        if len(suf) > 0 { return suf; }
+        return "<unknown:" + m + ">";
+    }
+
+    // Split a CamelCase identifier into morphemes, separated by
+    // "\n". "OrderProcessor" → "Order\nProcessor\n".
+    //
+    // Acronyms stay together. The split rule: emit a boundary
+    // before an uppercase char iff (a) the previous char is
+    // lowercase (the normal CamelCase boundary) or (b) the next
+    // char is lowercase (the acronym-ends-and-a-new-word-starts
+    // boundary, e.g. the C in "HTTPClient"). Consecutive
+    // uppers without a trailing lowercase stay clumped — so
+    // "URL" stays "URL" and "HTTPClient" splits as
+    // "HTTP\nClient". Prevents the single-letter morpheme
+    // noise ("H\nT\nT\nP\nClient") that earlier v0 produced.
+    fn split_camel(name: String) -> String {
+        let n = len(name);
+        if n == 0 { return ""; }
+        let mut out = "";
+        let mut start = 0;
+        let mut i = 1;
+        while i < n {
+            let c = name[i..i+1];
+            if self.is_upper(c) {
+                let prev = name[i-1..i];
+                let prev_lower = !self.is_upper(prev);
+                let mut next_lower = false;
+                if i + 1 < n {
+                    let next = name[i+1..i+2];
+                    next_lower = !self.is_upper(next);
+                }
+                if prev_lower || next_lower {
+                    out = out + name[start..i] + "\n";
+                    start = i;
+                }
+            }
+            i = i + 1;
+        }
+        out = out + name[start..n] + "\n";
+        return out;
+    }
+
+    // CamelCase name → motion form. Each morpheme rewritten
+    // independently; results joined with "-".
+    fn name_to_motion(name: String) -> String {
+        let morphemes = self.split_camel(name);
+        let total = len(morphemes);
+        let mut out = "";
+        let mut from = 0;
+        let mut first = true;
+        while from < total {
+            let rest = morphemes[from..total];
+            let nl = std::str::index_of(rest, "\n");
+            let mut m = "";
+            if nl < 0 {
+                m = rest;
+                from = total;
+            } else {
+                m = rest[0..nl];
+                from = from + nl + 1;
+            }
+            if len(m) > 0 {
+                let motion = self.morpheme_to_motion(m);
+                if first { out = motion; first = false; }
+                else { out = out + "-" + motion; }
+            }
+        }
+        return out;
+    }
+}

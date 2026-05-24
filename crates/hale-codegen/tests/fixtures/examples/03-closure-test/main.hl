@@ -1,0 +1,34 @@
+// 03-closure-test — collapse: clean dissolution.
+//
+// A locus declares two values and asserts they should match.
+// On dissolution, the closure is evaluated:
+//   - pass  -> collapse: clean dissolve, no observable output,
+//              parent (if any) sees a normal child-dissolution
+//              event.
+//
+// The fail path has two branches in F.9:
+//   - parent absorbs the ClosureViolation -> see
+//     `examples/03b-closure-absorbed/`.
+//   - parent bubbles or no parent handler -> process exits
+//     non-zero with the violation report. See
+//     `examples/03c-closure-bubbled/`.
+
+locus CheckerL {
+    params {
+        x: Int = 5;
+        y: Int = 5;
+    }
+
+    closure xy_match {
+        self.x ~~ self.y within 0;
+        // Default epoch: dissolve. Closure evaluates as the
+        // locus dissolves; if it fails, the locus is exploded.
+    }
+}
+
+fn main() {
+    // Closure passes (5 ~~ 5 within 0). Locus collapses
+    // cleanly; no output.
+    CheckerL { x: 5, y: 5 };
+    println("collapsed cleanly.");
+}

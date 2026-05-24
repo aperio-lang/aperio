@@ -1,0 +1,106 @@
+// 37-explicit-closures — m44: explicit-epoch closures.
+//
+// Closures with `epoch explicit;` fire only when the user
+// calls `check_closures();` from inside the locus's body.
+// Where birth/dissolve audit lifecycle bookends, tick fires
+// every cell, and duration fires every-N-of-time, explicit
+// is for "audit at THIS specific checkpoint" patterns where
+// the locus author knows precisely when an invariant should
+// hold (and can short-circuit early checks that would always
+// pass).
+//
+// With m44 landed, all five closure epochs now lower:
+// Birth + Dissolve + Tick + Duration + Explicit. The F.9
+// invariant-and-repair substrate is closure-epoch-complete.
+//
+// Implementation:
+//   - Codegen: synthetic `__explicit_closures(self, parent,
+//     on_failure)` fn that lowers each explicit-epoch
+//     assertion. `check_closures();` from inside a locus
+//     body emits a direct call with the locus's resolved
+//     parent + on_failure handler.
+//   - Interpreter: `closure_fires_at_explicit` predicate +
+//     `fire_explicit_closures` helper, intercepted on the
+//     `check_closures()` Call expression.
+//
+// What this exercises:
+//   - A Ledger locus with two state fields (debits / credits)
+//     and an explicit-epoch closure asserting
+//     `debits ~~ credits within 0` (double-entry invariant).
+//   - The handler `on_post(t: Tx)` updates one side per
+//     transaction. If updates land in pairs the invariant
+//     holds; a stray single-side update breaks it.
+//   - The Ledger calls `check_closures();` AFTER posting a
+//     full transaction batch (a checkpoint); the parent's
+//     on_failure absorbs any imbalance violation.
+//   - Tick would fire after every `on_post`, including in
+//     mid-batch states where one side is already updated and
+//     the other isn't yet — the invariant would
+//     spuriously fail. Explicit lets the locus express
+//     "audit only when I say it's safe."
+
+type Tx {
+    debit: Int;
+    credit: Int;
+}
+
+locus Ledger {
+    params {
+        debits: Int = 0;
+        credits: Int = 0;
+    }
+
+    closure balanced {
+        // Double-entry: total debits must equal total credits.
+        // Only meaningful at transaction-boundary checkpoints,
+        // not after every individual leg.
+        self.debits ~~ self.credits within 0;
+        epoch explicit;
+    }
+
+    bus {
+        subscribe "post" as on_post of type Tx;
+    }
+
+    fn on_post(t: Tx) {
+        // Apply both legs of the transaction, then audit.
+        // If a malformed Tx arrives (debit != credit), the
+        // explicit check will catch the imbalance.
+        self.debits = self.debits + t.debit;
+        self.credits = self.credits + t.credit;
+        println("Ledger.on_post: debits=", self.debits,
+                " credits=", self.credits);
+        check_closures();
+    }
+}
+
+locus Auditor {
+    on_failure(l: Ledger, err: ClosureViolation) {
+        println("Auditor: imbalance detected (", err.closure,
+                "); diff=", err.diff);
+    }
+
+    bus {
+        publish "post" of type Tx;
+    }
+
+    run() {
+        Ledger { };
+
+        println("--- balanced legs ---");
+        "post" <- Tx { debit: 100, credit: 100 };
+        "post" <- Tx { debit: 50, credit: 50 };
+
+        println("--- imbalanced leg ---");
+        "post" <- Tx { debit: 30, credit: 0 };
+
+        println("--- corrective leg ---");
+        "post" <- Tx { debit: 0, credit: 30 };
+
+        println("done");
+    }
+}
+
+fn main() {
+    Auditor { };
+}

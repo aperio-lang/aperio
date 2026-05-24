@@ -1,0 +1,38 @@
+// 12-user-types — user-defined `type` declarations as plain
+// data records.
+//
+// `type T { f1: T1; f2: T2; ... }` lowers to an LLVM struct;
+// `T { f1: v1, f2: v2 }` lowers to alloca + per-field stores
+// returning a pointer; `value.f1` lowers to GEP+load. Each
+// field can be any scalar or another user type.
+//
+// Foundational for the bus router (m12): bus payloads are
+// always user types, and handlers receive them as TypeRef
+// pointers. This milestone is the substrate the router will
+// dispatch through.
+
+type Point {
+    x: Int;
+    y: Int;
+}
+
+type Greeting {
+    text: String;
+    sender: String;
+    priority: Int;
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    println("p.x=", p.x, " p.y=", p.y);
+
+    let q = Point { x: p.x + 10, y: p.y * 2 };
+    println("q.x=", q.x, " q.y=", q.y);
+
+    let g = Greeting {
+        text: "hello",
+        sender: "alice",
+        priority: 7,
+    };
+    println(g.sender, " says ", g.text, " (priority ", g.priority, ")");
+}

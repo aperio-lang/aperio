@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hale-syntax",
+    "crates/hale-types",
+    "crates/hale-runtime",
+    "crates/hale-codegen",
+    "crates/hale-cli",
+    "crates/hale-ts-shim",
+]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2021"
+authors = ["the Hale authors"]
+license = "Apache-2.0"
+repository = "local"
+
+[workspace.dependencies]
+# All crates use only std for v0. Dependencies added as needed.

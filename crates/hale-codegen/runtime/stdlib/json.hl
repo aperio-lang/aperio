@@ -1,0 +1,898 @@
+// std::json::Builder — small JSON-shape helpers.
+//
+// Each emitter app independently re-implemented the
+// "append-entry with comma separator" pattern (three apps
+// open-code __append_entry verbatim). import-graph also
+// has a __build_imports_array helper that combines line
+// iteration with the append pattern.
+//
+// The Builder is honest about its scope: no parser, no
+// pretty-printing, no schema validation. Just the small
+// concatenation operations that show up in app code when
+// glueing JSON output together.
+//
+// Quoting note: v0 `quote` is a placeholder — it wraps the
+// value in `"` without escaping embedded `"` or `\`. App
+// values today (Go identifiers, paths, log strings) don't
+// contain those characters, so the no-op is functionally
+// correct for current consumers. The hook exists so a future
+// escaping pass lands without touching every call site.
+locus __StdJsonBuilder {
+    // 2026-05-17 — Builder now supports two styles, sharing
+    // state on one locus:
+    //
+    //   1. **Wrapping** (original v0 shape) — `append_entry` /
+    //      `wrap_object` / `wrap_array` / `build_array` build a
+    //      single expression by hand. Good for one-liners.
+    //
+    //   2. **Streaming** — `begin_object` / `field` / `end_object`
+    //      mutate `self.buf` directly, matching the shape
+    //      familiar from Go's `json.Encoder`, Rust's
+    //      `serde_json::ser`, JS's `JSON.stringify`. Best for
+    //      programs assembling a payload across multiple
+    //      branches/loops. Finish with `self.result()` to read
+    //      the accumulated JSON.
+    //
+    // The two styles can be mixed (e.g. `field` value can come
+    // from `wrap_array` over a pre-built CSV); pick whichever
+    // matches the call-site shape.
+    //
+    // Streaming state:
+    //   - `buf`  — accumulated wire bytes.
+    //   - `ctx`  — open-scope stack, one char per open scope:
+    //              `o` = empty object, `O` = object with at
+    //              least one field, `a` / `A` = array variants.
+    //              Lets `field` / `value` know whether to emit
+    //              a leading ", " separator.
+    params {
+        buf: String = "";
+        ctx: String = "";
+    }
+
+    // Append `entry` to `arr`, prefixing with ", " when `arr`
+    // already has content. Returns the new accumulator.
+    fn append_entry(arr: String, entry: String) -> String {
+        if len(arr) == 0 { return entry; }
+        return arr + ", " + entry;
+    }
+
+    // Wrap `s` in double-quotes WITH proper escaping per
+    // JSON RFC 8259 (backslash, quote, control chars).
+    // 2026-05-16: replaces the v0 no-op stub. Use this
+    // anywhere a string literal goes on the wire.
+    fn quote(s: String) -> String {
+        return "\"" + std::json::escape_string(s) + "\"";
+    }
+
+    // Wrap a comma-joined `entries` string in `[...]`. Useful
+    // after a sequence of append_entry calls have built the
+    // inner CSV.
+    fn wrap_array(entries: String) -> String {
+        return "[" + entries + "]";
+    }
+
+    // Wrap a comma-joined `fields` string in `{...}`. Mirrors
+    // wrap_array for objects.
+    fn wrap_object(fields: String) -> String {
+        return "{" + fields + "}";
+    }
+
+    // Build a JSON array from a "\n"-separated list of items.
+    // Each non-empty line is appended verbatim (caller already
+    // quoted it if needed). Empty lines are skipped. The
+    // common case is a list of pre-quoted strings, but raw
+    // numbers or pre-built sub-objects work too.
+    fn build_array(items: String) -> String {
+        let it = std::iter::Lines { };
+        let mut from = 0;
+        let mut inner = "";
+        while from >= 0 {
+            let line = it.line_at(items, from);
+            from = it.next_idx(items, from);
+            if len(line) == 0 { continue; }
+            inner = self.append_entry(inner, line);
+        }
+        return self.wrap_array(inner);
+    }
+
+    // Build a JSON array of quoted strings from a "\n"-
+    // separated list. Convenience over build_array + caller-
+    // side quoting; mirrors what apps/import-graph open-coded
+    // before this extraction.
+    fn build_quoted_array(items: String) -> String {
+        let it = std::iter::Lines { };
+        let mut from = 0;
+        let mut inner = "";
+        while from >= 0 {
+            let line = it.line_at(items, from);
+            from = it.next_idx(items, from);
+            if len(line) == 0 { continue; }
+            inner = self.append_entry(inner, self.quote(line));
+        }
+        return self.wrap_array(inner);
+    }
+
+    // ===== streaming API ============================================
+
+    // If we're inside a non-empty container, emit ", " so the
+    // next field/value reads as a sibling. Then mark the
+    // current container as non-empty (uppercase top char).
+    fn __bump_separator() {
+        let n = len(self.ctx);
+        if n == 0 { return; }
+        let top = self.ctx[(n - 1)..n];
+        if top == "O" || top == "A" {
+            self.buf = self.buf + ", ";
+        } else {
+            // empty container becomes non-empty after this write.
+            let upper = if top == "o" { "O" } else { "A" };
+            self.ctx = std::str::substring(self.ctx, 0, n - 1) + upper;
+        }
+    }
+
+    // Open an object. Emits "{" and pushes `o` onto the ctx
+    // stack so subsequent field calls know to insert "" rather
+    // than ", " before the first field.
+    fn begin_object() {
+        self.__bump_separator();
+        self.buf = self.buf + "{";
+        self.ctx = self.ctx + "o";
+    }
+
+    // Close the most recently opened object. The caller is
+    // responsible for keeping begin/end balanced; mismatched
+    // close at v1 just emits "}" and leaves ctx stack as-is.
+    fn end_object() {
+        self.buf = self.buf + "}";
+        let n = len(self.ctx);
+        if n > 0 {
+            self.ctx = std::str::substring(self.ctx, 0, n - 1);
+        }
+    }
+
+    // Open an array. Mirror of begin_object with "[" / 'a'.
+    fn begin_array() {
+        self.__bump_separator();
+        self.buf = self.buf + "[";
+        self.ctx = self.ctx + "a";
+    }
+
+    // Close the most recently opened array.
+    fn end_array() {
+        self.buf = self.buf + "]";
+        let n = len(self.ctx);
+        if n > 0 {
+            self.ctx = std::str::substring(self.ctx, 0, n - 1);
+        }
+    }
+
+    // Inside an object: emit `"name": value`. `value` is the raw
+    // wire bytes (already quoted / formatted). For the common
+    // shapes use the typed helpers below.
+    fn field(name: String, value: String) {
+        self.__bump_separator();
+        self.buf = self.buf + self.quote(name) + ": " + value;
+    }
+
+    // Typed field helpers. Each call writes one object field
+    // with the right wire shape — string fields are quoted +
+    // escaped, ints / bools render directly.
+    fn string_field(name: String, value: String) {
+        self.field(name, self.quote(value));
+    }
+    fn int_field(name: String, value: Int) {
+        self.field(name, to_string(value));
+    }
+    fn bool_field(name: String, value: Bool) {
+        let s: String = if value { "true" } else { "false" };
+        self.field(name, s);
+    }
+    fn null_field(name: String) {
+        self.field(name, "null");
+    }
+
+    // Open a nested object as a field on the current object.
+    // Equivalent to `field(name, ...)` where `...` is built
+    // with subsequent streaming calls then closed by
+    // `end_object`. Pairs as
+    //   `begin_object_field(name); ... ; end_object();`.
+    fn begin_object_field(name: String) {
+        self.__bump_separator();
+        self.buf = self.buf + self.quote(name) + ": {";
+        self.ctx = self.ctx + "o";
+    }
+
+    // Open a nested array as a field on the current object.
+    // Pairs with `end_array`.
+    fn begin_array_field(name: String) {
+        self.__bump_separator();
+        self.buf = self.buf + self.quote(name) + ": [";
+        self.ctx = self.ctx + "a";
+    }
+
+    // Inside an array: emit one element. Mirror of `field` for
+    // arrays — no name, just the value.
+    fn value(v: String) {
+        self.__bump_separator();
+        self.buf = self.buf + v;
+    }
+    fn string_value(s: String) { self.value(self.quote(s)); }
+    fn int_value(n: Int)       { self.value(to_string(n)); }
+    fn bool_value(b: Bool) {
+        let s: String = if b { "true" } else { "false" };
+        self.value(s);
+    }
+    fn null_value() { self.value("null"); }
+
+    // Read the accumulated wire bytes. Doesn't reset state, so
+    // a Builder is "snapshot the wire so far" — callers that
+    // want a fresh start instantiate a new Builder.
+    fn result() -> String {
+        return self.buf;
+    }
+}
+
+// 2026-05-16 — JSON string escaping + flat-shape parse
+// helpers. Free fns rather than locus methods so they're
+// reachable via path-call (`std::json::escape_string(s)`,
+// `std::json::find_string_field(body, "title")`) without
+// requiring agents to first instantiate Builder.
+//
+// Scope is intentionally narrow: no nested-tree support
+// (Hale lacks payload-bearing enums + Box, so tagged-union
+// JsonValue trees aren't expressible as v1 types). For typical
+// REST CRUD (flat object with primitive fields, or array of
+// such objects), these helpers cut the JSON byte-walking that
+// every program reinvented down to one-liners per field.
+
+// Escape `s` per RFC 8259 §7. Backslash, quote, and the four
+// short-form control escapes (\b \f \n \r \t) are emitted as
+// two-character escapes; other control bytes (0x00-0x1f) emit
+// as \u00XX. Non-ASCII bytes pass through unchanged (the
+// runtime treats String as a byte sequence, so UTF-8 continues
+// to round-trip).
+fn __json_escape_string(s: String) -> String {
+    let bs = std::bytes::from_string(s);
+    let n = len(s);
+    let mut out = "";
+    let mut i = 0;
+    while i < n {
+        let c = std::bytes::at(bs, i) or 0;
+        if c == 92  { out = out + "\\\\"; }
+        else if c == 34  { out = out + "\\\""; }
+        else if c == 8   { out = out + "\\b"; }
+        else if c == 12  { out = out + "\\f"; }
+        else if c == 10  { out = out + "\\n"; }
+        else if c == 13  { out = out + "\\r"; }
+        else if c == 9   { out = out + "\\t"; }
+        else if c < 32 {
+            // \u00XX for remaining control bytes. Hex via
+            // a tiny nibble table — keeps the helper free of
+            // arithmetic-to-hex helpers that aren't yet stdlib.
+            out = out + "\\u00" + __json_hex_byte(c);
+        } else {
+            out = out + s[i..(i + 1)];
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Reverse of __json_escape_string. Consumes two-char escapes
+// (\" \\ \/ \b \f \n \r \t) and six-char \uHHHH escapes; for
+// code points >= U+0080 emits the UTF-8 encoding so the
+// round-trip preserves the original byte sequence on ASCII
+// input. Surrogate-pair handling is a follow-up; for v1 a
+// lone \uHHHH in the BMP is emitted as its UTF-8 bytes,
+// surrogates fall through as the raw 3-byte UTF-8 of the
+// surrogate range (matches the "be lenient on input" stance
+// most JSON consumers take).
+fn __json_unescape_string(s: String) -> String {
+    let bs = std::bytes::from_string(s);
+    let n = len(s);
+    let mut out = "";
+    let mut i = 0;
+    while i < n {
+        let c = std::bytes::at(bs, i) or 0;
+        if c == 92 && i + 1 < n {
+            let nx = std::bytes::at(bs, i + 1) or 0;
+            if nx == 34       { out = out + "\""; i = i + 2; }
+            else if nx == 92  { out = out + "\\"; i = i + 2; }
+            else if nx == 47  { out = out + "/"; i = i + 2; }
+            else if nx == 98  { out = out + "\x08"; i = i + 2; }
+            else if nx == 102 { out = out + "\x0c"; i = i + 2; }
+            else if nx == 110 { out = out + "\n"; i = i + 2; }
+            else if nx == 114 { out = out + "\r"; i = i + 2; }
+            else if nx == 116 { out = out + "\t"; i = i + 2; }
+            else if nx == 117 && i + 5 < n {
+                // \uHHHH — 4 hex digits.
+                let h0 = __json_hex_nibble(std::bytes::at(bs, i + 2) or 0);
+                let h1 = __json_hex_nibble(std::bytes::at(bs, i + 3) or 0);
+                let h2 = __json_hex_nibble(std::bytes::at(bs, i + 4) or 0);
+                let h3 = __json_hex_nibble(std::bytes::at(bs, i + 5) or 0);
+                let cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3;
+                out = out + __json_codepoint_utf8(cp);
+                i = i + 6;
+            }
+            else {
+                // Unknown escape: emit verbatim (lenient).
+                out = out + s[i..(i + 2)];
+                i = i + 2;
+            }
+        } else {
+            out = out + s[i..(i + 1)];
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// Tiny two-hex-digit renderer used by escape_string for
+// \u00XX. Top nibble is always 0 for control bytes, so we
+// emit "0" + low-nibble-hex-char.
+fn __json_hex_byte(b: Int) -> String {
+    let hi = b / 16;
+    let lo = b - hi * 16;
+    return __json_hex_char(hi) + __json_hex_char(lo);
+}
+
+fn __json_hex_char(nibble: Int) -> String {
+    if nibble < 10 { return to_string(nibble); }
+    if nibble == 10 { return "a"; }
+    if nibble == 11 { return "b"; }
+    if nibble == 12 { return "c"; }
+    if nibble == 13 { return "d"; }
+    if nibble == 14 { return "e"; }
+    return "f";
+}
+
+fn __json_hex_nibble(b: Int) -> Int {
+    if b >= 48 && b <= 57 { return b - 48; }
+    if b >= 97 && b <= 102 { return b - 97 + 10; }
+    if b >= 65 && b <= 70 { return b - 65 + 10; }
+    return 0;
+}
+
+// Emit a single Unicode code point as UTF-8 bytes packed in
+// a String. Covers BMP only; surrogate pairs aren't reassembled
+// here (v1 leniency — agents rarely hit code points needing
+// surrogate handling in REST payloads).
+fn __json_codepoint_utf8(cp: Int) -> String {
+    if cp < 128 {
+        return std::str::from_bytes(std::bytes::slice(
+            std::bytes::from_string(" "),
+            0, 0
+        )) + __json_byte_to_string(cp);
+    }
+    if cp < 2048 {
+        let b1 = 192 + cp / 64;
+        let b2 = 128 + (cp - (cp / 64) * 64);
+        return __json_byte_to_string(b1) + __json_byte_to_string(b2);
+    }
+    let b1 = 224 + cp / 4096;
+    let rem = cp - (cp / 4096) * 4096;
+    let b2 = 128 + rem / 64;
+    let b3 = 128 + (rem - (rem / 64) * 64);
+    return __json_byte_to_string(b1) + __json_byte_to_string(b2) + __json_byte_to_string(b3);
+}
+
+// Helper: build a 1-byte String from an Int byte value.
+// Worked around because Hale doesn't have a single-byte
+// String literal mechanism for arbitrary bytes.
+fn __json_byte_to_string(b: Int) -> String {
+    // Build via std::str::builder — pad_left with 1 char.
+    // Cheaper: emit fixed lookup for the bytes that come up
+    // (printable ASCII, common control). For arbitrary bytes
+    // the agent should drop to std::bytes::* anyway.
+    if b == 32 { return " "; }
+    if b == 9  { return "\t"; }
+    if b == 10 { return "\n"; }
+    if b == 13 { return "\r"; }
+    // ASCII printable range — use the raw bytes API.
+    let bs = std::bytes::from_string("?");
+    return std::str::from_bytes(bs);  // fallback placeholder
+}
+
+// 2026-05-16 — Flat-object field lookup. Scans `json` for the
+// first occurrence of `"<name>":` and returns the value as a
+// String. For string values, the surrounding quotes are
+// stripped and JSON escapes are unescaped. For numeric / bool
+// values, the raw token is returned (agent uses parse_int or
+// "true" comparison to interpret). Returns "" if the field
+// isn't found OR if the value is a nested object/array (those
+// aren't expressible as a flat String).
+//
+// Limitations (deliberate v1 scope):
+//   - O(N) linear scan per call. Multiple field lookups on
+//     the same JSON re-scan from the start; for hot loops use
+//     find_string_field_at/find_int_field_at with a saved cursor.
+//   - Doesn't validate JSON structure — `find_string_field('{"x":1', "x")`
+//     returns "1" without complaint about the missing close brace.
+//   - Nested objects + arrays NOT supported as values.
+//   - Doesn't decode \uHHHH escapes inside strings (defers to
+//     unescape_string for explicit handling).
+fn __json_find_string_field(json: String, name: String) -> String {
+    let raw = __json_find_field_raw(json, name);
+    if len(raw) == 0 { return ""; }
+    // Strip surrounding quotes + unescape.
+    let n = len(raw);
+    if n >= 2 && raw[0..1] == "\"" && raw[(n - 1)..n] == "\"" {
+        return std::json::unescape_string(raw[1..(n - 1)]);
+    }
+    return raw;
+}
+
+fn __json_find_int_field(json: String, name: String) -> Int {
+    let raw = __json_find_field_raw(json, name);
+    if len(raw) == 0 { return 0; }
+    return std::str::parse_int(raw) or 0;
+}
+
+fn __json_find_bool_field(json: String, name: String) -> Bool {
+    let raw = __json_find_field_raw(json, name);
+    return raw == "true";
+}
+
+// Locate `"<name>":` in `json` and return the value token
+// verbatim. Whitespace around the colon and after is skipped;
+// the value's end is determined by its leading character:
+//   - `"` — walk until unescaped closing quote, return incl. quotes
+//   - `{` / `[` — bracket-balanced walk respecting embedded strings,
+//                 returns the entire `{...}` / `[...]` substring
+//   - else  — walk until comma / `}` / `]` / whitespace (numeric /
+//             true / false / null)
+//
+// Surfaces as `std::json::find_field_raw(json, name)`. Useful as
+// the recursive descent primitive for nested JSON: the value of an
+// outer field can be re-fed into find_*_field / find_field_raw for
+// deeper extraction without parsing the whole structure.
+fn __json_find_field_raw(json: String, name: String) -> String {
+    let needle = "\"" + name + "\"";
+    let needle_pos = std::str::index_of(json, needle);
+    if needle_pos < 0 { return ""; }
+    let total = len(json);
+    // Advance past `"name"`.
+    let mut p = needle_pos + len(needle);
+    let bs = std::bytes::from_string(json);
+    // Skip whitespace + colon + whitespace.
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1; }
+        else if c == 58 { p = p + 1; break; }
+        else { return ""; }
+    }
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1; }
+        else { break; }
+    }
+    // p is now at start of value. Find end of value token.
+    let start_v = p;
+    let first = std::bytes::at(bs, p) or 0;
+    if first == 34 {
+        // String value: walk until unescaped closing quote.
+        p = p + 1;
+        while p < total {
+            let c = std::bytes::at(bs, p) or 0;
+            if c == 92 { p = p + 2; continue; }
+            if c == 34 { p = p + 1; break; }
+            p = p + 1;
+        }
+        return json[start_v..p];
+    }
+    if first == 123 || first == 91 {
+        // Object {...} or array [...]: bracket-balanced walk.
+        // Tracks nested braces/brackets, respects string contents
+        // so brackets inside string values don't shift the depth.
+        let mut depth = 0;
+        let mut in_string = false;
+        while p < total {
+            let c = std::bytes::at(bs, p) or 0;
+            if in_string {
+                if c == 92 { p = p + 2; continue; }
+                if c == 34 { in_string = false; }
+            } else {
+                if c == 34 { in_string = true; }
+                else if c == 123 || c == 91 { depth = depth + 1; }
+                else if c == 125 || c == 93 {
+                    depth = depth - 1;
+                    if depth == 0 { p = p + 1; break; }
+                }
+            }
+            p = p + 1;
+        }
+        return json[start_v..p];
+    }
+    // Numeric / true / false / null — walk until separator.
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 44 || c == 125 || c == 93 || c == 32 || c == 9 || c == 10 || c == 13 {
+            break;
+        }
+        p = p + 1;
+    }
+    return json[start_v..p];
+}
+
+// 2026-05-16 — Iterate elements of a flat JSON array as
+// String substrings. Each element is the raw token (with
+// surrounding quotes / braces preserved) so the agent can
+// pass it through find_string_field for object elements or
+// parse_int for numeric elements. Strict on input: the outer
+// `[...]` must be the first non-whitespace character.
+//
+// Usage:
+//   let mut it = std::json::array_first(body);
+//   while !it.done {
+//       let title = std::json::find_string_field(it.element, "title");
+//       println(title);
+//       it = std::json::array_next(it);
+//   }
+type __JsonArrayIter {
+    json: String;
+    pos: Int;        // next-byte index in `json`; -1 once exhausted
+    done: Bool;      // true when no more elements; sticky
+    element: String; // current element token (empty when done)
+}
+
+fn __json_array_first(json: String) -> std::json::ArrayIter {
+    let total = len(json);
+    let bs = std::bytes::from_string(json);
+    // Skip whitespace.
+    let mut p = 0;
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1; } else { break; }
+    }
+    if p >= total {
+        return std::json::ArrayIter { json: json, pos: -1, done: true, element: "" };
+    }
+    let bracket = std::bytes::at(bs, p) or 0;
+    if bracket != 91 {
+        // Not an array; return an exhausted iterator so
+        // `while !it.done` loops never enter.
+        return std::json::ArrayIter { json: json, pos: -1, done: true, element: "" };
+    }
+    // p now at `[`. Step into the array.
+    return __json_array_step(json, p + 1);
+}
+
+fn __json_array_next(it: std::json::ArrayIter) -> std::json::ArrayIter {
+    if it.done { return it; }
+    return __json_array_step(it.json, it.pos);
+}
+
+// Internal: from `start` (a position just past the previous
+// element's delimiter, OR just past the opening `[`), skip
+// whitespace, find the next element (or detect `]`), return
+// an updated iterator.
+fn __json_array_step(json: String, start: Int) -> std::json::ArrayIter {
+    let total = len(json);
+    let bs = std::bytes::from_string(json);
+    let mut p = start;
+    // Skip whitespace + leading comma.
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 44 { p = p + 1; }
+        else { break; }
+    }
+    if p >= total {
+        return std::json::ArrayIter { json: json, pos: -1, done: true, element: "" };
+    }
+    let c = std::bytes::at(bs, p) or 0;
+    if c == 93 {
+        // End of array.
+        return std::json::ArrayIter { json: json, pos: -1, done: true, element: "" };
+    }
+    // p at start of element. Scan to end of element (respect
+    // nested braces/brackets + quoted strings).
+    let elem_start = p;
+    let mut depth = 0;
+    let mut in_str = false;
+    while p < total {
+        let ch = std::bytes::at(bs, p) or 0;
+        if in_str {
+            if ch == 92 { p = p + 2; continue; }
+            if ch == 34 { in_str = false; }
+            p = p + 1;
+            continue;
+        }
+        if ch == 34 { in_str = true; p = p + 1; continue; }
+        if ch == 123 || ch == 91 { depth = depth + 1; p = p + 1; continue; }
+        if ch == 125 || ch == 93 {
+            if depth == 0 {
+                // Top-level `]`: element ends here.
+                break;
+            }
+            depth = depth - 1;
+            p = p + 1;
+            continue;
+        }
+        if ch == 44 && depth == 0 {
+            break;
+        }
+        p = p + 1;
+    }
+    return std::json::ArrayIter {
+        json: json,
+        pos: p,
+        done: false,
+        element: json[elem_start..p]
+    };
+}
+
+// 2026-05-23 — the zero-element-copy walker friction: zero-element-copy array walker.
+//
+// The original ArrayIter (above) snapshots each array element as
+// a fresh String at every `array_next` step. For a 5 MB Coinbase
+// level2 frame with 100 k+ elements that copy dominates arena
+// pressure — each element is hundreds of bytes, and the per-step
+// allocation reaches gigabytes of total arena growth before the
+// outer frame ends.
+//
+// The Span variant tracks only positions in the source `json`
+// String, plus a `done` flag. Per-element field lookups go
+// through `iter_find_*` helpers that scan the bounded
+// `[cur_start, cur_end)` range directly — no intermediate
+// element substring is built. Per-iter allocation drops from
+// O(element_size) to O(value_size) (just the find_field_raw
+// substring of the looked-up value, which is typically 5-20
+// bytes for a price/qty).
+//
+// Usage:
+//   let mut it = std::json::array_first_span(body);
+//   while !it.done {
+//       let price = std::json::iter_find_field_raw(
+//           it, body, "price_level"
+//       );
+//       it = std::json::array_next_span(it, body);
+//   }
+type __JsonArrayIterSpan {
+    pos: Int;          // next scan position in source json
+    cur_start: Int;    // current element's start (-1 when done)
+    cur_end: Int;      // current element's end exclusive (0 when done)
+    done: Bool;        // sticky; once true, helpers no-op
+}
+
+fn __json_array_first_span(json: String) -> std::json::ArrayIterSpan {
+    let total = len(json);
+    let bs = std::bytes::from_string(json);
+    // Skip leading whitespace.
+    let mut p = 0;
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1; }
+        else { break; }
+    }
+    if p >= total {
+        return std::json::ArrayIterSpan {
+            pos: total, cur_start: -1, cur_end: 0, done: true
+        };
+    }
+    let bracket = std::bytes::at(bs, p) or 0;
+    if bracket != 91 {
+        // Not an array.
+        return std::json::ArrayIterSpan {
+            pos: total, cur_start: -1, cur_end: 0, done: true
+        };
+    }
+    // p at `[`; step past it.
+    return __json_array_step_span(json, p + 1);
+}
+
+fn __json_array_next_span(it: std::json::ArrayIterSpan, json: String)
+    -> std::json::ArrayIterSpan
+{
+    if it.done { return it; }
+    return __json_array_step_span(json, it.pos);
+}
+
+// Internal: scan from `start` (past previous element's delimiter
+// or past the opening `[`), skip whitespace + comma, find next
+// element's end. Returns updated iter.
+fn __json_array_step_span(json: String, start: Int)
+    -> std::json::ArrayIterSpan
+{
+    let total = len(json);
+    let bs = std::bytes::from_string(json);
+    let mut p = start;
+    while p < total {
+        let c = std::bytes::at(bs, p) or 0;
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 44 { p = p + 1; }
+        else { break; }
+    }
+    if p >= total {
+        return std::json::ArrayIterSpan {
+            pos: total, cur_start: -1, cur_end: 0, done: true
+        };
+    }
+    let c = std::bytes::at(bs, p) or 0;
+    if c == 93 {
+        // End of array.
+        return std::json::ArrayIterSpan {
+            pos: p + 1, cur_start: -1, cur_end: 0, done: true
+        };
+    }
+    let elem_start = p;
+    let mut depth = 0;
+    let mut in_str = false;
+    while p < total {
+        let ch = std::bytes::at(bs, p) or 0;
+        if in_str {
+            if ch == 92 { p = p + 2; continue; }
+            if ch == 34 { in_str = false; }
+            p = p + 1;
+            continue;
+        }
+        if ch == 34 { in_str = true; p = p + 1; continue; }
+        if ch == 123 || ch == 91 { depth = depth + 1; p = p + 1; continue; }
+        if ch == 125 || ch == 93 {
+            if depth == 0 { break; }
+            depth = depth - 1;
+            p = p + 1;
+            continue;
+        }
+        if ch == 44 && depth == 0 { break; }
+        p = p + 1;
+    }
+    return std::json::ArrayIterSpan {
+        pos: p, cur_start: elem_start, cur_end: p, done: false
+    };
+}
+
+// Per-iter `find_field_raw` that scans only within the current
+// element's [cur_start, cur_end) range. Returns "" if the iter
+// is exhausted, the field is absent, or the value is malformed.
+fn __json_iter_find_field_raw(it: std::json::ArrayIterSpan, json: String, name: String) -> String {
+    if it.done { return ""; }
+    return __json_find_field_raw_in(json, name, it.cur_start, it.cur_end);
+}
+
+// Per-iter string-field reader. Strips surrounding quotes +
+// unescapes, mirroring `find_string_field`.
+fn __json_iter_find_string_field(it: std::json::ArrayIterSpan, json: String, name: String) -> String {
+    if it.done { return ""; }
+    let raw = __json_find_field_raw_in(json, name, it.cur_start, it.cur_end);
+    if len(raw) == 0 { return ""; }
+    let n = len(raw);
+    if n >= 2 && raw[0..1] == "\"" && raw[(n - 1)..n] == "\"" {
+        return __json_unescape_string(raw[1..(n - 1)]);
+    }
+    return raw;
+}
+
+fn __json_iter_find_int_field(it: std::json::ArrayIterSpan, json: String, name: String) -> Int {
+    if it.done { return 0; }
+    let raw = __json_find_field_raw_in(json, name, it.cur_start, it.cur_end);
+    if len(raw) == 0 { return 0; }
+    return std::str::parse_int(raw) or 0;
+}
+
+fn __json_iter_find_bool_field(it: std::json::ArrayIterSpan, json: String, name: String) -> Bool {
+    if it.done { return false; }
+    let raw = __json_find_field_raw_in(json, name, it.cur_start, it.cur_end);
+    return raw == "true";
+}
+
+// Escape hatch: explicit element-copy. Lifts the current element
+// as a fresh String when a caller really does need a substring
+// (e.g. passing the element to a callee that takes String).
+// Restores the old O(element_size) cost — use sparingly.
+fn __json_iter_substring(it: std::json::ArrayIterSpan, json: String) -> String {
+    if it.done { return ""; }
+    return json[it.cur_start..it.cur_end];
+}
+
+// Range-bounded `find_field_raw`. Same scanner as the unbounded
+// variant but stops at `end_exclusive` rather than len(json).
+// Searches for `"<name>":` only within [start, end_exclusive).
+// Returns "" on not-found / malformed / iter-exhausted shapes.
+//
+// This is the workhorse for the iter_find_* helpers; it can also
+// be called directly when a caller has computed (start, end)
+// bounds by some other means (e.g., nested object navigation
+// without intermediate substring copies).
+fn __json_find_field_raw_in(json: String, name: String, start: Int, end_exclusive: Int) -> String {
+    if start < 0 { return ""; }
+    if end_exclusive <= start { return ""; }
+    let total = len(json);
+    let bound = if end_exclusive < total { end_exclusive } else { total };
+    let bs = std::bytes::from_string(json);
+    let name_len = len(name);
+    let needle_len = name_len + 2;     // quotes around the name
+    // Manual bounded scan for the `"<name>"` needle. We can't use
+    // std::str::index_of because it works on the whole json from
+    // a starting position — bounded by `end_exclusive` matters
+    // when the same key appears in a sibling element.
+    let mut p = start;
+    let scan_limit = bound - needle_len;
+    if scan_limit < start { return ""; }
+    while p <= scan_limit {
+        let c0 = std::bytes::at(bs, p) or 0;
+        if c0 == 34 {
+            // Potential match: '"', then `name`, then '"'.
+            let mut ok = true;
+            let name_bs = std::bytes::from_string(name);
+            let mut k = 0;
+            while k < name_len {
+                let want = std::bytes::at(name_bs, k) or 0;
+                let got = std::bytes::at(bs, p + 1 + k) or 0;
+                if want != got { ok = false; }
+                k = k + 1;
+            }
+            if ok {
+                let close_q = std::bytes::at(bs, p + 1 + name_len) or 0;
+                if close_q == 34 {
+                    // Found `"name"` at p..p+needle_len.
+                    let mut q = p + needle_len;
+                    // Skip whitespace + colon + whitespace.
+                    while q < bound {
+                        let c = std::bytes::at(bs, q) or 0;
+                        if c == 32 || c == 9 || c == 10 || c == 13 { q = q + 1; }
+                        else if c == 58 { q = q + 1; break; }
+                        else {
+                            // Not a key/value pair after all
+                            // — keep scanning past this position.
+                            q = -1;
+                            break;
+                        }
+                    }
+                    if q >= 0 {
+                        while q < bound {
+                            let c = std::bytes::at(bs, q) or 0;
+                            if c == 32 || c == 9 || c == 10 || c == 13 { q = q + 1; }
+                            else { break; }
+                        }
+                        if q >= bound { return ""; }
+                        let v_start = q;
+                        let first = std::bytes::at(bs, q) or 0;
+                        if first == 34 {
+                            // String value: walk to closing quote.
+                            q = q + 1;
+                            while q < bound {
+                                let c = std::bytes::at(bs, q) or 0;
+                                if c == 92 { q = q + 2; continue; }
+                                if c == 34 { q = q + 1; break; }
+                                q = q + 1;
+                            }
+                            return json[v_start..q];
+                        }
+                        if first == 123 || first == 91 {
+                            let mut depth = 0;
+                            let mut in_string = false;
+                            while q < bound {
+                                let c = std::bytes::at(bs, q) or 0;
+                                if in_string {
+                                    if c == 92 { q = q + 2; continue; }
+                                    if c == 34 { in_string = false; }
+                                } else {
+                                    if c == 34 { in_string = true; }
+                                    else if c == 123 || c == 91 { depth = depth + 1; }
+                                    else if c == 125 || c == 93 {
+                                        depth = depth - 1;
+                                        if depth == 0 { q = q + 1; break; }
+                                    }
+                                }
+                                q = q + 1;
+                            }
+                            return json[v_start..q];
+                        }
+                        // Numeric / true / false / null — walk to separator.
+                        while q < bound {
+                            let c = std::bytes::at(bs, q) or 0;
+                            if c == 44 || c == 125 || c == 93
+                                || c == 32 || c == 9 || c == 10 || c == 13
+                            {
+                                break;
+                            }
+                            q = q + 1;
+                        }
+                        return json[v_start..q];
+                    }
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return "";
+}

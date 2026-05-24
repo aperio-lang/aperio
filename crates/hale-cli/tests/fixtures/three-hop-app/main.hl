@@ -1,0 +1,17 @@
+// three-hop-app/main.hl — the app only imports the middle layer.
+//
+// A4 (G34) regression: app → mid → util chain. The app never
+// names `u::*` directly; it only sees the middle layer. But the
+// build must recursively resolve mid's `import "..." as u;`
+// directive so mid's body can compile.
+
+import "../three-hop-lib-mid" as mid;
+
+fn main() {
+    let w = mid::make_wrapped("answer", 42, "v1");
+    println(mid::describe(w));
+    // A5 (G18/G33): mid::label_of takes a `u::Box` param — the
+    // qualified cross-seed type resolves through the per-build
+    // path-rename table populated by A4's transitive walk.
+    println(mid::label_of(w.inner));
+}

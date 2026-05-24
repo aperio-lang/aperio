@@ -1,0 +1,437 @@
+// Hale stdlib — std::http.
+//
+// HTTP request parsing + response writing. Composes on
+// std::io::tcp::Stream (defined in io_tcp.hl, which comes
+// before this file in the concat order so __write_http_response's
+// signature can resolve `std::io::tcp::Stream` at fn-decl
+// time).
+//
+// User code reaches these via:
+//   - `std::http::Request` / `std::http::Response`
+//     (struct literals; types declared here)
+//   - `std::http::parse_request(raw)` (path-call dispatch
+//     in codegen routes to __parse_http_request below)
+//   - `std::http::write_response(s, resp)` (similarly routed
+//     to __write_http_response)
+
+// m84 — HTTP types: Request and Response.
+//
+// Both are `type` (records), not loci — they're plain data
+// with no lifecycle. Returnable from fns by value, embeddable
+// in larger structures, no dissolve to schedule. User code
+// references them via `std::http::Request` / `std::http::Response`
+// (path-rewritten to `__StdHttp*` at codegen time).
+//
+// Request carries the parsed request line (method, path,
+// HTTP version), the body, and a raw `headers` block
+// containing all header lines joined by `\r\n` (no trailing
+// CRLF). Users look up individual headers via the free fn
+// `std::http::header(req, name)` which walks the block.
+// Headers stay packed (not parsed into a map) because v0 has
+// no map type and a fixed-cap key/value array adds enough
+// machinery for marginal benefit on the typical < 30 headers
+// per request. Lookup is case-sensitive at v1 — callers that
+// need RFC-7230 case-insensitive semantics pre-normalize the
+// header name.
+type __StdHttpRequest {
+    method: String;
+    path: String;
+    version: String;
+    headers: String;
+    body: String;
+}
+
+// Response carries the status code (200, 404, etc.) plus a
+// content_type, an optional user-supplied `headers` block, and
+// the body. The fixed header set (Content-Type, Content-Length,
+// Connection: close) is still emitted unconditionally by
+// `write_response`; the C11 `headers` field (pond follow-up)
+// lets user code attach additional header lines (Set-Cookie,
+// X-Custom-*, CORS, etc.) without dropping down to a custom
+// Stream-driven writer. Mirrors `Request.headers` semantics:
+// CRLF-joined header lines with no trailing CRLF; lookup is
+// handled by the symmetric `std::http::header(resp, name)`
+// path-call. `content_type` defaults to "text/plain" so the
+// common case (`Response { status: 200, body: "ok" }`) writes
+// a valid response without the agent having to populate every
+// field. Set it explicitly for JSON / HTML / etc.
+type __StdHttpResponse {
+    status: Int;
+    content_type: String = "text/plain";
+    headers: String = "";
+    body: String;
+}
+
+// Map a numeric HTTP status to its canonical reason phrase.
+// v0 covers the codes a doc-server actually emits (200/301/
+// 400/404/500); any other input falls through to a generic
+// phrase. Lives in the stdlib so user code that wants
+// reason-phrase rendering doesn't have to redo this table.
+fn __status_phrase(status: Int) -> String {
+    if status == 200 { return "OK"; }
+    if status == 301 { return "Moved Permanently"; }
+    if status == 400 { return "Bad Request"; }
+    if status == 404 { return "Not Found"; }
+    if status == 500 { return "Internal Server Error"; }
+    return "Status";
+}
+
+// m84 — parse one HTTP request from a raw buffer.
+//
+// Pulls the request line (`METHOD PATH HTTP/VER\r\n`) and
+// the body (everything after `\r\n\r\n`). Headers between
+// the request line and the blank line are skipped — they
+// appear neither on the resulting Request nor on the wire
+// for the response. Malformed inputs (no CRLF in request
+// line, missing space, etc.) yield a Request with empty
+// fields rather than erroring; callers that care should
+// check `req.method == ""` and respond with 400.
+//
+// v0 assumption: the entire request-line + headers fit in
+// the recv buffer. Real-world browser GETs are well within
+// 4-8KB, so the m83 Listener's Stream.recv(8192) call covers
+// the common case. Streaming reassembly for oversized
+// requests is a later milestone.
+fn __parse_http_request(raw: String) -> std::http::Request {
+    // Locate end of request line.
+    let line_end = std::str::index_of(raw, "\r\n");
+    if line_end < 0 {
+        return std::http::Request {
+            method: "",
+            path: "",
+            version: "",
+            headers: "",
+            body: ""
+        };
+    }
+    let request_line = raw[0..line_end];
+    let raw_len = len(raw);
+
+    // Headers + body: split at `\r\n\r\n`. Headers are the
+    // raw lines between request-line end and that double-CRLF,
+    // joined as they appear on the wire (no trailing CRLF).
+    let header_end = std::str::index_of(raw, "\r\n\r\n");
+    let mut headers = "";
+    let mut body = "";
+    if header_end >= 0 {
+        let headers_start = line_end + 2;
+        if headers_start < header_end {
+            headers = raw[headers_start..header_end];
+        }
+        let body_start = header_end + 4;
+        if body_start < raw_len {
+            body = raw[body_start..raw_len];
+        }
+    }
+
+    // Split request line on spaces: METHOD SP PATH SP VERSION.
+    let sp1 = std::str::index_of(request_line, " ");
+    if sp1 < 0 {
+        return std::http::Request {
+            method: "",
+            path: "",
+            version: "",
+            headers: headers,
+            body: body
+        };
+    }
+    let line_len = len(request_line);
+    let method = request_line[0..sp1];
+    let after_method = request_line[(sp1 + 1)..line_len];
+
+    let sp2 = std::str::index_of(after_method, " ");
+    if sp2 < 0 {
+        return std::http::Request {
+            method: method,
+            path: after_method,
+            version: "",
+            headers: headers,
+            body: body
+        };
+    }
+    let after_method_len = len(after_method);
+    let path = after_method[0..sp2];
+    let version = after_method[(sp2 + 1)..after_method_len];
+
+    return std::http::Request {
+        method: method,
+        path: path,
+        version: version,
+        headers: headers,
+        body: body
+    };
+}
+
+// Header lookup over a CRLF-joined `name: value` block.
+// Walks the block looking for a line whose prefix matches
+// `name:` and returns the value with leading whitespace
+// trimmed, or an empty String if no header matches. Lookup is
+// case-insensitive per RFC 7230 §3.2 — both the needle and each
+// scanned header name are lowercased via std::str::lower before
+// comparison, so `Host` and `host` resolve identically. The
+// block shape matches the wire-side `\r\n`-joined header lines
+// produced by parse_request (no trailing CRLF) and the same
+// shape consumers attach via `Response.headers`. Factored out
+// of `__http_request_header` so the symmetric Response-side
+// getter (C11) doesn't duplicate the walker logic.
+fn __http_find_header_in_block(headers: String, name: String) -> String {
+    let total = len(headers);
+    if total <= 0 {
+        return "";
+    }
+    let needle = std::str::lower(name) + ":";
+    let needle_len = len(needle);
+    let mut cursor = 0;
+    while cursor < total {
+        // Find end of current line; fall through to total on
+        // the last unterminated entry (joined-by-CRLF block
+        // has no trailing CRLF).
+        let rel = std::str::index_of(headers[cursor..total], "\r\n");
+        let line_end = if rel < 0 { total } else { cursor + rel };
+        let line = headers[cursor..line_end];
+        let line_len = len(line);
+        if line_len >= needle_len {
+            let head = std::str::lower(line[0..needle_len]);
+            if head == needle {
+                // Trim leading whitespace on the value side.
+                let mut vstart = needle_len;
+                while vstart < line_len {
+                    let ch = line[vstart..(vstart + 1)];
+                    if ch == " " {
+                        vstart = vstart + 1;
+                    } else {
+                        return line[vstart..line_len];
+                    }
+                }
+                return "";
+            }
+        }
+        if rel < 0 {
+            return "";
+        }
+        cursor = line_end + 2;
+    }
+    return "";
+}
+
+// Request-side header lookup. Walks `req.headers` via the shared
+// block walker. Surfaced as `std::http::header(req, name)`.
+fn __http_request_header(req: std::http::Request, name: String) -> String {
+    return __http_find_header_in_block(req.headers, name);
+}
+
+// Response-side header lookup (C11, pond follow-up). Walks the
+// user-attached `resp.headers` block — the same CRLF-joined
+// shape as Request.headers. Surfaced as `std::http::header(resp,
+// name)`; the codegen dispatch forks on the first argument's
+// type so callers can use one path-call name regardless of
+// whether the receiver is a Request or a Response.
+fn __http_response_header(resp: std::http::Response, name: String) -> String {
+    return __http_find_header_in_block(resp.headers, name);
+}
+
+// m85 — write a Response to a Stream as HTTP/1.1 wire bytes.
+//
+// Wire shape:
+//   HTTP/1.1 <status> <phrase>\r\n
+//   Content-Type: <content_type>\r\n
+//   Content-Length: <byte length of body>\r\n
+//   Connection: close\r\n
+//   \r\n
+//   <body>
+//
+// Each Stream.send call ships one chunk through the m72
+// length-prefix-framed TCP substrate, but TCP is a stream —
+// peers see the raw bytes concatenated, which is what HTTP
+// expects. v0 sends headers + body separately to keep the
+// String concat work bounded; for very large bodies a future
+// milestone might stream chunks through the same Stream.
+//
+// `Connection: close` is hardcoded so the client knows the
+// connection terminates after this response. Keep-alive
+// would need a different request-handling loop in the
+// callback (read another request after responding); that's
+// deferred until persistent connections are actually
+// useful — most curl/browser doc-fetches close after one
+// request anyway.
+fn __write_http_response(s: std::io::tcp::Stream, resp: std::http::Response) {
+    let phrase = __status_phrase(resp.status);
+    let body_len = len(resp.body);
+    let status_line = "HTTP/1.1 " + to_string(resp.status) + " " + phrase + "\r\n";
+    let ct_header = "Content-Type: " + resp.content_type + "\r\n";
+    let cl_header = "Content-Length: " + to_string(body_len) + "\r\n";
+    // C11 (pond follow-up): user-supplied headers go after the
+    // fixed Content-Type / Content-Length / Connection lines but
+    // before the blank-line separator. When `resp.headers` is
+    // empty the wire bytes are byte-identical to the v0 shape:
+    // the existing `Connection: close\r\n\r\n` block is split
+    // into `Connection: close\r\n` + (optional user headers +
+    // `\r\n`) + a final `\r\n` blank-line — so the empty-headers
+    // path concatenates to the original four-line block exactly.
+    let conn_line = "Connection: close\r\n";
+    let extra_headers = if len(resp.headers) > 0 {
+        resp.headers + "\r\n"
+    } else {
+        ""
+    };
+    let blank_line = "\r\n";
+    let header = status_line + ct_header + cl_header + conn_line + extra_headers + blank_line;
+    s.send(header);
+    s.send(resp.body);
+}
+
+// 2026-05-16 — std::http::Handler interface. The contract a
+// Server's `handler` field is typed against. Any locus whose
+// method set covers `fn handle(req: Request) -> Response`
+// satisfies the interface structurally (F.20) — no `impl I
+// for L` ceremony. State lives on the handler-locus's params;
+// the Server's accept loop dispatches each request to
+// `handler.handle(req)` through a fat-pointer vtable.
+//
+// This replaces the v0 `handler: fn(Request) -> Response`
+// shape, which had no place to put per-request state because
+// Hale has no closures. Stateful HTTP (URL shortener, todo
+// list, session store) lands naturally now.
+interface __StdHttpHandler {
+    fn handle(req: std::http::Request) -> std::http::Response;
+}
+
+// 2026-05-16 — std::http::Server. Bundles the recv +
+// parse_request + dispatch + write_response loop every HTTP
+// program had to hand-roll on top of Listener. The agent
+// supplies a handler-locus whose state lives in its params
+// and whose `fn handle(req: Request) -> Response` method
+// dispatches each request; the Server locus owns the accept
+// loop and the per-connection scope.
+//
+// Usage:
+//   locus Routes {
+//       params {
+//           hits: Int = 0;
+//       }
+//       fn handle(req: std::http::Request) -> std::http::Response {
+//           self.hits = self.hits + 1;
+//           if req.path == "/health" {
+//               return std::http::Response { status: 200, body: "ok" };
+//           }
+//           return std::http::Response { status: 404, body: "not found" };
+//       }
+//   }
+//   fn main() {
+//       std::http::Server { port: 8080, handler: Routes { } };
+//   }
+//
+// Routes live inside the user-supplied handler's `handle`
+// body — Hale doesn't have a separate route-table primitive
+// and a string-keyed switch ladder inside one handler is
+// sized for the small route counts most apps actually have.
+// The Server locus covers the lifecycle (bind, accept loop,
+// per-connection Stream dissolution) and the wire protocol;
+// the handler-locus owns routing + state.
+
+// Per-connection helper. Recv up to 8KB (matches the Listener
+// default; spec/runtime.md notes the streaming-reassembly
+// follow-up for oversized requests), parse it, dispatch to
+// the user's handler via interface vtable, ship the response.
+// The Stream locus dissolves at fn-exit per the m82
+// scope-flush mechanism, which closes the conn fd.
+fn __http_handle_one_conn(conn_fd: Int, h: std::http::Handler) {
+    let s = std::io::tcp::Stream { conn_fd: conn_fd };
+    let raw = s.recv(8192);
+    let req = std::http::parse_request(raw);
+    let resp = h.handle(req);
+    std::http::write_response(s, resp);
+}
+
+locus __StdHttpServer {
+    params {
+        host: String = "127.0.0.1";
+        port: Int = 8080;
+        // -1 = run forever (canonical server shape); >= 0 caps
+        // the loop for tests + bounded workloads.
+        max_accepts: Int = -1;
+        // The user-supplied handler-locus, typed by the
+        // Handler interface so any locus with the right method
+        // shape satisfies it. Required — `Server { port: 8080 }`
+        // with no handler is a compile error so that "I forgot
+        // to wire up routes" surfaces immediately instead of
+        // shipping a server that 404s everything.
+        handler: std::http::Handler;
+        // 2026-05-17 — opt-in "I'm ready" announce. When
+        // non-empty, birth() prints this string after the
+        // listen socket binds successfully, so test oracles /
+        // supervisors can wait for it instead of polling
+        // connect-with-retry. Empty (the default) skips the
+        // print entirely. Canonical value: "READY".
+        ready_signal: String = "";
+        // not-yet-bound sentinel so dissolve() on a
+        // partially-constructed Server skips the close.
+        listen_fd: Int = -1;
+    }
+    // v1.x polish (2026-05-20): violate at birth() when the
+    // listen socket can't bind. Previously birth() proceeded
+    // with listen_fd = -1, ready_signal still printed, run()
+    // then spammed `accept: Bad file descriptor` at full speed
+    // (surfaced by a restart-within-60s scenario where
+    // the previous Server's port was in TIME_WAIT). The
+    // violation surfaces the bind failure immediately so a
+    // supervising parent's on_failure can address it (e.g.
+    // exit non-zero, signal an oracle), or it bubbles to the
+    // root if unaddressed.
+    closure listen_failed {
+        captures: host, port;
+        epoch inline;
+    }
+    birth() {
+        self.listen_fd = std::io::tcp::__listen_socket(self.host, self.port);
+        if self.listen_fd < 0 {
+            violate listen_failed;
+        }
+        if len(self.ready_signal) > 0 {
+            println(self.ready_signal);
+        }
+    }
+    run() {
+        let mut accepted = 0;
+        while self.max_accepts < 0 || accepted < self.max_accepts {
+            let conn = std::io::tcp::__accept_one(self.listen_fd);
+            // C-iii (2026-05-21): graceful exit on accept failure.
+            // Before, a -1 return (fd closed cross-thread, listen
+            // socket shut down by `shutdown()`, kernel error) was
+            // ignored — the loop spun on EBADF passing -1 down
+            // into __http_handle_one_conn at line rate (real workload
+            // hit this: 1.6M log lines in seconds when bind
+            // failed in birth() and run() proceeded anyway, a
+            // bug closed in `199f861`). The right behavior is to
+            // break and let dissolve() run; the canonical
+            // shutdown surface is `self.shutdown()` below which
+            // does shutdown(SHUT_RDWR) on the listen fd to
+            // unblock this accept from any thread.
+            if conn < 0 {
+                break;
+            }
+            __http_handle_one_conn(conn, self.handler);
+            accepted = accepted + 1;
+        }
+    }
+    // C-iii (2026-05-21): cross-thread shutdown signal. Calls
+    // shutdown(SHUT_RDWR) on the listen fd, which forces any
+    // blocking accept() on this socket to return immediately
+    // with an error. Safe to call from any scheduler /
+    // thread — that's the whole point: the cooperative
+    // scheduler running the Server's run() can't pump other
+    // work while accept blocks, so the wake has to come from
+    // outside the scheduler. Typical pattern: a pinned sibling
+    // locus (e.g. a pinned gateway) finishes its duration_s
+    // and calls `metrics_server.shutdown()` from its own
+    // thread before main() returns; run() unblocks, exits the
+    // loop, and dissolve() does the actual close. fd stays
+    // open here so dissolve() remains the canonical close
+    // path; a race between shutdown + dissolve is harmless.
+    fn shutdown() {
+        std::io::tcp::__shutdown_listen_socket(self.listen_fd);
+    }
+    dissolve() {
+        std::io::tcp::__close_fd(self.listen_fd);
+    }
+}

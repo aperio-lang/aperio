@@ -1,0 +1,12 @@
+// lib-toy/format.hl — a plain shape type, exported.
+//
+// Fixture for v1.x-IMPORT PR3 cross-seed end-to-end test. Held
+// together with `greet.hl` as one lib seed; intra-seed reference
+// goes from Greeter (in greet.hl) to Formatted (in this file)
+// via bare name — the mangler's unified rename map rewrites
+// both sides so the import-time mangling matches across files.
+
+type Formatted {
+    head: String;
+    body: String;
+}

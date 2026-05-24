@@ -1,0 +1,17 @@
+// three-hop-lib-util/box.hl — the deepest layer.
+//
+// Declares a shape type + a free fn the middle layer wraps.
+// A4 (G34) regression target.
+
+type Box {
+    label: String;
+    value: Int;
+}
+
+fn make_box(label: String, value: Int) -> Box {
+    return Box { label: label, value: value };
+}
+
+fn unbox(b: Box) -> String {
+    return b.label + "=" + b.value;
+}

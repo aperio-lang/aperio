@@ -1,0 +1,84 @@
+// 14-projection-classes — explicit projection annotations.
+//
+// Three coordinator loci, one per projection class. Each accepts
+// the same Leaf type. The projection annotation drives the
+// arena-allocation strategy at codegen — m22 routes chunked
+// children through `lotus_arena_create_subregion`; m23 routes
+// recognition the same way (with a documented stub for the
+// future bitmap-pool optimization). Rich uses independent
+// `lotus_arena_create` per child.
+//
+// All three coordinators produce identical output; the example
+// is a SUBSTRATE test — it exercises the codegen path for each
+// projection class so we know parsing + resolution + dispatch
+// don't regress as the allocator strategies refine.
+
+locus Leaf {
+    params {
+        value: Int = 0;
+    }
+    contract {
+        expose value: Int;
+    }
+}
+
+locus RichCoord : projection rich {
+    contract {
+        consume value: Int;
+    }
+    accept(c: Leaf) { }
+    run() {
+        let _l1 = Leaf { value: 1 };
+        let _l2 = Leaf { value: 2 };
+        let _l3 = Leaf { value: 3 };
+        let mut total: Int = 0;
+        for child in self.children {
+            total = total + child.value;
+        }
+        println("rich:        total=", total);
+    }
+}
+
+locus ChunkedCoord : projection chunked {
+    contract {
+        consume value: Int;
+    }
+    accept(c: Leaf) { }
+    run() {
+        let _l1 = Leaf { value: 1 };
+        let _l2 = Leaf { value: 2 };
+        let _l3 = Leaf { value: 3 };
+        let mut total: Int = 0;
+        for child in self.children {
+            total = total + child.value;
+        }
+        println("chunked:     total=", total);
+    }
+}
+
+// v1.x-3: recognition now requires a sub-mode commitment at the
+// declaration site. fixed_cell(bytes=64) gives each Leaf child a
+// 64-byte cell with bitmap-tracked acquire/release; cap=4 covers
+// 3 leaves plus one slot of headroom.
+locus RecognitionCoord : projection recognition(cap=4, fixed_cell) {
+    contract {
+        consume value: Int;
+    }
+    accept(c: Leaf) { }
+    run() {
+        let _l1 = Leaf { value: 1 };
+        let _l2 = Leaf { value: 2 };
+        let _l3 = Leaf { value: 3 };
+        let mut total: Int = 0;
+        for child in self.children {
+            total = total + child.value;
+        }
+        println("recognition: total=", total);
+    }
+}
+
+fn main() {
+    RichCoord { };
+    ChunkedCoord { };
+    RecognitionCoord { };
+}

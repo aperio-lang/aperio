@@ -1,0 +1,96 @@
+// 29-helpers — min / max / abs / starts_with / contains.
+//
+// Five small language-native helpers that fill out the
+// most-common gaps before deeper-substrate work. Per
+// spec/stdlib.md, these are formally `std::math` (min /
+// max / abs) and `std::string` (starts_with / contains)
+// territory; lotus exposes them as built-ins for now,
+// matching the existing pattern (`print` / `println` /
+// `len` / `to_string` are also nominally stdlib but live as
+// builtins until stdlib resolution wires up).
+//
+// What this exercises:
+//   - min / max across Int, Float, Duration
+//   - abs across Int, Float
+//   - starts_with — String prefix check
+//   - contains — String substring check
+//   - Composition with concat (`+`) and `to_string` from
+//     m36 / m37
+
+fn classify_temp(t: Float) -> String {
+    // bounded "warmth" classifier using min + max to clamp
+    // and starts_with on the input label later in main.
+    let clamped = max(min(t, 100.0), -50.0);
+    if clamped < 0.0 {
+        return "freezing";
+    }
+    if clamped < 20.0 {
+        return "cold";
+    }
+    if clamped < 30.0 {
+        return "warm";
+    }
+    return "hot";
+}
+
+fn main() {
+    // 1. min / max on Int.
+    println("min(3, 7) = ", min(3, 7));
+    println("max(3, 7) = ", max(3, 7));
+
+    // 2. min / max on Float.
+    println("min(2.5, 1.5) = ", to_string(min(2.5, 1.5)));
+    println("max(2.5, 1.5) = ", to_string(max(2.5, 1.5)));
+
+    // 3. min / max on Duration (timeout-like).
+    let a = 100ns;
+    let b = 250ns;
+    println("min duration = ", to_string(min(a, b)));
+    println("max duration = ", to_string(max(a, b)));
+
+    // 4. abs.
+    println("abs(-7) = ", abs(-7));
+    println("abs(7) = ", abs(7));
+    println("abs(-3.14) = ", to_string(abs(-3.14)));
+
+    // 5. classify with clamping.
+    println("classify(-100) = ", classify_temp(-100.0));
+    println("classify(15) = ", classify_temp(15.0));
+    println("classify(25) = ", classify_temp(25.0));
+    println("classify(40) = ", classify_temp(40.0));
+    println("classify(200) = ", classify_temp(200.0));
+
+    // 6. starts_with.
+    let path = "/usr/local/bin";
+    if starts_with(path, "/usr") {
+        println(path + " starts under /usr");
+    }
+    if !starts_with(path, "/etc") {
+        println(path + " is not in /etc");
+    }
+
+    // 7. contains.
+    let phrase = "hello, lotus world";
+    if contains(phrase, "lotus") {
+        println("phrase mentions lotus");
+    }
+    if !contains(phrase, "rust") {
+        println("phrase does not mention rust");
+    }
+
+    // 8. Composition: filter via starts_with + tally.
+    let ops = [
+        "ADD 3",
+        "ADD 5",
+        "SUB 2",
+        "ADD 1",
+        "MUL 4"
+    ];
+    let mut adds = 0;
+    for op in ops {
+        if starts_with(op, "ADD") {
+            adds = adds + 1;
+        }
+    }
+    println("ADD count = ", adds);
+}

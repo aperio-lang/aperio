@@ -1,0 +1,23 @@
+// 08-monotonic-sleep — `std::time::sleep` via the codegen path.
+//
+// Demonstrates the monotonic-clock sleep primitive: each
+// `std::time::sleep` call lowers to `clock_nanosleep(CLOCK_MONOTONIC,
+// 0, &req, &rem)` with EINTR retry. CLOCK_MONOTONIC means
+// scheduling is not warped by NTP / wall-clock adjustments;
+// CLOCK_REALTIME is reserved for `time::now()` (wall-clock
+// observation) and never used by lotus for scheduling.
+//
+// This example uses the bare-fn-main path; folding into a
+// locus's `run()` lifecycle method waits on the locus-as-struct
+// runtime ABI (next milestone in the Phase 3 ladder).
+
+
+fn main() {
+    let mut i = 0;
+    while i < 3 {
+        println("tick ", i);
+        std::time::sleep(50ms);
+        i = i + 1;
+    }
+    println("done");
+}

@@ -1,0 +1,24 @@
+// brained F.1 (2026-05-23) — qualified-path cell type in
+// @form(hashmap). Before the fix, the typechecker rejected
+// `pool entries of model::Project indexed_by id` because the
+// cell-type extraction only admitted single-segment paths.
+// The post-import rewrite pass now collapses `model::Project`
+// to the mangled single name BEFORE typecheck, so the
+// indexed_by field resolves cleanly.
+
+import "../form-hashmap-qualified-model" as model;
+
+@form(hashmap)
+locus ProjectStore {
+    capacity {
+        pool entries of model::Project indexed_by id;
+    }
+}
+
+fn main() {
+    let store = ProjectStore { };
+    store.set(model::Project { id: "p1", name: "alpha" });
+    store.set(model::Project { id: "p2", name: "beta" });
+    let p = store.get("p2") or raise;
+    println(p.id, " / ", p.name);
+}

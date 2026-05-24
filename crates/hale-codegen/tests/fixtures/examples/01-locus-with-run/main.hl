@@ -1,0 +1,26 @@
+// 01-locus-with-run — bounded ticker locus.
+//
+// A locus that does ongoing work after birth, terminates
+// naturally when its work is done, then drains and dissolves.
+// Demonstrates the run() lifecycle method.
+
+
+locus TickerL {
+    params {
+        n: Int = 5;
+        interval: Duration = 1s;
+    }
+
+    run() {
+        let mut i: Int = 0;
+        while i < self.n {
+            println("tick ", i);
+            std::time::sleep(self.interval);
+            i = i + 1;
+        }
+    }
+}
+
+fn main() {
+    TickerL { n: 3, interval: 500ms };
+}

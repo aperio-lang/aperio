@@ -1,0 +1,19 @@
+// import-form-vec-multi-consumer/main.hl — A9 (G27) regression.
+//
+// The imported lib splits a `@form(vec)` locus and a fn that
+// uses its synthesized methods across two files. Cross-seed
+// consumption exercises (a) the mangler's unified seed-renames
+// map, (b) the form synthesis pass picking up the mangled
+// locus name, and (c) the per-build path-rename table mapping
+// `lib::IntVec` to the mangled cell type.
+
+import "../lib-form-vec-multi" as lib;
+
+fn main() {
+    let v = lib::IntVec { };
+    lib::double_push(v, 5);
+    let first = v.get(0) or raise;
+    let second = v.get(1) or raise;
+    println(first);
+    println(second);
+}

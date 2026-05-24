@@ -1,0 +1,34 @@
+# m96: tree-sitter substrate for Hale std::ts.
+#
+# This crate exists to produce `libhale_ts_shim.a` — a staticlib
+# bundling the tree-sitter Rust crate, the Go grammar, and the
+# extern "C" wrappers in `runtime/lotus_treesitter.rs` (which is
+# the actual lib.rs source, redirected via `[lib].path`).
+#
+# `hale-codegen` invokes clang to link the user program against
+# this staticlib at compile time. Keeping it as a sibling
+# workspace crate (rather than a subcrate of hale-codegen)
+# isolates the tree-sitter dep tree from the codegen crate's
+# rlib build, and makes the staticlib artifact discoverable at a
+# stable path: `target/{profile}/libhale_ts_shim.a`.
+
+[package]
+name = "hale-ts-shim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Tree-sitter substrate (std::ts) for the Hale compiler"
+
+[lib]
+name = "hale_ts_shim"
+# The actual source lives next to the other runtime substrates
+# (lotus_arena.c, etc.) so all "what links into a compiled
+# Hale program" lives under one directory. The `[lib].path`
+# field redirects the lib root here.
+path = "../hale-codegen/runtime/lotus_treesitter.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+tree-sitter = "0.22"
+tree-sitter-go = "0.21"

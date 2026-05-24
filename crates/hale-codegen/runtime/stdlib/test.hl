@@ -1,0 +1,59 @@
+// Hale stdlib — std::test.
+//
+// Assertion primitives written purely in Hale (compose with
+// std::process::exit). Standalone — no dependencies on other
+// stdlib files, so order in the concat is flexible.
+//
+// User code reaches these via `std::test::assert(...)`,
+// `std::test::assert_eq_int(...)`, `std::test::assert_eq_str(...)`
+// — path-call dispatch in codegen routes to the bare-name
+// fns below.
+
+// m87 — std::test assertion primitives (Phase 2 v0.1).
+//
+// Three primitives, all written purely in Hale (compose
+// with std::process::exit). The assertion library is part of
+// the stdlib, not a separate testing framework — just like
+// spec/testing.md calls for. A test program is an ordinary
+// Hale binary that exits 0 on success, non-zero on failure.
+// Test runners (Rust integration test, future `hale test`
+// CLI) consume that exit-code surface.
+//
+// Failure path on each: print a diagnostic to stdout (for
+// dev visibility — stderr would also work but the surrounding
+// println machinery routes to stdout already), then call
+// std::process::exit(1) so the calling test runner sees a
+// non-zero status. Successful assertions are silent — that's
+// the design: a test program that runs to completion with
+// no output and exit 0 has passed.
+//
+// `assert(cond, msg)` covers the general case. The
+// `assert_eq_*` variants exist for the most common shape
+// (compare two values, want to see actual vs expected on
+// failure) — without them, users would write
+// `assert(a == b, "...")` and lose the diagnostic detail.
+
+fn __test_assert(cond: Bool, msg: String) {
+    if !cond {
+        println("ASSERTION FAILED: ", msg);
+        std::process::exit(1);
+    }
+}
+
+fn __test_assert_eq_int(actual: Int, expected: Int, msg: String) {
+    if actual != expected {
+        println("ASSERTION FAILED: ", msg);
+        println("  expected: ", expected);
+        println("  actual:   ", actual);
+        std::process::exit(1);
+    }
+}
+
+fn __test_assert_eq_str(actual: String, expected: String, msg: String) {
+    if actual != expected {
+        println("ASSERTION FAILED: ", msg);
+        println("  expected: \"", expected, "\"");
+        println("  actual:   \"", actual, "\"");
+        std::process::exit(1);
+    }
+}

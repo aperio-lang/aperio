@@ -1,0 +1,85 @@
+// 04-modes — one kernel, three projections.
+//
+// An aggregator over leaf children that exposes the same
+// underlying state through three modes:
+//   - bulk:       total sum across all children (aggregate)
+//   - harmonic:   count of children (per-class projection;
+//                 for homogeneous accept, this is just the
+//                 cardinality)
+//   - resolution: largest single child value (tail / edge)
+//
+// All three read self.children, the locus's typed collection
+// of accepted coordinatees. They share the locus's arena (per
+// design commitment F.5), so no copy or extra allocation
+// happens between modes.
+
+locus LeafL {
+    params {
+        value: Int = 0;
+    }
+    contract {
+        expose value: Int;
+    }
+}
+
+locus AggregatorL {
+    params {
+        B: Int = 100;
+        c: Int = 1;
+        sigma: Int = 1;
+        phi: Float = 1.0;
+    }
+
+    contract {
+        consume value: Int;
+    }
+
+    accept(c: LeafL) {
+        // Default accept body — registers the child. The
+        // declaration's type binding is what makes F.8
+        // contract-compatibility verifiable: AggregatorL's
+        // `consume value: Int` is checked against LeafL's
+        // `expose value: Int` at compile time.
+    }
+
+    mode bulk() -> Int {
+        let mut total: Int = 0;
+        for child in self.children {
+            total = total + child.value;
+        }
+        return total;
+    }
+
+    mode harmonic() -> Int {
+        let mut count: Int = 0;
+        for child in self.children {
+            count = count + 1;
+        }
+        return count;
+    }
+
+    mode resolution() -> Int {
+        let mut max: Int = 0;
+        for child in self.children {
+            if child.value > max {
+                max = child.value;
+            }
+        }
+        return max;
+    }
+
+    run() {
+        // Bind so leaves persist for the duration of run().
+        let _l1 = LeafL { value: 10 };
+        let _l2 = LeafL { value: 20 };
+        let _l3 = LeafL { value: 30 };
+
+        println("bulk (total):     ", self.bulk());
+        println("harmonic (count): ", self.harmonic());
+        println("resolution (max): ", self.resolution());
+    }
+}
+
+fn main() {
+    AggregatorL { };
+}

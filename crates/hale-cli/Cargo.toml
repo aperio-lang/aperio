@@ -1,0 +1,19 @@
+[package]
+name = "hale-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hale language CLI"
+
+[[bin]]
+name = "hale"
+path = "src/main.rs"
+
+[dependencies]
+hale-syntax = { path = "../hale-syntax" }
+hale-types = { path = "../hale-types" }
+hale-runtime = { path = "../hale-runtime" }
+hale-codegen = { path = "../hale-codegen" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

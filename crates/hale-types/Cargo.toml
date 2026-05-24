@@ -1,0 +1,10 @@
+[package]
+name = "hale-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hale language: type checker (Phase 1 milestone 2)"
+
+[dependencies]
+hale-syntax = { path = "../hale-syntax" }

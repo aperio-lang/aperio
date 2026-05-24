@@ -1,0 +1,7 @@
+// Model seed for brained F.1 reproducer. Declares the
+// struct type referenced as `model::Project` by the app's
+// @form(hashmap) cell.
+type Project {
+    id: String;
+    name: String;
+}

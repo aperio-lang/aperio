@@ -1,0 +1,8 @@
+// lib-form-vec-multi/helpers.hl — sibling-file consumer of the
+// `@form(vec)` locus declared in `vec.hl`. Calls `v.push(n)` —
+// a synthesized method.
+
+fn double_push(v: IntVec, n: Int) {
+    v.push(n);
+    v.push(n * 2);
+}

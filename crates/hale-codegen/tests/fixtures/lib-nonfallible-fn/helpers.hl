@@ -1,0 +1,22 @@
+// lib-nonfallible-fn/helpers.hl — fixture for A3 (G11) regression.
+//
+// Three non-fallible free fns the consumer reaches via cross-seed
+// path calls: `alias::add(...)`, `alias::greet(...)`, and
+// `alias::touch()`. Before A3, expression-position cross-seed
+// non-fallible calls errored with "path call X::Y in expression
+// position" because lower_path_call_expr's catch-all didn't
+// consult the per-build import-rename table.
+
+fn add(a: Int, b: Int) -> Int {
+    return a + b;
+}
+
+fn greet(name: String) -> String {
+    return "hello, " + name;
+}
+
+// Unit-returning free fn — exercises the statement-position
+// fix branch of A3 (the analogous _ => arm in `lower_path_call`).
+fn touch() {
+    println("touched");
+}

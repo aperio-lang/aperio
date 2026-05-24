@@ -1,0 +1,4 @@
+// lib-three-file/a.hl — declares one shape type.
+type Alpha {
+    label: String;
+}

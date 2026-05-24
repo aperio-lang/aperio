@@ -1,0 +1,12 @@
+[package]
+name = "hale-codegen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hale codegen targeting LLVM"
+
+[dependencies]
+hale-syntax = { path = "../hale-syntax" }
+hale-types = { path = "../hale-types" }
+inkwell = { version = "0.5", features = ["llvm18-0"] }

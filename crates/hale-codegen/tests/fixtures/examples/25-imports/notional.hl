@@ -1,0 +1,9 @@
+// notional.hl — derives the notional value for a Trade
+// (price * quantity). Lives in a separate file so concerns
+// stay split — types.hl declares the shape; this file declares
+// the projection. F.19 per-directory seed model makes Trade
+// visible here without any `import` statement.
+
+fn notional(t: Trade) -> Decimal {
+    return t.price * t.qty;
+}

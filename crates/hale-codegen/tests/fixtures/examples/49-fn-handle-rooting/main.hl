@@ -1,0 +1,85 @@
+// 49-fn-handle-rooting — m53: free-fn implicit-locus
+// handle-rooting.
+//
+// m49 shipped the *arena* half of spec/memory.md "Free `fn`
+// functions": every non-main free fn opens a per-call subregion
+// of the caller's arena, body allocations route through it, and
+// heap-typed returns deep-copy back into the caller's arena
+// before the subregion is destroyed. m53 ships the *lifecycle*
+// half: per spec, "the function returns when: (a) body's last
+// statement completes, AND (b) all children of the implicit
+// locus have dissolved." Pre-m53 the typed-return path silently
+// popped the deferred-dissolves frame opened at fn entry without
+// flushing it, leaking long-lived loci bound in the fn body.
+//
+// Concretely: any locus with `bus subscribe` or `bus publish` is
+// long-lived — its dissolve gets deferred to the enclosing
+// frame's exit. m53 closes the gap by hoisting
+// `flush_dissolve_frame` from the body-fall-through arm into
+// `emit_fn_exit_epilogue`, so every free-fn exit (open-end,
+// `return;`, `return v;`) flushes uniformly. The flush drains
+// the bus queue first (so any cells the body's loci published
+// during their birth() get dispatched while subscribers are
+// still alive), then dissolves the bound handles in reverse
+// order.
+//
+// This example exercises both the bus-traffic path and the
+// dissolution-order path:
+//
+//   make_pair(n) -> Int binds two long-lived loci:
+//     - Watcher subscribes to "evt" — its on_evt fires when a
+//       message arrives.
+//     - Pulse publishes "evt" in birth() — that publish enqueues
+//       a cell for Watcher.
+//   Then make_pair returns n + 1 (typed return, exercises the
+//   m53 fix specifically).
+//
+// Pre-m53 sequence: Pulse births → publishes "evt" → cell sits
+// in queue. make_pair returns 7. Watcher + Pulse stay registered
+// in the bus router (never deregistered because never dissolved).
+// At main exit, the queue drain fires Watcher.on_evt → prints
+// "watcher got". But Watcher and Pulse arenas leak.
+//
+// Post-m53: Pulse births → publishes → cell enqueued. make_pair
+// hits return → flush at fn.exit drains queue (fires Watcher's
+// on_evt while still alive) → dissolves Pulse → dissolves
+// Watcher. By the time make_pair returns, all in-fn-bound loci
+// are gone. The remainder of main runs, prints the return value,
+// exits cleanly with no leaked handles.
+//
+// Output is identical between backends because the interpreter
+// uses Rust ownership (Rc<RefCell>) — its lifetime model already
+// satisfies the spec without an explicit handle-rooting pass.
+
+type Msg {
+    v: Int;
+}
+
+locus Watcher {
+    bus {
+        subscribe "evt" as on_evt of type Msg;
+    }
+    fn on_evt(m: Msg) {
+        println("watcher got: ", m.v);
+    }
+}
+
+locus Pulse {
+    bus {
+        publish "evt" of type Msg;
+    }
+    birth() {
+        "evt" <- Msg { v: 42 };
+    }
+}
+
+fn make_pair(n: Int) -> Int {
+    let _w = Watcher { };
+    let _p = Pulse { };
+    return n + 1;
+}
+
+fn main() {
+    let r: Int = make_pair(6);
+    println("r = ", r);
+}

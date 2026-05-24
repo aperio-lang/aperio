@@ -1,0 +1,7 @@
+// lib-form-vec-multi/vec.hl — declares an @form(vec) locus.
+// Companion file `helpers.hl` references its synthesized methods.
+
+@form(vec)
+locus IntVec {
+    capacity { heap items of Int; }
+}

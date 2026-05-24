@@ -1,0 +1,47 @@
+// 10-stateful-locus — `self.X` mutation across birth → run.
+//
+// Demonstrates the locus runtime ABI introduced in codegen
+// milestone 7:
+//
+//   • A locus compiles to an LLVM struct with one field per param.
+//   • Each lifecycle method is an LLVM fn taking the struct ptr
+//     as its first arg; `self.X` reads/writes lower to GEPs.
+//   • State set by `birth()` is visible to `run()` through the
+//     same alloca'd struct.
+//   • `self.X = ...` and `self.X += ...` both work.
+//
+// State trace:
+//   birth: total = 0; total += step (10) → 10
+//          step *= 3                     → 30
+//   run:   while i < limit (5) {
+//            total += step               (10→40, 40→70, 70→100, 100→130, 130→160)
+//            i += 1
+//          }
+//          println("total=", total)     // 160
+
+locus Accumulator {
+    params {
+        total: Int = 0;
+        step: Int = 10;
+        limit: Int = 5;
+    }
+
+    birth() {
+        self.total += self.step;        // total = 10
+        self.step *= 3;                 // step  = 30
+    }
+
+    run() {
+        let mut i = 0;
+        while i < self.limit {
+            self.total = self.total + self.step;
+            i = i + 1;
+        }
+        println("total=", self.total);
+        println("step=", self.step);
+    }
+}
+
+fn main() {
+    Accumulator { };
+}

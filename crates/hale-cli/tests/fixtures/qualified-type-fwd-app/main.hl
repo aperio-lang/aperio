@@ -1,0 +1,33 @@
+// iris F.10 — cross-seed type used as a STRUCT FIELD type
+// AND a locus-method RETURN type, in entry-program decls
+// that the codegen sees BEFORE the lib's mangled `Rect`
+// decl in items order.
+//
+// Pre-fix: `apply_qualified_path_renames` rewrote
+// `gfx::Rect` to the single-segment mangled name, but
+// codegen's single-segment branch of
+// `type_expr_to_codegen_ty` only consulted `user_types`
+// (no `pending_type_names` forward-ref fallback). Cross-
+// declaration order failed: Surface's field type
+// `__lib_qualified_type_fwd_lib_main_Rect` errored as
+// "unknown type name in signature" because the lib's
+// `type Rect { ... }` registration hadn't run yet.
+
+import "../qualified-type-fwd-lib" as gfx;
+
+type Surface {
+    bounds: gfx::Rect;
+}
+
+locus Renderer {
+    fn rect_for() -> gfx::Rect {
+        return gfx::Rect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 };
+    }
+}
+
+fn main() {
+    let r = Renderer { };
+    let rect = r.rect_for();
+    let s = Surface { bounds: rect };
+    println("bounds.x=", s.bounds.x, " bounds.w=", s.bounds.w);
+}
