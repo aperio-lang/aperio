@@ -93,6 +93,19 @@ pub fn build_top_scope(bundle: &Bundle<'_>) -> (TopScope, Vec<Diag>) {
     if bundle_uses_form_machinery(bundle) {
         inject_form_stdlib_types(&mut scope);
     }
+    // FUv0.8.2 #1 (2026-05-25): if the user has declared a
+    // type whose name shadows a stdlib error type but with
+    // a different shape AND the program actually uses a
+    // stdlib path-call that needs that type, fire a type
+    // error at the user's decl span pointing at the rename /
+    // qualify workarounds — earlier than the codegen-time
+    // `emit_*_error_alloc` site, with a real user-side span.
+    //
+    // Per-type usage gating avoids false-positives for users
+    // who happen to name a type `ParseError` in a program
+    // that never calls `std::str::parse_*`.
+    let stdlib_usage = scan_stdlib_error_usage(bundle);
+    check_stdlib_error_shadowing(&scope, &stdlib_usage, &mut diags);
 
     (scope, diags)
 }
@@ -1456,6 +1469,435 @@ pub(crate) fn inject_form_stdlib_types(scope: &mut TopScope) {
                 span: zero,
             }),
         );
+    }
+}
+
+/// FUv0.8.2 #1 (2026-05-25): when a user has declared a `type
+/// E { ... }` whose name shadows one of the stdlib's expected
+/// error types, the prior architecture silently let the user's
+/// version win at the resolver layer; codegen later failed when
+/// it tried to allocate the stdlib's shape and found a field
+/// missing. The failure point was 100s of LOC away from the
+/// user's declaration, with a span-less diagnostic.
+///
+/// This pass fires AFTER `inject_form_stdlib_types` so the
+/// `scope.symbols[name]` for each candidate type holds whichever
+/// version "won" the contains_key race. If the winner is a
+/// user decl (real span) and its shape doesn't match the
+/// stdlib's expected shape (named field by name + primitive
+/// type), emit a type error at the user's decl span pointing
+/// at the rename / qualify workarounds.
+///
+/// Each stdlib error type the stdlib internally constructs by
+/// bare name lands in this table. If the language ever moves
+/// to mangled-name lookups internally (so user collisions are
+/// truly impossible), this pass becomes dead code and can be
+/// retired.
+/// Set of stdlib error type names that the program actually
+/// reaches for — populated from a walk of all path-call sites.
+/// If `ParseError` isn't in this set, the user can shadow it
+/// freely; no diagnostic fires.
+#[derive(Debug, Default)]
+struct StdlibErrorUsage {
+    parse_error: bool,
+    io_error: bool,
+    index_error: bool,
+    key_error: bool,
+    empty_error: bool,
+}
+
+/// Scan every top-level item, every fn / locus-method body,
+/// and every Expr for stdlib path-calls whose codegen needs
+/// one of the stdlib error types. Detection is by qualified
+/// path prefix (`std::str::parse_*`, `std::io::fs::*`,
+/// `std::io::tcp::*`) plus any `@form(vec)` / `@form(hashmap)`
+/// / `@form(ring_buffer)` decl that synthesizes a fallible
+/// method using the respective error type.
+fn scan_stdlib_error_usage(bundle: &Bundle<'_>) -> StdlibErrorUsage {
+    let mut out = StdlibErrorUsage::default();
+    for program in bundle.programs.values() {
+        scan_items_for_stdlib_usage(&program.items, &mut out);
+    }
+    out
+}
+
+fn scan_items_for_stdlib_usage(items: &[TopDecl], out: &mut StdlibErrorUsage) {
+    for item in items {
+        match item {
+            TopDecl::Locus(l) => {
+                if let Some(form) = &l.form {
+                    match form.name.name.as_str() {
+                        "vec" => out.index_error = true,
+                        "hashmap" => out.key_error = true,
+                        "ring_buffer" => out.empty_error = true,
+                        _ => {}
+                    }
+                }
+                for member in &l.members {
+                    match member {
+                        LocusMember::Lifecycle(lc) => {
+                            scan_block_for_stdlib_usage(&lc.body, out)
+                        }
+                        LocusMember::Fn(f) => {
+                            scan_block_for_stdlib_usage(&f.body, out)
+                        }
+                        LocusMember::Mode(md) => {
+                            scan_block_for_stdlib_usage(&md.body, out)
+                        }
+                        LocusMember::Failure(fd) => {
+                            scan_block_for_stdlib_usage(&fd.body, out)
+                        }
+                        LocusMember::Closure(c) => {
+                            if let Some(a) = &c.assertion {
+                                scan_expr_for_stdlib_usage(&a.left, out);
+                                scan_expr_for_stdlib_usage(&a.right, out);
+                                scan_expr_for_stdlib_usage(
+                                    &a.tolerance,
+                                    out,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            TopDecl::Fn(f) => scan_block_for_stdlib_usage(&f.body, out),
+            TopDecl::Module(m) => {
+                scan_items_for_stdlib_usage(&m.items, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_block_for_stdlib_usage(b: &Block, out: &mut StdlibErrorUsage) {
+    for s in &b.stmts {
+        scan_stmt_for_stdlib_usage(s, out);
+    }
+}
+
+fn scan_stmt_for_stdlib_usage(s: &Stmt, out: &mut StdlibErrorUsage) {
+    match s {
+        Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+            scan_expr_for_stdlib_usage(value, out)
+        }
+        Stmt::Assign { value, .. } => scan_expr_for_stdlib_usage(value, out),
+        Stmt::If(s) => {
+            scan_expr_for_stdlib_usage(&s.cond, out);
+            scan_block_for_stdlib_usage(&s.then_block, out);
+            match s.else_block.as_deref() {
+                None => {}
+                Some(ElseBranch::Else(b)) => {
+                    scan_block_for_stdlib_usage(b, out)
+                }
+                Some(ElseBranch::ElseIf(inner)) => {
+                    scan_stmt_for_stdlib_usage(
+                        &Stmt::If(inner.clone()),
+                        out,
+                    )
+                }
+            }
+        }
+        Stmt::Match(m) => {
+            scan_expr_for_stdlib_usage(&m.scrutinee, out);
+            for arm in &m.arms {
+                if let Some(g) = &arm.guard {
+                    scan_expr_for_stdlib_usage(g, out);
+                }
+                match &arm.body {
+                    MatchArmBody::Expr(e) => {
+                        scan_expr_for_stdlib_usage(e, out)
+                    }
+                    MatchArmBody::Block(b) => {
+                        scan_block_for_stdlib_usage(b, out)
+                    }
+                }
+            }
+        }
+        Stmt::For { iter, body, .. } => {
+            scan_expr_for_stdlib_usage(iter, out);
+            scan_block_for_stdlib_usage(body, out);
+        }
+        Stmt::While { cond, body, .. } => {
+            scan_expr_for_stdlib_usage(cond, out);
+            scan_block_for_stdlib_usage(body, out);
+        }
+        Stmt::Return(Some(e), _) => scan_expr_for_stdlib_usage(e, out),
+        Stmt::Fail { value, .. } => scan_expr_for_stdlib_usage(value, out),
+        Stmt::Block(b) => scan_block_for_stdlib_usage(b, out),
+        Stmt::Send { subject, value, .. } => {
+            scan_expr_for_stdlib_usage(subject, out);
+            scan_expr_for_stdlib_usage(value, out);
+        }
+        Stmt::Expr(e) => scan_expr_for_stdlib_usage(e, out),
+        Stmt::Recovery { args, .. } => {
+            for a in args {
+                scan_expr_for_stdlib_usage(a, out);
+            }
+        }
+        Stmt::Violate { payload, .. } => {
+            if let Some(p) = payload {
+                scan_expr_for_stdlib_usage(p, out);
+            }
+        }
+        Stmt::Return(None, _)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Yield(_) => {}
+    }
+}
+
+fn scan_expr_for_stdlib_usage(e: &Expr, out: &mut StdlibErrorUsage) {
+    match e {
+        Expr::Call { callee, args, .. } => {
+            check_callee_path_for_stdlib_error(callee, out);
+            scan_expr_for_stdlib_usage(callee, out);
+            for a in args {
+                scan_expr_for_stdlib_usage(a, out);
+            }
+        }
+        Expr::Path(qn) => mark_stdlib_error_from_path(qn, out),
+        Expr::Binary { left, right, .. } => {
+            scan_expr_for_stdlib_usage(left, out);
+            scan_expr_for_stdlib_usage(right, out);
+        }
+        Expr::Unary { operand, .. } => {
+            scan_expr_for_stdlib_usage(operand, out)
+        }
+        Expr::Field { receiver, .. } => {
+            scan_expr_for_stdlib_usage(receiver, out)
+        }
+        Expr::Index { receiver, index, .. } => {
+            scan_expr_for_stdlib_usage(receiver, out);
+            scan_expr_for_stdlib_usage(index, out);
+        }
+        Expr::Path2 { receiver, .. } => {
+            scan_expr_for_stdlib_usage(receiver, out)
+        }
+        Expr::Tuple(parts, _) | Expr::Array(parts, _) => {
+            for p in parts {
+                scan_expr_for_stdlib_usage(p, out);
+            }
+        }
+        Expr::Struct { inits, .. } => {
+            for i in inits {
+                scan_expr_for_stdlib_usage(&i.value, out);
+            }
+        }
+        Expr::Block(b) => scan_block_for_stdlib_usage(b, out),
+        Expr::If(s) => {
+            scan_expr_for_stdlib_usage(&s.cond, out);
+            scan_block_for_stdlib_usage(&s.then_block, out);
+            if let Some(ElseBranch::Else(b)) = s.else_block.as_deref() {
+                scan_block_for_stdlib_usage(b, out);
+            }
+        }
+        Expr::Match(m) => {
+            scan_expr_for_stdlib_usage(&m.scrutinee, out);
+            for arm in &m.arms {
+                if let Some(g) = &arm.guard {
+                    scan_expr_for_stdlib_usage(g, out);
+                }
+                match &arm.body {
+                    MatchArmBody::Expr(e) => {
+                        scan_expr_for_stdlib_usage(e, out)
+                    }
+                    MatchArmBody::Block(b) => {
+                        scan_block_for_stdlib_usage(b, out)
+                    }
+                }
+            }
+        }
+        Expr::Or { inner, disposition, .. } => {
+            scan_expr_for_stdlib_usage(inner, out);
+            match disposition {
+                OrDisposition::Substitute(rhs) => {
+                    scan_expr_for_stdlib_usage(rhs, out)
+                }
+                OrDisposition::Fail(payload, _) => {
+                    scan_expr_for_stdlib_usage(payload, out)
+                }
+                OrDisposition::Raise(_) | OrDisposition::Discard(_) => {}
+            }
+        }
+        Expr::Sum(inner, _) | Expr::Prod(inner, _) => {
+            scan_expr_for_stdlib_usage(inner, out)
+        }
+        Expr::Approx { left, right, tolerance, .. } => {
+            scan_expr_for_stdlib_usage(left, out);
+            scan_expr_for_stdlib_usage(right, out);
+            scan_expr_for_stdlib_usage(tolerance, out);
+        }
+        Expr::Range { lo, hi, .. } => {
+            scan_expr_for_stdlib_usage(lo, out);
+            scan_expr_for_stdlib_usage(hi, out);
+        }
+        Expr::ArrayRepeat { val, .. } => {
+            scan_expr_for_stdlib_usage(val, out)
+        }
+        _ => {}
+    }
+}
+
+fn check_callee_path_for_stdlib_error(
+    callee: &Expr,
+    out: &mut StdlibErrorUsage,
+) {
+    let Expr::Path(qn) = callee else { return };
+    mark_stdlib_error_from_path(qn, out);
+}
+
+fn mark_stdlib_error_from_path(
+    qn: &QualifiedName,
+    out: &mut StdlibErrorUsage,
+) {
+    let segs: Vec<&str> =
+        qn.segments.iter().map(|s| s.name.as_str()).collect();
+    if segs.len() >= 3 && segs[0] == "std" {
+        match segs[1] {
+            "str" => {
+                if segs[2].starts_with("parse_") {
+                    out.parse_error = true;
+                }
+            }
+            "io" => {
+                // std::io::fs::* and std::io::tcp::* both
+                // return fallible(IoError). std::io::stdin
+                // also has io fallibles.
+                if segs.len() >= 3 {
+                    out.io_error = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_stdlib_error_shadowing(
+    scope: &TopScope,
+    usage: &StdlibErrorUsage,
+    diags: &mut Vec<Diag>,
+) {
+    // (stdlib type name, expected fields, qualified-path
+    // suggestion to surface in the diagnostic, "is this type
+    // actually used in this program" gate).
+    let expected: &[(&str, &[(&str, PrimType)], &str, bool)] = &[
+        (
+            "ParseError",
+            &[
+                ("kind", PrimType::String),
+                ("input", PrimType::String),
+            ],
+            "std::str::ParseError",
+            usage.parse_error,
+        ),
+        (
+            "IoError",
+            &[
+                ("kind", PrimType::String),
+                ("errno", PrimType::Int),
+                ("path", PrimType::String),
+            ],
+            "std::io::IoError",
+            usage.io_error,
+        ),
+        (
+            "IndexError",
+            &[
+                ("kind", PrimType::String),
+                ("index", PrimType::Int),
+                ("len", PrimType::Int),
+            ],
+            "std::index::IndexError",
+            usage.index_error,
+        ),
+        (
+            "KeyError",
+            &[("kind", PrimType::String)],
+            "std::form::hashmap::KeyError",
+            usage.key_error,
+        ),
+        (
+            "EmptyError",
+            &[("kind", PrimType::String)],
+            "std::form::ring_buffer::EmptyError",
+            usage.empty_error,
+        ),
+    ];
+    for (name, expected_fields, qualified, in_use) in expected {
+        if !in_use {
+            continue;
+        }
+        let Some(TopSymbol::Type(ti)) = scope.symbols.get(*name)
+        else {
+            continue;
+        };
+        // Zero-span entries are the stdlib's own injections —
+        // those by definition match the stdlib's expected
+        // shape. Skip.
+        if ti.span.start.0 == 0 && ti.span.end.0 == 0 {
+            continue;
+        }
+        let TypeKind::Struct(actual) = &ti.kind else {
+            diags.push(Diag::ty(
+                ti.span,
+                format!(
+                    "user-declared `type {}` shadows the stdlib's \
+                     `{}` (used by stdlib path-calls that return \
+                     `fallible({})`) but is not a struct type. \
+                     Either rename your type (e.g. `My{}`) or use \
+                     `{}` qualified where you need the stdlib's \
+                     shape.",
+                    name, name, name, name, qualified,
+                ),
+            ));
+            continue;
+        };
+        for (field_name, expected_ty) in *expected_fields {
+            let matches = actual.iter().any(|f| {
+                f.name == *field_name
+                    && matches!(&f.ty, Ty::Prim(p) if p == expected_ty)
+            });
+            if matches {
+                continue;
+            }
+            diags.push(Diag::ty(
+                ti.span,
+                format!(
+                    "user-declared `type {}` shadows the stdlib's \
+                     `{}` but is missing the expected `{}: {}` \
+                     field (used by stdlib path-calls that \
+                     allocate `{}` on failure). Either match the \
+                     stdlib shape, rename your type (e.g. `My{}`), \
+                     or use `{}` qualified where you need the \
+                     stdlib's shape.",
+                    name,
+                    name,
+                    field_name,
+                    prim_display(*expected_ty),
+                    name,
+                    name,
+                    qualified,
+                ),
+            ));
+            break;
+        }
+    }
+}
+
+fn prim_display(p: PrimType) -> &'static str {
+    match p {
+        PrimType::Int => "Int",
+        PrimType::Uint => "Uint",
+        PrimType::Float => "Float",
+        PrimType::Decimal => "Decimal",
+        PrimType::Bool => "Bool",
+        PrimType::String => "String",
+        PrimType::Time => "Time",
+        PrimType::Duration => "Duration",
+        PrimType::Bytes => "Bytes",
+        PrimType::BytesView => "BytesView",
+        PrimType::StringView => "StringView",
     }
 }
 

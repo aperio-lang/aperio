@@ -2395,4 +2395,92 @@ mod tests {
             diags
         );
     }
+
+    // === FUv0.8.2 #1 stdlib error-type collision tests ====
+
+    #[test]
+    fn err_user_parse_error_shadows_stdlib_with_wrong_shape() {
+        // User declares `type ParseError` with fields the
+        // stdlib's parse_int / parse_float don't expect. The
+        // collision check fires at the user's decl span — we
+        // need to USE a stdlib parse_* fn so `bundle_uses_form_machinery`
+        // routes through inject_form_stdlib_types.
+        let src = r#"
+            type ParseError { code: Int; }
+            fn main() {
+                let v = std::str::parse_int("42") or raise;
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| {
+                d.message.contains("shadows the stdlib's `ParseError`")
+                    && d.message.contains("kind: String")
+                    && d.message.contains("std::str::ParseError")
+            }),
+            "expected ParseError-shadow diagnostic, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_user_parse_error_matches_stdlib_shape() {
+        // User declares a type with the same name but the right
+        // shape; the collision check is silent (typecheck clean
+        // on shape grounds; codegen uses the user's matching
+        // version).
+        let src = r#"
+            type ParseError { kind: String; input: String; }
+            fn main() {
+                let v = std::str::parse_int("42") or raise;
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("shadows")),
+            "expected no shadow diag when shape matches; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_user_io_error_shadows_stdlib_with_wrong_shape() {
+        // Same pattern for IoError, which the stdlib uses for
+        // std::io::fs::* path-calls.
+        let src = r#"
+            type IoError { reason: String; }
+            fn main() {
+                let s = std::io::fs::read_file("/tmp/x") or raise;
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| {
+                d.message.contains("shadows the stdlib's `IoError`")
+                    && d.message.contains("std::io::IoError")
+            }),
+            "expected IoError-shadow diagnostic, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_user_parse_error_in_form_free_program() {
+        // Without any form machinery in use, inject_form_stdlib_types
+        // doesn't run, so the collision check is skipped. The
+        // user is free to declare any type name.
+        let src = r#"
+            type ParseError { code: Int; }
+            fn main() {
+                let _ = ParseError { code: 1 };
+            }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "user-declared ParseError in a form-free program \
+             should typecheck clean; got: {:?}",
+            diags
+        );
+    }
 }
