@@ -1073,17 +1073,43 @@ fn run_build(target: &Path) -> ExitCode {
         found
     };
     let strict = cli_args.iter().any(|a| a == "--strict");
-    if strict && target_cache_arg.is_none() {
-        // `--strict` only gates `--target-cache`. Without it
-        // the flag does nothing — surface the misconfiguration
-        // so the user notices (and so a CI job doesn't silently
-        // believe it's enforcing a budget).
+    // Resolve the global target tier early so a parse error
+    // surfaces before any analysis runs.
+    let global_target: Option<hale_types::working_set::CacheTier> =
+        match target_cache_arg {
+            Some(raw) => match hale_types::working_set::parse_cache_tier(raw) {
+                Some(t) => Some(t),
+                None => {
+                    eprintln!(
+                        "error: --target-cache: unknown tier `{}` \
+                         (expected l1 / l2 / l3)",
+                        raw
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            None => None,
+        };
+    let any_locality_annotation = program.items.iter().any(|item| {
+        matches!(item, hale_syntax::ast::TopDecl::Locus(l) if l.locality.is_some())
+    });
+    if strict && global_target.is_none() && !any_locality_annotation {
+        // `--strict` gates the working-set breaches that
+        // surface from `--target-cache` or `@locality(...)`.
+        // Without either, no budget applies and `--strict`
+        // is a no-op — surface the misconfiguration so a CI
+        // job doesn't silently believe it's enforcing
+        // anything.
         eprintln!(
             "warning: --strict has no effect without \
-             --target-cache l1|l2|l3"
+             --target-cache l1|l2|l3 or `@locality(...)` annotations"
         );
     }
-    if want_report || target_cache_arg.is_some() {
+    // Always run the per-locus evaluator — even without
+    // `--target-cache`, loci carrying `@locality(L1|L2|L3)` are
+    // a hard contract and need checking. The early exit when
+    // there's nothing to evaluate is cheap.
+    if want_report || global_target.is_some() || any_locality_annotation {
         let map =
             hale_types::working_set::compute_program_working_set(
                 &program.items,
@@ -1094,32 +1120,22 @@ fn run_build(target: &Path) -> ExitCode {
                 hale_types::working_set::render_locality_report(&map)
             );
         }
-        if let Some(raw) = target_cache_arg {
-            let Some(tier) =
-                hale_types::working_set::parse_cache_tier(raw)
-            else {
-                eprintln!(
-                    "error: --target-cache: unknown tier `{}` \
-                     (expected l1 / l2 / l3)",
-                    raw
-                );
-                return ExitCode::from(2);
-            };
-            let breaches =
-                hale_types::working_set::breaches_against_tier(
-                    &map, tier,
-                );
-            if !breaches.is_empty() {
-                let severity = if strict { "error" } else { "warning" };
-                eprint!(
-                    "{}",
-                    hale_types::working_set::render_breach_diagnostic(
-                        &breaches, tier, severity,
-                    )
-                );
-                if strict {
-                    return ExitCode::from(1);
-                }
+        let breaches =
+            hale_types::working_set::breaches_with_per_locus_budgets(
+                &map,
+                &program.items,
+                global_target,
+            );
+        if !breaches.is_empty() {
+            let severity = if strict { "error" } else { "warning" };
+            eprint!(
+                "{}",
+                hale_types::working_set::render_breach_diagnostic(
+                    &breaches, severity,
+                )
+            );
+            if strict {
+                return ExitCode::from(1);
             }
         }
     }

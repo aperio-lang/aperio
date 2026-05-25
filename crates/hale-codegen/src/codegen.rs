@@ -9362,6 +9362,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             generics: Vec::new(),
             annotations: template.annotations.clone(),
             form: template.form.clone(),
+            locality: template.locality.clone(),
             members: new_members,
             span: template.span.clone(),
         })

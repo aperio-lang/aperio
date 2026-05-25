@@ -323,13 +323,34 @@ impl Parser {
     }
 
     fn parse_top_decl(&mut self) -> Result<TopDecl, Diag> {
-        // Annotation prefix dispatch. `@form(...)` precedes
-        // `locus`; `@ffi("c")` precedes `fn`. Peek the ident after
-        // `@` to decide which annotation parser to call.
-        if matches!(self.peek(), TokenKind::At) {
+        // Annotation prefix dispatch. `@form(...)` and
+        // `@locality(...)` precede `locus` (and may stack on
+        // one another); `@ffi("c")` precedes `fn`. Peek the
+        // ident after `@` to decide which annotation parser to
+        // call. After consuming all leading annotations the
+        // remaining token is either `Locus` / `Ident("main")`
+        // (for `main locus`) — locus path — or `Fn` (for `@ffi`).
+        let mut form: Option<FormAnnotation> = None;
+        let mut locality: Option<LocalityAnnotation> = None;
+        let mut leading_span: Option<Span> = None;
+        loop {
+            if !matches!(self.peek(), TokenKind::At) {
+                break;
+            }
             let kind_tok = self.peek_at(1);
             let is_ffi = matches!(&kind_tok, TokenKind::Ident(s) if s == "ffi");
+            let is_form = matches!(&kind_tok, TokenKind::Ident(s) if s == "form");
+            let is_locality =
+                matches!(&kind_tok, TokenKind::Ident(s) if s == "locality");
             if is_ffi {
+                if form.is_some() || locality.is_some() {
+                    return Err(Diag::parse(
+                        self.peek_token().span,
+                        "`@ffi(...)` is fn-only; it can't stack with \
+                         `@form(...)` or `@locality(...)` (those precede \
+                         `locus`)",
+                    ));
+                }
                 let ffi = self.parse_ffi_annotation()?;
                 if !matches!(self.peek(), TokenKind::Fn) {
                     return Err(Diag::parse(
@@ -341,17 +362,64 @@ impl Parser {
                 fn_decl.span = ffi.span.merge(fn_decl.span);
                 return Ok(TopDecl::Fn(fn_decl));
             }
-            // Otherwise expect `@form(...)` followed by `locus`.
-            let form = self.parse_form_annotation()?;
-            if !matches!(self.peek(), TokenKind::Locus) {
+            if is_form {
+                if form.is_some() {
+                    return Err(Diag::parse(
+                        self.peek_token().span,
+                        "duplicate `@form(...)` annotation; one form per \
+                         locus",
+                    ));
+                }
+                let f = self.parse_form_annotation()?;
+                leading_span = Some(match leading_span {
+                    Some(s) => s.merge(f.span),
+                    None => f.span,
+                });
+                form = Some(f);
+                continue;
+            }
+            if is_locality {
+                if locality.is_some() {
+                    return Err(Diag::parse(
+                        self.peek_token().span,
+                        "duplicate `@locality(...)` annotation; one per \
+                         locus",
+                    ));
+                }
+                let l = self.parse_locality_annotation()?;
+                leading_span = Some(match leading_span {
+                    Some(s) => s.merge(l.span),
+                    None => l.span,
+                });
+                locality = Some(l);
+                continue;
+            }
+            return Err(Diag::parse(
+                self.peek_token().span,
+                "expected `form`, `locality`, or `ffi` after `@`",
+            ));
+        }
+        if form.is_some() || locality.is_some() {
+            // Verify a `locus` (or contextual `main locus`)
+            // follows.
+            let next_is_locus = matches!(self.peek(), TokenKind::Locus);
+            let next_is_main = matches!(
+                self.peek(),
+                TokenKind::Ident(s) if s == "main"
+            );
+            if !next_is_locus && !next_is_main {
                 return Err(Diag::parse(
                     self.peek_token().span,
-                    "expected `locus` after `@form(...)` annotation",
+                    "expected `locus` (or `main locus`) after `@form(...)` \
+                     / `@locality(...)` annotation",
                 ));
             }
             let mut locus = self.parse_locus_decl()?;
-            locus.span = form.span.merge(locus.span);
-            locus.form = Some(form);
+            if let Some(s) = leading_span {
+                locus.span = s.merge(locus.span);
+            }
+            locus.form = form;
+            locus.locality = locality;
             return Ok(TopDecl::Locus(locus));
         }
         match self.peek() {
@@ -514,6 +582,61 @@ impl Parser {
         Ok(FormAnnotation {
             name: form_name,
             args,
+            span: at.span.merge(close.span),
+        })
+    }
+
+    /// F.32-2 v0.2 (2026-05-25): `@locality(L1|L2|L3|any)` on a
+    /// locus declaration. The tier name is a contextual ident —
+    /// accepted only inside this annotation.
+    ///
+    /// Grammar: `'@' 'locality' '(' ('L1'|'L2'|'L3'|'any') ')'`.
+    fn parse_locality_annotation(
+        &mut self,
+    ) -> Result<LocalityAnnotation, Diag> {
+        let at = self.expect(TokenKind::At, "@")?;
+        let next = self.peek_token().clone();
+        let is_locality = matches!(
+            &next.kind,
+            TokenKind::Ident(s) if s == "locality"
+        );
+        if !is_locality {
+            return Err(Diag::parse(
+                next.span,
+                "expected `locality` after `@`",
+            ));
+        }
+        self.bump();
+        self.expect(TokenKind::LParen, "(")?;
+        let tier_tok = self.peek_token().clone();
+        let tier = match &tier_tok.kind {
+            TokenKind::Ident(s) => match s.as_str() {
+                "L1" | "l1" => LocalityTier::L1,
+                "L2" | "l2" => LocalityTier::L2,
+                "L3" | "l3" => LocalityTier::L3,
+                "any" | "Any" => LocalityTier::Any,
+                _ => {
+                    return Err(Diag::parse(
+                        tier_tok.span,
+                        format!(
+                            "unknown locality tier `{}`; expected one of \
+                             `L1` / `L2` / `L3` / `any`",
+                            s,
+                        ),
+                    ));
+                }
+            },
+            _ => {
+                return Err(Diag::parse(
+                    tier_tok.span,
+                    "expected locality tier identifier (L1 / L2 / L3 / any)",
+                ));
+            }
+        };
+        self.bump();
+        let close = self.expect(TokenKind::RParen, ")")?;
+        Ok(LocalityAnnotation {
+            tier,
             span: at.span.merge(close.span),
         })
     }
@@ -682,6 +805,7 @@ impl Parser {
             generics,
             annotations,
             form: None,
+            locality: None,
             members,
             span: kw.span.merge(close.span),
         })
@@ -3894,6 +4018,136 @@ locus L { }
             "wrong error: {}",
             msg
         );
+    }
+
+    // === F.32-2 v0.2 @locality annotation tests ===========
+
+    #[test]
+    fn parse_locality_annotation_each_tier() {
+        for (spelling, want) in [
+            ("L1", LocalityTier::L1),
+            ("L2", LocalityTier::L2),
+            ("L3", LocalityTier::L3),
+            ("any", LocalityTier::Any),
+        ] {
+            let src = format!(
+                "@locality({spelling}) locus L {{ }}",
+                spelling = spelling
+            );
+            let prog = parse_str(&src).expect("parse failed");
+            match &prog.items[0] {
+                TopDecl::Locus(l) => {
+                    let loc = l
+                        .locality
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("expected locality for {}", spelling));
+                    assert_eq!(loc.tier, want, "wrong tier for {}", spelling);
+                }
+                _ => panic!("expected locus for {}", spelling),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_locality_stacks_with_form() {
+        let src = r#"
+type Entry { k: Int; v: Int; }
+@form(hashmap, sync = lockfree, cap = 64)
+@locality(L2)
+locus Reg {
+    capacity { pool entries of Entry indexed_by k; }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        match &prog.items[1] {
+            TopDecl::Locus(l) => {
+                assert!(l.form.is_some(), "expected form");
+                assert_eq!(
+                    l.locality.as_ref().expect("expected locality").tier,
+                    LocalityTier::L2,
+                );
+            }
+            _ => panic!("expected locus"),
+        }
+    }
+
+    #[test]
+    fn parse_locality_stack_order_is_either() {
+        // @form before @locality and @locality before @form
+        // are both valid stackings.
+        for src in [
+            r#"
+type E { k: Int; v: Int; }
+@locality(L1)
+@form(hashmap, sync = lockfree, cap = 8)
+locus R { capacity { pool entries of E indexed_by k; } }
+"#,
+            r#"
+type E { k: Int; v: Int; }
+@form(hashmap, sync = lockfree, cap = 8)
+@locality(L1)
+locus R { capacity { pool entries of E indexed_by k; } }
+"#,
+        ] {
+            let prog = parse_str(src).expect("parse failed");
+            match &prog.items[1] {
+                TopDecl::Locus(l) => {
+                    assert!(l.form.is_some());
+                    assert_eq!(
+                        l.locality.as_ref().unwrap().tier,
+                        LocalityTier::L1
+                    );
+                }
+                _ => panic!("expected locus"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_locality_rejects_unknown_tier() {
+        let src = "@locality(L4) locus L { }";
+        let err = parse_str(src).expect_err("expected parse error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("unknown locality tier"),
+            "wrong error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_locality_rejects_duplicate() {
+        let src = "@locality(L1) @locality(L2) locus L { }";
+        let err = parse_str(src).expect_err("expected parse error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("duplicate `@locality"),
+            "wrong error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_locality_main_locus_works() {
+        // Annotations must precede the `main` contextual
+        // keyword too.
+        let src = r#"
+@locality(L2)
+main locus App {
+    run() { }
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        match &prog.items[0] {
+            TopDecl::Locus(l) => {
+                assert!(l.is_main);
+                assert_eq!(
+                    l.locality.as_ref().unwrap().tier,
+                    LocalityTier::L2
+                );
+            }
+            _ => panic!("expected locus"),
+        }
     }
 
     #[test]
