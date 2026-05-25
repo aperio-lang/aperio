@@ -195,7 +195,7 @@ pub fn check_bundle(bundle: &Bundle<'_>, top: &TopScope) -> Vec<Diag> {
 /// siblings — even of the same locus type — live on different
 /// threads).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PoolId {
+pub enum PoolId {
     Cooperative(String),
     /// Field-path string of the pinned locus's instantiation
     /// site, e.g. `"heartbeat"` for `main.heartbeat: pinned`.
@@ -205,7 +205,7 @@ pub(crate) enum PoolId {
 }
 
 impl PoolId {
-    pub(crate) fn display(&self) -> String {
+    pub fn display(&self) -> String {
         match self {
             PoolId::Cooperative(name) => {
                 format!("cooperative(pool = {})", name)
@@ -220,13 +220,24 @@ impl PoolId {
 /// the bundle and flags direct `recv.foo(args)` calls whose
 /// receiver resolves to a field of a locus type with a different
 /// pool than the enclosing method's locus.
-fn check_placement_single_thread(
+/// FUv0.8.2 #4 (2026-05-25): F.31 pool propagation extracted
+/// as a pub helper so callers outside this module (the
+/// `apply_sync_inference` finalization pass that runs before
+/// codegen) can re-derive the map without re-running typecheck.
+///
+/// Seeds from the main locus's `placement { }` block, then
+/// propagates the pool to each nested locus-typed param field.
+/// First-wins on conflict — a single locus type appearing in
+/// two towers with different pools is rare in v1; we pick the
+/// first.
+///
+/// Returns an empty map for programs without a main locus
+/// (free-fn-main scripts), so callers can skip the rest of
+/// the analysis cheaply.
+pub fn compute_pool_of_locus_type(
     bundle: &Bundle<'_>,
     top: &TopScope,
-    diags: &mut Vec<Diag>,
-) {
-    // 1. Locate the bundle's main locus, if any. Free-fn-main
-    //    programs have no placement to enforce.
+) -> BTreeMap<String, PoolId> {
     let mut main_locus: Option<&LocusDecl> = None;
     for program in bundle.programs.values() {
         for item in &program.items {
@@ -238,59 +249,44 @@ fn check_placement_single_thread(
         }
     }
     let Some(main) = main_locus else {
-        return;
+        return BTreeMap::new();
     };
 
-    // 2. Seed pool map from main's placement entries. Each main
-    //    params field gets a pool — explicit entry or default
-    //    `Cooperative("main")`. The default for a main params
-    //    field whose type is a locus mirrors what Phase 3a's
-    //    `main_placement_map` lookup returns (`None` → default
-    //    cooperative).
-    let placement_block = main
-        .members
-        .iter()
-        .find_map(|m| match m {
-            LocusMember::Placement(pb) => Some(pb),
-            _ => None,
-        });
+    let placement_block = main.members.iter().find_map(|m| match m {
+        LocusMember::Placement(pb) => Some(pb),
+        _ => None,
+    });
     let placement_map: BTreeMap<String, PoolId> = placement_block
         .map(|pb| {
             pb.entries
                 .iter()
-                .map(|e| (e.field.name.clone(), placement_spec_to_pool(&e.spec, &e.field.name)))
+                .map(|e| {
+                    (
+                        e.field.name.clone(),
+                        placement_spec_to_pool(&e.spec, &e.field.name),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
 
-    // 3. Build `pool_of_locus_type: BTreeMap<String, PoolId>` by
-    //    walking each main-locus params field whose type is a
-    //    locus. Nested params loci inherit the parent tower's
-    //    pool (recursive walk). First-wins on conflict (a single
-    //    locus type appearing in two towers with different pools
-    //    is rare in v1; we just pick the first).
-    //
-    //    The main locus itself maps to `Cooperative("main")` —
-    //    its lifecycle methods (and bare-fn `main { ... }`
-    //    contents) run on the binary's primary OS thread.
     let mut pool_of_locus_type: BTreeMap<String, PoolId> = BTreeMap::new();
     pool_of_locus_type.insert(
         main.name.name.clone(),
         PoolId::Cooperative("main".to_string()),
     );
-    let main_params = main
-        .members
-        .iter()
-        .find_map(|m| match m {
-            LocusMember::Params(pb) => Some(pb),
-            _ => None,
-        });
+    let main_params = main.members.iter().find_map(|m| match m {
+        LocusMember::Params(pb) => Some(pb),
+        _ => None,
+    });
     if let Some(params) = main_params {
         for p in &params.params {
             let pool = placement_map
                 .get(&p.name.name)
                 .cloned()
-                .unwrap_or_else(|| PoolId::Cooperative("main".to_string()));
+                .unwrap_or_else(|| {
+                    PoolId::Cooperative("main".to_string())
+                });
             if let Some(ty) = &p.ty {
                 if let Some(locus_name) = type_expr_locus_name(ty, top) {
                     pool_of_locus_type
@@ -306,6 +302,31 @@ fn check_placement_single_thread(
             }
         }
     }
+    pool_of_locus_type
+}
+
+fn check_placement_single_thread(
+    bundle: &Bundle<'_>,
+    top: &TopScope,
+    diags: &mut Vec<Diag>,
+) {
+    let pool_of_locus_type = compute_pool_of_locus_type(bundle, top);
+    if pool_of_locus_type.is_empty() {
+        return;
+    }
+    // The main locus is needed downstream for the cross-pool
+    // walk's `enclosing_locus`; re-locate it (cheap).
+    let mut main_locus: Option<&LocusDecl> = None;
+    for program in bundle.programs.values() {
+        for item in &program.items {
+            if let TopDecl::Locus(l) = item {
+                if l.is_main {
+                    main_locus = Some(l);
+                }
+            }
+        }
+    }
+    let _main = main_locus;
 
     // 4. Walk every locus method body in the bundle and emit
     //    diagnostics for direct cross-pool calls. The check

@@ -770,10 +770,26 @@ fn run_check(target: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let (programs, sources) = match parse_files(&files) {
+    let (mut programs, sources) = match parse_files(&files) {
         Ok(x) => x,
         Err(code) => return code,
     };
+
+    // FUv0.8.2 #4: auto-apply sync inference before typecheck so
+    // `hale check` validates the post-inference shape the build
+    // path will see. Without this, `check` warns on
+    // auto-inferable cross-pool calls while `build` silently
+    // applies — same source, divergent answers.
+    for prog in programs.values_mut() {
+        let pre_diags = hale_types::apply_sync_inference(prog);
+        if !pre_diags.is_empty() {
+            let any_source = sources.values().next().map(|s| s.as_str()).unwrap_or("");
+            for d in &pre_diags {
+                eprintln!("{}", d.render(any_source));
+            }
+            return ExitCode::from(1);
+        }
+    }
 
     let bundle_programs: BTreeMap<String, &Program> = programs
         .iter()
@@ -893,7 +909,7 @@ fn run_build(target: &Path) -> ExitCode {
     // directory shape is the user-facing answer to the
     // single-file-app-monolith friction; the file shape stays for
     // backwards compatibility and for one-off scripts.
-    let (program, renames, sources, output, entry_ctx) = if target.is_file() {
+    let (mut program, renames, sources, output, entry_ctx) = if target.is_file() {
         let (program, renames, sources, ctx) = match parse_with_imports(target) {
             Ok(x) => x,
             Err(errors) => {
@@ -1017,6 +1033,23 @@ fn run_build(target: &Path) -> ExitCode {
         eprintln!("not a file or directory: {}", target.display());
         return ExitCode::from(1);
     };
+
+    // FUv0.8.2 #4 (2026-05-25): auto-apply sync inference
+    // BEFORE typecheck. Walks the program, runs F.32-1∞ on
+    // `@form(hashmap)` loci without explicit `sync = `, and
+    // injects the picked discipline as a synthetic FormArg.
+    // The subsequent typecheck sees an explicit sync and the
+    // F.32-0 cross-pool diagnostic stays quiet for auto-
+    // inferable cases. Loci with existing sync kwarg or
+    // single-pool use are left alone.
+    let pre_diags = hale_types::apply_sync_inference(&mut program);
+    if !pre_diags.is_empty() {
+        let any_source = sources.values().next().map(|s| s.as_str()).unwrap_or("");
+        for d in &pre_diags {
+            eprintln!("{}", d.render(any_source));
+        }
+        return ExitCode::from(1);
+    }
 
     // Typecheck before lowering. Render diagnostics against the
     // entry-file's source — diagnostic spans currently point into

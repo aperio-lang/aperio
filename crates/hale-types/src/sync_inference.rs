@@ -120,7 +120,7 @@ const READ_METHODS: &[&str] =
 /// `pool_of_locus_type` is the F.31 placement-driven map
 /// (locus type name → pool the type's instances run on). Same
 /// shape `check_placement_single_thread` consumes.
-pub(crate) fn infer_sync_for_bundle(
+pub fn infer_sync_for_bundle(
     bundle: &Bundle<'_>,
     top: &TopScope,
     pool_of_locus_type: &BTreeMap<String, PoolId>,
