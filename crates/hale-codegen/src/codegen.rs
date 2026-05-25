@@ -2336,6 +2336,42 @@ struct CapacitySlotLayout {
     /// locus birth mallocs `cap * elem_size` bytes and the
     /// buffer never grows. `None` for all other slot kinds.
     ring_buffer_cap: Option<u64>,
+    /// F.32-1α (2026-05-24): for `@form(hashmap)` slots, the
+    /// sync discipline picked by the form annotation's
+    /// `sync = X` kwarg. `SyncMode::None` is the default
+    /// (plain `@form(hashmap)` — single-pool, no runtime
+    /// synchronization, cross-pool typecheck-rejected per
+    /// F.32-0). `SyncMode::Serialized` switches the init call
+    /// to `lotus_hashmap_init_serialized` (per-map mutex; the
+    /// existing `_set` / `_get` / etc entry points wrap their
+    /// bodies in lock/unlock when the map has `has_sync = 1`).
+    /// Striped (β) and Lockfree (γ) variants are reserved for
+    /// future F.32-1 ships; today the typechecker rejects
+    /// those values.
+    sync_mode: SyncMode,
+}
+
+/// F.32-1α (2026-05-24): which cross-pool sync discipline a
+/// `@form(hashmap)` slot opted into. See the F.32 delivery
+/// plan in `notes/f32-cache-aware-delivery-plan.md` for the
+/// per-discipline trade-offs and implementation notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncMode {
+    /// No sync — plain `@form(hashmap)` default. Cross-pool
+    /// calls are typecheck-rejected (F.32-0).
+    None,
+    /// `sync = serialized` — `pthread_mutex_t` per map; every
+    /// entry point takes the lock around its body. F.32-1α.
+    Serialized,
+    /// `sync = striped` — cell-level CAS on the occupancy byte
+    /// + `pthread_rwlock_t` for grow exclusion + cache-padded
+    /// cell stride. Concurrent writers race only on slot
+    /// collisions; readers see writers' publishes via the
+    /// acquire-release pair on slot[0]. F.32-1β2.
+    Striped,
+    // Lockfree variant (γ) is reserved for the future; the
+    // typechecker accepts the `sync = lockfree` keyword shape
+    // but emits a "deferred" diagnostic until γ ships.
 }
 
 /// v1.x-FORM-2: which form lowering is in play for a capacity slot.
@@ -2760,6 +2796,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         );
         self.module
             .add_function("lotus_hashmap_init", hashmap_init_ty, None);
+        // F.32-1α (2026-05-24): sync = serialized variant.
+        // Same signature as the plain init; differs only in
+        // that it pthread_mutex_init's the per-map mutex.
+        self.module
+            .add_function("lotus_hashmap_init_serialized", hashmap_init_ty, None);
+        // F.32-1β2 (2026-05-25): sync = striped variant. Cell
+        // stride is cache-padded; a per-map pthread_rwlock_t
+        // gates grow exclusion; entry points use cell-level
+        // CAS for slot claim.
+        self.module
+            .add_function("lotus_hashmap_init_striped", hashmap_init_ty, None);
         let hashmap_set_ty =
             void_t.fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false);
         self.module
@@ -10669,6 +10716,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     // already verified exactly one pool slot with
                     // indexed_by exists when @form(hashmap) is in
                     // play.
+                    //
+                    // F.32-1α/β2 (2026-05-24 / 2026-05-25): trailing
+                    // fields encode the sync-discipline state.
+                    //   sync_mode: i32     — 0=NONE, 1=SERIALIZED, 2=STRIPED
+                    //   mu: ptr            — pthread_mutex_t* (SERIALIZED only)
+                    //   mu_grow: ptr       — pthread_rwlock_t* (STRIPED only)
+                    //   cell_stride: i64   — padded cell size (β2: round up to LOTUS_CACHE_LINE)
+                    //   cursor_i: i64      — monotonic-iteration cursor (2026-05-25 fix)
+                    //   cursor_slot: i64   — cursor's slot index
+                    //
+                    // Plain @form(hashmap) zeros sync_mode / mu /
+                    // mu_grow at init; sets cell_stride to the
+                    // packed value. SERIALIZED + STRIPED variants
+                    // run their respective init to set everything.
                     let i32_t = self.context.i32_type();
                     let hashmap_struct_ty = self.context.struct_type(
                         &[
@@ -10678,6 +10739,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             i64_t.into(),  // value_size
                             i32_t.into(),  // key_type_tag
                             ptr_t.into(),  // slots (4-byte pad inserted before)
+                            i32_t.into(),  // sync_mode (F.32-1α; β2 widens semantics)
+                            ptr_t.into(),  // mu (F.32-1α; 4-byte pad inserted before)
+                            ptr_t.into(),  // mu_grow (F.32-1β2)
+                            i64_t.into(),  // cell_stride (F.32-1β2)
+                            i64_t.into(),  // cursor_i (2026-05-25)
+                            i64_t.into(),  // cursor_slot (2026-05-25)
                         ],
                         false,
                     );
@@ -10707,6 +10774,31 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 } else {
                     None
                 };
+                // F.32-1α (2026-05-24): read the @form(hashmap)
+                // `sync = X` kwarg if present. Typecheck has
+                // already validated the value shape; codegen
+                // just maps the recognized identifier to its
+                // SyncMode variant. Unrecognized / absent →
+                // SyncMode::None (single-pool, no runtime sync).
+                let sync_mode = if matches!(form, Some(SlotForm::Hashmap)) {
+                    l.form
+                        .as_ref()
+                        .and_then(|f| {
+                            f.args.iter().find(|a| a.name.name == "sync")
+                        })
+                        .and_then(|a| match &a.value {
+                            Expr::Ident(i) => Some(i.name.as_str()),
+                            _ => None,
+                        })
+                        .map(|name| match name {
+                            "serialized" => SyncMode::Serialized,
+                            "striped" => SyncMode::Striped,
+                            _ => SyncMode::None,
+                        })
+                        .unwrap_or(SyncMode::None)
+                } else {
+                    SyncMode::None
+                };
                 capacity_slots.push(CapacitySlotLayout {
                     name: slot.name.name.clone(),
                     kind: slot.kind,
@@ -10722,6 +10814,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .as_ref()
                         .map(|i| i.name.clone()),
                     ring_buffer_cap,
+                    sync_mode,
                 });
             }
         }
@@ -32344,10 +32437,21 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .context
                         .i32_type()
                         .const_int(key_type_tag, false);
+                    // F.32-1α/β2 (2026-05-24 / 2026-05-25): pick
+                    // the init variant from sync_mode. The runtime
+                    // `sync_mode` field on lotus_hashmap_t routes
+                    // every entry point through the right locking
+                    // discipline at call time — no codegen change
+                    // needed beyond picking the right init.
+                    let init_fn_name = match slot.sync_mode {
+                        SyncMode::None => "lotus_hashmap_init",
+                        SyncMode::Serialized => "lotus_hashmap_init_serialized",
+                        SyncMode::Striped => "lotus_hashmap_init_striped",
+                    };
                     let init_fn = self
                         .module
-                        .get_function("lotus_hashmap_init")
-                        .expect("lotus_hashmap_init extern declared");
+                        .get_function(init_fn_name)
+                        .expect("lotus_hashmap_init[_serialized|_striped] extern declared");
                     self.builder
                         .build_call(
                             init_fn,

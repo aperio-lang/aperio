@@ -668,8 +668,43 @@ Rules verified at typecheck:
 - `as_parent_for` on the slot is rejected — `@form(hashmap)`
   owns its slot's allocator, so the borrow mechanic from
   v1.x-4b doesn't compose.
-- `@form(hashmap, ...)` with annotation arguments is rejected:
-  there are no tuning knobs at v1.
+- `@form(hashmap, ...)` accepts one optional kwarg:
+  `sync = X` (F.32-1; see "Cross-pool sync disciplines"
+  below). All other kwargs are rejected.
+
+## Cross-pool sync disciplines
+
+By default, `@form(hashmap)` is **single-pool only** — the
+runtime has no synchronization on the hashmap entry points
+(`lotus_hashmap_set` / `_grow` / etc), and cross-pool calls
+into a plain `@form(hashmap)` receiver are typecheck-rejected
+(F.32-0). The opt-in path is the `sync = ` kwarg:
+
+| Annotation | Discipline | Status |
+|---|---|---|
+| `@form(hashmap)` | single-pool only | shipped |
+| `@form(hashmap, sync = serialized)` | per-map `pthread_mutex_t` (F.32-1α) | shipped |
+| `@form(hashmap, sync = striped)` | per-cell atomic + grow RW-lock + cache-padded cells (F.32-1β) | planned |
+| `@form(hashmap, sync = lockfree)` | CAS-based (F.32-1γ) | deferred |
+
+The `serialized` discipline wraps every public entry point in
+a per-map mutex. Throughput is bounded by lock contention
+(`~5-10 M ops/s` on a 4-writer workload); correctness is
+trivial. The map's `lotus_hashmap_t` struct grows by 12 bytes
+(int has_sync + pointer mu); the pthread_mutex_t is
+heap-allocated at init and destroyed at dissolve.
+
+Cross-pool method calls into a `@form(hashmap, sync = ...)`
+receiver are accepted without diagnostic — the chosen
+discipline carries the substrate's safety contract. Inside a
+single pool, `serialized` is the same cost as
+`pthread_mutex_lock` on an uncontended mutex (~30 ns).
+
+See `notes/f32-cache-aware-delivery-plan.md` § F.32-1 for the
+per-discipline implementation strategy and trade-off
+analysis, and `spec/types.md` § "Single-threaded-method
+invariant (F.31)" for how cross-pool calls into form-bearing
+receivers interact with the placement system.
 
 The key type `K` is derived from the resolved type of the
 indexed-by field. At v1, K must be `Int` or `String`. Other

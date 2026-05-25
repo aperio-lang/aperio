@@ -332,18 +332,21 @@ fn main() { App { }; }
 }
 
 #[test]
-fn cross_pool_call_on_form_bearing_locus_accepted() {
-    // A locus declared `@form(hashmap)` (or any `@form(...)`) acts as a
-    // synchronization primitive through the form ABI, so
-    // cross-pool method calls into it are pragma-allowed.
-    // The pond/metrics Registry pattern: producers on
-    // various pools call `self.registry.counter(...)`,
-    // a consumer pool calls `self.registry.render()`. The
-    // hashmap cells serialize the writes.
+fn cross_pool_call_on_plain_form_locus_rejected_with_upgrade_hint() {
+    // F.32-0 (2026-05-24): plain `@form(...)` loci no longer
+    // get the cross-pool exemption. The 3ec6391 first-cut
+    // assumed the form ABI serialized cell access; bench-prep
+    // for F.32-1 surfaced that the runtime has no
+    // synchronization on `lotus_hashmap_set` / `_grow` and
+    // concurrent writers double-free during grow. F.32-0
+    // restores single-pool default for plain `@form(...)`;
+    // the diagnostic now points authors at the upgrade path
+    // (`sync = serialized` or `sync = striped`, lands in
+    // F.32-1α/β).
     //
-    // Phase 5 pre-fix flagged every such call as
-    // cross-pool; post-fix it trusts the form layout's
-    // serialization and the diagnostic is skipped.
+    // Pre-F.32-0 behavior (kept for history): the diagnostic
+    // was skipped for any `@form(...)` receiver. Test was
+    // named `cross_pool_call_on_form_bearing_locus_accepted`.
     let src = r#"
 type Counter { name: String; v: Int = 0; }
 
@@ -368,9 +371,34 @@ main locus App {
 fn main() { App { }; }
 "#;
     let msgs = check(src);
-    assert!(
-        msgs.iter().all(|m| !m.contains("cross-pool")),
-        "expected @form-bearing receiver locus to be exempt; got: {:?}",
+    let cross_pool: Vec<_> = msgs.iter()
+        .filter(|m| m.contains("cross-pool"))
+        .collect();
+    assert_eq!(
+        cross_pool.len(),
+        1,
+        "expected exactly one cross-pool diagnostic; got msgs: {:?}",
         msgs
+    );
+    let msg = cross_pool[0];
+    assert!(
+        msg.contains("self.registry.render"),
+        "diagnostic should name the offending call site: {}",
+        msg
+    );
+    assert!(
+        msg.contains("`Registry` is `@form(...)`"),
+        "diagnostic should flag the receiver as form-bearing: {}",
+        msg
+    );
+    assert!(
+        msg.contains("sync = serialized") && msg.contains("sync = striped"),
+        "upgrade hint should name both serialized and striped: {}",
+        msg
+    );
+    assert!(
+        msg.contains("F.32"),
+        "upgrade hint should reference the F.32 delivery plan: {}",
+        msg
     );
 }

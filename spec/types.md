@@ -544,26 +544,55 @@ which are what carry per-locus arena state.
 
 **Interaction with `@form(...)` loci.** A locus declared
 with a `@form(...)` annotation (`@form(hashmap)`,
-`@form(vec)`, `@form(ring_buffer)`) is implicitly
-cross-pool-callable. The form ABI's cell storage acts as
-the synchronization primitive — all reads and writes go
-through the substrate's serializing accessors, and the
-locus's other fields (the form's bookkeeping state) are
-the only mutable state the methods touch. Cross-pool
-method calls into form-bearing receivers are accepted
-without diagnostic; the locus author has implicitly
-asserted thread-safety by choosing a form layout.
+`@form(vec)`, `@form(ring_buffer)`) is **single-pool by
+default** — its methods participate in the same single-
+threaded-method invariant as any other locus. Plain
+`@form(...)` cells have no runtime synchronization;
+concurrent writers from different pools corrupt the
+underlying structure.
 
-Concrete shape: a `Registry @form(hashmap) of Counter
-indexed_by name` shared across producer pools (gateway
-loci incrementing counters) and a consumer pool
+Cross-pool access is opt-in via the `sync = ` kwarg on
+the form annotation:
+
+| Annotation | Discipline | Trade-off |
+|---|---|---|
+| `@form(hashmap)` | single-pool only | densest layout, no sync overhead, cross-pool calls rejected |
+| `@form(hashmap, sync = serialized)` | per-map mutex (F.32-1α) | correct cross-pool; throughput bounded by lock contention |
+| `@form(hashmap, sync = striped)` | per-cell atomic + grow RW-lock + cache-padded cells (F.32-1β) | parallel writers; grow path serializes |
+| `@form(hashmap, sync = lockfree)` | CAS-based (F.32-1γ; deferred) | highest throughput; not yet shipped |
+
+When a locus carries a recognized sync discipline, cross-
+pool method calls into it are accepted without diagnostic —
+the substrate's chosen discipline carries the safety
+contract. Plain `@form(...)` (no sync kwarg) gets the same
+cross-pool diagnostic as any other locus, extended with an
+upgrade-path hint naming the sync kwargs.
+
+Concrete shape: a `Registry @form(hashmap, sync = striped)
+of Counter indexed_by name` shared across producer pools
+(gateway loci incrementing counters) and a consumer pool
 (`MetricsEndpoint` rendering Prometheus text) typechecks
-clean. The hashmap cells' load-store boundary is where
-serialization happens; the typechecker trusts that.
+clean. Without the `sync = striped`, every cross-pool
+`self.registry.counter(...)` would be rejected.
 
-Non-form receiver loci still go through the strict
-single-thread check. To opt in, declare the locus
-`@form(...)` over the relevant cell layout.
+Non-form receiver loci have no sync discipline available;
+cross-pool coordination must go through the bus.
+
+**Inference.** F.32-1∞ adds a closed-world inference pass
+that picks a `sync` default per form-bearing locus type
+from the pool-propagation graph. The explicit annotation
+always overrides; the inferred pick is shown via a
+compile-time diagnostic at the decl site. See
+`notes/f32-cache-aware-delivery-plan.md` § F.32-1∞.
+
+**History.** Commit `3ec6391` (2026-05-24, first cut)
+admitted any `@form(...)` locus into the cross-pool-safe
+set unconditionally, on the strength of a not-yet-shipped
+"form ABI serializes" claim. Bench-prep for F.32-1
+surfaced that the runtime had no synchronization on the
+form paths; F.32-0 (this section's current state) scopes
+the exemption to explicit opt-in via `sync = X`. See
+`notes/f32-cache-aware-delivery-plan.md` § F.32-0.
 
 ## Closure-test typing
 

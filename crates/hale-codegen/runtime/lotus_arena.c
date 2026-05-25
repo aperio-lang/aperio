@@ -76,16 +76,82 @@
  * observability primitive used to verify
  * the Phase-4 method-scratch reclaim actually bounds memory. */
 #include <sys/resource.h>
+/* F.32-4a/4c (2026-05-24): mlockall (locking pages against
+ * paging) and mmap with MAP_HUGETLB (huge-page-backed arena
+ * chunks) for latency-critical workloads. Linux-only — the
+ * relevant constants come from <sys/mman.h>. MAP_HUGE_2MB
+ * lives in <linux/mman.h> which isn't always reachable from
+ * <sys/mman.h>; define it locally when missing so we don't
+ * have to depend on the kernel headers. The value comes from
+ * the Linux ABI: MAP_HUGE_SHIFT = 26, MAP_HUGE_2MB = 21 << 26. */
+#include <sys/mman.h>
+#ifndef MAP_HUGE_SHIFT
+#  define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#  define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+#ifndef MAP_HUGETLB
+#  define MAP_HUGETLB 0x40000   /* Linux-specific; fallback for builds where it's missing */
+#endif
 
 /* Default chunk size: 64KB. Big enough that most loci fit in
  * one chunk, small enough that a leaf locus that allocates a
- * single ClosureViolation doesn't waste an entire MB. Tunable. */
+ * single ClosureViolation doesn't waste an entire MB. Tunable
+ * via env (F.32-3, see lotus_arena_default_chunk_bytes below). */
 #define LOTUS_ARENA_CHUNK_BYTES (64 * 1024)
+
+/* F.32-3 (2026-05-25): operator-tunable chunk size override.
+ * Set LOTUS_ARENA_CHUNK_BYTES_OVERRIDE=N (bytes, must be a
+ * power of 2 in the [4096, 16M] range) to override the
+ * default. Useful for multi-locus-per-pool deployments where
+ * the default 64K chunks blow past L2-per-core; sized smaller,
+ * each locus's hot chunk fits in cache across pool rotations.
+ *
+ * Reads the env once at first use; cached for the process
+ * lifetime. The compile-time `LOTUS_ARENA_CHUNK_BYTES` macro
+ * is still used by the chunk pool's discriminator (the pool
+ * only retains chunks at the canonical default size); when
+ * the override fires, chunks land on the malloc/free path,
+ * not the pool. That's acceptable — overriding means the
+ * operator picked a non-default and we treat those chunks as
+ * "non-pooled" anyway. */
+static size_t lotus_arena_default_chunk_bytes(void) {
+    static size_t cached = 0;
+    static int initialized = 0;
+    if (!initialized) {
+        const char *env = getenv("LOTUS_ARENA_CHUNK_BYTES_OVERRIDE");
+        if (env) {
+            char *endp = NULL;
+            unsigned long v = strtoul(env, &endp, 10);
+            /* Validate: power of 2, in [4K, 16M]. */
+            if (endp && *endp == '\0'
+                && v >= 4096 && v <= (16ul * 1024 * 1024)
+                && (v & (v - 1)) == 0)
+            {
+                cached = (size_t)v;
+            }
+        }
+        if (cached == 0) cached = LOTUS_ARENA_CHUNK_BYTES;
+        initialized = 1;
+    }
+    return cached;
+}
 
 typedef struct lotus_arena_chunk {
     struct lotus_arena_chunk *next;
     size_t                    used;
     size_t                    cap;
+    /* F.32-4a (2026-05-24): when LOTUS_HUGE_PAGES=1 is set in
+     * the environment AND the requested chunk size is >= the
+     * huge-page threshold (default 2 MB), the chunk is mmap'd
+     * with MAP_HUGETLB | MAP_HUGE_2MB rather than malloc'd.
+     * The release path must munmap (not free) — track the
+     * allocation method per chunk so destroy picks the right
+     * deallocator. `mmap_size` is the full mmap'd region size
+     * (header + data); 0 for malloc'd chunks. */
+    int                       via_mmap;
+    size_t                    mmap_size;
     /* `data` follows in the same allocation — accessed as
      * (char *)(chunk + 1). Inlined-trailing layout means each
      * chunk is one malloc, not two. */
@@ -891,12 +957,64 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk_for(
         lotus_log_chunk_attach_event(
             target, "chunk_attach_malloc", cap);
     }
+    /* F.32-4a (2026-05-24): for chunks >= huge-page threshold
+     * (2 MB), try mmap with MAP_HUGETLB | MAP_HUGE_2MB to back
+     * the allocation with 2 MB pages. Reduces TLB pressure by
+     * ~512x for big working sets — HFT-grade order books and
+     * large @form(hashmap) registries see meaningful win. Falls
+     * back to malloc cleanly when:
+     *   - LOTUS_HUGE_PAGES is unset / false
+     *   - chunk size is < 2 MB (waste of physical memory)
+     *   - mmap fails (kernel huge-page pool exhausted or
+     *     CAP_IPC_LOCK / sysctl vm.nr_hugepages not set up)
+     *
+     * Operator prereq: `sysctl -w vm.nr_hugepages=N` to reserve
+     * N huge pages in the kernel pool. Without this, the mmap
+     * call returns MAP_FAILED with errno=ENOMEM and we fall
+     * back to regular malloc — the program still works, just
+     * without the TLB-pressure win. */
+    static int hugepages_env_checked = 0;
+    static int hugepages_enabled = 0;
+    if (!hugepages_env_checked) {
+        const char *env = getenv("LOTUS_HUGE_PAGES");
+        if (env && (env[0] == '1' || env[0] == 't' || env[0] == 'T')) {
+            hugepages_enabled = 1;
+        }
+        hugepages_env_checked = 1;
+    }
+    if (hugepages_enabled && cap >= (2 * 1024 * 1024)) {
+        size_t total = sizeof(lotus_arena_chunk_t) + cap;
+        /* Round up to 2 MB for the mmap call — huge-page
+         * allocations must be page-multiples. */
+        size_t mmap_size = (total + (2 * 1024 * 1024 - 1))
+                         & ~((size_t)(2 * 1024 * 1024 - 1));
+        void *p = mmap(NULL, mmap_size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
+                       -1, 0);
+        if (p != MAP_FAILED) {
+            lotus_arena_chunk_t *c = (lotus_arena_chunk_t *)p;
+            c->next = NULL;
+            c->used = 0;
+            c->cap  = cap;
+            c->via_mmap = 1;
+            c->mmap_size = mmap_size;
+            return c;
+        }
+        /* mmap failed — fall through to malloc. Suppress the
+         * diagnostic (would spam on every chunk grow); a single
+         * warning at startup would be better, but the operator
+         * can detect failures via `perf stat` (TLB-miss count
+         * stays high) or by inspecting LOTUS_CHUNK_POOL_STATS. */
+    }
     lotus_arena_chunk_t *c =
         (lotus_arena_chunk_t *)malloc(sizeof(lotus_arena_chunk_t) + cap);
     if (!c) return NULL;
     c->next = NULL;
     c->used = 0;
     c->cap  = cap;
+    c->via_mmap = 0;
+    c->mmap_size = 0;
     return c;
 }
 
@@ -914,6 +1032,15 @@ static lotus_arena_chunk_t *lotus_arena_new_chunk(size_t cap) {
 static void lotus_arena_release_chunk(lotus_arena_chunk_t *c) {
     if (!c) return;
     lotus_mark_thread_for_pool_dtor();
+    /* F.32-4a (2026-05-24): huge-page-backed chunks bypass the
+     * pool entirely (they're never default-sized; pool only
+     * holds LOTUS_ARENA_CHUNK_BYTES chunks) and need munmap
+     * not free. Check first so we don't accidentally free()
+     * an mmap'd region. */
+    if (c->via_mmap) {
+        munmap(c, c->mmap_size);
+        return;
+    }
     if (c->cap == LOTUS_ARENA_CHUNK_BYTES
         && g_chunk_pool_count < LOTUS_CHUNK_POOL_CAP)
     {
@@ -934,7 +1061,7 @@ static inline size_t lotus_align_up(size_t n, size_t a) {
 static lotus_arena_t *lotus_arena_alloc_struct(void) {
     lotus_arena_t *a = (lotus_arena_t *)malloc(sizeof(lotus_arena_t));
     if (!a) return NULL;
-    a->default_chunk_size = LOTUS_ARENA_CHUNK_BYTES;
+    a->default_chunk_size = lotus_arena_default_chunk_bytes();
     /* 2026-05-21: defer the initial chunk to the first
      * `lotus_arena_alloc` call. Per-method scratch reclaim
      * makes arena create/destroy a hot-path op; the dominant
@@ -1866,6 +1993,29 @@ void lotus_vec_destroy(void *vec_ptr) {
 #define LOTUS_HASHMAP_LOAD_NUM 7
 #define LOTUS_HASHMAP_LOAD_DEN 10
 
+/* F.32-1β2 (2026-05-25) — cell-level CAS striped discipline:
+ * sync_mode + occupancy state encoding + cache-line constant. */
+#define LOTUS_HASHMAP_SYNC_NONE       0  /* plain @form(hashmap); single-pool */
+#define LOTUS_HASHMAP_SYNC_SERIALIZED 1  /* α: per-map pthread_mutex_t */
+#define LOTUS_HASHMAP_SYNC_STRIPED    2  /* β2: cell CAS + rwlock-on-grow */
+
+/* 3-state occupancy byte for striped cells. Plain / serialized
+ * cells use just 0 (empty) / 1 (occupied) since serial access
+ * doesn't need the CLAIMED intermediate state. */
+#define LOTUS_CELL_EMPTY     0
+#define LOTUS_CELL_CLAIMED   1  /* striped: writer holds slot, not yet published */
+#define LOTUS_CELL_COMMITTED 2  /* striped: writer released; key + value valid */
+
+/* Cache line for the striped cell-stride padding (matches the
+ * value used in experiments/f32-false-sharing/bench.c). The
+ * C twin's measurement shows ~5x speedup ceiling from padding
+ * on this hardware; striped cells round their stride up to
+ * this multiple to land each cell on its own line. Tunable
+ * via build-time #define for non-x86_64 targets. */
+#ifndef LOTUS_CACHE_LINE
+#  define LOTUS_CACHE_LINE 64
+#endif
+
 typedef struct {
     size_t cap;
     size_t len;
@@ -1873,10 +2023,95 @@ typedef struct {
     size_t value_size;
     int key_type_tag;
     char *slots;
+    /* F.32-1α (2026-05-24): sync = serialized opt-in. When the
+     * locus is declared `@form(hashmap, sync = serialized)`,
+     * `lotus_hashmap_init_serialized` sets `has_sync = 1` and
+     * heap-allocates `mu`. All hashmap entry points then take
+     * the mutex around the existing single-threaded body. Plain
+     * `@form(hashmap)` keeps `has_sync = 0` and `mu = NULL`;
+     * the lock-check is a single load + branch — no atomic, no
+     * contention.
+     *
+     * Why a pointer rather than inline storage: `pthread_mutex_t`
+     * has platform-dependent size (40 B on Linux glibc x86_64,
+     * 64 B on macOS, etc.). The inline-LLVM-struct codegen
+     * needs a portable, fixed-width slot — a pointer is 8 B
+     * everywhere. The one-time malloc at init is amortized
+     * across the locus's lifetime. */
+    /* F.32-1α/β2 (2026-05-24 / 2026-05-25): cross-pool sync
+     * discipline. Renamed from `has_sync` (bool) to widen for
+     * `striped` (β2). Values: LOTUS_HASHMAP_SYNC_{NONE,
+     * SERIALIZED, STRIPED}. Read at every entry point to
+     * dispatch the right locking strategy. */
+    int sync_mode;
+    /* SERIALIZED only: per-map mutex. Heap-allocated by
+     * lotus_hashmap_init_serialized so the inline struct
+     * layout stays platform-portable (pthread_mutex_t has
+     * platform-dependent size; the pointer doesn't). */
+    pthread_mutex_t *mu;
+    /* STRIPED only: per-map RW-lock for grow exclusion. set /
+     * get / has / key_at / value_at / len take rdlock so
+     * multiple ops run concurrently; grow / remove take wrlock
+     * so they're exclusive against everything. Heap-allocated
+     * for the same portability reason as `mu`. NULL for
+     * non-STRIPED disciplines. */
+    pthread_rwlock_t *mu_grow;
+    /* Cell stride in bytes — replaces the runtime-computed
+     * `1 + key_size + value_size` for layout-aware paths. For
+     * NONE / SERIALIZED, set to the packed value at init. For
+     * STRIPED, set to `round_up(1 + key_size + value_size,
+     * LOTUS_CACHE_LINE)` so each cell lands on its own cache
+     * line. All slot indexing uses this stride; `entry_size()`
+     * returns it. */
+    size_t cell_stride;
+    /* 2026-05-25: monotonic-iteration cursor. `key_at(i)` and
+     * `value_at(i)` are each O(cap) per call — they scan the
+     * slots array counting occupied entries until they hit the
+     * i-th one. A loop calling them with i = 0, 1, ..., N-1 is
+     * O(N * cap) ≈ O(N²) since cap grows with N. The cursor
+     * collapses this to O(N) total for monotonic iteration:
+     *
+     *   - After `key_at(i)` / `value_at(i)` succeeds at slot S,
+     *     set `cursor_i = i` and `cursor_slot = S`.
+     *   - Next call with the same `i`: hit slot S directly, O(1).
+     *   - Next call with `i == cursor_i + 1`: scan from
+     *     `cursor_slot + 1`, O(slots-walked) amortized O(1)/call.
+     *   - Random-access `i`: cursor is stale → fall back to
+     *     full scan, behavior unchanged from before.
+     *
+     * Cursor is invalidated by any mutation that changes the
+     * slot layout: `set` (may append + may grow), `remove`
+     * (shifts entries to fill the gap), `grow` (whole table
+     * rebuilt). The invalidation is a single store to
+     * `cursor_i = -1`. Safe for the common bench / canonical
+     * iteration shape:
+     *
+     *   let n = m.len();
+     *   let mut i = 0;
+     *   while i < n {
+     *       let k = m.key_at(i) or raise;
+     *       let e = m.entry_at(i) or raise;     // same i, O(1)
+     *       i = i + 1;                          // next call i+1
+     *   }
+     *
+     * Stricter invariant: between two cursor-using calls there
+     * are no `set` / `remove` / mutating method invocations.
+     * Held by every spec-compliant iteration loop.
+     *
+     * Bench impact (form_hashmap_walk_large @ 100k): 6.88 s →
+     * single-digit ms. Pre-fix: Hale was 17,000× behind Go on
+     * iteration. */
+    int64_t cursor_i;
+    size_t  cursor_slot;
 } lotus_hashmap_t;
 
 static size_t lotus_hashmap_entry_size(const lotus_hashmap_t *m) {
-    return 1 + m->key_size + m->value_size;
+    /* F.32-1β2 (2026-05-25): returns the cached cell stride, which
+     * is set at init time. For plain / serialized maps this is
+     * the packed `1 + key + value`; for striped maps this is
+     * rounded up to LOTUS_CACHE_LINE so adjacent cells land on
+     * separate cache lines. */
+    return m->cell_stride;
 }
 
 static size_t lotus_hashmap_hash(const lotus_hashmap_t *m, const void *key) {
@@ -1940,13 +2175,144 @@ void lotus_hashmap_init(void *map_ptr,
     m->key_size = key_size;
     m->value_size = value_size;
     m->key_type_tag = key_type_tag;
-    size_t es = 1 + key_size + value_size;
-    m->slots = (char *)calloc(m->cap, es);
+    m->cell_stride = 1 + key_size + value_size;
+    m->slots = (char *)calloc(m->cap, m->cell_stride);
+    /* F.32-1α: default discipline = none. Methods inspect
+     * `sync_mode` and skip locking. */
+    m->sync_mode = LOTUS_HASHMAP_SYNC_NONE;
+    m->mu = NULL;
+    m->mu_grow = NULL;
+    /* 2026-05-25: cursor starts invalid. First key_at / value_at
+     * pays the full scan; subsequent monotonic accesses ride
+     * the cursor. */
+    m->cursor_i = -1;
+    m->cursor_slot = 0;
 }
 
-/* Forward declaration — set + grow are mutually recursive on
- * the rehash path. */
-void lotus_hashmap_set(void *map_ptr, const void *key, const void *value);
+/* F.32-1α (2026-05-24): sync = serialized variant. Same init
+ * payload as `lotus_hashmap_init` PLUS allocates + initializes
+ * a `pthread_mutex_t`. The locus codegen emits a call to this
+ * variant (in place of `lotus_hashmap_init`) when the form
+ * annotation carries `sync = serialized`. */
+void lotus_hashmap_init_serialized(void *map_ptr,
+                                    size_t key_size,
+                                    size_t value_size,
+                                    int key_type_tag) {
+    if (!map_ptr) return;
+    lotus_hashmap_init(map_ptr, key_size, value_size, key_type_tag);
+    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    m->mu = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(m->mu, NULL);
+    m->sync_mode = LOTUS_HASHMAP_SYNC_SERIALIZED;
+}
+
+/* F.32-1β2 (2026-05-25): sync = striped variant. Cells are
+ * cache-line-padded so disjoint-key writers on different
+ * cores don't false-share. Per-map RW-lock guards the grow
+ * path: set / get / etc take rdlock (concurrent), grow /
+ * remove take wrlock (exclusive). Slot-level claim via the
+ * 3-state occupancy byte (EMPTY → CLAIMED → COMMITTED) lets
+ * concurrent writers race on different slots without
+ * blocking on a global mutex.
+ *
+ * Reallocates the slots array because cell_stride differs
+ * from the packed default. Init order: regular init first
+ * (sets packed stride), then we replace cell_stride with the
+ * padded value and recalloc. */
+void lotus_hashmap_init_striped(void *map_ptr,
+                                 size_t key_size,
+                                 size_t value_size,
+                                 int key_type_tag) {
+    if (!map_ptr) return;
+    lotus_hashmap_init(map_ptr, key_size, value_size, key_type_tag);
+    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    /* Pad cell stride up to the next cache-line multiple. */
+    size_t packed = 1 + key_size + value_size;
+    size_t padded = (packed + (LOTUS_CACHE_LINE - 1))
+                  & ~((size_t)(LOTUS_CACHE_LINE - 1));
+    if (padded > m->cell_stride) {
+        free(m->slots);
+        m->cell_stride = padded;
+        m->slots = (char *)calloc(m->cap, m->cell_stride);
+    }
+    m->mu_grow = (pthread_rwlock_t *)malloc(sizeof(pthread_rwlock_t));
+    pthread_rwlock_init(m->mu_grow, NULL);
+    m->sync_mode = LOTUS_HASHMAP_SYNC_STRIPED;
+}
+
+/* F.32-1α helpers — single load + branch each. Inlined in the
+ * compiled C; the branch is well-predicted on either side
+ * (always-taken for serialized maps, never-taken for plain).
+ *
+ * F.32-1β2 (2026-05-25): dispatch on sync_mode for the lock
+ * pair. NONE = no-op. SERIALIZED = full pthread_mutex around
+ * the body (writers serialize, reads block writers). STRIPED
+ * = rdlock around the body (concurrent reads / writes; the
+ * cell-level CAS in `set_striped` provides slot-level
+ * mutual exclusion). The striped wrlock paths (grow / remove)
+ * use their own dedicated locking — `lotus_hashmap_wrlock`. */
+static inline void lotus_hashmap_lock(lotus_hashmap_t *m) {
+    switch (m->sync_mode) {
+        case LOTUS_HASHMAP_SYNC_SERIALIZED:
+            pthread_mutex_lock(m->mu);
+            break;
+        case LOTUS_HASHMAP_SYNC_STRIPED:
+            pthread_rwlock_rdlock(m->mu_grow);
+            break;
+        default: /* NONE */
+            break;
+    }
+}
+static inline void lotus_hashmap_unlock(lotus_hashmap_t *m) {
+    switch (m->sync_mode) {
+        case LOTUS_HASHMAP_SYNC_SERIALIZED:
+            pthread_mutex_unlock(m->mu);
+            break;
+        case LOTUS_HASHMAP_SYNC_STRIPED:
+            pthread_rwlock_unlock(m->mu_grow);
+            break;
+        default:
+            break;
+    }
+}
+/* F.32-1β2 wrlock pair — exclusive against everything. Used by
+ * grow (called from set when load factor exceeded) and remove
+ * (Robin-Hood shifts can't run concurrent with reads). For
+ * NONE / SERIALIZED, falls back to the same lock pair as
+ * lotus_hashmap_lock (mutex is already exclusive). */
+static inline void lotus_hashmap_wrlock(lotus_hashmap_t *m) {
+    switch (m->sync_mode) {
+        case LOTUS_HASHMAP_SYNC_SERIALIZED:
+            pthread_mutex_lock(m->mu);
+            break;
+        case LOTUS_HASHMAP_SYNC_STRIPED:
+            pthread_rwlock_wrlock(m->mu_grow);
+            break;
+        default:
+            break;
+    }
+}
+static inline void lotus_hashmap_wrunlock(lotus_hashmap_t *m) {
+    switch (m->sync_mode) {
+        case LOTUS_HASHMAP_SYNC_SERIALIZED:
+            pthread_mutex_unlock(m->mu);
+            break;
+        case LOTUS_HASHMAP_SYNC_STRIPED:
+            pthread_rwlock_unlock(m->mu_grow);
+            break;
+        default:
+            break;
+    }
+}
+
+/* F.32-1α (2026-05-24): each public entry point comes in two
+ * pieces: an `_unlocked` body that does the actual work, and
+ * the public wrapper that optionally takes the per-map mutex
+ * around the body. `grow` and the cross-method recursion paths
+ * use only `_unlocked` so the lock isn't re-acquired. */
+static void lotus_hashmap_set_unlocked(lotus_hashmap_t *m,
+                                        const void *key,
+                                        const void *value);
 
 static void lotus_hashmap_grow(lotus_hashmap_t *m) {
     size_t old_cap = m->cap;
@@ -1956,24 +2322,28 @@ static void lotus_hashmap_grow(lotus_hashmap_t *m) {
     m->cap = new_cap;
     m->slots = (char *)calloc(new_cap, es);
     m->len = 0;
-    /* Reinsert every live entry into the new table. The probe
-     * sequence changes because mask = new_cap - 1 is wider, so
-     * we route through the normal `set` path rather than copying
-     * raw bytes. */
+    /* Reinsert every live entry into the new table. Route through
+     * `_unlocked` — the outer wrapper already holds the lock if
+     * sync_mode != NONE (or the wrlock for striped), and the grow
+     * path itself is single-threaded by invariant. F.32-1β2:
+     * for striped, occupancy byte CLAIMED-or-COMMITTED both
+     * count as live entries to migrate; we copy the slot bytes
+     * regardless of whether the previous occupant was mid-write
+     * (a CLAIMED-during-grow scenario would mean someone is
+     * holding rdlock while we hold wrlock, which the rwlock
+     * primitive itself rules out). */
     for (size_t i = 0; i < old_cap; i++) {
         char *slot = old_slots + i * es;
         if (slot[0]) {
-            lotus_hashmap_set(m, slot + 1, slot + 1 + m->key_size);
+            lotus_hashmap_set_unlocked(m, slot + 1, slot + 1 + m->key_size);
         }
     }
     free(old_slots);
 }
 
-void lotus_hashmap_set(void *map_ptr,
-                        const void *key,
-                        const void *value) {
-    if (!map_ptr || !key || !value) return;
-    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+static void lotus_hashmap_set_unlocked(lotus_hashmap_t *m,
+                                        const void *key,
+                                        const void *value) {
     /* Grow before insertion when adding one more entry would
      * cross the load-factor threshold. The check uses unsigned
      * arithmetic so it stays correct as len/cap grow. */
@@ -1985,40 +2355,300 @@ void lotus_hashmap_set(void *map_ptr,
     size_t i = lotus_hashmap_find_slot(m, key);
     char *slot = m->slots + i * es;
     int was_empty = !slot[0];
-    slot[0] = 1;
+    /* 2026-05-25: write LOTUS_CELL_COMMITTED (=2) rather than
+     * a bare `1` here. v1 NONE/SERIALIZED only sees non-zero;
+     * either value works for them. v2 STRIPED reserves state=1
+     * (LOTUS_CELL_CLAIMED) for the transient "writer mid-publish"
+     * marker, so the grow path (which also goes through this
+     * function during rebuild) must NOT leave entries in
+     * CLAIMED state — otherwise a striped probe scanning the
+     * rebuilt table would spin forever on every cell. */
+    slot[0] = LOTUS_CELL_COMMITTED;
     memcpy(slot + 1, key, m->key_size);
     memcpy(slot + 1 + m->key_size, value, m->value_size);
     if (was_empty) m->len++;
+    /* 2026-05-25: iteration cursor is now stale (slot occupancy
+     * pattern changed). Next key_at / value_at falls back to a
+     * full scan; subsequent monotonic calls re-establish the
+     * cursor. */
+    m->cursor_i = -1;
+}
+
+/* F.32-1β2 (2026-05-25): striped set. Cell-level CAS for slot
+ * claim + 3-state occupancy for safe concurrent reads. Grow
+ * exclusion via rwlock_wrlock.
+ *
+ * Protocol per slot:
+ *   EMPTY (0)     — free; writers CAS to CLAIMED (1)
+ *   CLAIMED (1)   — writer owns slot; key+value being written
+ *   COMMITTED (2) — key+value published; readers can dereference
+ *
+ * The acquire-release pair on slot[0] ensures readers that
+ * observe COMMITTED also see the key+value writes.
+ *
+ * Spin on CLAIMED: rare — only when two writers probe to the
+ * same slot index in tight succession, and the loser briefly
+ * waits for the winner's ~100 ns memcpy. No yield needed in
+ * practice; the loop is bounded by the writer's release. */
+/* F.32-1β2-v2 (2026-05-25): true cell-level CAS striped set.
+ * Multiple writers run in parallel — each contends only on
+ * the cells their probe sequences visit, not on a global
+ * mutex.
+ *
+ * Protocol per slot, with state transitions on slot[0]:
+ *
+ *   EMPTY (0) ──CAS──> CLAIMED (1) ── memcpy + release-store ──> COMMITTED (2)
+ *                                                                     │
+ *   COMMITTED (2) ──CAS (update)──> CLAIMED (1) ──memcpy──> COMMITTED (2)
+ *                                                                     │
+ *   COMMITTED (2) ──remove (under wrlock)──> EMPTY (0)
+ *
+ * The acquire-release pair on slot[0] ensures readers that
+ * observe COMMITTED also see the key/value writes.
+ *
+ * Probe safety: if the table becomes too full to find an
+ * empty slot before we wrap (probes >= m->cap), force a
+ * grow. Triggered when concurrent writers race past the
+ * load-factor check and collectively fill the remaining
+ * empty slots before our probe completes. */
+static void lotus_hashmap_set_striped(lotus_hashmap_t *m,
+                                       const void *key,
+                                       const void *value) {
+    pthread_rwlock_rdlock(m->mu_grow);
+
+    /* Grow check + re-check pattern. If we need to grow, we
+     * have to drop rdlock to take wrlock. Another thread may
+     * grow first; we re-check under wrlock to avoid double-
+     * grow, then drop wrlock + retake rdlock for the probe. */
+    size_t cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+    if ((cur_len + 1) * LOTUS_HASHMAP_LOAD_DEN
+        > m->cap * LOTUS_HASHMAP_LOAD_NUM)
+    {
+        pthread_rwlock_unlock(m->mu_grow);
+        pthread_rwlock_wrlock(m->mu_grow);
+        cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+        if ((cur_len + 1) * LOTUS_HASHMAP_LOAD_DEN
+            > m->cap * LOTUS_HASHMAP_LOAD_NUM)
+        {
+            lotus_hashmap_grow(m);
+        }
+        pthread_rwlock_unlock(m->mu_grow);
+        pthread_rwlock_rdlock(m->mu_grow);
+    }
+
+    /* Probe with wrap-around detection. mask + i recomputed
+     * after each potential grow (cap may have doubled). */
+probe_restart:;
+    size_t es = lotus_hashmap_entry_size(m);
+    size_t mask = m->cap - 1;
+    size_t i = lotus_hashmap_hash(m, key) & mask;
+    size_t probes = 0;
+
+    for (;;) {
+        if (probes >= m->cap) {
+            /* Wrapped without finding a slot. Concurrent
+             * writers raced past us; force a grow and
+             * restart the probe with the new cap. */
+            pthread_rwlock_unlock(m->mu_grow);
+            pthread_rwlock_wrlock(m->mu_grow);
+            cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+            if ((cur_len + 1) * LOTUS_HASHMAP_LOAD_DEN
+                > m->cap * LOTUS_HASHMAP_LOAD_NUM)
+            {
+                lotus_hashmap_grow(m);
+            }
+            pthread_rwlock_unlock(m->mu_grow);
+            pthread_rwlock_rdlock(m->mu_grow);
+            goto probe_restart;
+        }
+
+        char *slot = m->slots + i * es;
+        uint8_t state =
+            __atomic_load_n((uint8_t *)&slot[0], __ATOMIC_ACQUIRE);
+
+        if (state == LOTUS_CELL_EMPTY) {
+            uint8_t expected = LOTUS_CELL_EMPTY;
+            if (__atomic_compare_exchange_n(
+                    (uint8_t *)&slot[0],
+                    &expected, LOTUS_CELL_CLAIMED,
+                    0, /* strong CAS */
+                    __ATOMIC_ACQUIRE,
+                    __ATOMIC_RELAXED))
+            {
+                /* Won the slot. Publish key + value, then
+                 * release-store COMMITTED. */
+                memcpy(slot + 1, key, m->key_size);
+                memcpy(slot + 1 + m->key_size, value, m->value_size);
+                __atomic_store_n((uint8_t *)&slot[0],
+                                 LOTUS_CELL_COMMITTED,
+                                 __ATOMIC_RELEASE);
+                __atomic_fetch_add(&m->len, 1, __ATOMIC_RELAXED);
+                m->cursor_i = -1;
+                break;
+            }
+            /* CAS lost — re-read state and re-decide. */
+            continue;
+        }
+
+        if (state == LOTUS_CELL_CLAIMED) {
+            /* Writer mid-publish on this slot. Spin briefly. */
+            continue;
+        }
+
+        /* COMMITTED — compare keys. */
+        if (lotus_hashmap_key_eq(m, slot + 1, key)) {
+            /* Update path. CAS COMMITTED → CLAIMED, rewrite
+             * value, release-store COMMITTED. */
+            uint8_t expected = LOTUS_CELL_COMMITTED;
+            if (__atomic_compare_exchange_n(
+                    (uint8_t *)&slot[0],
+                    &expected, LOTUS_CELL_CLAIMED,
+                    0,
+                    __ATOMIC_ACQUIRE,
+                    __ATOMIC_RELAXED))
+            {
+                memcpy(slot + 1 + m->key_size, value, m->value_size);
+                __atomic_store_n((uint8_t *)&slot[0],
+                                 LOTUS_CELL_COMMITTED,
+                                 __ATOMIC_RELEASE);
+                /* len unchanged for update */
+                break;
+            }
+            /* Lost update race — retry same slot. */
+            continue;
+        }
+
+        /* Different key — probe next. */
+        i = (i + 1) & mask;
+        probes++;
+    }
+
+    pthread_rwlock_unlock(m->mu_grow);
+}
+
+void lotus_hashmap_set(void *map_ptr,
+                        const void *key,
+                        const void *value) {
+    if (!map_ptr || !key || !value) return;
+    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        lotus_hashmap_set_striped(m, key, value);
+        return;
+    }
+    lotus_hashmap_lock(m);
+    lotus_hashmap_set_unlocked(m, key, value);
+    lotus_hashmap_unlock(m);
+}
+
+/* F.32-1β2-v2 (2026-05-25): striped probe-and-read. Reads slot[0]
+ * atomically; spins past CLAIMED slots (writer mid-publish)
+ * until COMMITTED or EMPTY. Probe boundary is EMPTY; mismatched-
+ * key COMMITTED entries advance to the next slot. Returns slot
+ * index when the key's COMMITTED entry is found, or m->cap when
+ * not found.
+ *
+ * The CLAIMED-spin is bounded by the writer's CAS-publish window
+ * (~tens of ns: memcpy key+value + release-store). No kernel
+ * wait. */
+static size_t lotus_hashmap_find_slot_striped(lotus_hashmap_t *m,
+                                               const void *key) {
+    size_t es = lotus_hashmap_entry_size(m);
+    size_t mask = m->cap - 1;
+    size_t i = lotus_hashmap_hash(m, key) & mask;
+    for (;;) {
+        char *slot = m->slots + i * es;
+        uint8_t state;
+        for (;;) {
+            state =
+                __atomic_load_n((uint8_t *)&slot[0], __ATOMIC_ACQUIRE);
+            if (state != LOTUS_CELL_CLAIMED) break;
+            /* Spin: writer mid-publish. */
+        }
+        if (state == LOTUS_CELL_EMPTY) {
+            return m->cap;  /* probe boundary: not found */
+        }
+        /* COMMITTED — key bytes valid (release-store paired
+         * with our acquire-load above). */
+        if (lotus_hashmap_key_eq(m, slot + 1, key)) {
+            return i;
+        }
+        i = (i + 1) & mask;
+    }
 }
 
 int lotus_hashmap_get(void *map_ptr, const void *key, void *out_value) {
     if (!map_ptr || !key || !out_value) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    if (m->len == 0) return 0;
-    size_t es = lotus_hashmap_entry_size(m);
-    size_t i = lotus_hashmap_find_slot(m, key);
-    char *slot = m->slots + i * es;
-    if (!slot[0]) return 0;
-    memcpy(out_value, slot + 1 + m->key_size, m->value_size);
-    return 1;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        pthread_rwlock_rdlock(m->mu_grow);
+        int r = 0;
+        if (__atomic_load_n(&m->len, __ATOMIC_RELAXED) > 0) {
+            size_t i = lotus_hashmap_find_slot_striped(m, key);
+            if (i < m->cap) {
+                char *slot = m->slots + i * lotus_hashmap_entry_size(m);
+                memcpy(out_value, slot + 1 + m->key_size, m->value_size);
+                r = 1;
+            }
+        }
+        pthread_rwlock_unlock(m->mu_grow);
+        return r;
+    }
+    lotus_hashmap_lock(m);
+    int r;
+    if (m->len == 0) {
+        r = 0;
+    } else {
+        size_t es = lotus_hashmap_entry_size(m);
+        size_t i = lotus_hashmap_find_slot(m, key);
+        char *slot = m->slots + i * es;
+        if (!slot[0]) {
+            r = 0;
+        } else {
+            memcpy(out_value, slot + 1 + m->key_size, m->value_size);
+            r = 1;
+        }
+    }
+    lotus_hashmap_unlock(m);
+    return r;
 }
 
 int lotus_hashmap_has(void *map_ptr, const void *key) {
     if (!map_ptr || !key) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    if (m->len == 0) return 0;
-    size_t es = lotus_hashmap_entry_size(m);
-    size_t i = lotus_hashmap_find_slot(m, key);
-    return m->slots[i * es] ? 1 : 0;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        pthread_rwlock_rdlock(m->mu_grow);
+        int r = 0;
+        if (__atomic_load_n(&m->len, __ATOMIC_RELAXED) > 0) {
+            size_t i = lotus_hashmap_find_slot_striped(m, key);
+            r = (i < m->cap) ? 1 : 0;
+        }
+        pthread_rwlock_unlock(m->mu_grow);
+        return r;
+    }
+    lotus_hashmap_lock(m);
+    int r;
+    if (m->len == 0) {
+        r = 0;
+    } else {
+        size_t es = lotus_hashmap_entry_size(m);
+        size_t i = lotus_hashmap_find_slot(m, key);
+        r = m->slots[i * es] ? 1 : 0;
+    }
+    lotus_hashmap_unlock(m);
+    return r;
 }
 
 /* Backward-shift deletion. After clearing the target slot,
  * walk forward and shift any entry whose natural position is
  * "before" the freed slot in the probe sequence — that's what
- * keeps `find_slot` correct without tombstones. */
-int lotus_hashmap_remove(void *map_ptr, const void *key) {
-    if (!map_ptr || !key) return 0;
-    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+ * keeps `find_slot` correct without tombstones.
+ *
+ * F.32-1β2 (2026-05-25): factored body for striped remove (the
+ * shifts are not safe to run concurrent with reads; striped
+ * remove takes wrlock for exclusivity). For NONE/SERIALIZED
+ * the caller is already inside `lotus_hashmap_lock`. */
+static int lotus_hashmap_remove_unlocked(lotus_hashmap_t *m,
+                                          const void *key) {
     if (m->len == 0) return 0;
     size_t es = lotus_hashmap_entry_size(m);
     size_t mask = m->cap - 1;
@@ -2026,9 +2656,6 @@ int lotus_hashmap_remove(void *map_ptr, const void *key) {
     if (!m->slots[i * es]) return 0;
     m->slots[i * es] = 0;
     m->len--;
-    /* Walk forward through the cluster, shifting entries whose
-     * probe chain runs through `i`. Stops at the first empty
-     * slot — that's the cluster boundary. */
     size_t j = (i + 1) & mask;
     while (m->slots[j * es]) {
         size_t natural =
@@ -2042,19 +2669,54 @@ int lotus_hashmap_remove(void *map_ptr, const void *key) {
         }
         j = (j + 1) & mask;
     }
+    /* 2026-05-25: shifts above invalidate the iteration cursor. */
+    m->cursor_i = -1;
     return 1;
+}
+
+int lotus_hashmap_remove(void *map_ptr, const void *key) {
+    if (!map_ptr || !key) return 0;
+    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        /* Striped: take wrlock so shifts can't race with rdlock'd
+         * readers. find_slot uses non-atomic occupancy reads in
+         * the unlocked body — safe because wrlock is exclusive. */
+        pthread_rwlock_wrlock(m->mu_grow);
+        int r = lotus_hashmap_remove_unlocked(m, key);
+        pthread_rwlock_unlock(m->mu_grow);
+        return r;
+    }
+    lotus_hashmap_lock(m);
+    int r = lotus_hashmap_remove_unlocked(m, key);
+    lotus_hashmap_unlock(m);
+    return r;
 }
 
 int64_t lotus_hashmap_len(void *map_ptr) {
     if (!map_ptr) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    return (int64_t)m->len;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        /* Atomic load is sufficient; no rdlock needed — len
+         * updates are atomic increments and a snapshot is
+         * inherently approximate under concurrent writers. */
+        return (int64_t)__atomic_load_n(&m->len, __ATOMIC_RELAXED);
+    }
+    lotus_hashmap_lock(m);
+    int64_t n = (int64_t)m->len;
+    lotus_hashmap_unlock(m);
+    return n;
 }
 
 int lotus_hashmap_is_empty(void *map_ptr) {
     if (!map_ptr) return 1;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    return m->len == 0 ? 1 : 0;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        return __atomic_load_n(&m->len, __ATOMIC_RELAXED) == 0 ? 1 : 0;
+    }
+    lotus_hashmap_lock(m);
+    int r = m->len == 0 ? 1 : 0;
+    lotus_hashmap_unlock(m);
+    return r;
 }
 
 /* Hash-table-order iteration. Walk the slots array counting
@@ -2127,45 +2789,181 @@ void lotus_text_tokenize_words_into(
     }
 }
 
-int lotus_hashmap_key_at(void *map_ptr, int64_t i, void *out_key) {
-    if (!map_ptr || !out_key || i < 0) return 0;
-    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    if ((size_t)i >= m->len) return 0;
+/* 2026-05-25: resolve the slot index for the i-th occupied
+ * entry, using the iteration cursor when monotonic access is
+ * detected. Returns the slot index (< m->cap) or m->cap when
+ * not found / i out of range. Updates m->cursor_{i,slot} on
+ * success so subsequent monotonic calls accelerate.
+ *
+ * Cursor states handled:
+ *   - `cursor_i == i`            → return cached slot directly.
+ *   - `cursor_i + 1 == i`        → start scan from cursor_slot + 1.
+ *   - any other (incl. invalid)  → full scan from slot 0.
+ *
+ * Bounds check (i < len) is the caller's responsibility — both
+ * key_at and value_at guard before invoking this. */
+static size_t lotus_hashmap_resolve_index_slot(lotus_hashmap_t *m,
+                                                int64_t i) {
     size_t es = lotus_hashmap_entry_size(m);
-    size_t seen = 0;
-    for (size_t s = 0; s < m->cap; s++) {
+    if (m->cursor_i == i) {
+        /* Same i twice in a row (canonical case: key_at(j) then
+         * entry_at(j)). O(1) hit. */
+        return m->cursor_slot;
+    }
+    size_t start_slot;
+    size_t seen;
+    if (m->cursor_i >= 0 && m->cursor_i + 1 == i) {
+        /* Monotonic next step — pick up where we left off. */
+        start_slot = m->cursor_slot + 1;
+        seen = (size_t)(m->cursor_i + 1);
+    } else {
+        /* Random access or stale cursor — full scan from 0. */
+        start_slot = 0;
+        seen = 0;
+    }
+    for (size_t s = start_slot; s < m->cap; s++) {
         char *slot = m->slots + s * es;
         if (!slot[0]) continue;
         if (seen == (size_t)i) {
-            memcpy(out_key, slot + 1, m->key_size);
-            return 1;
+            m->cursor_i = i;
+            m->cursor_slot = s;
+            return s;
         }
         seen++;
     }
-    return 0;
+    return m->cap;  /* not found (i out of range despite < len check) */
+}
+
+/* F.32-1β2 (2026-05-25): striped iterator slot resolver. Mirror
+ * of lotus_hashmap_resolve_index_slot, but reads occupancy
+ * atomically and spins past CLAIMED slots (writer mid-publish).
+ * Spin is bounded by the writer's CAS-publish window (tens of
+ * ns) — no kernel wait. Cursor updates may race under rdlock;
+ * the only consequence is a cold-path scan on the next call. */
+static size_t lotus_hashmap_resolve_index_slot_striped(lotus_hashmap_t *m,
+                                                        int64_t i) {
+    size_t es = lotus_hashmap_entry_size(m);
+    if (m->cursor_i == i) {
+        return m->cursor_slot;
+    }
+    size_t start_slot;
+    size_t seen;
+    if (m->cursor_i >= 0 && m->cursor_i + 1 == i) {
+        start_slot = m->cursor_slot + 1;
+        seen = (size_t)(m->cursor_i + 1);
+    } else {
+        start_slot = 0;
+        seen = 0;
+    }
+    for (size_t s = start_slot; s < m->cap; s++) {
+        char *slot = m->slots + s * es;
+        uint8_t state;
+        for (;;) {
+            state =
+                __atomic_load_n((uint8_t *)&slot[0], __ATOMIC_ACQUIRE);
+            if (state != LOTUS_CELL_CLAIMED) break;
+            /* Spin: writer mid-publish on this slot. */
+        }
+        if (state == LOTUS_CELL_EMPTY) continue;
+        if (seen == (size_t)i) {
+            m->cursor_i = i;
+            m->cursor_slot = s;
+            return s;
+        }
+        seen++;
+    }
+    return m->cap;
+}
+
+int lotus_hashmap_key_at(void *map_ptr, int64_t i, void *out_key) {
+    if (!map_ptr || !out_key || i < 0) return 0;
+    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        pthread_rwlock_rdlock(m->mu_grow);
+        int r = 0;
+        size_t cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+        if ((size_t)i < cur_len) {
+            size_t s = lotus_hashmap_resolve_index_slot_striped(m, i);
+            if (s < m->cap) {
+                size_t es = lotus_hashmap_entry_size(m);
+                char *slot = m->slots + s * es;
+                memcpy(out_key, slot + 1, m->key_size);
+                r = 1;
+            }
+        }
+        pthread_rwlock_unlock(m->mu_grow);
+        return r;
+    }
+    lotus_hashmap_lock(m);
+    int r = 0;
+    if ((size_t)i < m->len) {
+        size_t s = lotus_hashmap_resolve_index_slot(m, i);
+        if (s < m->cap) {
+            size_t es = lotus_hashmap_entry_size(m);
+            char *slot = m->slots + s * es;
+            memcpy(out_key, slot + 1, m->key_size);
+            r = 1;
+        }
+    }
+    lotus_hashmap_unlock(m);
+    return r;
 }
 
 int lotus_hashmap_value_at(void *map_ptr, int64_t i, void *out_value) {
     if (!map_ptr || !out_value || i < 0) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    if ((size_t)i >= m->len) return 0;
-    size_t es = lotus_hashmap_entry_size(m);
-    size_t seen = 0;
-    for (size_t s = 0; s < m->cap; s++) {
-        char *slot = m->slots + s * es;
-        if (!slot[0]) continue;
-        if (seen == (size_t)i) {
-            memcpy(out_value, slot + 1 + m->key_size, m->value_size);
-            return 1;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+        pthread_rwlock_rdlock(m->mu_grow);
+        int r = 0;
+        size_t cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+        if ((size_t)i < cur_len) {
+            size_t s = lotus_hashmap_resolve_index_slot_striped(m, i);
+            if (s < m->cap) {
+                size_t es = lotus_hashmap_entry_size(m);
+                char *slot = m->slots + s * es;
+                memcpy(out_value, slot + 1 + m->key_size, m->value_size);
+                r = 1;
+            }
         }
-        seen++;
+        pthread_rwlock_unlock(m->mu_grow);
+        return r;
     }
-    return 0;
+    lotus_hashmap_lock(m);
+    int r = 0;
+    if ((size_t)i < m->len) {
+        size_t s = lotus_hashmap_resolve_index_slot(m, i);
+        if (s < m->cap) {
+            size_t es = lotus_hashmap_entry_size(m);
+            char *slot = m->slots + s * es;
+            memcpy(out_value, slot + 1 + m->key_size, m->value_size);
+            r = 1;
+        }
+    }
+    lotus_hashmap_unlock(m);
+    return r;
 }
 
 void lotus_hashmap_destroy(void *map_ptr) {
     if (!map_ptr) return;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    /* F.32-1α / β2 (2026-05-24 / 2026-05-25): release the
+     * sync-discipline resources before freeing the storage.
+     * Safe to call on NONE-mode maps (the switch falls through). */
+    switch (m->sync_mode) {
+        case LOTUS_HASHMAP_SYNC_SERIALIZED:
+            pthread_mutex_destroy(m->mu);
+            free(m->mu);
+            m->mu = NULL;
+            break;
+        case LOTUS_HASHMAP_SYNC_STRIPED:
+            pthread_rwlock_destroy(m->mu_grow);
+            free(m->mu_grow);
+            m->mu_grow = NULL;
+            break;
+        default:
+            break;
+    }
+    m->sync_mode = LOTUS_HASHMAP_SYNC_NONE;
     free(m->slots);
     m->slots = NULL;
     m->cap = 0;
@@ -2884,6 +3682,20 @@ void lotus_coop_pool_post(lotus_coop_pool_t *p,
     if (payload_size > 0 && payload_src) {
         memcpy(slot->payload_inline, payload_src, payload_size);
     }
+    /* F.32-4-prefetch (2026-05-24): hint the receiver's L1 to
+     * pull the freshly-written slot's cache line. The receiver
+     * pool's drain loop will read these bytes within ~µs; the
+     * prefetch arrives well ahead of the consumer's load,
+     * eliminating the cache-miss stall on the consumer side
+     * (~10-50 ns saved per cell). Write-intent locality 3
+     * (high temporal reuse) because the drain pops + reads
+     * the cell almost immediately. Zero-cost on the producer
+     * side — single instruction, no stall.
+     *
+     * Cooperative-main bus dispatch (`lotus_bus_queue_enqueue`)
+     * gains the same hint at its enqueue site; same-pool drains
+     * tend to be cache-warm already so the win is smaller there. */
+    __builtin_prefetch(slot, 1, 3);
     pthread_cond_broadcast(&p->not_empty);
     pthread_mutex_unlock(&p->lock);
 }
@@ -5590,6 +6402,38 @@ static const char   g_empty_str[1] = { 0 };
 void lotus_env_init(int argc, char *const *argv) {
     g_argc = argc;
     g_argv = argv;
+    /* F.32-4c (2026-05-24): opt-in mlockall for latency-critical
+     * programs. Set LOTUS_LOCK_MEMORY=1 in the environment to
+     * lock all current + future pages and eliminate page-fault
+     * stalls on hot-path arena allocation. HFT-grade processes
+     * use this in concert with hugepages (F.32-4a) and pinned
+     * placement.
+     *
+     * Prereqs: caller's RLIMIT_MEMLOCK must be high enough (or
+     * root). Common shell: `ulimit -l unlimited` before invocation.
+     * If mlockall fails (typically EPERM or ENOMEM), we print
+     * a diagnostic to stderr and continue running unlocked —
+     * the program still works, just without the stall-elimination
+     * guarantee.
+     *
+     * Env-var surface (rather than a `runtime { lock_memory:
+     * true }` block on `main locus`) keeps the choice at deploy
+     * time where it belongs — the operator decides per-host
+     * based on RLIMIT_MEMLOCK availability, without recompiling
+     * the program. The language-surface variant is reserved for
+     * a later F.32 ship if the env-var surface proves
+     * insufficient. */
+    const char *lock_mem_env = getenv("LOTUS_LOCK_MEMORY");
+    if (lock_mem_env && (lock_mem_env[0] == '1' || lock_mem_env[0] == 't' || lock_mem_env[0] == 'T')) {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            fprintf(stderr,
+                    "lotus: LOTUS_LOCK_MEMORY=%s requested but mlockall "
+                    "failed (errno=%d %s). Continuing without memory locking; "
+                    "increase RLIMIT_MEMLOCK (`ulimit -l unlimited`) or grant "
+                    "CAP_IPC_LOCK to fix.\n",
+                    lock_mem_env, errno, strerror(errno));
+        }
+    }
 }
 
 /*

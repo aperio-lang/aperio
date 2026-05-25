@@ -1698,7 +1698,14 @@ mod tests {
     }
 
     #[test]
-    fn err_form_hashmap_with_args() {
+    fn err_form_hashmap_with_unknown_arg() {
+        // F.32-1α (2026-05-24): @form(hashmap) now accepts an
+        // optional `sync = X` kwarg (X ∈ {serialized, striped,
+        // lockfree}). Other kwargs are still rejected, but the
+        // diagnostic shape changed from "takes no arguments"
+        // to "unknown arg `<name>`" naming the only valid kwarg.
+        // History: pre-F.32-1α this asserted on
+        // "@form(hashmap) takes no arguments".
         let src = r#"
             type Entry { name: String; v: Int; }
             @form(hashmap, cap = 64)
@@ -1711,8 +1718,71 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("@form(hashmap) takes no arguments")),
-            "expected hashmap-no-args diag, got: {:?}",
+                .any(|d| d.message.contains("unknown arg `cap`")
+                      && d.message.contains("sync = X")),
+            "expected hashmap unknown-arg diag naming sync = X, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_with_sync_serialized() {
+        // F.32-1α (2026-05-24): the canonical opt-in path for
+        // cross-pool @form(hashmap). Standalone test that the
+        // typecheck accepts the kwarg.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, sync = serialized)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean typecheck on sync = serialized; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_with_sync_striped() {
+        // F.32-1β2 (2026-05-25): striped accepted — cell-level
+        // CAS + rwlock-on-grow + cache-padded cells. Was
+        // rejected as "not yet shipped" pre-β2.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, sync = striped)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean typecheck on sync = striped; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_with_unknown_sync_value() {
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, sync = potato)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown sync discipline")),
+            "expected unknown-sync-value diag, got: {:?}",
             diags
         );
     }

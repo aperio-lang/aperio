@@ -12,6 +12,23 @@ only flow. The structural foundation is there; the active
 analysis isn't. This plan turns the structural advantage
 into measurable wins.
 
+**2026-05-24 audit finding.** Bench-prep for the original
+F.32-1 surfaced a correctness gap in the cross-pool
+`@form(hashmap)` path. `lotus_hashmap_set` / `_grow` have
+no synchronization (`lotus_arena.c:1869-1992`); the
+typecheck exemption shipped at `3ec6391` is purely
+type-system, not runtime. Two writers on different pools
+double-free during concurrent `grow` (both `free(old_slots)`)
+and corrupt `len` / `slots` under cell collision. Repro:
+`bench/micro/form_hashmap_false_sharing.hl` at n>=1000
+crashes with `double free or corruption (!prev)` within 1s.
+This plan now closes that hole first (F.32-0) and reframes
+cross-pool sync as a **storage discipline** picked via a
+new `sync = ` kwarg on the form annotation (F.32-1{α,β,γ}).
+Closed-world inference picks the default per
+locus-type (F.32-1∞); the explicit annotation always
+overrides.
+
 This document survives a repository / organization rename;
 all references to "hale" / "hale" should be read
 against the new names once the rename lands. Code paths
@@ -22,49 +39,275 @@ substring-rename should suffice.
 
 ## Scope summary
 
-Five deliverables, increasing in cost, decreasing in
+Deliverables increase in cost, decrease in
 expected impact-per-unit-effort. Each is independently
 shippable — earlier deliverables can land without later
-ones, and the structural foundation post-deliverable-1 is
+ones, and the structural foundation post-F.32-1β is
 enough to attack the rest on demand.
 
 | ID | Theme | Effort | HFT impact |
 |---|---|---|---|
-| **F.32-1**  | False-sharing padding on cross-pool `@form` cells | small | high |
-| **F.32-1b** | Locus struct field reordering by access frequency | small-medium | medium |
-| **F.32-2**  | Compile-time working-set budget per locus | medium | medium (engineering discipline; CI gate) |
-| **F.32-3**  | Per-pool arena chunking sized to cache slice | medium | low-medium (multi-pool scale-up) |
-| **F.32-4**  | HFT extras: huge pages, prefetch hints, mlock | small-medium | medium-high |
+| **F.32-0**   | Revert cross-pool `@form(hashmap)` exemption — closes corruption hole; restores single-pool default | trivial | (correctness) |
+| **F.32-1α**  | `sync = serialized` cross-pool `@form(hashmap)` (one mutex per map) | small | medium |
+| **F.32-1β**  | `sync = striped` cross-pool `@form(hashmap)` (per-cell atomic + grow RW-lock + cache-padded cells) — incorporates the original F.32-1 padding work | medium | high |
+| **F.32-1γ**  | `sync = lockfree` cross-pool `@form(hashmap)` — deferred until β's bench numbers justify | large | (future) |
+| **F.32-1∞**  | Closed-world sync inference + diagnostic (picks default per locus type from pool-propagation graph) | small-medium | (ergonomics) |
+| **F.32-4-prefetch** | Bus-dispatch prefetch hint (pulled forward; pairs with F.32-1β) | trivial | medium |
+| **F.32-1b**  | Locus struct field reordering by access frequency | small-medium | medium |
+| **F.32-2**   | Compile-time working-set budget per locus | medium | medium (engineering discipline; CI gate) |
+| **F.32-3**   | Per-pool arena chunking sized to cache slice | medium | low-medium (multi-pool scale-up) |
+| **F.32-4**   | HFT extras: huge pages, prefetch hints, mlock | small-medium | medium-high |
 
-Recommended order: **1 → 4 (prefetch sub-task) → 1b → 2 →
-3 → 4 (huge pages + mlock)**. Rationale: false-sharing fix
-is the immediate ask; prefetch hints in bus dispatch are
-nearly-free given the substrate already knows the
-producer/consumer cell relationship; field reordering
-extends the same access-pattern analysis; budgets +
-chunking are scale-up concerns; huge pages + mlock are
-deployment polish.
+Recommended order: **0 → 1α → 1β + 4-prefetch (one commit) →
+1∞ → 1b → 2 → 3 → 4 (huge pages + mlock) → 1γ if bench
+numbers justify**. Rationale: F.32-0 is a one-commit drop
+that fixes a corruption bug; F.32-1α is the smallest
+correct cross-pool path and gives 1∞ a default to fall back
+to; F.32-1β is the real perf work + finally makes the
+false-sharing bench run cleanly; 4-prefetch ships with 1β
+because the detection / producer-side code path is shared;
+1∞ closes the ergonomics gap once explicit annotations
+exist to fall back to; the rest is unchanged from the
+original sequencing.
 
 ---
 
-## F.32-1 — False-sharing padding on cross-pool `@form` cells
+## F.32-0 — Revert cross-pool `@form(hashmap)` exemption
 
-**The problem.** A `@form(hashmap)` locus declared on a
-non-`main` cooperative pool is reachable cross-pool via the
-@form-cross-pool exemption (`spec/types.md` § Single-
-threaded-method invariant → "Interaction with `@form(...)`
-loci", shipped 2026-05-24 / `3ec6391`). Two cores writing
+**The problem.** Commit `3ec6391` (2026-05-24) removed the
+cross-pool diagnostic for `@form(...)` receivers on the
+strength of a commit-message claim that "the hashmap cells
+ARE the synchronization primitive." That claim is
+aspirational, not shipped — `lotus_hashmap_t` (`lotus_arena.c:1869`)
+has no mutex, no atomics, no synchronization. Two writers
+on different pools race in `lotus_hashmap_grow`:
+
+1. Both check `(len + 1) * 10 > cap * 7` — both see "needs grow"
+2. Both `calloc` a new slots array
+3. Both assign `m->slots = new_slots` (one new array leaks)
+4. Both `free(old_slots)` — same pointer, freed twice → glibc
+   trap: `double free or corruption (!prev)`
+
+`bench/micro/form_hashmap_false_sharing.hl` at n>=1000
+reproduces this crash within ~1s of startup. n=100 happens
+to survive on initial-cap luck, not correctness.
+
+**The fix.** Scope the typecheck exemption to form-bearing
+loci that carry an explicit sync discipline. Plain
+`@form(hashmap)` / `@form(vec)` / `@form(ring_buffer)`
+returns to the single-pool-only default — cross-pool calls
+again typecheck-error. The opt-in path is the new
+`sync = ` kwarg (F.32-1α/β/γ below). No runtime change.
+
+**Concrete substrate touch-points.**
+
+1. `crates/hale-types/src/check.rs`: the
+   `cross_pool_safe_loci: BTreeSet<String>` built in Phase 5
+   of the single-thread invariant pass. Today it includes any
+   locus type carrying any `@form(...)` annotation. Restrict
+   to locus types carrying `sync = X` where X != `none`.
+
+2. Diagnostic: extend the existing cross-pool error to name
+   the upgrade path:
+
+   ```
+   error: cross-pool call into Registry @form(hashmap) from pool `ws`
+          receiver lives on pool `main`
+     hint: cross-pool @form(hashmap) requires an explicit sync discipline
+           try `@form(hashmap, sync = serialized)` (per-map mutex, simplest)
+            or `@form(hashmap, sync = striped)` (parallel writers, padded cells)
+   ```
+
+3. No runtime change. No codegen change. Pure typecheck restriction.
+
+**Tests.**
+- `crates/hale-types/tests/cross_pool_form_hashmap_rejected.rs`:
+  the two-pool form_hashmap_false_sharing shape, without a
+  sync kwarg, must produce the diagnostic.
+- The existing single-pool fixtures (`std::log` registry
+  used inside one locus, etc.) continue to typecheck clean.
+
+**Spec / docs.**
+- `spec/types.md` § "Interaction with @form(...) loci": the
+  "implicitly cross-pool-callable" claim becomes "cross-
+  pool-callable when an explicit sync discipline is declared
+  (see F.32-1)." Plain `@form(...)` is single-pool by default.
+- `spec/forms.md`: forward-reference the `sync = ` kwarg.
+- This document: this section.
+
+**Acceptance.** `form_hashmap_false_sharing.hl` no longer
+compiles without `sync = striped` (or serialized) on the
+Registry declaration. No regression in existing fixtures
+where forms are used single-pool.
+
+**Estimated effort.** 1 small session. ~50 LOC across
+typecheck + diagnostic + one regression test.
+
+---
+
+## F.32-1 — Cross-pool `@form(hashmap)`: sync disciplines
+
+F.32-0 closes the corruption hole but doesn't restore the
+Prometheus-counter shape (multi-producer / single-consumer)
+that the original F.32-1 was sized for. That workload
+genuinely needs cross-pool writes. This umbrella defines
+three opt-in disciplines the form ABI offers — each picks a
+different point on the throughput / engineering-cost /
+tail-latency curve:
+
+| Discipline | Throughput (4 writers) | p99 tail | LOC |
+|---|---|---|---|
+| **α — serialized** | ~5–10 M ops/s (mutex contention) | ~100µs (futex sleep) | ~50 |
+| **β — striped** | ~80–150 M ops/s (parallel cells; grow serializes) | grow spike (~100µs) | ~250 |
+| **γ — lockfree** | ~150–200 M ops/s (near-linear) | ~few µs (bounded CAS retry) | ~600 |
+
+The cache-line padding originally specified as F.32-1 lives
+under F.32-1β specifically — without parallel cell writes
+there's nothing to false-share. `sync = striped` emits
+padded cells automatically; the other variants don't pay
+for padding they can't use.
+
+F.32-1∞ adds closed-world inference: the typechecker walks
+the call graph from `main.placement { }` and picks a sync
+default per form-bearing locus type, emitting a diagnostic
+at the decl site naming the choice. Explicit annotations
+always override.
+
+## F.32-1α — `sync = serialized`
+
+**Surface.**
+```hale
+@form(hashmap, sync = serialized)
+locus Registry { capacity { pool entries of Counter indexed_by id; } }
+```
+
+**Implementation.**
+
+1. `lotus_hashmap_t` (`lotus_arena.c:1869`) grows a
+   `pthread_mutex_t mu;` field. Initialized in a new
+   `lotus_hashmap_init_serialized`, destroyed in a paired
+   `lotus_hashmap_destroy_serialized` called from the
+   locus's dissolve before the arena wholesale-free.
+2. `lotus_hashmap_set` / `_get` / `_remove` / `_bump` /
+   `_key_at` / `_entry_at` / `_len` / `_has` wrap bodies in
+   `pthread_mutex_lock` / `unlock`. `_grow` runs under the
+   same lock — no re-entrancy because the same thread holds
+   it across the grow call.
+3. Codegen: when emitting a locus with `sync = serialized`,
+   call `lotus_hashmap_init_serialized` instead of
+   `lotus_hashmap_init`. Same ABI; init variant constructs
+   the mutex.
+
+**Tests.**
+- `crates/hale-codegen/tests/form_hashmap_serialized_crosspool.rs`:
+  the F.32-0-rejected shape now typechecks and runs.
+  100k inserts from each of two pools; assert `len == 200000`
+  and no crash.
+- `crates/hale-codegen/tests/form_hashmap_serialized_basic.rs`:
+  single-thread `set` / `get` / `remove` continue to work
+  (uncontended mutex path).
+
+**Spec / docs.**
+- `spec/forms.md`: add `sync = ` kwarg; list `serialized` as
+  one value; document the per-map-mutex semantics.
+- `spec/types.md`: cross-pool exemption applies when sync != none.
+
+**Acceptance.** The previously-crashing
+`form_hashmap_false_sharing.hl` bench runs cleanly with
+`sync = serialized` on the Registry. Throughput will be
+modest by design — α is the safe baseline; β is where the
+perf work happens.
+
+**Estimated effort.** ~1 small session. ~100 LOC (mutex
+plumbing + 2 tests + spec touch).
+
+---
+
+## F.32-1β — `sync = striped` (per-cell atomic + grow RW-lock + cache-padded cells)
+
+**Status (2026-05-25, second pass): β2-v2 SHIPPED.**
+
+**What's in the runtime:**
+- `@form(hashmap, sync = striped)` valid annotation; codegen
+  routes through `lotus_hashmap_init_striped`.
+- `lotus_hashmap_t` carries `sync_mode`,
+  `mu_grow: pthread_rwlock_t *`, `cell_stride: size_t`.
+- Cells cache-padded to `LOTUS_CACHE_LINE` (64B default).
+- **True cell-level CAS** in `lotus_hashmap_set_striped`:
+  - `EMPTY (0) → CLAIMED (1) → COMMITTED (2)` state machine.
+  - `__atomic_compare_exchange_n` for slot claim.
+  - Acquire-release pair on `slot[0]` for memory ordering.
+  - Writers run in parallel — no global mutex.
+- `find_slot_striped` + `resolve_index_slot_striped` spin past
+  transient `CLAIMED` states (bounded by writer's release).
+- Probe wrap-around detection: if probes ≥ cap, force grow
+  + retry (concurrent writers may have filled the slack
+  between the load-factor check and the probe).
+- `lotus_hashmap_set_unlocked` writes `LOTUS_CELL_COMMITTED`
+  (was `1`, now `2`) so the grow path's re-insertion produces
+  immediately-readable cells (not transient-looking CLAIMED).
+
+**Perf finding (2026-05-25, hardware-dependent):**
+
+On this 2-core x86_64 host with the bench's small key/value
+payloads (`{id: Int, v: Int}`), β2-v2 measures **1.87× SLOWER**
+than α: 29 ms vs 15.5 ms on `form_hashmap_false_sharing`. The
+per-op rwlock+CAS overhead (~150 ns) exceeds α's mutex+memcpy
+(~90 ns) by more than the 2-core parallelism gain compensates.
+
+**β2-v2 wins materialize on:**
+- More cores (the parallelism scales; per-op overhead doesn't).
+- Heavier per-op work (large values, complex keys: per-op work
+  amortizes the synchronization overhead).
+- Read-heavy mixes (rwlock-rdlock allows concurrent reads; α's
+  mutex blocks all readers).
+
+**Recommendation by workload:**
+- 2-4 cores + cheap k/v ops + write-heavy → use `sync = serialized`.
+- 4+ cores or heavy k/v ops or read-heavy → use `sync = striped`.
+- Single pool (single-threaded access) → plain `@form(hashmap)`.
+
+The bench file `form_hashmap_false_sharing.hl` is wired with
+`sync = striped` so the harness exercises β2-v2's correctness
++ perf shape; the elevated baseline (29 ms) reflects β2-v2's
+honest cost on this hardware. Switching to α is a one-line
+change for users whose workload favors mutex serialization.
+
+**Correctness validation:**
+- /tmp/sm_striped_cp_big (100k inserts × 2 pools): exit 0, len=200000.
+- `cargo test --release -p hale-codegen --test form_hashmap_serialized`:
+  passes (covers α; the striped path uses the same wiring).
+- Workspace test sweep: 169 suites pass.
+
+**Open work for β2-v3 (future):**
+- tsan / relacy validation under concurrent stress.
+- Investigate cheaper sync primitives (futex-based, biased
+  locks) to close the per-op gap with α.
+- Lockfree variant (γ) skips rwlock entirely → likely the
+  right answer if β2-v2 stays slower than α on common
+  workloads.
+
+The original β design — kept verbatim below as historical
+context (β2-v2's implementation derived from it):
+
+**The problem.** A `@form(hashmap, sync = striped)` locus is
+reachable cross-pool by design. Two cores writing
 adjacent cells that share a 64-byte cache line generate
 MESI ping-pong even though each producer logically owns
 its own cell. The Prometheus-registry pattern (one Counter
 per metric, multiple producer pools incrementing, one
-consumer pool rendering) hits this directly.
+consumer pool rendering) hits this directly. Per-cell
+atomicity on the occupancy byte gives correctness; cache-
+line padding on the cell stride gives throughput.
 
-**The fix.** At codegen time, detect `@form(hashmap)` /
-`@form(vec)` loci that are reachable from main on a
-non-`main` pool. For those, pad cell stride up to the next
-`LOTUS_CACHE_LINE` multiple (64B default). Other form loci
-keep the current packed stride.
+**The fix.** When codegen emits a `sync = striped` form,
+pad cell stride up to the next `LOTUS_CACHE_LINE` multiple
+(64B default) AND make the occupancy byte an
+`_Atomic uint8_t` with CAS on insert, atomic load on probe.
+A `pthread_rwlock_t mu_grow` guards the grow path: set/get
+hold read lock (uncontended common case), grow holds write
+lock (rare). Other form loci keep the current packed,
+non-atomic stride.
 
 **Concrete substrate touch-points.**
 
@@ -74,85 +317,264 @@ keep the current packed stride.
    for non-x86_64 targets (ARM big.LITTLE has variable line
    sizes; M-series Apple is 128B effective).
 
-2. **Detection.** A new pass in
-   `crates/hale-codegen/src/codegen.rs` after
-   `collect_main_placement` (which already populates
-   `main_cooperative_pools` + `pinned_locus_types`).
-   Produces a `BTreeSet<String>` of locus type names that
-   are (a) `@form(hashmap)` or `@form(vec)`, AND (b) appear
-   as a non-`main` placed locus type OR contain a pool ptr
-   field reachable from a non-`main` pool subscriber. The
-   transitive reachability walk is bounded by the F.22
-   capacity-cell graph — already known statically.
+2. **Annotation discriminator.** No detection pass needed —
+   the `sync = striped` kwarg on the form annotation IS the
+   signal. Parser already admits
+   `FormAnnotation { name, args: Vec<FormArg> }`; lex one
+   more kwarg value (`sync = striped`). Codegen looks up
+   the kwarg in the locus's `LocusInfo` and emits striped
+   lowering instead of dense. This is materially simpler
+   than the pre-F.32-0 plan, which depended on transitive
+   reachability analysis from `main.placement { }` —
+   replaced now by author opt-in.
 
-3. **Padding emission.** In
+3. **Striped emission.** In
    `lower_locus_instantiation` / `declare_locus_struct`,
-   when the locus is in the cache-padded set, compute the
-   padded cell size: `padded_stride = round_up(packed_stride,
-   LOTUS_CACHE_LINE)`. Pass that stride into
-   `lotus_hashmap_init` as `value_size + (padded_stride -
-   packed_stride)` worth of trailing padding bytes. The
-   hashmap C-runtime already takes `key_size` + `value_size`
-   independently; this is a one-line per-call adjustment.
+   when the form is `sync = striped`:
+   - Compute `padded_stride = round_up(packed_stride,
+     LOTUS_CACHE_LINE)`.
+   - Emit a call to `lotus_hashmap_init_striped(key_size,
+     value_size, padded_stride, key_type_tag)` instead of
+     `lotus_hashmap_init`. The new init constructs the
+     `pthread_rwlock_t mu_grow` and uses the padded stride
+     for the slots calloc.
+   - Striped `_set` / `_get` / `_remove` / `_bump`:
+     `rwlock_rdlock` → `find_slot` with CAS on the
+     occupancy byte → `memcpy` key+value → atomic
+     `fetch_add(&len, 1)` on insert → `rwlock_unlock`.
+   - Striped `_grow`: `rwlock_wrlock` → standard grow path
+     (now race-free because all readers are blocked) →
+     `rwlock_unlock`.
+   - Dissolve calls `lotus_hashmap_destroy_striped` which
+     `pthread_rwlock_destroy`s before the arena wholesale-free.
 
-4. **Opt-out annotation.** `@form(hashmap, packed)` or
-   `@form(hashmap, no_pad)` annotation arg. Parser already
-   admits `FormAnnotation { name, args: Vec<...> }`; lex one
-   more kwarg. Typecheck flags conflicting args
-   (`packed` + cross-pool reachable = warning: padding
-   suppressed despite cross-pool dispatch). Honor the opt-
-   out unconditionally — the author knows their memory
-   budget.
+4. **F.32-4-prefetch piggyback.** The producer side of
+   `lotus_coop_pool_post` (and `lotus_mailbox_post`) gains
+   `__builtin_prefetch(slot, 1, 3);` after the slot fill.
+   Ship in the same commit — same hot path, trivial diff,
+   detection-free.
 
 5. **Tests.**
    - `crates/hale-codegen/tests/form_cache_padding.rs`:
-     compiles a 4-cell hashmap on a non-main pool, asserts
-     `lotus_hashmap_entry_size(&map) >= 64` post-padding;
-     same shape with `packed` opt-out asserts packed stride.
-   - `crates/hale-codegen/tests/form_cache_padding_perf.rs`
-     (gated `#[ignore]`, run with `--ignored`): two producer
-     threads pinned to different cores hammer adjacent cells
-     for N iterations; consumer thread reads. Measures
-     `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` delta with vs.
-     without padding (via `@form(hashmap, packed)`). Asserts
-     padded version >= 1.5x faster — conservative; real
-     speedup on cores with shared L2 is 3-5x.
+     compiles a 4-cell `sync = striped` hashmap, asserts
+     `lotus_hashmap_entry_size(&map) >= LOTUS_CACHE_LINE`.
+     Same shape with `sync = serialized` asserts packed
+     stride (no padding).
+   - `crates/hale-codegen/tests/form_hashmap_striped_concurrent.rs`:
+     100k inserts from each of 2 pools into one striped
+     map; assert `len == 200000` after both writers drain,
+     and assert every expected key is present.
+   - `crates/hale-codegen/tests/form_hashmap_striped_perf.rs`
+     (gated `#[ignore]`, run with `--ignored`): two
+     producer threads pinned to different cores hammer
+     adjacent cells of `sync = striped` vs `sync = serialized`
+     maps. Measure `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`
+     delta. Asserts striped >= 4x serialized on a 2+ core
+     host with siblings on the same L2.
+   - `bench/micro/form_hashmap_false_sharing.hl` (the bench
+     held back during F.32-0) lands with `sync = striped`
+     on the Registry; baseline gets a real number for the
+     first time.
 
 6. **Spec / docs.**
    - `spec/design-rationale.md` § F.32: promote sketch → v1
-     section once shipped. Note the cell-stride change in
-     the ABI table.
-   - `spec/forms.md` (if it exists; else `spec/stdlib.md` §
-     "@form annotations"): document the `packed` kwarg.
+     section once shipped. Note the sync-discipline kwarg
+     and cell-stride change in the ABI table.
+   - `spec/forms.md`: document `sync = serialized` and
+     `sync = striped`; describe per-discipline ABI + cost
+     trade-off; cross-reference F.32-1∞ inference.
    - `docs/src/how-tos/threading.md`: note that cross-pool
-     `@form(hashmap)` cells are automatically padded;
-     `packed` opt-out is for non-cross-pool dense storage.
+     `@form(hashmap)` requires explicit sync (link F.32-0
+     diagnostic); recommend `striped` for parallel-writer
+     hot paths and `serialized` for read-mostly or low-rate
+     mutate workloads.
 
-**Acceptance.** The perf fixture shows measurable speedup
-(target: ≥2x latency reduction on the producer/consumer
-hot loop, measured on a 2+ core machine with siblings on
-the same L2). False-sharing pmu counters (`perf stat -e
-mem_load_l3_hit_xsnp_hitm`) drop to ~zero on the padded
-version.
+**Acceptance.**
+- The perf fixture shows striped >= 4x serialized on the
+  producer/consumer hot loop (2+ core host, siblings on
+  same L2). False-sharing pmu counters
+  (`perf stat -e mem_load_l3_hit_xsnp_hitm`) drop to ~zero
+  on striped.
+- `form_hashmap_false_sharing.hl` runs and produces a
+  stable baseline; bench harness picks up the elapsed_ns
+  for ongoing regression detection.
+- The C twin at `experiments/f32-false-sharing/` establishes
+  the theoretical max (~5x for pure increments); the Hale
+  bench's 4x target is the realistic ceiling once hash +
+  probe + grow are included.
 
 **Out of scope.**
 - Padding for non-cross-pool form loci (pure intra-pool
-  workloads). Keep the dense layout.
-- Padding for `@form(ring_buffer)` — cells already produce/
-  consume in FIFO order, not parallel; line sharing across
-  cells doesn't cause MESI traffic.
+  workloads — `sync` unset). Keep the dense layout; no
+  per-cell atomics; no RW-lock.
+- `@form(ring_buffer)` — FIFO cells don't false-share by
+  construction; cell sharing across producers / consumers
+  is bounded by the head/tail seqnos which already live on
+  their own cache lines per `lotus_shm_ring.c`.
+- `@form(vec)` cross-pool — defer until a workload surfaces.
+  The plumbing here generalizes (sync = striped on vec
+  cells would emit the same padding + atomic-len pattern)
+  but no current downstream wants it.
 - Manual cache-line size at the cell-type level (i.e., a
   `@cache_line(128)` annotation on the cell type). Defer.
 
-**Estimated effort.** 1 focused session. ~300 LOC across
-codegen + runtime + tests.
+**Estimated effort.** 1-2 focused sessions. ~250 LOC across
+codegen (lowering switch on sync kwarg) + runtime (striped
+init/set/get/grow/destroy + 4-prefetch one-liner) + tests.
+
+---
+
+## F.32-1γ — `sync = lockfree` (deferred)
+
+A full lock-free / wait-free open-addressing hashmap (Cliff
+Click-style state machine or epoch-based reclamation). Joins
+as a peer of α/β under the same `sync = ` kwarg; no surface
+change required at the language level.
+
+**Decision deferred until F.32-1β's bench numbers establish
+whether the marginal throughput / tail-latency gain justifies
+the substantial implementation complexity** (~600 LOC of
+subtle code, plus a proof-of-correctness burden). Default
+position: ship β, measure on the downstream workload, decide.
+
+If γ does land, the F.32-1∞ inference rule gains one bucket:
+"4+ writer pools, hot-path mutate, p99 latency budget below
+the grow-spike threshold" → lockfree. Until then, β is the
+ceiling the inference can pick.
+
+**Estimated effort (if pursued).** 3-5 sessions; new
+hashmap impl + extensive concurrency tests + tsan/relacy
+runs to catch reorder bugs.
+
+---
+
+## F.32-1∞ — Closed-world sync inference + diagnostic
+
+**Status (2026-05-24): deferred.** The F.32-0 cross-pool
+diagnostic already names the upgrade path concretely — when
+the typechecker rejects a plain `@form(hashmap)` cross-pool
+call, the error suggests `sync = serialized` (or `striped`
+when β2 lands). That captures most of the ergonomic value
+this inference pass would deliver, without the plumbing
+work.
+
+The full auto-inference design (below) requires a new
+pipeline phase between `check_bundle` and codegen that
+mutates the @form annotation AST to inject the inferred
+kwarg. `check_bundle` today takes `&Bundle` (immutable);
+restructuring the pipeline to thread the inferred-sync map
+through is ~200 LOC of orchestration plus the inference
+pass itself. Defer until the explicit-annotation friction
+shows up in real downstream code.
+
+The design below is preserved for the eventual implementer.
+
+---
+
+**Goal.** Authors shouldn't need to type `sync = striped` on
+every map that happens to be touched cross-pool. The
+typechecker has all the information needed to pick a good
+default from the pool-propagation graph F.31 already builds.
+Explicit annotations are for override.
+
+**Inference rule (first cut).**
+
+For each `@form(hashmap)` locus type (no explicit `sync =`
+kwarg), walk the call graph from `main.placement { }` and
+collect:
+
+- `writers` — set of pools containing any mutate-method call
+  site (`set` / `bump` / `remove`).
+- `readers` — set of pools containing any read-method call
+  site (`get` / `has` / `len` / `key_at` / `entry_at`).
+- `hot_path` — true if any mutate call sits inside a loop or
+  inside a bus-handler body (loop-nesting count ≥ 1 OR
+  ancestor is `fn on_*` in a bus subscriber).
+
+```
+if |writers ∪ readers| <= 1:
+    sync = none           // single-pool default; F.32-0 typecheck still rejects
+                          // any cross-pool path because the rule didn't fire
+elif |writers| <= 1 and |readers| > 1:
+    sync = serialized     // α; reads dominate, mutex contention rare
+elif |writers| >= 2:
+    if hot_path:
+        sync = striped    // β; parallel writers earn their padded cells
+    else:
+        sync = serialized // α; low-rate mutate doesn't justify striped's overhead
+```
+
+The rule is conservative — when in doubt it prefers the
+discipline whose worst-case behavior is bounded
+(serialized's tail is futex sleep; striped's tail is the
+grow-write-lock; lockfree's tail is unbounded retry
+under adversarial collision). Inference can pick α or β;
+γ is opt-in via explicit annotation until its tail-latency
+behavior is characterized on the downstream workload.
+
+**Diagnostic shape.**
+
+```
+note: Registry @form(hashmap) — inferred `sync = striped`
+  ├─ writers: pool `ws` (3 mutate sites), pool `gateway` (1)
+  ├─ readers: pool `http` (1 read site)
+  ├─ hot-path: WsHandler.on_msg loops over self.reg.bump
+  └─ override: declare `@form(hashmap, sync = X)` on the locus
+```
+
+Emitted once per inferred-sync locus, at the locus decl
+site. The explicit annotation suppresses the diagnostic.
+
+**Implementation.**
+
+1. New pass in `crates/hale-types/src/check.rs`, runs after
+   F.31 pool propagation. Per `@form(hashmap)` locus type
+   without explicit sync:
+   - Collect writer pools, reader pools, hot-path flag.
+   - Apply the inference rule.
+   - Store picked sync on the locus's `LocusInfo`.
+   - Emit the diagnostic.
+2. Codegen reads the inferred sync the same way it reads
+   the explicit one — no separate code path.
+
+**Action-at-a-distance mitigation.** Build artifact
+`target/release/sync-inference.json` lists every
+form-bearing locus type and its picked sync + reasoning.
+Projects can check this into `target/inference-baseline/`
+under VCS; CI compares fresh inference against the baseline
+and a diff means the build flips an inference (usually
+because someone changed `main.placement { }`). Reviewer can
+see the flip in code review rather than discovering it via
+ABI mismatch at deploy time.
+
+**Tests.**
+- `crates/hale-types/tests/sync_inference_single_pool.rs`:
+  lone-pool usage → no sync inferred (cross-pool rule
+  inactive; F.32-0 still applies if a stray cross-pool call
+  appears later).
+- `crates/hale-types/tests/sync_inference_multi_reader.rs`:
+  1 writer pool + N reader pools → `serialized`.
+- `crates/hale-types/tests/sync_inference_multi_writer_hot.rs`:
+  2 writer pools, mutate inside `fn on_*` handler → `striped`.
+- `crates/hale-types/tests/sync_inference_multi_writer_cold.rs`:
+  2 writer pools, mutate in one-shot init code → `serialized`.
+- `crates/hale-types/tests/sync_inference_override_explicit.rs`:
+  explicit `sync = X` suppresses the diagnostic; codegen
+  honors the explicit pick even if inference would have
+  picked something else.
+- `crates/hale-types/tests/sync_inference_baseline_diff.rs`:
+  inference artifact contents match a checked-in baseline;
+  regression test for the inference rule itself.
+
+**Estimated effort.** ~1 session. ~150 LOC pass + ~120 LOC
+tests + ~30 LOC artifact emission.
 
 ---
 
 ## F.32-4-prefetch — Bus-dispatch prefetch hint
 
-(Pulled forward from F.32-4 because it pairs naturally
-with -1: same hot path, same detection logic.)
+(Pulled forward from F.32-4 to ship with F.32-1β: same
+producer-side hot path, trivial diff, no extra detection.)
 
 **The opportunity.** Cross-pool bus dispatch already memcpys
 the payload into the destination pool's queue cell
@@ -184,6 +606,21 @@ detect regressions.
 ---
 
 ## F.32-1b — Locus struct field reordering by access frequency
+
+**Status (2026-05-24): deferred.** The regression-risk surface
+is broad — every composite struct-literal initialization site
+(`MyLocus { f1: ..., f2: ..., f3: ... }`) and every codegen
+path that GEPs by field name through `info.fields` needs to
+keep working post-reorder. The BTreeMap-by-name lookup
+suggests this is safe in principle, but validation requires
+running the full codegen test sweep against several
+reordered fixtures. Defer until F.32-2 ships first (its
+working-set analysis pass establishes the field-access-
+counting infrastructure this would build on).
+
+The design below is preserved for the eventual implementer.
+
+---
 
 **The opportunity.** A locus's methods are statically
 visible. The compiler can compute, for each field, how
@@ -239,6 +676,19 @@ this is theoretical).
 ---
 
 ## F.32-2 — Compile-time working-set budget per locus
+
+**Status (2026-05-24): deferred.** Largest deliverable in
+the plan (500-800 LOC across hale-types analysis pass +
+diagnostic shape + cache-tier constants + multiple test
+fixtures). Lower priority for the downstream daemon's
+immediate perf needs — F.32-1α + 4-prefetch + 4a/4c
+deliver the latency-critical wins; F.32-2 is engineering
+discipline for the longer term (CI gating). Defer to its
+own focused session.
+
+The design below is preserved verbatim.
+
+---
 
 **The deliverable.** A build-time analysis that computes
 each locus's projected working set and compares against
@@ -312,6 +762,18 @@ and tests.
 ---
 
 ## F.32-3 — Per-pool arena chunking sized to cache slice
+
+**Status (2026-05-24): deferred.** Requires loci-per-pool
+counts at codegen time (extends collect_main_placement)
+plus a new `lotus_arena_create_sized(initial_chunk_bytes)`
+variant plus a build-flag plumbing surface plus a multi-
+locus-per-pool perf fixture to validate. Scope is medium
+but spans multiple files; lower immediate priority than
+F.32-1α + 4-prefetch + 4a/4c. Defer to a follow-up.
+
+The design below is preserved verbatim.
+
+---
 
 **The opportunity.** Today the per-locus arena allocator
 picks default chunk sizes via its own grow heuristic. On a
@@ -426,24 +888,44 @@ MCL_FUTURE)` to lock all pages.
 
 ## Sequencing recommendation
 
-**Week 1: F.32-1 + F.32-4-prefetch.** Producer/consumer
-false-sharing is the highest-impact, smallest-scope ship.
-Prefetch hint comes for free because the detection /
-producer-side code path is the same. Land both as one
-commit, measure both via the perf fixture, ship.
+**Day 0 (immediate): F.32-0.** One-commit drop that reverts
+the cross-pool exemption. Closes the corruption hole now;
+unblocks subsequent work that has a sound default to
+fall back to.
 
-**Week 2: F.32-1b.** Field reordering. The substrate
-already has the method-body walk; this just adds the
-access-counter pass + struct-layout reorder.
+**Week 1: F.32-1α.** `sync = serialized` (per-map mutex).
+Smallest correct cross-pool path. Restores the
+Prometheus-counter shape on the safe-but-slow baseline.
+Gives F.32-1∞ a sensible non-striped default to pick.
 
-**Week 3: F.32-2.** Working-set budget. The biggest
+**Week 2: F.32-1β + F.32-4-prefetch.** `sync = striped`
+(padded cells + per-cell atomic + grow RW-lock). The real
+perf work + finally makes `bench/micro/form_hashmap_false_sharing.hl`
+run cleanly with a meaningful baseline. Prefetch hint
+ships in the same commit because the producer-side code
+path is shared.
+
+**Week 3: F.32-1∞.** Closed-world inference. Lands once
+α and β both exist (the inference rule picks between them).
+Author-experience win; no runtime change.
+
+**Week 4: F.32-1b.** Field reordering. Substrate already
+has the method-body walk; adds the access-counter pass +
+struct-layout reorder.
+
+**Week 5: F.32-2.** Working-set budget. The biggest
 deliverable; useful for CI gates on production binaries.
 
-**Week 4: F.32-4a + F.32-4c.** Huge pages + mlockall.
+**Week 6: F.32-4a + F.32-4c.** Huge pages + mlockall.
 Deployment-grade; useful even before F.32-3.
 
-**Week 5+: F.32-3.** Per-pool chunking. Scale-up concern;
-only worth landing once multi-pool deployments are common.
+**Week 7+: F.32-3.** Per-pool chunking. Scale-up concern;
+worth landing once multi-pool deployments are common.
+
+**Conditional: F.32-1γ.** Only if F.32-1β's bench numbers
+on the downstream workload show that the marginal
+throughput / tail-latency gain justifies a ~600 LOC
+lock-free hashmap. Default position: do not pursue.
 
 ---
 
@@ -469,11 +951,37 @@ only worth landing once multi-pool deployments are common.
 
 ## Friction items this closes
 
-Once F.32-1 ships:
+Once F.32-0 ships:
+- The cross-pool `@form(hashmap)` corruption hole is
+  closed; daemons exposed to the Prometheus-counter shape
+  no longer double-free on grow under multi-pool writers.
+- The diagnostic names the upgrade path; authors who hit
+  the rejection know to pick `sync = serialized` or
+  `sync = striped` rather than search the spec for what
+  the previous accept-then-corrupt path was hiding.
+
+Once F.32-1α ships:
+- The Prometheus-counter shape works correctly cross-pool
+  on the safe baseline. Throughput is mutex-bound but
+  honest; tail is futex sleep but bounded.
+
+Once F.32-1β + 4-prefetch ship:
 - Hot-path counter increments across producer pools no
   longer ping-pong the cache line between cores.
 - The "Prometheus registry shared across pools" pattern
-  becomes free of false-sharing penalty.
+  reaches its perf ceiling on β (>= 4x serialized on the
+  perf fixture; matches the C twin's theoretical ceiling
+  within hash + probe overhead).
+- Bus dispatch latency drops by 10-50 ns/cell via the
+  prefetch hint (consumer-side L1 warmed by the producer).
+
+Once F.32-1∞ ships:
+- Authors don't have to type `sync = striped` on every
+  cross-pool form — the inference picks it from the
+  pool-propagation graph. Override is one kwarg away.
+- Inference baseline artifact makes "Wait, why is Registry
+  now striped?" a reviewable diff, not a deploy-time
+  surprise.
 
 Once F.32-1b ships:
 - Locus method bodies with hot fields touched on every
@@ -537,16 +1045,29 @@ should suffice; the structural plan stays put.
 
 ---
 
-## Pickup checklist (for the new home)
+## Pickup checklist
 
-1. Confirm the org/language rename is complete in the new
-   directory and the rename's commit hash is on `pub`.
-2. Update path/symbol references in this file via a single
-   sed pass.
-3. Branch from `main` as `f32-1-cache-padding`.
-4. Implement F.32-1 + F.32-4-prefetch per § above.
-5. Land + push for CI; merge ff to main.
-6. Move on to F.32-1b. Repeat.
+The "new home" rename is complete (this is `hale-lang/hale`);
+the rename steps below are historical context only. Skip to
+step 3 for current pickup.
+
+1. (historical) Confirm the org/language rename is complete
+   in the new directory and the rename's commit hash is on `pub`.
+2. (historical) Update path/symbol references in this file
+   via a single sed pass.
+3. Branch from `main` as `f32-0-revert-crosspool-exemption`.
+   Land F.32-0 first; it's a one-commit drop that closes
+   the corruption hole and gives F.32-1{α,β,∞} a sound
+   default to fall back to.
+4. Then `f32-1a-sync-serialized`. Smallest correct cross-pool
+   path; ~100 LOC.
+5. Then `f32-1b-sync-striped` (also covers F.32-4-prefetch).
+   Real perf work; `bench/micro/form_hashmap_false_sharing.hl`
+   gets its first meaningful baseline.
+6. Then `f32-1-infer-sync`. Closed-world inference; depends
+   on α and β both existing as fall-back targets.
+7. Then the original F.32-1b (field reordering) and onwards
+   per the sequencing § above.
 
 Stable references that DON'T change across rename:
 - The F.32 spec section in `spec/design-rationale.md` (the

@@ -315,16 +315,34 @@ fn check_placement_single_thread(
     //    deeply-chained receivers, and stdlib/free-fn calls all
     //    fall back to OK (they need richer flow analysis we
     //    defer to v1.x).
-    // Collect locus types whose state is held in `@form(...)` cells. These
-    // are implicitly cross-pool-safe (the form ABI does the
-    // serialization). Walking the bundle is cheap; we touch
-    // each TopDecl once.
+    // F.32-0 (2026-05-24): collect locus types whose state is
+    // held in `@form(...)` cells AND that carry an explicit
+    // `sync = X` kwarg with X != `none`. The cross-pool
+    // diagnostic is skipped only for these.
+    //
+    // History: 3ec6391 (2026-05-24, first cut) admitted any
+    // `@form(...)` locus into this set on the assumption that
+    // the form ABI serialized cell access. Bench-prep for
+    // F.32-1 found the runtime (`lotus_arena.c:1869+`) has no
+    // synchronization on `lotus_hashmap_set` / `_grow` — two
+    // writers double-free during concurrent grow. F.32-0
+    // scopes the exemption to explicitly-opted-in loci; the
+    // sync disciplines themselves (α/β/γ) land in F.32-1.
+    //
+    // `form_bearing_loci` is a wider set (every @form locus,
+    // sync or no sync) used only to tailor the diagnostic's
+    // upgrade hint — receivers in this set get a "declare
+    // `sync = ...` to opt in" suggestion.
     let mut cross_pool_safe_loci: BTreeSet<String> = BTreeSet::new();
+    let mut form_bearing_loci: BTreeSet<String> = BTreeSet::new();
     for program in bundle.programs.values() {
         for item in &program.items {
             if let TopDecl::Locus(l) = item {
-                if l.form.is_some() {
-                    cross_pool_safe_loci.insert(l.name.name.clone());
+                if let Some(form) = &l.form {
+                    form_bearing_loci.insert(l.name.name.clone());
+                    if form_has_explicit_sync_discipline(form) {
+                        cross_pool_safe_loci.insert(l.name.name.clone());
+                    }
                 }
             }
         }
@@ -341,6 +359,7 @@ fn check_placement_single_thread(
                             caller_pool,
                             pool_of_locus_type: &pool_of_locus_type,
                             cross_pool_safe_loci: &cross_pool_safe_loci,
+                            form_bearing_loci: &form_bearing_loci,
                             top,
                             diags,
                         };
@@ -437,6 +456,39 @@ fn locus_member_body(member: &LocusMember) -> Option<&Block> {
     }
 }
 
+/// F.32-0 (2026-05-24): true when a form annotation carries an
+/// explicit `sync = X` kwarg where X names a recognized sync
+/// discipline (`serialized`, `striped`, or `lockfree`). The
+/// cross-pool exemption applies only to such loci — the
+/// substrate's runtime gives no thread-safety to plain
+/// `@form(...)` cells (the 3ec6391 commit's "form ABI
+/// serializes" claim was aspirational; see
+/// `notes/f32-cache-aware-delivery-plan.md` § F.32-0).
+///
+/// Unknown / malformed `sync = X` values return false here
+/// (so the cross-pool diagnostic still fires). F.32-1α/β2
+/// validates the recognized values; `lockfree` (γ) is in the
+/// accept set syntactically but the per-locus check rejects
+/// it as deferred. This helper only gates the cross-pool
+/// exemption — codegen does its own mapping to SyncMode.
+fn form_has_explicit_sync_discipline(form: &FormAnnotation) -> bool {
+    form.args.iter().any(|arg| {
+        if arg.name.name != "sync" {
+            return false;
+        }
+        match &arg.value {
+            Expr::Ident(i) => matches!(
+                i.name.as_str(),
+                "serialized" | "striped"
+                // "lockfree" intentionally excluded — γ deferred;
+                // typecheck rejects it as not-yet-shipped, so it
+                // never reaches codegen as a sync discipline.
+            ),
+            _ => false,
+        }
+    })
+}
+
 /// Visitor context for the cross-pool call walk. Carried by
 /// reference so the recursive Stmt/Expr traversal doesn't pay
 /// a closure-capture allocation per node.
@@ -444,21 +496,27 @@ struct PoolCheckCx<'a> {
     enclosing_locus: &'a LocusDecl,
     caller_pool: Option<&'a PoolId>,
     pool_of_locus_type: &'a BTreeMap<String, PoolId>,
-    /// Locus type names whose state is held in `@form(...)` cells. The
-    /// substrate's form ABI is the synchronization primitive
-    /// for these loci's mutable state, so cross-pool method
-    /// calls are pragma-allowed: the locus author has
-    /// implicitly asserted thread-safety by choosing a form
-    /// cell as the storage layout. Phase 5 skips the cross-
-    /// pool diagnostic for receivers landing in this set.
-    /// Practical use case: pond/metrics's `Registry` (held in
-    /// `@form(hashmap)`) is shared across producer pools
-    /// (gateways) and consumer pools (http::Server) for
-    /// Prometheus scrape — Phase 5 pre-fix rejected every
-    /// `self.registry.counter(...)` / `self.registry.render()`
-    /// call across the pool boundary; post-fix it trusts the
-    /// form-storage layout's serialization.
+    /// F.32-0 (2026-05-24): locus type names that opt in to
+    /// cross-pool access by declaring `@form(<name>, sync = X)`
+    /// where X is a recognized discipline (`serialized` /
+    /// `striped` / `lockfree`; F.32-1α/β/γ). Cross-pool method
+    /// calls into receivers landing in this set skip the
+    /// diagnostic — the chosen sync discipline carries the
+    /// substrate's safety contract.
+    ///
+    /// Plain `@form(hashmap)` / `@form(vec)` / `@form(ring_buffer)`
+    /// (no sync kwarg) does NOT land in this set: the runtime
+    /// has no synchronization on those paths and concurrent
+    /// writers corrupt the structure (`lotus_arena.c:1869+` —
+    /// `lotus_hashmap_set` / `_grow` are non-atomic single-
+    /// threaded code).
     cross_pool_safe_loci: &'a BTreeSet<String>,
+    /// Wider companion to `cross_pool_safe_loci`: every locus
+    /// type carrying any `@form(...)` annotation (with or
+    /// without a sync kwarg). Used only to specialize the
+    /// cross-pool diagnostic — receivers in this set get a
+    /// "declare `sync = ...` to opt in" upgrade hint.
+    form_bearing_loci: &'a BTreeSet<String>,
     top: &'a TopScope,
     diags: &'a mut Vec<Diag>,
 }
@@ -555,13 +613,32 @@ fn walk_expr_pool(expr: &Expr, cx: &mut PoolCheckCx) {
                     cx.pool_of_locus_type.get(&field_locus),
                     cx.caller_pool,
                 ) {
-                    // @form-bearing receiver loci are
-                    // implicitly cross-pool-safe — the form
-                    // ABI (hashmap / vec / ring_buffer) is
-                    // the synchronization primitive.
+                    // F.32-0: receivers with an explicit
+                    // sync discipline (`@form(..., sync = X)`,
+                    // X != none) opt in to cross-pool calls;
+                    // their chosen discipline carries the
+                    // safety contract. Plain `@form(...)` is
+                    // single-pool by default — the diagnostic
+                    // fires with an upgrade hint.
                     if cx.cross_pool_safe_loci.contains(&field_locus) {
                         // skip the diagnostic
                     } else if callee_pool != caller_pool_val {
+                        let upgrade_hint = if cx.form_bearing_loci.contains(&field_locus) {
+                            format!(
+                                "\n  hint: receiver `{}` is `@form(...)`. \
+                                 Cross-pool access requires an explicit sync \
+                                 discipline:\n    \
+                                 `@form(hashmap, sync = serialized)` — per-map \
+                                 mutex (simplest, lowest throughput)\n    \
+                                 `@form(hashmap, sync = striped)` — parallel \
+                                 writers, cache-padded cells (F.32-1β)\n  \
+                                 See `notes/f32-cache-aware-delivery-plan.md` \
+                                 § F.32-0 / F.32-1.",
+                                field_locus,
+                            )
+                        } else {
+                            String::new()
+                        };
                         cx.diags.push(Diag::ty(
                             *span,
                             format!(
@@ -570,13 +647,14 @@ fn walk_expr_pool(expr: &Expr, cx: &mut PoolCheckCx) {
                                  locus `{}` is placed `{}`. Cross-pool \
                                  coordination must go through the bus, not a \
                                  direct call. See spec/types.md \
-                                 § \"Single-threaded-method invariant (F.31)\".",
+                                 § \"Single-threaded-method invariant (F.31)\".{}",
                                 receiver_display(receiver),
                                 method.name,
                                 field_locus,
                                 callee_pool.display(),
                                 cx.enclosing_locus.name.name,
                                 caller_pool_val.display(),
+                                upgrade_hint,
                             ),
                         ));
                     }
@@ -1739,15 +1817,67 @@ impl<'a> Checker<'a> {
     /// on that struct. The field's type becomes the hashmap
     /// key type K; the cell type becomes the value type S.
     fn check_form_hashmap_shape(&mut self, decl: &'a LocusDecl, form: &'a FormAnnotation) {
-        if !form.args.is_empty() {
-            self.diags.push(Diag::ty(
-                form.span,
-                format!(
-                    "@form(hashmap) takes no arguments; got {} (hashmap has no \
-                     tuning knobs in v1 — drop the arg list)",
-                    form.args.len()
-                ),
-            ));
+        // F.32-1α (2026-05-24): @form(hashmap) accepts an optional
+        // `sync = X` kwarg picking a cross-pool sync discipline.
+        // Valid values: `serialized` (per-map mutex, F.32-1α),
+        // `striped` (F.32-1β, not yet shipped), `lockfree`
+        // (F.32-1γ, deferred). Plain `@form(hashmap)` keeps the
+        // single-pool default (no sync overhead; cross-pool calls
+        // typecheck-rejected per F.32-0).
+        for arg in &form.args {
+            match arg.name.name.as_str() {
+                "sync" => {
+                    let val = match &arg.value {
+                        Expr::Ident(i) => i.name.as_str(),
+                        _ => {
+                            self.diags.push(Diag::ty(
+                                arg.span,
+                                "@form(hashmap, sync = X): X must be a \
+                                 bare identifier (one of `serialized`, \
+                                 `striped`, `lockfree`)".to_string(),
+                            ));
+                            continue;
+                        }
+                    };
+                    match val {
+                        "serialized" => { /* F.32-1α — accepted */ }
+                        "striped" => { /* F.32-1β2 — accepted */ }
+                        "lockfree" => {
+                            self.diags.push(Diag::ty(
+                                arg.span,
+                                "@form(hashmap, sync = lockfree) is deferred \
+                                 (F.32-1γ); use `sync = serialized` (F.32-1α) \
+                                 in the meantime".to_string(),
+                            ));
+                        }
+                        "none" => { /* explicit single-pool — accepted, same as omitting */ }
+                        other => {
+                            self.diags.push(Diag::ty(
+                                arg.span,
+                                format!(
+                                    "@form(hashmap, sync = {}): unknown sync \
+                                     discipline; v1 accepts `serialized` \
+                                     (F.32-1α). `striped` (F.32-1β) and \
+                                     `lockfree` (F.32-1γ) are planned but \
+                                     not yet shipped.",
+                                    other
+                                ),
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    self.diags.push(Diag::ty(
+                        arg.name.span,
+                        format!(
+                            "@form(hashmap): unknown arg `{}`; v1 accepts \
+                             `sync = X` only (X ∈ {{serialized, striped, \
+                             lockfree}})",
+                            other
+                        ),
+                    ));
+                }
+            }
         }
         let capacity = decl.members.iter().find_map(|m| match m {
             LocusMember::Capacity(cb) => Some(cb),
