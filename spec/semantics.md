@@ -1270,43 +1270,89 @@ sites. The mapping is canonical, not advisory:
   - **Free fns** — pure application-layer computations whose
     failure shape matters call-by-call.
   - **Stdlib-synthesized methods on `@form(...)` containers**
-    (`@form(vec).get`, `@form(vec).pop`, future `@form(...)`
-    methods). Application-layer storage substrate: the
-    container's role is application-layer data, not locus-
-    structural participation in the substrate's lifecycle.
+    (`@form(vec).get` / `.pop`, `@form(hashmap).get` /
+    `.remove` / `.key_at` / `.entry_at`,
+    `@form(ring_buffer).pop`). Application-layer storage
+    substrate: the container's role is application-layer
+    data, not locus-structural participation in the
+    substrate's lifecycle.
+  - **User-declared `fn` member fns on a locus**
+    (open-question #24, shipped 2026-05-25 in two phases:
+    MVP at `d565d6f` with value-only payloads, v0.2 at
+    `98910b9` extending to heap-bearing payloads via the
+    TLS caller-arena snapshot non-fallible heap-returning
+    methods already use). The narrowed rule recognises that
+    a `fn` member fn is *not* substrate-orchestrated — its
+    callers hold a frame, can address the error channel
+    inline, and the value-error path doesn't conflict with
+    the closure-violation channel.
 - **`fallible(E)` may NOT be declared on:**
-  - **User-declared locus methods.** Substrate-facing surface
-    — methods on user-declared loci participate in the
-    substrate's lifecycle (bus subscriptions, modes,
-    contract reads). Their failures are *structural events*
-    that belong on the closure-violation channel. A locus
-    method that needs to expose application-layer failure
-    semantics wraps a fallible free fn:
+  - **Lifecycle methods** (`birth` / `run` / `accept` /
+    `drain` / `dissolve` / `on_failure`). The substrate
+    orchestrates these — bus dispatch invokes the handler,
+    parent invokes `accept`, runtime invokes `run` — and
+    there's no caller frame in user code to address a value
+    error. Physically rejected at the AST level
+    (`LifecycleDecl` carries no `fallible` field).
+  - **Mode methods** (`bulk` / `harmonic` / `resolution`).
+    Same shape: AST doesn't carry the field.
+  - **Closure assertions.** Substrate evaluates the
+    assertion at the epoch boundary; there's no caller in
+    the expression's frame to address a value error.
+    Closures route failure via their own structural channel
+    (assertion firing → `on_failure`), not a value channel.
+  - **Bus-subscribed handlers.** Verified at the
+    `subscribe ... as handler` site rather than at the fn
+    decl: a fn that's `fallible(E)` by declaration may not
+    also be referenced by a `subscribe` entry. Bus dispatch
+    has no caller frame; subscribing a fallible fn would
+    have nowhere to send `out_err`. The typecheck
+    diagnostic fires at the subscribe site, naming the
+    handler fn.
 
-    ```hale
-    fn parse_message(b: Bytes) -> Message fallible(ParseError) { ... }
+The rule is **two-channel separation at substrate-facing
+surfaces**, not "no fallible on any locus method." The
+load-bearing constraint is *who's the caller* — when the
+substrate orchestrates a method (lifecycle, mode, closure
+assertion, bus handler) there's no caller frame to address
+the error channel, so `fallible(E)` would describe a
+contract that cannot be satisfied. User-declared `fn`
+members called from inside a method body or from another
+locus's method body have an addressable caller; they carry
+`fallible(E)` like free fns do, with the same `or`
+disposition surface.
 
-    locus Reader {
-        fn handle_input(b: Bytes) -> () {
-            let m = parse_message(b) or default_message();
-            // ...
-        }
+Example shape post-narrowing:
+
+```hale
+type ParseError { msg: String; }
+
+locus Reader {
+    // Allowed: user-declared `fn` member with fallible(E).
+    // The body can `fail ParseError { msg: ... }` or call
+    // other fallible functions and propagate via `or raise`.
+    fn parse_message(b: Bytes) -> Message fallible(ParseError) {
+        // ...
+        if bad { fail ParseError { msg: "bad header" }; }
+        return Message { ... };
     }
-    ```
 
-    The typechecker rejects `fn ... fallible(E)` on a locus
-    member with a diagnostic naming this rule. The forcing
-    function is productive: it surfaces *which channel* the
-    failure lives in at the declaration site, where the
-    design intent is set, rather than at the use site where
-    the channel choice is ambiguous.
+    // Allowed: lifecycle method calling a fallible member fn
+    // and addressing the error inline.
+    run() {
+        let m = self.parse_message(b) or default_message();
+        // ...
+    }
+}
+```
 
-The rule is **two-channel separation as a design enforcement**,
-not a temporary limitation. Adding fallible to user-declared
-locus methods would create a third pathway with overlapping
-semantics — the same shape The Design counsels against
-(`spec/forms.md` discussion of parametric vs form-shaped
-collections is the parallel argument at the type layer).
+The earlier v0 rule (blanket "no fallible on locus methods")
+was narrowed because the friction signal across multiple
+apps and libraries showed devs extracting free fns just to
+get a value-error channel back — losing `self` ergonomics
+and splitting closely-related code across two top-level
+decls. See `notes/open-questions.md` § #24 for the
+narrowing's full reasoning and the rejected alternatives.
 
 ### `fail` statement
 

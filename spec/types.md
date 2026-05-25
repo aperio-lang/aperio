@@ -624,11 +624,43 @@ the design rationale.
 **Declaration sites are restricted by the two-channel rule
 (see `spec/semantics.md` § "Fallible call semantics"
 § "Where each channel lives").** `fallible(E)` may be
-declared on free fns and on stdlib-synthesized methods over
-`@form(...)` containers; it is **rejected** on user-declared
-locus methods, which communicate failure structurally via the
-closure-violation channel. The typechecker emits the
-diagnostic at the locus method's declaration site.
+declared on:
+
+- Free fns.
+- Stdlib-synthesized methods over `@form(...)` containers
+  (`@form(vec).get` / `.pop`, `@form(hashmap).get` / `.remove` /
+  `.key_at` / `.entry_at`, `@form(ring_buffer).pop`).
+- **User-declared `fn` member fns on a locus** (open-question
+  #24, shipped 2026-05-25). Heap-bearing success and err
+  payload types are supported via the same TLS caller-arena
+  snapshot non-fallible heap-returning locus methods use.
+
+`fallible(E)` is **rejected** on substrate-facing surfaces
+that have no caller frame to address the error channel:
+
+- **Lifecycle methods** (`birth` / `run` / `accept` / `drain` /
+  `dissolve` / `on_failure`). Physically rejected at the AST
+  level — `LifecycleDecl` doesn't carry a `fallible` field.
+- **Mode methods** (`bulk` / `harmonic` / `resolution`).
+  Same shape as lifecycle: AST doesn't carry a `fallible`
+  field.
+- **Closure assertions.** Substrate evaluates the assertion at
+  the epoch boundary; no caller frame exists in the expression.
+- **Bus-subscribed handlers.** A fn that's declared
+  `fallible(E)` may not also be referenced by a `bus
+  subscribe ... as <fn>` declaration. Bus dispatch has no
+  return path. Rejected at the subscribe site, not the fn
+  decl (one fn may be referenced by zero subscriptions; the
+  subscription is what fails to typecheck).
+
+The narrowing from "no fallible on locus methods" to
+"substrate-facing surfaces only" preserves the two-channel
+separation (structural failures still flow vertically via
+closure violations + `on_failure`) while removing the
+friction that made devs extract free fns just to get a value-
+error channel back. The typechecker emits the diagnostic at
+the offending site (locus member decl for lifecycle / mode;
+subscribe site for bus-handler-fallible conflict).
 
 ### `Ty::Fallible { success, payload }`
 
@@ -732,6 +764,90 @@ bubble(err);
 
 The compiler verifies the argument is a valid handle / error
 in the current scope.
+
+## Working-set estimator (F.32-2)
+
+F.32-2 ships a compile-time working-set estimator that
+projects each user-declared locus's approximate byte cost
+and compares against a cache-tier budget. The estimator runs
+post-typecheck, pre-codegen; it doesn't change codegen
+output and emits diagnostics rather than changing program
+behavior.
+
+**Estimator formula** (per-locus, in bytes):
+
+```
+working_set(L) =
+    sizeof(L's struct)                              [arena + user fields with alignment padding]
+  + sum(slot in L's capacity slots) cap × cell_stride
+  + sum(child in L's params if locus-typed) working_set(child)
+```
+
+Cache-tier budgets are read from
+`/sys/devices/system/cpu/cpu0/cache/index{0,2,3}/size` on
+Linux at first probe (cached for the build's lifetime);
+static fallbacks 32 KB / 512 KB / 8 MB apply on non-Linux or
+when sysfs is unavailable. See `hale_types::working_set` for
+the engine.
+
+**Per-locus annotation** (F.32-2 v0.2, 2026-05-25):
+
+`@locality(L1)` / `@locality(L2)` / `@locality(L3)` declare
+a per-locus cache-tier expectation. `@locality(any)`
+explicitly opts the locus out of any global gate. The
+annotation stacks with `@form(...)` in either order:
+
+```hale
+@form(hashmap, sync = lockfree, cap = 64)
+@locality(L2)
+locus Registry {
+    capacity { pool entries of Entry indexed_by k; }
+}
+```
+
+The grammar surface is in `grammar.ebnf`
+§ `locality_annotation`.
+
+**Build-flag surface** (CLI, on `hale build`):
+
+| Flag | Effect |
+|---|---|
+| `--locality-report` | Emit a per-locus stderr report listing each locus's estimated bytes, smallest-fitting tier, and a struct / capacity / children byte decomposition. Build proceeds. |
+| `--target-cache l1\|l2\|l3` | Evaluate each locus against the named tier's budget. Over-budget loci surface as a stderr warning by default. |
+| `--strict` | Convert the warning into a build error (exit 1 before codegen). Only meaningful in combination with `--target-cache` or a program that carries `@locality(...)` annotations. |
+
+**Effective budget precedence** (per locus):
+
+1. `@locality(L1|L2|L3)` annotation → that tier (hard
+   contract; evaluated regardless of CLI flag).
+2. `@locality(any)` annotation → no budget (opts out even
+   under `--target-cache`).
+3. No annotation → falls through to `--target-cache` global
+   tier (or no budget when the flag isn't set).
+
+`--strict` controls warnings vs errors uniformly across both
+sources. The diagnostic names which source applied (per the
+`BudgetSource::label()` "@locality" / "--target-cache"
+attribution).
+
+**Estimator approximations** (deliberately imprecise; see
+the working_set module doc for the full list):
+
+- `params { }` field layout uses alignment-correct
+  accumulation (each field rounded up to its natural
+  alignment; struct rounded up to max field alignment). Was
+  packed-layout in v0.1; v0.2 adds the padding.
+- Arena overhead modeled as a flat 64-byte budget for
+  synthetic headers.
+- Heap-managed primitives (`String` / `Bytes` / `*View`)
+  count as 16 bytes (ptr + len); the heap buffer's contents
+  are not counted (lives in the locus's arena).
+- Per-method scratch high-water mark — not modeled. The
+  scratch arena is destroyed at method exit, so contents
+  are transient, not resident.
+- Unbounded-cap capacity slots (no `cap = N` on the form)
+  surface in `WorkingSetEstimate::unbounded_slots` rather
+  than contributing zero silently.
 
 ## What's deferred
 

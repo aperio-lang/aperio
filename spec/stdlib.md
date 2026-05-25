@@ -267,11 +267,14 @@ the file path / connection target / empty string for socket-fd
 ops without a useful path label.
 
 `Stream.send` / `Stream.recv_bytes` / `Stream.send_bytes` are
-*locus methods*, not path-calls, and per the two-channel rule
-([`semantics.md` § Fallible call semantics](./semantics.md))
-locus methods cannot declare `fallible(E)`. They use the legacy
-sentinel shape (returning -1 / 0 on failure). The same is true
-of `std::io::stdin::read_line` (path-call but pairs with
+*locus methods* on `std::io::tcp::Stream`. They use the
+legacy sentinel shape (returning -1 / 0 on failure) for
+historical reasons — they predate open-question #24
+(2026-05-25) lifting the "no fallible on locus methods"
+restriction. Migrating them to `fallible(IoError)` is
+follow-on work; the sentinel surface stays load-bearing for
+the existing stdlib consumers. The same is true of
+`std::io::stdin::read_line` (path-call but pairs with
 `read_line_status` for EOF-vs-error distinction).
 
 ### `ParseError`

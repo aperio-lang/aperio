@@ -352,11 +352,14 @@ locus DbPool {
 
 **Why this shape.** Three forces meet:
 
-- **The two-channel rule** (locus methods cannot declare
-  `fallible(E)`, F.22-era) keeps recovery legible: parents
-  handle structural failures via `on_failure`, free fns +
-  `@form`-synthesized methods handle value errors via
-  `fallible`.
+- **The two-channel rule** (narrowed 2026-05-25, open-question
+  #24): substrate-facing surfaces — lifecycle methods, mode
+  methods, closure assertions, bus-subscribed handlers —
+  cannot declare `fallible(E)`. User-declared `fn` member
+  fns can. Recovery stays legible: parents handle structural
+  failures via `on_failure`; free fns + `@form`-synthesized
+  methods + user-declared `fn` members handle value errors
+  via `fallible(E)`.
 - **Channel conversion needs one named site.** The error-check
   fn is that site: one method per error-context, owning both
   the audit-log update (`self.last_error = ...`) and the
@@ -581,12 +584,14 @@ underlying surface lands.
   (`0` / `""` / `-1` / `false` / `nil`) paired with a sibling
   bool predicate (`parse_int` + `can_parse_int`). For true error
   paths where diagnostic context matters, declare the function
-  `fallible(E)` (v1.x-FORM-1; free fns, stdlib-synthesized
-  `@form(...)` methods, and stdlib path-call wrappers — e.g.
-  `std::io::fs::*` / `std::io::tcp::*` returning
-  `fallible(IoError)` — per the two-channel rule in
-  `spec/semantics.md` § "Fallible call semantics". Locus methods
-  on user-declared loci cannot declare `fallible(E)`.).
+  `fallible(E)` (v1.x-FORM-1 for free fns + stdlib path-call
+  wrappers like `std::io::fs::*` / `std::io::tcp::*` returning
+  `fallible(IoError)`; open-question #24, 2026-05-25,
+  extends this to user-declared `fn` member fns on loci.
+  Substrate-facing surfaces — lifecycle, mode, closure
+  assertions, bus-subscribed handlers — stay non-fallible
+  per the two-channel rule in `spec/semantics.md`
+  § "Fallible call semantics").
 - **Empty `if` bodies parse-fail.** Put a `// note` comment
   inside, or refactor to a positive condition.
 - **`hale run` rejects qualified-name struct/locus literals**

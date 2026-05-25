@@ -94,14 +94,31 @@ form_annotation   = "@" , "form" , "(" , IDENTIFIER ,
                     { "," , form_arg } , ")" ;
 form_arg          = IDENTIFIER , "=" , expression ;
 
+(* F.32-2 v0.2 (2026-05-25): `@locality(L1|L2|L3|any)` pins a
+   per-locus cache-tier budget that the working-set estimator
+   evaluates. `L1` / `L2` / `L3` declare a tier the locus is
+   expected to fit in; `any` explicitly opts out of any global
+   `--target-cache` gate. Tier name is a contextual identifier —
+   accepted only inside this annotation. Stacks with
+   `@form(...)` in either order. See `spec/types.md`
+   § "Working-set estimator". *)
+locality_annotation = "@" , "locality" , "(" , locality_tier , ")" ;
+locality_tier     = "L1" | "L2" | "L3" | "any" ;
+
 (* Phase 2: optional `main` modifier marks the locus as the
    binary's entry-point holder. Only a `main` locus may host a
    `bindings { }` member. At most one `main` locus per bundle.
    `main` is a contextual keyword (lexed as IDENTIFIER) recognized
-   only in this prefix position. *)
-locus_decl        = [ form_annotation ] , [ "main" ] , "locus" , IDENTIFIER ,
+   only in this prefix position.
+
+   F.32-2 v0.2: `@form(...)` and `@locality(...)` may both
+   appear; order is either, and each may appear at most once. *)
+locus_decl        = { locus_decorator } , [ "main" ] , "locus" , IDENTIFIER ,
                     [ locus_annotations ] ,
                     "{" , { locus_member } , "}" ;
+locus_decorator   = form_annotation
+                  | locality_annotation
+                  ;
 
 (* F.31 (2026-05-23): `schedule` removed from locus_annotation.
    Placement is a deployment seam; it lives in a `placement { }`
