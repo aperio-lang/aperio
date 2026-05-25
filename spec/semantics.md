@@ -755,6 +755,243 @@ Out of scope for v1 (fall through to bus dispatch unchanged):
 A bound topic is never optimized: the binding may publish to
 remote subscribers that aren't visible at compile time.
 
+### Phase 3: routing keys (v0.1 proposal, 2026-05-25)
+
+Phase 3 extends topic declarations with a per-message **routing
+key** so the bus can shard dispatch by key value at the
+`(subject, key)` granularity, rather than fanning every published
+message to every subscriber on the subject. Motivated by the
+fathom `apps/mdgw/kraken` workload (handoff
+`handoff-compiler-hashmap-bigcell-leak-2026-05-25.md`): one
+reader thread publishes book frames for N symbols; N per-symbol
+loci each want only their own symbol's frames. Without routing
+keys, every BookSignal would receive every L2Data frame and have
+to filter in user code — O(N × messages) dispatches; per-symbol
+state corruption pressure if filtering is forgotten.
+
+Routing keys are also reusable for any "many similar loci sharing
+one publisher" pattern (per-tenant request streams, per-account
+ledger updates, etc.).
+
+**Surface — three pieces.**
+
+```hale
+type L2Data {
+    sym_id:   Int;                          // i64 routing key field
+    bids:     [BookLevel; 100];
+    asks:     [BookLevel; 100];
+}
+
+topic KrakenL2 {                            // (1) topic-decl additions
+    payload:      L2Data;
+    subject:      "kraken.l2";
+    keyed_by      sym_id;                   //  ←  new
+    on_unmatched: swallow;                  //  ←  new (default if absent)
+}
+
+locus BookSignal {
+    params { sym_id: Int = 0; ... }
+    bus {                                   // (2) subscribe-clause filter
+        subscribe KrakenL2 as on_l2
+                  where key == self.sym_id; //  ←  new
+    }
+    fn on_l2(d: L2Data) { /* d.sym_id == self.sym_id, statically */ }
+}
+
+main locus Mdgw {                           // (3) per-instance bindings
+    params {
+        btc: BookSignal = BookSignal { sym_id: 1 };
+        eth: BookSignal = BookSignal { sym_id: 2 };
+        sol: BookSignal = BookSignal { sym_id: 3 };
+    }
+}
+```
+
+**Width is inherited from the `keyed_by` field's type.** No
+separate width annotation. Acceptable field types and their bus
+storage at v0.1:
+
+| Field type | Bus storage | Compare cost |
+|---|---|---|
+| `Bool` | u64 (zero-extended) | one i64 cmp |
+| `Int` | u64 | one i64 cmp |
+| `Time`, `Duration` | u64 (ns since epoch) | one i64 cmp |
+| no-payload `enum` | u64 (i32 tag zero-extended) | one i64 cmp |
+| `Decimal` | u128 (i64 pair) | two i64 cmps |
+
+The bus runtime stores both halves of a u128 uniformly
+(`key_lo: u64, key_hi: u64`) — narrower types zero-extend. Apps
+that need compound keys (`(sym_id, venue, side)`) pack them into
+a `Decimal` field themselves; the language does not bake compound-
+key derivation at v0.1.
+
+**`where key == EXPR` — what EXPR can be.**
+
+The RHS is evaluated at the subscribing locus's instantiation (the
+point where its `params` defaults are resolved), and the resulting
+key value is captured into the bus registry alongside the
+handler's self pointer. v0.1 restricts EXPR to:
+
+1. An integer / decimal literal: `where key == 42`
+2. A const identifier resolving to a scalar of the topic's key type
+3. A `self.<field>` path read, where `<field>` is a `params`-block
+   field of the subscribing locus
+
+Higher-shape expressions (`self.a + self.b`, method calls in the
+filter, cross-locus reads) are reserved for later. The
+restriction keeps the static check simple ("EXPR is a let-
+bindable expression with no side effects, types to the topic's
+key type") and avoids surprising semantics at registration time.
+
+**Key stability — captured by value at register.**
+
+A routing-key subscription captures its key value at the locus's
+instantiation (or restart). Subsequent mutations to fields the
+filter expression references do **not** change which messages the
+handler receives. If dynamic re-keying is needed, dissolve and
+re-instantiate the locus. The alternative — re-evaluating the
+filter on every dispatch — would break the bus's "register once,
+dispatch many" cost model and introduce ordering complexity
+against concurrent `self` mutation; the capture-by-value rule is
+the right default, and a `re-subscribe` API is a follow-up if a
+workload demands it.
+
+**`on_unmatched: V` — policy when no subscriber's key matches.**
+
+A keyed publish may find zero subscribers whose `where key == X`
+filter matches the message's key. Topic-level config picks the
+behavior; default is `swallow` (matches today's no-subscriber
+semantics on unkeyed topics).
+
+| `on_unmatched:` | Behavior |
+|---|---|
+| `swallow` *(default)* | Drop the message silently. Diag visible only with `LOTUS_BUS_LOG_UNMATCHED=1` env var (per-publish stderr line citing subject + key + subscriber counts). |
+| `fail` | Publish becomes a fallible expression. Caller must use `or raise` / `or handler(err)` / `or discard` / `or fallback` (same vocabulary as `@form(hashmap).get(missing)`). Err payload: `BusUnmatchedKey { subject: String, key_lo: Int, key_hi: Int }`. |
+| `fallback` | A catch-unmatched subscriber on the subject — `subscribe T as h where key == _` — receives the message. At least one such subscriber is required; cross-module resolve-time check rejects the topic otherwise. The `_` sentinel is legal only on `fallback` topics. |
+
+Static checks at typecheck:
+
+1. `keyed_by FIELD` — FIELD must be a declared field of the
+   topic's payload type; FIELD's type must be one of the table
+   above; the topic must not also declare a `keyed_by` via a
+   parent topic with a different field.
+2. `where key == EXPR` — EXPR's type must match the topic's
+   keyed-by field type after width inference.
+3. `where key == EXPR` is forbidden on topics without
+   `keyed_by`; rejecting prevents silent-no-match bugs from
+   typo'd filters.
+4. `where key == _` is forbidden except on topics with
+   `on_unmatched: fallback`.
+5. `fail` topics: every `Topic <- value` send site must be in a
+   fallible-disposition position (the same machinery already
+   used for `@form(hashmap).get`).
+6. `fallback` topics: at least one program-wide `where key == _`
+   subscriber must exist; checked at resolve after import
+   merging.
+
+Routing keys are orthogonal to topic hierarchy (Phase 2): a
+parent's `keyed_by` and `on_unmatched` are inherited by children
+that don't override; children may override either independently.
+A child topic re-declaring `keyed_by` must agree with the
+parent's key type (subjects derived from a parent's wire prefix
+share the parent's key shape — anything else makes dispatch
+ambiguous on the wire).
+
+**Runtime — `lotus_bus_entry_t` extension.**
+
+The bus router's subscriber-entry struct
+(`crates/hale-codegen/runtime/lotus_arena.c`, around line 4034)
+gains a tri-state filter and a u128 key value:
+
+```c
+typedef struct {
+    /* ...existing fields: subject, self_ptr, handler, etc... */
+    uint8_t  key_filter_kind;     /* 0 = no filter (receive-all)
+                                   * 1 = specific key
+                                   * 2 = catch-unmatched (`_`) */
+    uint64_t key_lo;              /* i64 key, or low half of i128  */
+    uint64_t key_hi;              /* 0 for i64 / narrower types    */
+} lotus_bus_entry_t;
+```
+
+Dispatch (`lotus_bus_local_dispatch_keyed`):
+
+```c
+int matched_specific = 0;
+for (entry in g_bus_entries with matching subject):
+    if (entry.key_filter_kind == 1
+        && entry.key_lo == msg.key_lo
+        && entry.key_hi == msg.key_hi) {
+        fire(entry);
+        matched_specific = 1;
+    } else if (entry.key_filter_kind == 0) {
+        fire(entry);                  /* unkeyed receive-all */
+    }
+if (!matched_specific) {
+    for (entry in g_bus_entries with matching subject):
+        if (entry.key_filter_kind == 2) fire(entry);
+}
+```
+
+Walk cost is O(N_subscribers_on_subject) for the specific pass,
+with a second pass only when there's no specific match (fallback
+case). For workloads with thousands of keyed subscribers per
+subject, a per-`(subject, key_lo, key_hi)` open-addressing index
+can be added later — YAGNI until a workload demands.
+
+Two new runtime symbols:
+
+```c
+void  lotus_bus_register_keyed(
+        const char *subject, void *self,
+        lotus_handler_fn handler,
+        /* ...existing... */,
+        uint8_t  key_filter_kind,
+        uint64_t key_lo,
+        uint64_t key_hi);
+
+int   lotus_bus_dispatch_keyed(           /* returns match count;
+                                           * `fail` topics check this */
+        lotus_bus_queue_t *queue,
+        const char *subject,
+        const void *payload, size_t payload_size,
+        uint64_t key_lo, uint64_t key_hi,
+        lotus_serialize_fn serialize_fn);
+```
+
+Existing `lotus_bus_register` / `lotus_bus_dispatch` stay as
+the unkeyed entry points (compat for unkeyed topics).
+
+**Backward compatibility.** Topics without `keyed_by` and
+subscribers without `where key ==` behave exactly as today —
+the new fields default to `key_filter_kind = 0` (receive-all)
+and the dispatch dispatches uniformly. Existing programs need
+no source change to keep working; new programs opt in
+per-topic.
+
+**Out of scope at v0.1 (explicit non-goals):**
+
+- Multi-field / tuple `keyed_by` (`keyed_by (sym_id, side)`).
+  Apps that need compound keys pack into a `Decimal` field in
+  user code. Eligible for a v0.2 sugar once a workload's
+  ergonomics surface the friction.
+- Wildcard key sets (`where key in [1, 2, 3]`).
+- Range predicates (`where key > 100`). Equality match is the
+  workload-driven sweet spot; broader predicates would defeat
+  the O(1)-dispatch cost model.
+- String routing keys. String-equality match defeats the
+  perf goal; only int-shaped scalars at v0.1.
+- Method blocks on enums to make enum-typed routing keys
+  ergonomic. Treated as a separable language feature; users at
+  v0.1 use bare Int / Decimal or existing no-payload enums.
+- Per-publish key override (publishing with a key value that
+  isn't derived from the payload field). Tied to the payload's
+  identity so wire-format consumers see a consistent key.
+- Cross-process keyed dispatch (over the remote-fanout path).
+  v0.1 ships keyed dispatch for the intra-process bus only;
+  remote subscribers still fanout per-subject and filter in
+  their own bus router after deserialize.
+
 ## Placement block (F.31)
 
 The `placement { }` block on `main locus` controls per-locus

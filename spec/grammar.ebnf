@@ -77,7 +77,16 @@ topic_decl        = "topic" , IDENTIFIER ,
                     "{" , { topic_field } , "}" ;
 topic_field       = "payload" , ":" , type_expr , ";"
                   | "subject" , ":" , STRING_LIT , ";"
+                  | "keyed_by" , IDENTIFIER , ";"
+                  | "on_unmatched" , ":" , unmatched_policy , ";"
                   ;
+
+(* Routing-key policy on no-key-match publishes — see
+   `spec/semantics.md` § "Topic declarations" / "Phase 3:
+   routing keys" for full semantics. `swallow` is the default
+   when `on_unmatched` is omitted (matches today's no-
+   subscriber behavior on unkeyed topics). *)
+unmatched_policy  = "swallow" | "fail" | "fallback" ;
 
 (* FUv0.8.2 #7 (2026-05-25): `target <name> { cap, cap, ... }`
    declares a substrate the program runs on plus its capability
@@ -310,10 +319,24 @@ bus_member        = bus_subscribe
    the alias chain through the per-build path-rename table. *)
 bus_subject       = STRING_LIT | qualified_name ;
 bus_subscribe     = "subscribe" , bus_subject , "as" , IDENTIFIER ,
-                    [ "of" , "type" , type_expr ] , ";" ;
+                    [ "of" , "type" , type_expr ] ,
+                    [ key_filter ] , ";" ;
 bus_publish       = "publish" , bus_subject ,
                     [ "of" , "type" , type_expr ] ,
                     [ "as" , IDENTIFIER ] , ";" ;
+
+(* Routing-key filter (v0.1). RHS is one of:
+   - a literal of an int-sized scalar type
+   - a const identifier resolving to such a literal
+   - `self.<field>` — captured at locus instantiation
+   - the sentinel `_`, only legal when the topic declared
+     `on_unmatched: fallback` (catch-unmatched subscriber).
+   Bare-Int and through-enum key types are both accepted; the
+   bus stores the underlying integer tag. See `spec/semantics.md`
+   § "Phase 3: routing keys". *)
+key_filter        = "where" , "key" , "==" , key_filter_rhs ;
+key_filter_rhs    = "_"
+                  | expr ;
 
 
 (* === 5b. Capacity block (F.22) ================================= *)
