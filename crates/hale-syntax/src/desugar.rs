@@ -426,11 +426,38 @@ pub fn desugar_intra_locus_topics(program: &mut Program) {
     let (pubs, subs) = collect_pub_sub(&program.items);
     let locus_types = collect_locus_type_names(&program.items);
     let locus_fields = collect_locus_typed_fields(&program.items, &locus_types);
+    // Phase 3 (2026-05-25): collect the set of topic names that
+    // declare `keyed_by` (or `on_unmatched`). The intra-locus
+    // optimization rewrites publishes to direct method calls,
+    // bypassing the bus runtime — which means the routing-key
+    // filter never runs. For keyed topics the filter is the
+    // whole point, so skip the optimization here and let the
+    // publish fall through to the bus dispatch path.
+    //
+    // A keyed topic could still in principle benefit from the
+    // optimization if every subscriber's filter is a literal
+    // that matches every possible payload key, but enumerating
+    // that is workload-driven and YAGNI for v0.1.
+    let keyed_topics: std::collections::BTreeSet<String> = program
+        .items
+        .iter()
+        .filter_map(|d| match d {
+            TopDecl::Topic(t)
+                if t.keyed_by.is_some() || t.on_unmatched.is_some() =>
+            {
+                Some(t.name.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
 
     // Identify topic → rewrite recipe for each eligible topic.
     let mut eligible: BTreeMap<String, EligibleRewrite> = BTreeMap::new();
     for (topic, pub_loci) in &pubs {
         if bindings.contains(topic) {
+            continue;
+        }
+        if keyed_topics.contains(topic) {
             continue;
         }
         if pub_loci.len() != 1 {

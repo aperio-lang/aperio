@@ -7672,6 +7672,14 @@ void lotus_bus_dispatch_wire(const char *subject,
         if (!e->subject) continue;
         if (!lotus_subject_match(e->subject, subject)) continue;
         if (!e->deserialize) continue;
+        /* Phase 3 (2026-05-25): mirror lotus_bus_local_dispatch —
+         * unkeyed publishes (which is what this entry point
+         * services; the keyed variant is lotus_bus_dispatch_wire_keyed)
+         * must NOT fire entries that registered a key filter.
+         * Otherwise an unkeyed `<-` to a keyed subject would
+         * deliver to every kind=1 subscriber regardless of key,
+         * bypassing the routing-key contract. */
+        if (e->key_filter_kind != 0) continue;
         /* Load the subscriber's __arena via the m20 fixed-offset
          * GEP: slot 0 of every locus struct is `__arena: ptr`. */
         lotus_arena_t *sub_arena =

@@ -340,6 +340,7 @@ pub fn build_executable_with_options(
             .collect(),
         bus_state: None,
         shm_ring_subjects: std::collections::BTreeMap::new(),
+        routing_key_subjects: std::collections::BTreeMap::new(),
         deferred_dissolves: Vec::new(),
         in_main: false,
         current_arena_override: None,
@@ -1067,6 +1068,15 @@ struct Cx<'ctx, 'p> {
     /// subscribe-registration codegen (subscriber-side reader
     /// thread spawn) can consult it at call sites.
     shm_ring_subjects: std::collections::BTreeMap<String, ShmRingBindingInfo>,
+    /// Phase 3 (2026-05-25, spec/semantics.md § "Phase 3: routing
+    /// keys"). Per-subject topic metadata for keyed-dispatch
+    /// codegen. Indexed by wire subject (the same string the bus
+    /// runtime uses). Populated in a pre-pass over the program's
+    /// topic declarations before any user-code lowering. Unkeyed
+    /// topics are NOT present in this map; absence ⇒ "route
+    /// through the legacy lotus_bus_dispatch path."
+    routing_key_subjects:
+        std::collections::BTreeMap<String, RoutingKeySubjectInfo>,
     /// Stack of "deferred-dissolve" frames: each enclosing fn
     /// body / lifecycle method body opens one. Long-lived loci
     /// (any locus with a `bus subscribe` declaration) instantiated
@@ -1394,6 +1404,21 @@ struct BusState;
 /// before user-code lowering so the publish-side
 /// (`lower_send_shm_ring`) and subscribe-side (subscriber
 /// registration in `emit_locus_birth`) can both consult it.
+/// Phase 3 (2026-05-25): per-keyed-topic metadata used by
+/// `lower_send` to route through `lotus_bus_dispatch_keyed`
+/// instead of the legacy unkeyed dispatch. Populated in a
+/// pre-pass over top-level topic decls; indexed by wire subject.
+#[derive(Debug, Clone)]
+struct RoutingKeySubjectInfo {
+    /// Name of the topic's payload struct type. Looked up in
+    /// `user_types` for the field GEP at the publish site.
+    payload_type_name: String,
+    /// Field name on the payload that carries the routing key.
+    /// Validated to exist + be int-eligible at typecheck; codegen
+    /// trusts the field is present and key_value_to_i64_pair-able.
+    keyed_by_field: String,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]  // K7's `overflow` reserved for K7b fallible-`<-`
 struct ShmRingBindingInfo {
@@ -2274,7 +2299,12 @@ struct LocusInfo<'ctx> {
     /// mailbox_or_null, deserialize_fn_ptr) into the global
     /// bus table — the deserialize fn is looked up via the
     /// payload type name in `cx.serializers` (m60).
-    subscriptions: Vec<(String, String, String)>,
+    /// Each subscription: (subject, handler_name, payload_type,
+    /// optional Phase-3 key filter). The key filter is `Some(...)`
+    /// when the subscribe clause carried `where key == EXPR`; the
+    /// codegen evaluates EXPR at locus birth (where `self` is in
+    /// scope) and threads the value into `lotus_bus_register_keyed`.
+    subscriptions: Vec<(String, String, String, Option<KeyFilter>)>,
     /// Closure declarations on this locus. All five epochs lower
     /// (Birth m39, Dissolve, Tick m42, Duration m43, Explicit m44).
     /// Each element is `(name, assertion, epoch)` carried over from
@@ -7023,6 +7053,131 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// — used to look up `__deserialize_T` so the reader thread
     /// (m59) can decode wire-format bytes into a struct before
     /// dispatching to the handler.
+    /// Phase 3 (2026-05-25): lower a `where key == EXPR` clause's
+    /// RHS into the (kind, key_lo, key_hi) triple that
+    /// `lotus_bus_register_keyed` expects.
+    ///
+    /// v0.1 supports three RHS shapes:
+    ///   - literal Int / Decimal / Time / Duration / Bool /
+    ///     no-payload enum variant
+    ///   - `self.<field>` path read (field must be int-shaped,
+    ///     enforced here as a codegen-time diag if it isn't)
+    ///   - `_` sentinel → kind = 2 (catch-unmatched fallback)
+    ///
+    /// For absent filter: kind = 0; key_lo = key_hi = 0
+    /// (receive-all, today's behavior).
+    fn lower_subscribe_key_filter(
+        &mut self,
+        self_ptr: PointerValue<'ctx>,
+        key_filter: Option<&KeyFilter>,
+        subject: &str,
+    ) -> Result<(u8, IntValue<'ctx>, IntValue<'ctx>), CodegenError> {
+        let i64_t = self.context.i64_type();
+        match key_filter {
+            None => Ok((0, i64_t.const_zero(), i64_t.const_zero())),
+            Some(KeyFilter::Unmatched { .. }) => {
+                // The typecheck for v0.1 of the impl rejects
+                // `on_unmatched: fallback`, so we shouldn't
+                // see `_` filters in practice. If one slips
+                // through (e.g., a fixture written ahead of the
+                // policy impl), reject loudly rather than emit
+                // a half-wired filter.
+                Err(CodegenError::Unsupported(format!(
+                    "subscribe `{}` uses `where key == _` but the \
+                     `on_unmatched: fallback` policy is not yet \
+                     implemented (v0.1 of routing-keys impl ships \
+                     swallow only)",
+                    subject
+                )))
+            }
+            Some(KeyFilter::Specific { expr, .. }) => {
+                // Lower the EXPR. `lower_expr` reads `self.X`
+                // through `self.current_self` (set by the caller —
+                // `lower_locus_instantiation` wraps the
+                // subscription loop with a temp-current_self
+                // assignment so the just-constructed locus's
+                // fields are visible).
+                let _ = self_ptr;
+                let scope = Scope::default();
+                let (val, ty) = self.lower_expr(expr, &scope)?;
+                let (key_lo, key_hi) = self.key_value_to_i64_pair(val, &ty)
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(format!(
+                            "subscribe `{}`: `where key == EXPR` RHS \
+                             of type {:?} is not int-shaped (must be \
+                             Int / Decimal / Time / Duration / Bool / \
+                             no-payload enum)",
+                            subject, ty
+                        ))
+                    })?;
+                Ok((1, key_lo, key_hi))
+            }
+        }
+    }
+
+    /// Phase 3 (2026-05-25): pack a value of an int-shaped scalar
+    /// type into the (key_lo, key_hi) i64 pair the bus runtime
+    /// stores. Int / Time / Duration / Bool / enum tag → key_lo
+    /// gets the value zero-extended, key_hi = 0. Decimal (i128) →
+    /// key_lo = low 64, key_hi = high 64. Returns `None` if the
+    /// type isn't key-eligible (codegen rejects upstream).
+    fn key_value_to_i64_pair(
+        &self,
+        val: BasicValueEnum<'ctx>,
+        ty: &CodegenTy,
+    ) -> Option<(IntValue<'ctx>, IntValue<'ctx>)> {
+        let i64_t = self.context.i64_type();
+        match ty {
+            CodegenTy::Int
+            | CodegenTy::Time
+            | CodegenTy::Duration => {
+                // Already i64.
+                Some((val.into_int_value(), i64_t.const_zero()))
+            }
+            CodegenTy::Bool => {
+                let iv = val.into_int_value();
+                let lo = self
+                    .builder
+                    .build_int_z_extend(iv, i64_t, "key.bool.zext")
+                    .ok()?;
+                Some((lo, i64_t.const_zero()))
+            }
+            CodegenTy::Enum(_) => {
+                // No-payload enums lower to i32 tags; widen to i64.
+                let iv = val.into_int_value();
+                if iv.get_type().get_bit_width() == 64 {
+                    Some((iv, i64_t.const_zero()))
+                } else {
+                    let lo = self
+                        .builder
+                        .build_int_z_extend(iv, i64_t, "key.enum.zext")
+                        .ok()?;
+                    Some((lo, i64_t.const_zero()))
+                }
+            }
+            CodegenTy::Decimal => {
+                // i128: split into low + high i64 halves.
+                let iv = val.into_int_value();
+                let i128_t = self.context.i128_type();
+                let shift = i128_t.const_int(64, false);
+                let lo_128 = self
+                    .builder
+                    .build_int_truncate(iv, i64_t, "key.dec.lo")
+                    .ok()?;
+                let hi_128 = self
+                    .builder
+                    .build_right_shift(iv, shift, false, "key.dec.hi_shift")
+                    .ok()?;
+                let hi = self
+                    .builder
+                    .build_int_truncate(hi_128, i64_t, "key.dec.hi")
+                    .ok()?;
+                Some((lo_128, hi))
+            }
+            _ => None,
+        }
+    }
+
     fn emit_bus_register(
         &mut self,
         subject: &str,
@@ -7030,6 +7185,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         handler_fn: FunctionValue<'ctx>,
         mailbox_or_null: Option<PointerValue<'ctx>>,
         payload_type: &str,
+        key_filter: Option<&KeyFilter>,
     ) -> Result<(), CodegenError> {
         let _ = self
             .bus_state
@@ -7051,64 +7207,59 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .deserialize
             .as_global_value()
             .as_pointer_value();
-        // F.31 Phase 4: route through the with_pool register when
-        // the enclosing locus is on a non-main cooperative pool.
-        // Pool ptr is resolved at runtime via lotus_coop_pool_lookup
-        // (one strcmp over the small registry — cheaper than
-        // baking per-subscriber pool globals).
-        if let Some(pool_name) = self.current_cooperative_pool.clone() {
+        // Compute the optional coop_pool ptr (F.31 Phase 4) and
+        // the Phase 3 key-filter triple (kind, lo, hi) up front,
+        // then funnel through lotus_bus_register_keyed which
+        // accepts both. Lotus_bus_register / _with_pool both
+        // delegate to _keyed internally for kind=0 (no filter)
+        // → backward compat preserved on the runtime side.
+        let coop_pool_ptr = if let Some(pool_name) =
+            self.current_cooperative_pool.clone()
+        {
             let name_str = self.global_string(&pool_name);
             let lookup_fn = self
                 .module
                 .get_function("lotus_coop_pool_lookup")
                 .expect("lotus_coop_pool_lookup declared in declare_builtins");
-            let pool_ptr = self
-                .builder
+            self.builder
                 .build_call(lookup_fn, &[name_str.into()], "coop_pool.lookup")
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
                 .try_as_basic_value()
                 .left()
                 .expect("lotus_coop_pool_lookup returns ptr")
-                .into_pointer_value();
-            let register_fn = self
-                .module
-                .get_function("lotus_bus_register_with_pool")
-                .expect(
-                    "lotus_bus_register_with_pool declared in declare_builtins",
-                );
-            self.builder
-                .build_call(
-                    register_fn,
-                    &[
-                        subj_str.into(),
-                        self_ptr.into(),
-                        handler_ptr.into(),
-                        mailbox_val.into(),
-                        deserialize_ptr.into(),
-                        pool_ptr.into(),
-                    ],
-                    "bus.register_with_pool.call",
-                )
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-            return Ok(());
-        }
-        let register_fn = self
+                .into_pointer_value()
+        } else {
+            ptr_t.const_null()
+        };
+
+        let i8_t = self.context.i8_type();
+        let i64_t = self.context.i64_type();
+        let (kind_v, key_lo_v, key_hi_v) =
+            self.lower_subscribe_key_filter(self_ptr, key_filter, subject)?;
+        let kind_iv = i8_t.const_int(kind_v as u64, false);
+
+        let register_keyed_fn = self
             .module
-            .get_function("lotus_bus_register")
-            .expect("lotus_bus_register declared in declare_builtins");
+            .get_function("lotus_bus_register_keyed")
+            .expect("lotus_bus_register_keyed declared in declare_builtins");
         self.builder
             .build_call(
-                register_fn,
+                register_keyed_fn,
                 &[
                     subj_str.into(),
                     self_ptr.into(),
                     handler_ptr.into(),
                     mailbox_val.into(),
                     deserialize_ptr.into(),
+                    coop_pool_ptr.into(),
+                    kind_iv.into(),
+                    key_lo_v.into(),
+                    key_hi_v.into(),
                 ],
-                "bus.register.call",
+                "bus.register_keyed.call",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let _ = i64_t; // silence unused if branches diverge later
         Ok(())
     }
 
@@ -7182,6 +7333,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // calls are emitted later by `emit_bindings_prelude` in
         // main's prelude.
         self.collect_shm_ring_subjects();
+
+        // Phase 3 (2026-05-25, spec/semantics.md § "Phase 3:
+        // routing keys"): pre-pass over top-level topic decls to
+        // record per-keyed-topic metadata. `lower_send` consults
+        // this map; if the wire subject is in the map, dispatch
+        // routes through lotus_bus_dispatch_keyed instead of
+        // lotus_bus_dispatch.
+        self.collect_routing_key_subjects();
 
         // F.31 (2026-05-23): pre-pass over main locus's
         // placement entries. Populates `main_placement_map`
@@ -7484,7 +7643,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // drops in by replacing the bodies, not the call sites.
         let mut payload_types: BTreeSet<String> = BTreeSet::new();
         for info in self.user_loci.values() {
-            for (_, _, payload_type) in &info.subscriptions {
+            for (_, _, payload_type, _) in &info.subscriptions {
                 payload_types.insert(payload_type.clone());
             }
         }
@@ -7974,6 +8133,44 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Phase 3 (2026-05-25): walk top-level topic decls and
+    /// record each KEYED topic's (wire subject → payload type +
+    /// keyed_by field) for the codegen-side publish lookup.
+    /// Unkeyed topics are not stored; `lower_send` falls through
+    /// to the legacy `lotus_bus_dispatch` path when a publish's
+    /// subject isn't in this map.
+    fn collect_routing_key_subjects(&mut self) {
+        let mut wire_subjects: BTreeMap<String, String> = BTreeMap::new();
+        Self::collect_topic_wire_subjects(&self.program.items, &mut wire_subjects);
+        for item in &self.program.items {
+            if let TopDecl::Topic(t) = item {
+                let keyed_field = match &t.keyed_by {
+                    Some(f) => f.name.clone(),
+                    None => continue,
+                };
+                let payload_name = match &t.payload {
+                    TypeExpr::Named { path, generic_args, .. }
+                        if path.segments.len() == 1 && generic_args.is_empty() =>
+                    {
+                        path.segments[0].name.clone()
+                    }
+                    _ => continue,
+                };
+                let wire = wire_subjects
+                    .get(&t.name.name)
+                    .cloned()
+                    .unwrap_or_else(|| t.name.name.clone());
+                self.routing_key_subjects.insert(
+                    wire,
+                    RoutingKeySubjectInfo {
+                        payload_type_name: payload_name,
+                        keyed_by_field: keyed_field,
+                    },
+                );
             }
         }
     }
@@ -11382,7 +11579,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let mut accept_param: Option<(String, String)> = None;
         let mut user_methods: BTreeMap<String, FunctionValue<'ctx>> =
             BTreeMap::new();
-        let mut subscriptions: Vec<(String, String, String)> = Vec::new();
+        let mut subscriptions: Vec<(String, String, String, Option<KeyFilter>)> =
+            Vec::new();
         let mut closures: Vec<(String, ClosureAssertion, EpochSpec)> =
             Vec::new();
         let mut failure_handler: Option<(String, FunctionValue<'ctx>)> = None;
@@ -11517,7 +11715,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     // first param signature later in pass A2.
                     for bm in &bb.members {
                         match bm {
-                            BusMember::Subscribe { subject, handler, ty, .. } => {
+                            BusMember::Subscribe { subject, handler, ty, key_filter, .. } => {
                                 let payload_type_name = ty
                                     .as_ref()
                                     .and_then(|t| {
@@ -11542,6 +11740,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                                     subject.canonical().to_string(),
                                     handler.name.clone(),
                                     payload_type_name,
+                                    key_filter.clone(),
                                 ));
                             }
                             BusMember::Publish { .. } => {
@@ -12640,7 +12839,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let is_subscribed_handler = info
                     .subscriptions
                     .iter()
-                    .any(|(_, h, _)| h == &fd.name.name);
+                    .any(|(_, h, _, _)| h == &fd.name.name);
                 if is_subscribed_handler {
                     let i64_t = self.context.i64_type();
                     let q_slot = self
@@ -12700,7 +12899,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     let is_subscribed_handler = info
                         .subscriptions
                         .iter()
-                        .any(|(_, h, _)| h == &fd.name.name);
+                        .any(|(_, h, _, _)| h == &fd.name.name);
                     if is_subscribed_handler {
                         // Load parent_self and parent_handler
                         // once; both tick and duration fns
@@ -34344,7 +34543,19 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             matches!(info.schedule_class, ScheduleClass::Pinned(_))
                 && !info.subscriptions.is_empty();
         if !pinned_subscriptions {
-            for (subject, handler_name, payload_type) in &info.subscriptions {
+            // Phase 3 (2026-05-25): `where key == self.X` in any
+            // subscribe clause needs `current_self` set to this
+            // new locus so the key-filter EXPR's `self.X` reads
+            // resolve correctly. Save / restore around the loop
+            // (same pattern birth_check_decls uses below).
+            let prev_self = self.current_self.clone();
+            self.current_self = Some(SelfCx {
+                locus_name: locus_name.to_string(),
+                struct_ty: info.struct_ty,
+                self_ptr,
+                fields: info.fields.clone(),
+            });
+            for (subject, handler_name, payload_type, key_filter) in &info.subscriptions {
                 let handler_fn = info
                     .user_methods
                     .get(handler_name)
@@ -34375,9 +34586,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         handler_fn,
                         None,
                         payload_type,
+                        key_filter.as_ref(),
                     )?;
                 }
             }
+            self.current_self = prev_self;
         }
 
         // Fire birth → run in order. drain → dissolve are deferred
@@ -34480,7 +34693,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     self.builder
                         .build_store(mb_slot, mb_ptr)
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                    for (subject, handler_name, payload_type) in
+                    // Phase 3 same setup as the cooperative path
+                    // above — set current_self for the key-filter
+                    // EXPR's `self.X` reads.
+                    let prev_self_pinned = self.current_self.clone();
+                    self.current_self = Some(SelfCx {
+                        locus_name: locus_name.to_string(),
+                        struct_ty: info.struct_ty,
+                        self_ptr,
+                        fields: info.fields.clone(),
+                    });
+                    for (subject, handler_name, payload_type, key_filter) in
                         &info.subscriptions
                     {
                         let handler_fn = info
@@ -34500,8 +34723,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             handler_fn,
                             Some(mb_ptr),
                             payload_type,
+                            key_filter.as_ref(),
                         )?;
                     }
+                    self.current_self = prev_self_pinned;
                     Some(mb_ptr)
                 } else {
                     None
@@ -39502,6 +39727,92 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 "bus.dispatch.queue",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // Phase 3 (2026-05-25): if the subject is keyed_by, route
+        // through lotus_bus_dispatch_keyed with the key extracted
+        // from the payload's keyed_by field. The subject must be
+        // a compile-time-constant string for the lookup to fire;
+        // computed subjects always go through the legacy unkeyed
+        // path (no static way to know which topic they're for).
+        let keyed_info: Option<RoutingKeySubjectInfo> = match subject {
+            Expr::Literal(Literal::String(s), _) => {
+                self.routing_key_subjects.get(s).cloned()
+            }
+            _ => None,
+        };
+        if let Some(info) = keyed_info {
+            // GEP into payload at the keyed_by field, load it,
+            // convert to (key_lo, key_hi) i64 pair.
+            let payload_struct_info = self
+                .user_types
+                .get(&info.payload_type_name)
+                .cloned()
+                .expect("keyed topic's payload type registered");
+            let (field_idx, field_ty) = payload_struct_info
+                .fields
+                .get(&info.keyed_by_field)
+                .cloned()
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "keyed_by field `{}` missing on payload `{}` \
+                         (typecheck should have caught this)",
+                        info.keyed_by_field, info.payload_type_name
+                    ))
+                })?;
+            let field_slot = self
+                .builder
+                .build_struct_gep(
+                    payload_struct_info.struct_ty,
+                    payload_val.into_pointer_value(),
+                    field_idx,
+                    &format!(
+                        "bus.send.key.{}.{}.ptr",
+                        info.payload_type_name, info.keyed_by_field
+                    ),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let llvm_field_ty = self.llvm_basic_type(&field_ty);
+            let field_val = self
+                .builder
+                .build_load(
+                    llvm_field_ty,
+                    field_slot,
+                    &format!(
+                        "bus.send.key.{}.{}.load",
+                        info.payload_type_name, info.keyed_by_field
+                    ),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let (key_lo, key_hi) = self
+                .key_value_to_i64_pair(field_val, &field_ty)
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "keyed_by field `{}.{}` of type {:?} is not \
+                         int-shaped (typecheck should have caught this)",
+                        info.payload_type_name, info.keyed_by_field, field_ty
+                    ))
+                })?;
+            let dispatch_keyed_fn = self
+                .module
+                .get_function("lotus_bus_dispatch_keyed")
+                .expect("lotus_bus_dispatch_keyed declared in declare_builtins");
+            self.builder
+                .build_call(
+                    dispatch_keyed_fn,
+                    &[
+                        queue_ptr.into(),
+                        subj_val.into(),
+                        payload_val.into(),
+                        payload_size_iv.into(),
+                        ser_fn.as_global_value().as_pointer_value().into(),
+                        key_lo.into(),
+                        key_hi.into(),
+                    ],
+                    "bus.dispatch_keyed.call",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            return Ok(());
+        }
+
         let dispatch_fn = self
             .module
             .get_function("lotus_bus_dispatch")
