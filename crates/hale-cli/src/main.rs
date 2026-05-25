@@ -1043,23 +1043,101 @@ fn run_build(target: &Path) -> ExitCode {
         }
     };
     // F.32-2 (2026-05-25): operator-facing per-locus working-set
-    // report. Opted in via `hale build . --locality-report`;
-    // emits a textual table on stderr listing each user-declared
-    // locus's estimated bytes, the smallest cache tier it fits
-    // in (L1 ≤32K, L2 ≤512K, L3 ≤8M), and a struct/capacity/
-    // children byte decomposition. Estimator is approximate
-    // (alignment padding elided; method scratch heuristic-only)
-    // — see `hale_types::working_set` module docs. Build itself
-    // proceeds normally; this is report-only in v0.1, no
-    // `--strict` gate yet.
-    if std::env::args().any(|a| a == "--locality-report") {
+    // report + budget gate.
+    //
+    // * `--locality-report` emits the full per-locus table on
+    //   stderr (informational; build proceeds).
+    // * `--target-cache l1|l2|l3` evaluates each locus against
+    //   the named cache tier's budget. Over-budget loci surface
+    //   as a stderr warning by default, or — with `--strict` —
+    //   a build error (exit 1 before codegen).
+    // * Both flags can be combined: `--locality-report
+    //   --target-cache l2` shows everything AND gates.
+    //
+    // The estimator is approximate (alignment padding partially
+    // accounted, method scratch heuristic-only). The budget
+    // gate consults the same numbers the report shows, so a
+    // warning matches what the report attributes to each
+    // locus.
+    let cli_args: Vec<String> = std::env::args().collect();
+    let want_report = cli_args.iter().any(|a| a == "--locality-report");
+    let target_cache_arg: Option<&str> = {
+        let mut found = None;
+        let mut it = cli_args.iter();
+        while let Some(a) = it.next() {
+            if a == "--target-cache" {
+                found = it.next().map(|s| s.as_str());
+                break;
+            }
+        }
+        found
+    };
+    let strict = cli_args.iter().any(|a| a == "--strict");
+    // Resolve the global target tier early so a parse error
+    // surfaces before any analysis runs.
+    let global_target: Option<hale_types::working_set::CacheTier> =
+        match target_cache_arg {
+            Some(raw) => match hale_types::working_set::parse_cache_tier(raw) {
+                Some(t) => Some(t),
+                None => {
+                    eprintln!(
+                        "error: --target-cache: unknown tier `{}` \
+                         (expected l1 / l2 / l3)",
+                        raw
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            None => None,
+        };
+    let any_locality_annotation = program.items.iter().any(|item| {
+        matches!(item, hale_syntax::ast::TopDecl::Locus(l) if l.locality.is_some())
+    });
+    if strict && global_target.is_none() && !any_locality_annotation {
+        // `--strict` gates the working-set breaches that
+        // surface from `--target-cache` or `@locality(...)`.
+        // Without either, no budget applies and `--strict`
+        // is a no-op — surface the misconfiguration so a CI
+        // job doesn't silently believe it's enforcing
+        // anything.
+        eprintln!(
+            "warning: --strict has no effect without \
+             --target-cache l1|l2|l3 or `@locality(...)` annotations"
+        );
+    }
+    // Always run the per-locus evaluator — even without
+    // `--target-cache`, loci carrying `@locality(L1|L2|L3)` are
+    // a hard contract and need checking. The early exit when
+    // there's nothing to evaluate is cheap.
+    if want_report || global_target.is_some() || any_locality_annotation {
         let map =
             hale_types::working_set::compute_program_working_set(
                 &program.items,
             );
-        let report =
-            hale_types::working_set::render_locality_report(&map);
-        eprint!("{}", report);
+        if want_report {
+            eprint!(
+                "{}",
+                hale_types::working_set::render_locality_report(&map)
+            );
+        }
+        let breaches =
+            hale_types::working_set::breaches_with_per_locus_budgets(
+                &map,
+                &program.items,
+                global_target,
+            );
+        if !breaches.is_empty() {
+            let severity = if strict { "error" } else { "warning" };
+            eprint!(
+                "{}",
+                hale_types::working_set::render_breach_diagnostic(
+                    &breaches, severity,
+                )
+            );
+            if strict {
+                return ExitCode::from(1);
+            }
+        }
     }
     // Stage-2 FFI: append the FFI surface declared by each
     // imported lib's hale.toml [ffi] section. CLI flags from
@@ -1186,6 +1264,30 @@ fn parse_build_options() -> Result<hale_codegen::BuildOptions, String> {
             // codegen; recognized here so parse_build_options
             // doesn't error out on an unknown flag.
             "--locality-report" => {
+                i += 1;
+            }
+            // F.32-2 v0.2 (2026-05-25): cache-budget gate.
+            // `--target-cache l1|l2|l3` runs the working-set
+            // estimator against the named tier and emits a
+            // warning (or, with `--strict`, a build error) for
+            // any locus whose total exceeds the budget. The
+            // value is taken from the next argv entry, parallel
+            // to --link / --csrc. Consumed in main.rs; just
+            // skipped here so the unknown-flag arm doesn't
+            // fire.
+            "--target-cache" => {
+                // Eat the tier value too; main.rs will re-parse
+                // env::args. Defensive: if --target-cache is
+                // the last arg we still consume one entry and
+                // let main.rs surface the missing-value error
+                // (keeps parse_build_options simple).
+                if args.get(i + 1).is_some() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--strict" => {
                 i += 1;
             }
             other => {

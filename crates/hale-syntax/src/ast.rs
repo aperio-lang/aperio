@@ -129,6 +129,12 @@ pub struct LocusDecl {
     /// lowering and synthesizes a standard method set. One form
     /// per locus in v1.
     pub form: Option<FormAnnotation>,
+    /// F.32-2 v0.2 (2026-05-25): optional `@locality(L1|L2|L3|any)`
+    /// annotation. When present, the F.32-2 working-set
+    /// estimator evaluates this locus against the named cache
+    /// tier's budget (or, for `any`, explicitly opts out of the
+    /// global `--target-cache` gate).
+    pub locality: Option<LocalityAnnotation>,
     pub members: Vec<LocusMember>,
     pub span: Span,
 }
@@ -147,6 +153,25 @@ pub struct FormAnnotation {
     pub name: Ident,
     pub args: Vec<FormArg>,
     pub span: Span,
+}
+
+/// F.32-2 v0.2 (2026-05-25): `@locality(L1|L2|L3|any)`
+/// annotation on a locus declaration. Pins a per-locus cache-
+/// tier budget that the working-set estimator evaluates
+/// against. `Any` is the explicit opt-out from any global
+/// `--target-cache` gate (no budget for this locus).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalityAnnotation {
+    pub tier: LocalityTier,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalityTier {
+    L1,
+    L2,
+    L3,
+    Any,
 }
 
 /// `@ffi("c")` annotation on a free fn declaration. Marks the fn

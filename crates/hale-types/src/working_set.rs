@@ -44,8 +44,8 @@
 use std::collections::BTreeMap;
 
 use hale_syntax::ast::{
-    CapacitySlot, Expr, LocusDecl, LocusMember, Literal, PrimType,
-    TopDecl, TypeDecl, TypeDeclBody, TypeExpr,
+    CapacitySlot, Expr, LocalityTier, LocusDecl, LocusMember, Literal,
+    PrimType, TopDecl, TypeDecl, TypeDeclBody, TypeExpr,
 };
 
 /// Approximate working-set estimate for one locus, in bytes.
@@ -211,6 +211,183 @@ fn nearest_tier(total_bytes: u64) -> Option<CacheTier> {
         }
     }
     None
+}
+
+/// F.32-2 v0.2 (2026-05-25): parse a `--target-cache` value
+/// (case-insensitive `l1` / `l2` / `l3`). Returns `None` for
+/// unrecognized values; the CLI surfaces the diagnostic with
+/// the unknown spelling.
+pub fn parse_cache_tier(s: &str) -> Option<CacheTier> {
+    match s.to_ascii_lowercase().as_str() {
+        "l1" => Some(CacheTier::L1),
+        "l2" => Some(CacheTier::L2),
+        "l3" => Some(CacheTier::L3),
+        _ => None,
+    }
+}
+
+/// F.32-2 v0.2 budget breach record: one locus that exceeds
+/// its effective budget. `excess_bytes` is total − budget.
+/// `source` names where the budget came from (per-locus
+/// annotation vs global `--target-cache`) so the diagnostic
+/// can attribute the contract correctly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetBreach {
+    pub locus_name: String,
+    pub total_bytes: u64,
+    pub budget_bytes: u64,
+    pub excess_bytes: u64,
+    pub tier: CacheTier,
+    pub source: BudgetSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetSource {
+    /// Tier came from a per-locus `@locality(L1|L2|L3)`
+    /// annotation. The annotation is a hard contract; breaches
+    /// surface even without `--target-cache` on the command
+    /// line.
+    LocalityAnnotation,
+    /// Tier came from the global `--target-cache` CLI flag.
+    GlobalTargetCache,
+}
+
+impl BudgetSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            BudgetSource::LocalityAnnotation => "@locality",
+            BudgetSource::GlobalTargetCache => "--target-cache",
+        }
+    }
+}
+
+/// F.32-2 v0.2: evaluate every locus in `map` against the
+/// named cache tier's budget. Returns the set of breaches in
+/// alphabetical locus order (matching the report's sort
+/// stability). Empty vec = clean. All breaches are attributed
+/// to `GlobalTargetCache`; the per-locus-annotation path uses
+/// `breaches_with_per_locus_budgets`.
+pub fn breaches_against_tier(
+    map: &BTreeMap<String, WorkingSetEstimate>,
+    tier: CacheTier,
+) -> Vec<BudgetBreach> {
+    let budget = tier.budget_bytes();
+    map.iter()
+        .filter_map(|(name, est)| {
+            let total = est.total();
+            if total > budget {
+                Some(BudgetBreach {
+                    locus_name: name.clone(),
+                    total_bytes: total,
+                    budget_bytes: budget,
+                    excess_bytes: total - budget,
+                    tier,
+                    source: BudgetSource::GlobalTargetCache,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// F.32-2 v0.2 (2026-05-25): resolve a locus's effective
+/// budget. Per-locus `@locality(L1|L2|L3)` wins over the
+/// global `--target-cache`; `@locality(any)` explicitly opts
+/// out of the global gate; an absent annotation falls through
+/// to the global tier (or `None` if no global is set).
+///
+/// Returned tuple's second component names the source so a
+/// downstream breach record can attribute the contract.
+/// Returns `None` when the locus has no effective budget.
+pub fn effective_locus_budget(
+    locus: &LocusDecl,
+    global_target: Option<CacheTier>,
+) -> Option<(CacheTier, BudgetSource)> {
+    match locus.locality.as_ref().map(|a| a.tier) {
+        Some(LocalityTier::L1) => {
+            Some((CacheTier::L1, BudgetSource::LocalityAnnotation))
+        }
+        Some(LocalityTier::L2) => {
+            Some((CacheTier::L2, BudgetSource::LocalityAnnotation))
+        }
+        Some(LocalityTier::L3) => {
+            Some((CacheTier::L3, BudgetSource::LocalityAnnotation))
+        }
+        Some(LocalityTier::Any) => None,
+        None => global_target.map(|t| (t, BudgetSource::GlobalTargetCache)),
+    }
+}
+
+/// F.32-2 v0.2: walk the program's loci, resolve each one's
+/// effective budget (per-locus annotation overrides
+/// `global_target`; `@locality(any)` opts out), and report
+/// every breach. Returns alphabetical-by-locus-name order.
+/// `global_target = None` still evaluates loci carrying
+/// explicit `@locality` annotations — those are a hard
+/// contract regardless of CLI flags.
+pub fn breaches_with_per_locus_budgets(
+    map: &BTreeMap<String, WorkingSetEstimate>,
+    items: &[TopDecl],
+    global_target: Option<CacheTier>,
+) -> Vec<BudgetBreach> {
+    let idx = build_index(items);
+    let mut out: Vec<BudgetBreach> = Vec::new();
+    for (name, est) in map {
+        let Some(locus) = idx.loci.get(name.as_str()) else {
+            continue;
+        };
+        let Some((tier, source)) =
+            effective_locus_budget(locus, global_target)
+        else {
+            continue;
+        };
+        let total = est.total();
+        let budget = tier.budget_bytes();
+        if total > budget {
+            out.push(BudgetBreach {
+                locus_name: name.clone(),
+                total_bytes: total,
+                budget_bytes: budget,
+                excess_bytes: total - budget,
+                tier,
+                source,
+            });
+        }
+    }
+    out
+}
+
+/// F.32-2 v0.2: format a breach list as a stderr-friendly
+/// diagnostic. `severity` is "error" or "warning" — the
+/// caller picks based on whether `--strict` is set. Each
+/// breach line attributes its budget to either the per-locus
+/// annotation or the global `--target-cache` flag.
+pub fn render_breach_diagnostic(
+    breaches: &[BudgetBreach],
+    severity: &str,
+) -> String {
+    let mut out = String::new();
+    if breaches.is_empty() {
+        return out;
+    }
+    out.push_str(&format!(
+        "{}: {} locus(es) exceed their working-set budget:\n",
+        severity,
+        breaches.len(),
+    ));
+    for b in breaches {
+        out.push_str(&format!(
+            "  {}: estimated {} B (+ {} B over {} = {} B; from {})\n",
+            b.locus_name,
+            b.total_bytes,
+            b.excess_bytes,
+            b.tier.label(),
+            b.budget_bytes,
+            b.source.label(),
+        ));
+    }
+    out
 }
 
 struct Index<'a> {
@@ -695,5 +872,205 @@ mod tests {
         // exact byte count is sensitive to ordering, which is
         // implementation detail.
         assert!(est.total() >= ARENA_OVERHEAD);
+    }
+
+    // === F.32-2 v0.2 strict-gate tests ====================
+
+    #[test]
+    fn parse_cache_tier_recognizes_canonical_labels() {
+        assert_eq!(parse_cache_tier("l1"), Some(CacheTier::L1));
+        assert_eq!(parse_cache_tier("l2"), Some(CacheTier::L2));
+        assert_eq!(parse_cache_tier("l3"), Some(CacheTier::L3));
+        // Case-insensitive — operator likely types "L1".
+        assert_eq!(parse_cache_tier("L1"), Some(CacheTier::L1));
+        assert_eq!(parse_cache_tier("L2"), Some(CacheTier::L2));
+        assert_eq!(parse_cache_tier("L3"), Some(CacheTier::L3));
+        assert_eq!(parse_cache_tier("l4"), None);
+        assert_eq!(parse_cache_tier(""), None);
+        assert_eq!(parse_cache_tier("32k"), None);
+    }
+
+    #[test]
+    fn breaches_against_tier_picks_over_budget_loci() {
+        let src = r#"
+            type Entry { k: Int; v: Int; }
+            @form(hashmap, sync = lockfree, cap = 4096)
+            locus Big {
+                capacity { pool entries of Entry indexed_by k; }
+            }
+            locus Tiny { params { x: Int = 0; } }
+            fn main() { Big { }; Tiny { }; }
+        "#;
+        let p = parse_source(src).expect("parse");
+        let map = compute_program_working_set(&p.items);
+        // Big = 64 arena + 4096 × 16 cell = 65600 B → exceeds
+        // L1 (32K) but fits L2 (512K).
+        let l1 = breaches_against_tier(&map, CacheTier::L1);
+        assert_eq!(l1.len(), 1, "got: {:?}", l1);
+        assert_eq!(l1[0].locus_name, "Big");
+        assert!(l1[0].total_bytes > l1[0].budget_bytes);
+        assert_eq!(l1[0].excess_bytes, l1[0].total_bytes - l1[0].budget_bytes);
+        // Tiny fits all tiers — no breach.
+        let l2 = breaches_against_tier(&map, CacheTier::L2);
+        assert!(l2.is_empty(), "got: {:?}", l2);
+        let l3 = breaches_against_tier(&map, CacheTier::L3);
+        assert!(l3.is_empty(), "got: {:?}", l3);
+    }
+
+    #[test]
+    fn render_breach_diagnostic_uses_severity_label() {
+        let breach = BudgetBreach {
+            locus_name: "Big".to_string(),
+            total_bytes: 100_000,
+            budget_bytes: 32 * 1024,
+            excess_bytes: 100_000 - 32 * 1024,
+            tier: CacheTier::L1,
+            source: BudgetSource::GlobalTargetCache,
+        };
+        let err =
+            render_breach_diagnostic(&[breach.clone()], "error");
+        assert!(err.starts_with("error:"), "got: {}", err);
+        assert!(err.contains("L1"), "got: {}", err);
+        assert!(err.contains("Big"), "got: {}", err);
+        assert!(err.contains("--target-cache"), "got: {}", err);
+        let warn = render_breach_diagnostic(&[breach], "warning");
+        assert!(warn.starts_with("warning:"), "got: {}", warn);
+    }
+
+    #[test]
+    fn render_breach_diagnostic_empty_returns_empty_string() {
+        let out = render_breach_diagnostic(&[], "error");
+        assert!(out.is_empty(), "got: {}", out);
+    }
+
+    #[test]
+    fn locality_annotation_overrides_global_target() {
+        // Two loci: BigL1 has `@locality(L1)`; BigL2 has no
+        // annotation. With `--target-cache l2` global:
+        //   - BigL1 evaluated against L1 (its annotation wins),
+        //     breach if it exceeds 32K.
+        //   - BigL2 evaluated against L2 (global tier).
+        let src = r#"
+            type Entry { k: Int; v: Int; }
+            @form(hashmap, sync = lockfree, cap = 4096)
+            @locality(L1)
+            locus BigL1 {
+                capacity { pool entries of Entry indexed_by k; }
+            }
+            @form(hashmap, sync = lockfree, cap = 4096)
+            locus BigL2 {
+                capacity { pool entries of Entry indexed_by k; }
+            }
+            fn main() { BigL1 { }; BigL2 { }; }
+        "#;
+        let p = parse_source(src).expect("parse");
+        let map = compute_program_working_set(&p.items);
+        // 4096 × 16 + 64 = 65600 B per locus.
+        // Global L2 (524288) — neither exceeds. BigL1's L1
+        // annotation (32768) is exceeded.
+        let breaches = breaches_with_per_locus_budgets(
+            &map,
+            &p.items,
+            Some(CacheTier::L2),
+        );
+        let names: Vec<&str> = breaches
+            .iter()
+            .map(|b| b.locus_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["BigL1"], "got: {:?}", breaches);
+        assert_eq!(breaches[0].tier, CacheTier::L1);
+        assert_eq!(breaches[0].source, BudgetSource::LocalityAnnotation);
+    }
+
+    #[test]
+    fn locality_any_opts_out_of_global_gate() {
+        // Locus has `@locality(any)`. Global --target-cache=L1
+        // would normally flag it; the explicit opt-out
+        // exempts it.
+        let src = r#"
+            type Entry { k: Int; v: Int; }
+            @form(hashmap, sync = lockfree, cap = 4096)
+            @locality(any)
+            locus Big {
+                capacity { pool entries of Entry indexed_by k; }
+            }
+            fn main() { Big { }; }
+        "#;
+        let p = parse_source(src).expect("parse");
+        let map = compute_program_working_set(&p.items);
+        let breaches = breaches_with_per_locus_budgets(
+            &map,
+            &p.items,
+            Some(CacheTier::L1),
+        );
+        assert!(breaches.is_empty(), "got: {:?}", breaches);
+    }
+
+    #[test]
+    fn locality_annotation_checked_without_global_target() {
+        // Without --target-cache, loci without annotations
+        // get no budget. Loci with @locality(Lx) are still
+        // checked — the annotation is a hard contract.
+        let src = r#"
+            type Entry { k: Int; v: Int; }
+            @form(hashmap, sync = lockfree, cap = 4096)
+            @locality(L1)
+            locus Big {
+                capacity { pool entries of Entry indexed_by k; }
+            }
+            locus Tiny { params { x: Int = 0; } }
+            fn main() { Big { }; Tiny { }; }
+        "#;
+        let p = parse_source(src).expect("parse");
+        let map = compute_program_working_set(&p.items);
+        let breaches = breaches_with_per_locus_budgets(
+            &map,
+            &p.items,
+            None,
+        );
+        let names: Vec<&str> = breaches
+            .iter()
+            .map(|b| b.locus_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Big"], "got: {:?}", breaches);
+        assert_eq!(breaches[0].source, BudgetSource::LocalityAnnotation);
+    }
+
+    #[test]
+    fn effective_budget_resolution() {
+        // Pin the precedence directly: locality wins; any
+        // opts out; no annotation falls through to global.
+        let parse_locus = |src: &str| {
+            let p = parse_source(src).expect("parse");
+            for item in p.items {
+                if let TopDecl::Locus(l) = item {
+                    return l;
+                }
+            }
+            panic!("no locus");
+        };
+        let l1 = parse_locus("@locality(L1) locus X { }");
+        let l2 = parse_locus("@locality(L2) locus X { }");
+        let any = parse_locus("@locality(any) locus X { }");
+        let bare = parse_locus("locus X { }");
+
+        assert_eq!(
+            effective_locus_budget(&l1, Some(CacheTier::L3)),
+            Some((CacheTier::L1, BudgetSource::LocalityAnnotation)),
+        );
+        assert_eq!(
+            effective_locus_budget(&l2, None),
+            Some((CacheTier::L2, BudgetSource::LocalityAnnotation)),
+        );
+        assert_eq!(
+            effective_locus_budget(&any, Some(CacheTier::L1)),
+            None,
+            "any opts out even with global target",
+        );
+        assert_eq!(
+            effective_locus_budget(&bare, Some(CacheTier::L2)),
+            Some((CacheTier::L2, BudgetSource::GlobalTargetCache)),
+        );
+        assert_eq!(effective_locus_budget(&bare, None), None);
     }
 }
