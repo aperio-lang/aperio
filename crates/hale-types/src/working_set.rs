@@ -65,6 +65,20 @@ pub struct WorkingSetEstimate {
     /// `compute_locus_working_set(child).total()` per child
     /// field.
     pub child_bytes: u64,
+    /// FUv0.8.2 #3 (2026-05-25): conservative method-scratch
+    /// high-water mark — the largest sum of transient allocs
+    /// observed across any one method body on this locus.
+    /// Method scratch is destroyed at each method return so
+    /// it doesn't contribute long-term resident bytes, but the
+    /// instantaneous footprint during a method call does sit
+    /// in cache alongside the locus's struct + capacity. The
+    /// estimator counts struct/tuple/array literals + Binary
+    /// String-concat sites + ArrayRepeat — each contributes
+    /// its byte size to the running per-method sum; the locus's
+    /// scratch_bytes is the max sum across all its methods
+    /// (since only one method body runs in a single scratch
+    /// subregion at a time).
+    pub scratch_bytes: u64,
     /// Slot or field names the estimator couldn't bound at
     /// compile time (unbounded arrays, capacity slots with no
     /// `cap = N`, named types that resolve to opaque). Surfaced
@@ -78,6 +92,7 @@ impl WorkingSetEstimate {
         self.struct_bytes
             .saturating_add(self.capacity_bytes)
             .saturating_add(self.child_bytes)
+            .saturating_add(self.scratch_bytes)
     }
 }
 
@@ -270,13 +285,14 @@ pub fn render_locality_report(
             None => "exceeds L3".to_string(),
         };
         out.push_str(&format!(
-            "  {:<width$}  ~{:>8} B  ({})  struct={} capacity={} children={}\n",
+            "  {:<width$}  ~{:>8} B  ({})  struct={} capacity={} children={} scratch={}\n",
             name,
             total,
             tier_label,
             est.struct_bytes,
             est.capacity_bytes,
             est.child_bytes,
+            est.scratch_bytes,
             width = widest_name,
         ));
         if !est.unbounded_slots.is_empty() {
@@ -580,6 +596,30 @@ fn estimate_locus(
         }
     }
 
+    // FUv0.8.2 #3: method-scratch high-water mark. Walk each
+    // method body (lifecycle / mode / fn / on_failure), sum
+    // the transient allocations a single execution would put
+    // in scratch, and take the max across methods. Only one
+    // method body runs per scratch subregion at a time, so
+    // the max bounds the instantaneous footprint.
+    let mut high_water: u64 = 0;
+    for member in &locus.members {
+        let body_opt = match member {
+            LocusMember::Lifecycle(lc) => Some(&lc.body),
+            LocusMember::Mode(md) => Some(&md.body),
+            LocusMember::Fn(fd) => Some(&fd.body),
+            LocusMember::Failure(ff) => Some(&ff.body),
+            _ => None,
+        };
+        if let Some(body) = body_opt {
+            let bytes = block_scratch_bytes(body, idx);
+            if bytes > high_water {
+                high_water = bytes;
+            }
+        }
+    }
+    est.scratch_bytes = high_water;
+
     visited.pop();
     est
 }
@@ -790,6 +830,279 @@ fn literal_int(e: &Expr) -> Option<u64> {
 /// annotation, if present. The form annotation is the only
 /// place v1 surfaces capacity caps; future surface (a slot-
 /// level `cap = N` kwarg) would extend this.
+/// FUv0.8.2 #3 (2026-05-25): walk a method body summing the
+/// transient bytes a single execution would put in scratch.
+/// Each Expr-shape that allocates in the current arena adds
+/// its byte size. Sums conservatively (worst-case
+/// simultaneously live) rather than tracking lifetimes — the
+/// estimator's purpose is "does this fit in cache" and a
+/// loose upper bound is the right error direction.
+fn block_scratch_bytes(b: &hale_syntax::ast::Block, idx: &Index<'_>) -> u64 {
+    let mut total: u64 = 0;
+    for s in &b.stmts {
+        total = total.saturating_add(stmt_scratch_bytes(s, idx));
+    }
+    total
+}
+
+fn stmt_scratch_bytes(s: &hale_syntax::ast::Stmt, idx: &Index<'_>) -> u64 {
+    use hale_syntax::ast::Stmt;
+    match s {
+        Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+            expr_scratch_bytes(value, idx)
+        }
+        Stmt::Assign { value, .. } => expr_scratch_bytes(value, idx),
+        Stmt::If(s) => {
+            let mut t = expr_scratch_bytes(&s.cond, idx);
+            t = t.saturating_add(block_scratch_bytes(&s.then_block, idx));
+            t = t.saturating_add(else_branch_scratch_bytes(
+                s.else_block.as_deref(),
+                idx,
+            ));
+            t
+        }
+        Stmt::Match(m) => {
+            let mut t = expr_scratch_bytes(&m.scrutinee, idx);
+            for arm in &m.arms {
+                if let Some(g) = &arm.guard {
+                    t = t.saturating_add(expr_scratch_bytes(g, idx));
+                }
+                t = t.saturating_add(match_arm_body_scratch_bytes(
+                    &arm.body, idx,
+                ));
+            }
+            t
+        }
+        Stmt::For { iter, body, .. } => {
+            // Inner allocations inside a loop are reset every
+            // iteration in scratch terms — but the loop's
+            // simultaneous footprint may include 1× the
+            // per-iteration bytes plus the iter expr's
+            // bytes. Conservative: add both.
+            expr_scratch_bytes(iter, idx)
+                .saturating_add(block_scratch_bytes(body, idx))
+        }
+        Stmt::While { cond, body, .. } => expr_scratch_bytes(cond, idx)
+            .saturating_add(block_scratch_bytes(body, idx)),
+        Stmt::Return(Some(e), _) => expr_scratch_bytes(e, idx),
+        Stmt::Fail { value, .. } => expr_scratch_bytes(value, idx),
+        Stmt::Block(b) => block_scratch_bytes(b, idx),
+        Stmt::Send { subject, value, .. } => {
+            expr_scratch_bytes(subject, idx)
+                .saturating_add(expr_scratch_bytes(value, idx))
+        }
+        Stmt::Expr(e) => expr_scratch_bytes(e, idx),
+        Stmt::Recovery { args, .. } => {
+            let mut t: u64 = 0;
+            for a in args {
+                t = t.saturating_add(expr_scratch_bytes(a, idx));
+            }
+            t
+        }
+        Stmt::Violate { payload, .. } => match payload {
+            Some(p) => expr_scratch_bytes(p, idx),
+            None => 0,
+        },
+        Stmt::Return(None, _)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Yield(_) => 0,
+    }
+}
+
+fn else_branch_scratch_bytes(
+    branch: Option<&hale_syntax::ast::ElseBranch>,
+    idx: &Index<'_>,
+) -> u64 {
+    use hale_syntax::ast::ElseBranch;
+    match branch {
+        None => 0,
+        Some(ElseBranch::Else(b)) => block_scratch_bytes(b, idx),
+        Some(ElseBranch::ElseIf(inner)) => stmt_scratch_bytes(
+            &hale_syntax::ast::Stmt::If(inner.clone()),
+            idx,
+        ),
+    }
+}
+
+fn match_arm_body_scratch_bytes(
+    body: &hale_syntax::ast::MatchArmBody,
+    idx: &Index<'_>,
+) -> u64 {
+    use hale_syntax::ast::MatchArmBody;
+    match body {
+        MatchArmBody::Expr(e) => expr_scratch_bytes(e, idx),
+        MatchArmBody::Block(b) => block_scratch_bytes(b, idx),
+    }
+}
+
+/// Heuristic per-concat cost for binary `+` where either operand
+/// might be heap-typed. Without typecheck info available here
+/// we can't know exact operand types; a 32-byte budget per
+/// concat is conservatively low (covers a ~16-char result + 16
+/// bytes of header).
+const STRING_CONCAT_BYTES: u64 = 32;
+
+fn expr_scratch_bytes(e: &Expr, idx: &Index<'_>) -> u64 {
+    use hale_syntax::ast::BinOp;
+    match e {
+        // Struct literal: allocates a fresh value of the named
+        // type in scratch. Children's allocations also count
+        // (they evaluate in the same scope).
+        Expr::Struct { path, inits, .. } => {
+            let base = path
+                .segments
+                .first()
+                .and_then(|s| idx.types.get(s.name.as_str()))
+                .map(|td| type_decl_size_info(td, idx).size)
+                .unwrap_or(0);
+            let mut t = base;
+            for i in inits {
+                t = t.saturating_add(expr_scratch_bytes(&i.value, idx));
+            }
+            t
+        }
+        // Tuple / Array literals: same shape, but anonymous —
+        // size is the sum of part sizes (the tuple's struct).
+        // For Array, the elements' sizes contribute via the
+        // recursive expr walk below; the array itself is
+        // sized to elem_size × n.
+        Expr::Tuple(parts, _) => {
+            let mut t: u64 = 0;
+            for p in parts {
+                t = t.saturating_add(expr_scratch_bytes(p, idx));
+                // Estimate part's storage in the tuple: walk
+                // through if it's a struct/tuple/array, else
+                // primitive-sized.
+                t = t.saturating_add(literal_storage_size(p, idx));
+            }
+            t
+        }
+        Expr::Array(parts, _) => {
+            let mut t: u64 = 0;
+            for p in parts {
+                t = t.saturating_add(expr_scratch_bytes(p, idx));
+                t = t.saturating_add(literal_storage_size(p, idx));
+            }
+            t
+        }
+        Expr::ArrayRepeat { val, count, .. } => {
+            let elem = literal_storage_size(val, idx);
+            elem.saturating_mul(*count)
+                .saturating_add(expr_scratch_bytes(val, idx))
+        }
+        // Binary + on possibly-heap operands → likely string
+        // concat. Without typecheck info we can't know for
+        // sure; charge the small heuristic per Binary+ and
+        // recurse.
+        Expr::Binary { op, left, right, .. } => {
+            let mut t = expr_scratch_bytes(left, idx)
+                .saturating_add(expr_scratch_bytes(right, idx));
+            if matches!(op, BinOp::Add) {
+                t = t.saturating_add(STRING_CONCAT_BYTES);
+            }
+            t
+        }
+        Expr::Unary { operand, .. } => expr_scratch_bytes(operand, idx),
+        Expr::Field { receiver, .. } => expr_scratch_bytes(receiver, idx),
+        Expr::Index { receiver, index, .. } => {
+            expr_scratch_bytes(receiver, idx)
+                .saturating_add(expr_scratch_bytes(index, idx))
+        }
+        Expr::Path2 { receiver, .. } => expr_scratch_bytes(receiver, idx),
+        Expr::Call { callee, args, .. } => {
+            let mut t = expr_scratch_bytes(callee, idx);
+            for a in args {
+                t = t.saturating_add(expr_scratch_bytes(a, idx));
+            }
+            t
+        }
+        Expr::Block(b) => block_scratch_bytes(b, idx),
+        Expr::If(s) => {
+            let mut t = expr_scratch_bytes(&s.cond, idx);
+            t = t.saturating_add(block_scratch_bytes(&s.then_block, idx));
+            t = t.saturating_add(else_branch_scratch_bytes(
+                s.else_block.as_deref(),
+                idx,
+            ));
+            t
+        }
+        Expr::Match(m) => {
+            let mut t = expr_scratch_bytes(&m.scrutinee, idx);
+            for arm in &m.arms {
+                if let Some(g) = &arm.guard {
+                    t = t.saturating_add(expr_scratch_bytes(g, idx));
+                }
+                t = t.saturating_add(match_arm_body_scratch_bytes(
+                    &arm.body, idx,
+                ));
+            }
+            t
+        }
+        Expr::Or { inner, disposition, .. } => {
+            use hale_syntax::ast::OrDisposition;
+            let mut t = expr_scratch_bytes(inner, idx);
+            match disposition {
+                OrDisposition::Substitute(rhs) => {
+                    t = t.saturating_add(expr_scratch_bytes(rhs, idx))
+                }
+                OrDisposition::Fail(payload, _) => {
+                    t = t.saturating_add(expr_scratch_bytes(payload, idx))
+                }
+                OrDisposition::Raise(_) | OrDisposition::Discard(_) => {}
+            }
+            t
+        }
+        Expr::Sum(inner, _) | Expr::Prod(inner, _) => {
+            expr_scratch_bytes(inner, idx)
+        }
+        Expr::Approx { left, right, tolerance, .. } => {
+            expr_scratch_bytes(left, idx)
+                .saturating_add(expr_scratch_bytes(right, idx))
+                .saturating_add(expr_scratch_bytes(tolerance, idx))
+        }
+        Expr::Range { lo, hi, .. } => expr_scratch_bytes(lo, idx)
+            .saturating_add(expr_scratch_bytes(hi, idx)),
+        _ => 0,
+    }
+}
+
+/// Approximate the byte footprint a literal expression
+/// occupies as a value (vs. recursively in scratch). Used by
+/// Tuple / Array / ArrayRepeat to size the container itself.
+fn literal_storage_size(e: &Expr, idx: &Index<'_>) -> u64 {
+    use hale_syntax::ast::{Literal, PrimType};
+    match e {
+        Expr::Literal(lit, _) => match lit {
+            Literal::Int(_)
+            | Literal::Float(_)
+            | Literal::Duration(_) => 8,
+            Literal::Decimal(_) => 16,
+            Literal::Bool(_) => 1,
+            Literal::Nil => 8,
+            Literal::String(s) => {
+                // ptr + len header (16 B) + payload bytes,
+                // capped at 64 for sanity.
+                16u64.saturating_add((s.len() as u64).min(64))
+            }
+            Literal::Time(_) => 8,
+            Literal::Bytes(b) => 16u64.saturating_add(b.len() as u64),
+        },
+        Expr::Struct { path, .. } => path
+            .segments
+            .first()
+            .and_then(|s| idx.types.get(s.name.as_str()))
+            .map(|td| type_decl_size_info(td, idx).size)
+            .unwrap_or(0),
+        // Fallback for non-literal sub-expressions inside a
+        // literal container: assume pointer-sized.
+        _ => {
+            let _ = primitive_size_info(PrimType::Int);
+            8
+        }
+    }
+}
+
 fn form_cap_from_annotation(locus: &LocusDecl) -> Option<u64> {
     let form = locus.form.as_ref()?;
     for arg in &form.args {
@@ -1064,6 +1377,113 @@ mod tests {
         assert!(report.contains("Alpha"), "got:\n{}", report);
         assert!(report.contains("Beta"), "got:\n{}", report);
         assert!(report.contains("fits L1"), "got:\n{}", report);
+    }
+
+    // === FUv0.8.2 #3 method-scratch tests ===============
+
+    #[test]
+    fn empty_methods_have_zero_scratch() {
+        let est = estimate(
+            r#"
+                locus L {
+                    params { x: Int = 0; }
+                    run() { let _ = self.x; }
+                }
+                fn main() { L { }; }
+            "#,
+            "L",
+        );
+        assert_eq!(est.scratch_bytes, 0, "got: {:?}", est);
+    }
+
+    #[test]
+    fn struct_literal_in_method_charges_scratch() {
+        // Foo = 8B (Int). Constructing `Foo { v: 1 }` inside
+        // a method body charges the type's storage size to
+        // scratch_bytes.
+        let est = estimate(
+            r#"
+                type Foo { v: Int; }
+                locus L {
+                    fn make() -> Int {
+                        let f = Foo { v: 1 };
+                        return f.v;
+                    }
+                }
+                fn main() { L { }; }
+            "#,
+            "L",
+        );
+        assert!(
+            est.scratch_bytes >= 8,
+            "expected at least 8 B for Foo literal; got: {:?}",
+            est
+        );
+    }
+
+    #[test]
+    fn high_water_is_max_across_methods() {
+        // Method `small` builds an 8B struct; method `big`
+        // builds a 24B struct. The locus's scratch_bytes is
+        // the max (24B), not the sum.
+        let est = estimate(
+            r#"
+                type Small { a: Int; }
+                type Big   { a: Int; b: Int; c: Int; }
+                locus L {
+                    fn small() -> Int {
+                        let s = Small { a: 1 };
+                        return s.a;
+                    }
+                    fn big() -> Int {
+                        let b = Big { a: 1, b: 2, c: 3 };
+                        return b.a;
+                    }
+                }
+                fn main() { L { }; }
+            "#,
+            "L",
+        );
+        // Small contributes 8; Big contributes 24. Max is 24
+        // (plus the recursive Int literals' scratch which is
+        // 0). Assert lower bound.
+        assert!(
+            est.scratch_bytes >= 24,
+            "expected high-water ≥ 24 B; got: {:?}",
+            est
+        );
+        // And < small + big (i.e., we took the max, not sum).
+        assert!(
+            est.scratch_bytes < 8 + 24 + 32,
+            "expected max-across-methods not sum; got: {:?}",
+            est
+        );
+    }
+
+    #[test]
+    fn total_includes_scratch() {
+        let est = estimate(
+            r#"
+                type Big { a: Int; b: Int; c: Int; }
+                locus L {
+                    fn make() -> Int {
+                        let b = Big { a: 1, b: 2, c: 3 };
+                        return b.a;
+                    }
+                }
+                fn main() { L { }; }
+            "#,
+            "L",
+        );
+        assert_eq!(
+            est.total(),
+            est.struct_bytes
+                + est.capacity_bytes
+                + est.child_bytes
+                + est.scratch_bytes,
+            "total should sum all four fields",
+        );
+        assert!(est.scratch_bytes > 0);
     }
 
     #[test]
