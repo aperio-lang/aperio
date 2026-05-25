@@ -199,6 +199,31 @@ For diagnosing what's growing, the substrate exposes:
 | `LOTUS_CHUNK_POOL_STATS=1` | At thread exit: print pool hits/misses/stores/overflows. |
 | `LOTUS_CHUNK_POOL_PREFILL=N` | Warm the pool to N chunks at first touch. |
 
+## F.32 cache-aware env vars (2026-05-25)
+
+Operator-tunable knobs from the F.32 cache-aware substrate
+work. Each is opt-in; defaults match shipped behavior.
+
+**Runtime env vars** (read by the running binary):
+
+| Env var | Effect |
+|---|---|
+| `LOTUS_ARENA_CHUNK_BYTES_OVERRIDE=N` | Override the default 64 KB arena chunk size. N must be a power of 2 in `[4096, 16777216]`. For multi-locus-per-pool deployments where the default chunk dwarfs L2-per-core, set N smaller (e.g. 16384) so each locus's hot chunk fits in cache across pool rotations. (F.32-3.) |
+| `LOTUS_HUGE_PAGES=1` | Use `mmap(MAP_HUGETLB \| MAP_HUGE_2MB)` for arena chunks ≥ 2 MB. Falls back to plain malloc on failure (no diagnostic — check `perf stat -e dTLB-load-misses` to verify the path took). Operator prereq: `sudo sysctl vm.nr_hugepages=N` first to reserve N 2-MB huge pages in the kernel pool. (F.32-4a.) |
+| `LOTUS_LOCK_MEMORY=1` | Call `mlockall(MCL_CURRENT \| MCL_FUTURE)` at startup to lock all current + future pages against paging out. Eliminates worst-case page-fault stalls on hot-path allocation. Operator prereq: `ulimit -l unlimited` or `CAP_IPC_LOCK` on the binary. On failure: stderr warning + continue unlocked. (F.32-4c.) |
+
+**Build-time env vars** (read by `hale build`):
+
+| Env var | Effect |
+|---|---|
+| `LOTUS_DISABLE_PREFETCH=1` | Compile the runtime with the bus-dispatch `__builtin_prefetch` hint stubbed out. Default = enabled (matches shipped behavior). Use for A/B measuring the prefetch's contribution on your hardware — the hint's win varies wildly with L2/L3 size and interconnect speed. (F.32-4-prefetch.) |
+
+**Language-surface sync disciplines** (NOT env vars — these
+are declared on `@form(hashmap, sync = X)` at the source level;
+see [`spec/forms.md`](../../spec/forms.md) "Cross-pool sync disciplines"):
+`sync = serialized` (F.32-1α), `sync = striped` (F.32-1β2-v2),
+`sync = lockfree, cap = N` (F.32-1γ-v1).
+
 See [the diagnostic workflow][diag] for how these compose to
 narrow down a leak.
 
