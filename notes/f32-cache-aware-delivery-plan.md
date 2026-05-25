@@ -50,7 +50,7 @@ enough to attack the rest on demand.
 | **F.32-0**   | Revert cross-pool `@form(hashmap)` exemption — closes corruption hole; restores single-pool default | trivial | (correctness) |
 | **F.32-1α**  | `sync = serialized` cross-pool `@form(hashmap)` (one mutex per map) | small | medium |
 | **F.32-1β**  | `sync = striped` cross-pool `@form(hashmap)` (per-cell atomic + grow RW-lock + cache-padded cells) — incorporates the original F.32-1 padding work | medium | high |
-| **F.32-1γ**  | `sync = lockfree` cross-pool `@form(hashmap)` — deferred until β's bench numbers justify | large | (future) |
+| **F.32-1γ**  | `sync = lockfree` cross-pool `@form(hashmap)` — γ-v1 SHIPPED 2026-05-25 (fixed-cap, no remove); γ-v2 (grow + remove) is the natural follow-up | medium (v1), large (v2) | **high (v1 measures 1.30× faster than α on the bench)** |
 | **F.32-1∞**  | Closed-world sync inference + diagnostic (picks default per locus type from pool-propagation graph) | small-medium | (ergonomics) |
 | **F.32-4-prefetch** | Bus-dispatch prefetch hint (pulled forward; pairs with F.32-1β) | trivial | medium |
 | **F.32-1b**  | Locus struct field reordering by access frequency | small-medium | medium |
@@ -424,27 +424,82 @@ init/set/get/grow/destroy + 4-prefetch one-liner) + tests.
 
 ---
 
-## F.32-1γ — `sync = lockfree` (deferred)
+## F.32-1γ — `sync = lockfree` (γ-v1 SHIPPED 2026-05-25)
+
+**Status (2026-05-25, third pass): γ-v1 SHIPPED.**
+
+After β2-v2's perf finding (rwlock+CAS slower than α at
+2-core / cheap-payload), γ-v1 was sized DOWN from the
+original "full lock-free / wait-free hashmap" scope to a
+minimum-viable variant that ships in this session and
+proves out the parallel-writer thesis.
+
+**γ-v1 scope:**
+- Fixed cap (user declares `cap = N`; runtime never grows).
+- Cache-padded cells like β2-v2.
+- Pure CAS on the 3-state occupancy machine — NO
+  pthread_rwlock, NO pthread_mutex anywhere on the hot path.
+- No remove (returns 0; tombstones land in γ-v2 if a
+  workload needs them).
+- Silent drop on cap exhaustion (caller sizes cap to 2-4× peak).
+
+**Perf finding (2026-05-25, the headline F.32 win):**
+
+On `form_hashmap_false_sharing` (200k cross-pool concurrent
+inserts, AMD Ryzen 7 9800X3D):
+
+| Discipline | Elapsed | vs α |
+|---|---:|---:|
+| γ-v1 (`sync = lockfree`) | **11.95 ms** | **0.77× (1.30× faster)** |
+| α (`sync = serialized`)  | 15.51 ms | 1.00× |
+| β2-v2 (`sync = striped`) | 28.37 ms | 1.83× slower |
+
+γ-v1 vs Go's `sync.Mutex`-protected map closes the gap
+from 1.66× (under α) to 1.18×. Hale is now within striking
+distance of Go on the canonical 2-writer concurrent-hashmap
+workload — the closest the language has been on a cross-
+pool perf benchmark.
+
+**Why γ-v1 beats β2-v2:**
+- Per-op cost: γ-v1 ~60 ns/op (CAS + memcpy) vs β2-v2 ~150
+  ns/op (rwlock_rdlock + CAS + memcpy + rwlock_unlock).
+- Parallelism: identical (both use cell-level CAS).
+- The rwlock overhead is the dominant cost in β2-v2 on this
+  hardware; removing it more than offsets the loss of grow
+  support.
+
+**Why γ-v1 beats α:**
+- α serializes all writers through one mutex (~90 ns/op
+  serialized, ~22M ops/s/core × 1 core).
+- γ-v1 runs writers in parallel (~60 ns/op × 2 cores =
+  ~33M ops/s aggregate).
+
+**γ-v2 follow-up scope** (when a workload demands it):
+- Tombstones + periodic compaction → `remove` supported.
+- Lockfree grow (Cliff Click state machine) → cap no longer
+  required upfront.
+- tsan / relacy validation under high-contention stress.
+
+**Integration notes:**
+- The F.32-1∞ inference rule (when shipped) should default
+  to `lockfree` for cross-pool write-heavy maps where cap is
+  static, and fall back to `striped` or `serialized` for
+  workloads requiring grow / remove.
+- The bench file `form_hashmap_false_sharing.hl` is wired
+  with `sync = lockfree, cap = 300000` and documents the
+  measured ordering on this hardware.
+
+**Original γ design** — kept verbatim below for the
+eventual γ-v2 implementer who'll add grow + remove:
 
 A full lock-free / wait-free open-addressing hashmap (Cliff
 Click-style state machine or epoch-based reclamation). Joins
 as a peer of α/β under the same `sync = ` kwarg; no surface
 change required at the language level.
 
-**Decision deferred until F.32-1β's bench numbers establish
-whether the marginal throughput / tail-latency gain justifies
-the substantial implementation complexity** (~600 LOC of
-subtle code, plus a proof-of-correctness burden). Default
-position: ship β, measure on the downstream workload, decide.
-
-If γ does land, the F.32-1∞ inference rule gains one bucket:
-"4+ writer pools, hot-path mutate, p99 latency budget below
-the grow-spike threshold" → lockfree. Until then, β is the
-ceiling the inference can pick.
-
-**Estimated effort (if pursued).** 3-5 sessions; new
-hashmap impl + extensive concurrency tests + tsan/relacy
-runs to catch reorder bugs.
+**Estimated effort (if γ-v2 pursued).** 3-5 sessions; grow
+state machine + tombstone compaction + extensive concurrency
+tests + tsan/relacy runs to catch reorder bugs.
 
 ---
 

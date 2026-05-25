@@ -558,8 +558,8 @@ the form annotation:
 |---|---|---|
 | `@form(hashmap)` | single-pool only | densest layout, no sync overhead, cross-pool calls rejected |
 | `@form(hashmap, sync = serialized)` | per-map mutex (F.32-1α) | correct cross-pool; throughput bounded by lock contention |
-| `@form(hashmap, sync = striped)` | per-cell atomic + grow RW-lock + cache-padded cells (F.32-1β) | parallel writers; grow path serializes |
-| `@form(hashmap, sync = lockfree)` | CAS-based (F.32-1γ; deferred) | highest throughput; not yet shipped |
+| `@form(hashmap, sync = striped)` | cell-level CAS + per-map rwlock for grow + cache-padded cells (F.32-1β2-v2) | parallel writers; grow path serializes; rwlock overhead can outweigh parallelism on cheap-payload workloads |
+| `@form(hashmap, sync = lockfree, cap = N)` | fixed-cap, cell-level CAS, no rwlock or mutex (F.32-1γ-v1) | highest measured throughput on the false-sharing bench; no grow, no remove in v1 |
 
 When a locus carries a recognized sync discipline, cross-
 pool method calls into it are accepted without diagnostic —

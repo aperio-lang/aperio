@@ -178,6 +178,103 @@ when the type-system / operational-semantics docs are drafted.
     `restart` / `restart_in_place` / `quarantine` / `bubble` +
     `reorganize` (per #16) — five primitives, no overlap.
 
+24. **`fallible(E)` on user-declared locus member fns.**
+    **Open (2026-05-25): worth a focused proposal.**
+
+    Friction signal: across multiple apps + libraries, devs
+    work around the "no fallible on locus methods" rule by
+    extracting a free fn that takes the locus as the first
+    arg. Loses `self` ergonomics, requires explicit threading
+    of the locus pointer at every call site, splits closely-
+    related code across two top-level decls. F.27's
+    `closure + violate + error-check fn + draining` four-piece
+    pattern handles "kill the locus on this error" cleanly,
+    but it doesn't address "propagate this error to my caller
+    and let them decide" — that's where the friction shows up.
+
+    **Proposed narrowing:** drop the blanket "no fallible on
+    locus methods" rule. Replace with targeted rules per call
+    surface:
+
+    - **Substrate-facing surfaces — stay non-fallible.** The
+      substrate orchestrates these and has no place to route
+      a `fallible(E)` return; failure goes ↑:
+      - **Lifecycle methods** (birth / run / drain / dissolve /
+        accept / on_failure / mode entry / exit).
+      - **Bus-subscribed handlers**. Verified at the
+        `subscribe ... as handler` site (bus dispatch has no
+        return path). The check is per-subscribe, not per-fn,
+        so a fn that's fallible-by-decl just can't also be
+        subscribed.
+      - **Closure assertions** (tick / duration / dissolve /
+        inline-violate / birth epochs). The substrate evaluates
+        the assertion expression at the epoch boundary; there's
+        no caller in the expression's frame to address a value
+        error. Closures route failure via their own structural
+        channel (the closure firing → `on_failure`), not a
+        value channel.
+    - **All other user-declared `fn` members** — can be
+      `fallible(E)` just like free fns. Caller addresses
+      with the standard surface (`or raise` / `or default` /
+      `or handler(err)`); F.27's `violate` pattern stays as
+      the canonical "kill the locus on this error" idiom and
+      coexists with fallible member fns (caller picks).
+
+    **Why this isn't a contract change:**
+
+    - The substrate-orchestrated paths (lifecycle, bus,
+      on_failure) keep the two-channel discipline — failure
+      classification stays load-bearing where the substrate
+      can't address a value return.
+    - `@form(...)`-synthesized member fns are already fallible
+      (`get` / `remove` / `key_at` / `entry_at` all return
+      `fallible(...)`). The exception exists today; this
+      generalizes it to user-declared `fn` members.
+    - Cross-arena transfer reuses the existing
+      `lotus_current_caller_arena` TLS routing free fns use.
+
+    **Implementation scope estimate:**
+
+    - Typecheck: `crates/hale-types/src/check.rs` — relax the
+      "no fallible on locus methods" check; add a "bus-subscribed
+      handler must not be fallible" check at the subscribe site.
+    - Codegen: `crates/hale-codegen/src/codegen.rs` — locus
+      method call lowering emits the existing `{ error_tag,
+      value }` fallible-return shape for fallible-decl members;
+      reuse free fn arena routing.
+    - Tests: positive case (member fn returns fallible, caller
+      addresses with `or raise`); negative case (subscribed
+      handler with fallible return — rejected at subscribe).
+    - Spec: `spec/types.md` two-channel rule section narrows
+      to substrate-orchestrated paths.
+
+    **Open sub-questions before drafting:**
+
+    - Can a closure assertion body **call** a fallible member
+      fn (even though it can't itself be fallible)? Likely no
+      — assertions are expression-shaped and `or raise` /
+      `or default` / `or handler` are statement-position
+      dispositions that don't compose cleanly inside an
+      assertion expression. The expected pattern: factor the
+      value-error path out of the closure into a regular
+      member fn or free fn, and let the closure assert over
+      pre-computed locus state.
+    - Does this interact with cross-pool calls on
+      `@form(...)`-bearing receivers? The fallible return
+      value would need to cross the pool boundary; the
+      caller-arena routing handles that today for synthesized
+      methods, so it should generalize.
+
+    **Empirical evidence to collect before landing:**
+
+    - Specific friction-log call sites that motivated this.
+      The proposal lands cleaner if it can quote the
+      worst-offending patterns and show the post-change shape.
+    - Whether the F.27 four-piece pattern is being USED in
+      practice or whether devs are already routing around it
+      via free fns. If the latter, the language is paying the
+      cost without getting the benefit.
+
 ## Bus handler shape
 
 **Bus handler default-param policy.**

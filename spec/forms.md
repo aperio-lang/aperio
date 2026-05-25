@@ -684,27 +684,72 @@ into a plain `@form(hashmap)` receiver are typecheck-rejected
 |---|---|---|
 | `@form(hashmap)` | single-pool only | shipped |
 | `@form(hashmap, sync = serialized)` | per-map `pthread_mutex_t` (F.32-1α) | shipped |
-| `@form(hashmap, sync = striped)` | per-cell atomic + grow RW-lock + cache-padded cells (F.32-1β) | planned |
-| `@form(hashmap, sync = lockfree)` | CAS-based (F.32-1γ) | deferred |
+| `@form(hashmap, sync = striped)` | cell-level CAS + per-map `pthread_rwlock_t` for grow + cache-padded cells (F.32-1β2-v2) | shipped |
+| `@form(hashmap, sync = lockfree, cap = N)` | fixed-cap, cell-level CAS, no rwlock or mutex (F.32-1γ-v1) | shipped |
+
+**Discipline picker by workload:**
+
+- **Single-pool only** (no cross-pool calls): plain
+  `@form(hashmap)`. Densest layout, zero sync overhead;
+  cross-pool calls are typecheck-rejected.
+- **Cross-pool, write-heavy, cap unknown / dynamic**:
+  `sync = serialized`. Per-map mutex; writers serialize but
+  the path is short. Beats striped on 2-core / cheap-payload.
+- **Cross-pool, read-heavy or per-op work is expensive**:
+  `sync = striped`. Rwlock lets concurrent readers run in
+  parallel; cache-padded cells avoid false-sharing between
+  reader and writer cells. Slower than serialized on 2-core
+  / cheap-payload writes (rwlock overhead > parallelism gain).
+- **Cross-pool, write-heavy, cap known at deploy time**:
+  `sync = lockfree, cap = N`. Pure CAS — no kernel-mediated
+  sync anywhere. Fastest of the four on the
+  `form_hashmap_false_sharing` bench (~1.3× faster than α
+  serialized at 2 cores). Trade-off: fixed cap, no `remove`
+  in v1.
 
 The `serialized` discipline wraps every public entry point in
 a per-map mutex. Throughput is bounded by lock contention
-(`~5-10 M ops/s` on a 4-writer workload); correctness is
+(~5-10 M ops/s on a 4-writer workload); correctness is
 trivial. The map's `lotus_hashmap_t` struct grows by 12 bytes
-(int has_sync + pointer mu); the pthread_mutex_t is
+(int sync_mode + pointer mu); the pthread_mutex_t is
 heap-allocated at init and destroyed at dissolve.
+
+The `striped` discipline adds cache-line padding to the cell
+stride (rounds up to `LOTUS_CACHE_LINE`, 64B default) and uses
+a 3-state occupancy machine (EMPTY → CLAIMED → COMMITTED) with
+`__atomic_compare_exchange_n` for slot claim. A
+`pthread_rwlock_t` guards the grow path (set/get hold rdlock,
+grow holds wrlock). On the 2-core / cheap-payload bench
+striped measures ~1.87× slower than serialized — the rwlock
+overhead per op (~150 ns) exceeds α's mutex+memcpy (~90 ns)
+by more than the 2-core parallelism gain compensates.
+Striped's win materializes on 4+ cores or with heavier per-op
+work where the rwlock overhead amortizes.
+
+The `lockfree` discipline (F.32-1γ-v1) drops the rwlock
+entirely. It requires `cap = N` upfront (no grow path);
+`remove` is a no-op in v1 (tombstones + compaction land in
+γ-v2). Pure CAS on the same 3-state occupancy machine; no
+kernel-mediated synchronization on the hot path. The
+`form_hashmap_false_sharing` bench measures lockfree at
+~1.30× faster than serialized and ~2.54× faster than striped
+on the 2-pool concurrent-write workload. Cap should be sized
+to 2-4× the peak expected entry count to keep linear-probe
+latency bounded; the runtime rounds the user's `cap = N` up
+to the next power of 2 (needed for the `& mask` probe).
 
 Cross-pool method calls into a `@form(hashmap, sync = ...)`
 receiver are accepted without diagnostic — the chosen
 discipline carries the substrate's safety contract. Inside a
-single pool, `serialized` is the same cost as
-`pthread_mutex_lock` on an uncontended mutex (~30 ns).
+single pool, all three sync modes pay only their respective
+uncontended-fastpath costs (~30 ns for serialized,
+~10 ns for lockfree's CAS).
 
 See `notes/f32-cache-aware-delivery-plan.md` § F.32-1 for the
-per-discipline implementation strategy and trade-off
-analysis, and `spec/types.md` § "Single-threaded-method
-invariant (F.31)" for how cross-pool calls into form-bearing
-receivers interact with the placement system.
+per-discipline implementation strategy + trade-off analysis,
+and `spec/types.md` § "Single-threaded-method invariant
+(F.31)" for how cross-pool calls into form-bearing receivers
+interact with the placement system.
 
 The key type `K` is derived from the resolved type of the
 indexed-by field. At v1, K must be `Int` or `String`. Other

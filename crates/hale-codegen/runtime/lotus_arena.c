@@ -1998,6 +1998,7 @@ void lotus_vec_destroy(void *vec_ptr) {
 #define LOTUS_HASHMAP_SYNC_NONE       0  /* plain @form(hashmap); single-pool */
 #define LOTUS_HASHMAP_SYNC_SERIALIZED 1  /* α: per-map pthread_mutex_t */
 #define LOTUS_HASHMAP_SYNC_STRIPED    2  /* β2: cell CAS + rwlock-on-grow */
+#define LOTUS_HASHMAP_SYNC_LOCKFREE   3  /* γ-v1: fixed-cap, pure CAS, no rwlock, no remove */
 
 /* 3-state occupancy byte for striped cells. Plain / serialized
  * cells use just 0 (empty) / 1 (occupied) since serial access
@@ -2204,6 +2205,53 @@ void lotus_hashmap_init_serialized(void *map_ptr,
     m->mu = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
     pthread_mutex_init(m->mu, NULL);
     m->sync_mode = LOTUS_HASHMAP_SYNC_SERIALIZED;
+}
+
+/* F.32-1γ-v1 (2026-05-25): sync = lockfree variant.
+ * Fixed-cap (user-declared via `cap = N` on the form
+ * annotation; no grow). Cache-padded cells like β2. Pure CAS
+ * on slot[0] for the 3-state occupancy machine; no rwlock,
+ * no mutex.
+ *
+ * Trades grow + remove (v1 doesn't support either) for the
+ * cheapest possible per-op cost: load_acquire + CAS +
+ * memcpy + release_store, no kernel-mediated synchronization
+ * primitives anywhere on the hot path. Suited for:
+ *   - Workloads where the entry count is bounded + known at
+ *     deploy time (Prometheus registries with a fixed metric
+ *     list, route tables, config caches).
+ *   - High-core-count writes (8+ cores) where the rwlock
+ *     overhead in β2 dominates.
+ *
+ * Behavior on cap exhaustion: `set` silently drops (the probe
+ * walks `cap` cells and returns no-op). The caller is
+ * responsible for sizing — `cap = N` should be 2-4× the
+ * peak expected entry count to keep linear-probe latency
+ * bounded. `len()` reports the current count so monitoring
+ * can detect approaching saturation. */
+void lotus_hashmap_init_lockfree(void *map_ptr,
+                                  size_t key_size,
+                                  size_t value_size,
+                                  int key_type_tag,
+                                  size_t fixed_cap) {
+    if (!map_ptr) return;
+    /* Round cap up to next power of 2 for the `& mask` probe;
+     * the user's `cap = N` is treated as a floor, not an
+     * exact count. */
+    size_t cap = 1;
+    while (cap < fixed_cap) cap <<= 1;
+    if (cap < LOTUS_HASHMAP_INITIAL_CAP) cap = LOTUS_HASHMAP_INITIAL_CAP;
+    lotus_hashmap_init(map_ptr, key_size, value_size, key_type_tag);
+    lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    /* Pad cell stride + reallocate slots to the user's cap. */
+    size_t packed = 1 + key_size + value_size;
+    size_t padded = (packed + (LOTUS_CACHE_LINE - 1))
+                  & ~((size_t)(LOTUS_CACHE_LINE - 1));
+    free(m->slots);
+    m->cell_stride = padded;
+    m->cap = cap;
+    m->slots = (char *)calloc(cap, m->cell_stride);
+    m->sync_mode = LOTUS_HASHMAP_SYNC_LOCKFREE;
 }
 
 /* F.32-1β2 (2026-05-25): sync = striped variant. Cells are
@@ -2526,11 +2574,78 @@ probe_restart:;
     pthread_rwlock_unlock(m->mu_grow);
 }
 
+/* F.32-1γ-v1 (2026-05-25): lockfree set. Same 3-state CAS
+ * machine as β2's set_striped, minus the rwlock and the
+ * grow path. Probe bounded by m->cap; silent drop on
+ * exhaustion. */
+static void lotus_hashmap_set_lockfree(lotus_hashmap_t *m,
+                                        const void *key,
+                                        const void *value) {
+    size_t es = lotus_hashmap_entry_size(m);
+    size_t mask = m->cap - 1;
+    size_t i = lotus_hashmap_hash(m, key) & mask;
+    size_t probes = 0;
+    for (;;) {
+        if (probes >= m->cap) {
+            /* Cap exhausted. Silent drop per the γ-v1 contract
+             * — caller should have sized the map to 2-4x peak
+             * expected entries. len() reports the saturation
+             * for monitoring. */
+            return;
+        }
+        char *slot = m->slots + i * es;
+        uint8_t state =
+            __atomic_load_n((uint8_t *)&slot[0], __ATOMIC_ACQUIRE);
+        if (state == LOTUS_CELL_EMPTY) {
+            uint8_t expected = LOTUS_CELL_EMPTY;
+            if (__atomic_compare_exchange_n(
+                    (uint8_t *)&slot[0],
+                    &expected, LOTUS_CELL_CLAIMED,
+                    0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            {
+                memcpy(slot + 1, key, m->key_size);
+                memcpy(slot + 1 + m->key_size, value, m->value_size);
+                __atomic_store_n((uint8_t *)&slot[0],
+                                 LOTUS_CELL_COMMITTED,
+                                 __ATOMIC_RELEASE);
+                __atomic_fetch_add(&m->len, 1, __ATOMIC_RELAXED);
+                return;
+            }
+            continue;  /* CAS lost; re-read */
+        }
+        if (state == LOTUS_CELL_CLAIMED) continue;  /* spin */
+        /* COMMITTED — compare keys. */
+        if (lotus_hashmap_key_eq(m, slot + 1, key)) {
+            /* Update path. Same CAS COMMITTED → CLAIMED →
+             * write → release-store COMMITTED. */
+            uint8_t expected = LOTUS_CELL_COMMITTED;
+            if (__atomic_compare_exchange_n(
+                    (uint8_t *)&slot[0],
+                    &expected, LOTUS_CELL_CLAIMED,
+                    0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            {
+                memcpy(slot + 1 + m->key_size, value, m->value_size);
+                __atomic_store_n((uint8_t *)&slot[0],
+                                 LOTUS_CELL_COMMITTED,
+                                 __ATOMIC_RELEASE);
+                return;
+            }
+            continue;  /* lost update race; retry */
+        }
+        i = (i + 1) & mask;
+        probes++;
+    }
+}
+
 void lotus_hashmap_set(void *map_ptr,
                         const void *key,
                         const void *value) {
     if (!map_ptr || !key || !value) return;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        lotus_hashmap_set_lockfree(m, key, value);
+        return;
+    }
     if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
         lotus_hashmap_set_striped(m, key, value);
         return;
@@ -2579,6 +2694,16 @@ static size_t lotus_hashmap_find_slot_striped(lotus_hashmap_t *m,
 int lotus_hashmap_get(void *map_ptr, const void *key, void *out_value) {
     if (!map_ptr || !key || !out_value) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        /* Lockfree get: no rwlock, just atomic probe. Uses the
+         * same find_slot_striped helper (spins past CLAIMED). */
+        if (__atomic_load_n(&m->len, __ATOMIC_RELAXED) == 0) return 0;
+        size_t i = lotus_hashmap_find_slot_striped(m, key);
+        if (i >= m->cap) return 0;
+        char *slot = m->slots + i * lotus_hashmap_entry_size(m);
+        memcpy(out_value, slot + 1 + m->key_size, m->value_size);
+        return 1;
+    }
     if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
         pthread_rwlock_rdlock(m->mu_grow);
         int r = 0;
@@ -2615,6 +2740,11 @@ int lotus_hashmap_get(void *map_ptr, const void *key, void *out_value) {
 int lotus_hashmap_has(void *map_ptr, const void *key) {
     if (!map_ptr || !key) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        if (__atomic_load_n(&m->len, __ATOMIC_RELAXED) == 0) return 0;
+        size_t i = lotus_hashmap_find_slot_striped(m, key);
+        return (i < m->cap) ? 1 : 0;
+    }
     if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
         pthread_rwlock_rdlock(m->mu_grow);
         int r = 0;
@@ -2677,6 +2807,13 @@ static int lotus_hashmap_remove_unlocked(lotus_hashmap_t *m,
 int lotus_hashmap_remove(void *map_ptr, const void *key) {
     if (!map_ptr || !key) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        /* F.32-1γ-v1: remove is not supported. Tombstones +
+         * periodic compaction land in γ-v2 if a workload
+         * needs them. For v1 the contract is "fixed cap,
+         * grow-only" — `remove` is a no-op. */
+        return 0;
+    }
     if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
         /* Striped: take wrlock so shifts can't race with rdlock'd
          * readers. find_slot uses non-atomic occupancy reads in
@@ -2695,8 +2832,9 @@ int lotus_hashmap_remove(void *map_ptr, const void *key) {
 int64_t lotus_hashmap_len(void *map_ptr) {
     if (!map_ptr) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
-        /* Atomic load is sufficient; no rdlock needed — len
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED
+        || m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        /* Atomic load is sufficient; no lock needed — len
          * updates are atomic increments and a snapshot is
          * inherently approximate under concurrent writers. */
         return (int64_t)__atomic_load_n(&m->len, __ATOMIC_RELAXED);
@@ -2710,7 +2848,8 @@ int64_t lotus_hashmap_len(void *map_ptr) {
 int lotus_hashmap_is_empty(void *map_ptr) {
     if (!map_ptr) return 1;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
-    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED
+        || m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
         return __atomic_load_n(&m->len, __ATOMIC_RELAXED) == 0 ? 1 : 0;
     }
     lotus_hashmap_lock(m);
@@ -2878,6 +3017,20 @@ static size_t lotus_hashmap_resolve_index_slot_striped(lotus_hashmap_t *m,
 int lotus_hashmap_key_at(void *map_ptr, int64_t i, void *out_key) {
     if (!map_ptr || !out_key || i < 0) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        int r = 0;
+        size_t cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+        if ((size_t)i < cur_len) {
+            size_t s = lotus_hashmap_resolve_index_slot_striped(m, i);
+            if (s < m->cap) {
+                size_t es = lotus_hashmap_entry_size(m);
+                char *slot = m->slots + s * es;
+                memcpy(out_key, slot + 1, m->key_size);
+                r = 1;
+            }
+        }
+        return r;
+    }
     if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
         pthread_rwlock_rdlock(m->mu_grow);
         int r = 0;
@@ -2912,6 +3065,20 @@ int lotus_hashmap_key_at(void *map_ptr, int64_t i, void *out_key) {
 int lotus_hashmap_value_at(void *map_ptr, int64_t i, void *out_value) {
     if (!map_ptr || !out_value || i < 0) return 0;
     lotus_hashmap_t *m = (lotus_hashmap_t *)map_ptr;
+    if (m->sync_mode == LOTUS_HASHMAP_SYNC_LOCKFREE) {
+        int r = 0;
+        size_t cur_len = __atomic_load_n(&m->len, __ATOMIC_RELAXED);
+        if ((size_t)i < cur_len) {
+            size_t s = lotus_hashmap_resolve_index_slot_striped(m, i);
+            if (s < m->cap) {
+                size_t es = lotus_hashmap_entry_size(m);
+                char *slot = m->slots + s * es;
+                memcpy(out_value, slot + 1 + m->key_size, m->value_size);
+                r = 1;
+            }
+        }
+        return r;
+    }
     if (m->sync_mode == LOTUS_HASHMAP_SYNC_STRIPED) {
         pthread_rwlock_rdlock(m->mu_grow);
         int r = 0;

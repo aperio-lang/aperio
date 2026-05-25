@@ -479,10 +479,7 @@ fn form_has_explicit_sync_discipline(form: &FormAnnotation) -> bool {
         match &arg.value {
             Expr::Ident(i) => matches!(
                 i.name.as_str(),
-                "serialized" | "striped"
-                // "lockfree" intentionally excluded — γ deferred;
-                // typecheck rejects it as not-yet-shipped, so it
-                // never reaches codegen as a sync discipline.
+                "serialized" | "striped" | "lockfree"
             ),
             _ => false,
         }
@@ -1817,13 +1814,17 @@ impl<'a> Checker<'a> {
     /// on that struct. The field's type becomes the hashmap
     /// key type K; the cell type becomes the value type S.
     fn check_form_hashmap_shape(&mut self, decl: &'a LocusDecl, form: &'a FormAnnotation) {
-        // F.32-1α (2026-05-24): @form(hashmap) accepts an optional
-        // `sync = X` kwarg picking a cross-pool sync discipline.
-        // Valid values: `serialized` (per-map mutex, F.32-1α),
-        // `striped` (F.32-1β, not yet shipped), `lockfree`
-        // (F.32-1γ, deferred). Plain `@form(hashmap)` keeps the
-        // single-pool default (no sync overhead; cross-pool calls
-        // typecheck-rejected per F.32-0).
+        // F.32-1α/β2/γ (2026-05-24 → 2026-05-25): @form(hashmap)
+        // accepts optional kwargs:
+        //   sync = X  (X ∈ {none, serialized, striped, lockfree})
+        //   cap  = N  (positive int literal; REQUIRED when
+        //              sync = lockfree, rejected otherwise)
+        //
+        // Plain `@form(hashmap)` keeps the single-pool default
+        // (no sync overhead; cross-pool calls typecheck-rejected
+        // per F.32-0).
+        let mut sync_value: Option<&str> = None;
+        let mut cap_arg: Option<&FormArg> = None;
         for arg in &form.args {
             match arg.name.name.as_str() {
                 "sync" => {
@@ -1840,44 +1841,82 @@ impl<'a> Checker<'a> {
                         }
                     };
                     match val {
-                        "serialized" => { /* F.32-1α — accepted */ }
-                        "striped" => { /* F.32-1β2 — accepted */ }
-                        "lockfree" => {
-                            self.diags.push(Diag::ty(
-                                arg.span,
-                                "@form(hashmap, sync = lockfree) is deferred \
-                                 (F.32-1γ); use `sync = serialized` (F.32-1α) \
-                                 in the meantime".to_string(),
-                            ));
-                        }
-                        "none" => { /* explicit single-pool — accepted, same as omitting */ }
+                        "serialized" => { sync_value = Some("serialized"); }
+                        "striped"    => { sync_value = Some("striped"); }
+                        "lockfree"   => { sync_value = Some("lockfree"); }
+                        "none"       => { /* same as omitting */ }
                         other => {
                             self.diags.push(Diag::ty(
                                 arg.span,
                                 format!(
                                     "@form(hashmap, sync = {}): unknown sync \
                                      discipline; v1 accepts `serialized` \
-                                     (F.32-1α). `striped` (F.32-1β) and \
-                                     `lockfree` (F.32-1γ) are planned but \
-                                     not yet shipped.",
+                                     (F.32-1α), `striped` (F.32-1β2), and \
+                                     `lockfree` (F.32-1γ-v1).",
                                     other
                                 ),
                             ));
                         }
                     }
                 }
+                "cap" => {
+                    cap_arg = Some(arg);
+                }
                 other => {
                     self.diags.push(Diag::ty(
                         arg.name.span,
                         format!(
                             "@form(hashmap): unknown arg `{}`; v1 accepts \
-                             `sync = X` only (X ∈ {{serialized, striped, \
-                             lockfree}})",
+                             `sync = X` and (when sync = lockfree) `cap = N`",
                             other
                         ),
                     ));
                 }
             }
+        }
+        // F.32-1γ-v1: lockfree REQUIRES cap = N (positive int
+        // literal); other sync modes REJECT cap (they grow
+        // dynamically). The asymmetry tracks the runtime
+        // contract: lockfree has no grow path, so the user has
+        // to size the map at decl time.
+        match (sync_value, cap_arg) {
+            (Some("lockfree"), None) => {
+                self.diags.push(Diag::ty(
+                    form.span,
+                    "@form(hashmap, sync = lockfree) requires a `cap = N` \
+                     arg (positive int literal). Lockfree maps are fixed-cap; \
+                     there's no grow path. Size to 2-4x peak expected \
+                     entries to keep linear-probe latency bounded."
+                        .to_string(),
+                ));
+            }
+            (Some("lockfree"), Some(arg)) => {
+                match &arg.value {
+                    Expr::Literal(Literal::Int(n), _) if *n > 0 => {
+                        /* OK */
+                    }
+                    _ => {
+                        self.diags.push(Diag::ty(
+                            arg.span,
+                            "@form(hashmap, sync = lockfree) `cap` must be a \
+                             positive integer literal (v1 doesn't const-evaluate \
+                             expressions for form args)".to_string(),
+                        ));
+                    }
+                }
+            }
+            (_, Some(arg)) => {
+                self.diags.push(Diag::ty(
+                    arg.name.span,
+                    "@form(hashmap): `cap = N` is only valid with \
+                     `sync = lockfree`. Other sync modes (none, serialized, \
+                     striped) grow dynamically; their initial cap is \
+                     LOTUS_HASHMAP_INITIAL_CAP (8) and managed by the \
+                     runtime."
+                        .to_string(),
+                ));
+            }
+            _ => { /* nothing else to check */ }
         }
         let capacity = decl.members.iter().find_map(|m| match m {
             LocusMember::Capacity(cb) => Some(cb),

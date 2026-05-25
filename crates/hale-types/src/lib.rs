@@ -1699,16 +1699,14 @@ mod tests {
 
     #[test]
     fn err_form_hashmap_with_unknown_arg() {
-        // F.32-1α (2026-05-24): @form(hashmap) now accepts an
-        // optional `sync = X` kwarg (X ∈ {serialized, striped,
-        // lockfree}). Other kwargs are still rejected, but the
-        // diagnostic shape changed from "takes no arguments"
-        // to "unknown arg `<name>`" naming the only valid kwarg.
-        // History: pre-F.32-1α this asserted on
-        // "@form(hashmap) takes no arguments".
+        // F.32-1α (2026-05-24): @form(hashmap) accepts `sync = X`
+        // (X ∈ {serialized, striped, lockfree}) and γ-v1 added
+        // `cap = N` (valid with sync = lockfree). Other kwargs
+        // remain rejected with a "unknown arg" diagnostic naming
+        // the valid surface.
         let src = r#"
             type Entry { name: String; v: Int; }
-            @form(hashmap, cap = 64)
+            @form(hashmap, bogus = 64)
             locus L {
                 capacity { pool entries of Entry indexed_by name; }
             }
@@ -1718,7 +1716,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("unknown arg `cap`")
+                .any(|d| d.message.contains("unknown arg `bogus`")
                       && d.message.contains("sync = X")),
             "expected hashmap unknown-arg diag naming sync = X, got: {:?}",
             diags
@@ -1763,6 +1761,71 @@ mod tests {
         assert!(
             diags.is_empty(),
             "expected clean typecheck on sync = striped; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ok_form_hashmap_with_sync_lockfree_and_cap() {
+        // F.32-1γ-v1: lockfree requires cap = N.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, sync = lockfree, cap = 1024)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected clean typecheck on sync = lockfree with cap; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_lockfree_without_cap() {
+        // F.32-1γ-v1: lockfree without cap is rejected.
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, sync = lockfree)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("sync = lockfree")
+                      && d.message.contains("requires")
+                      && d.message.contains("cap")),
+            "expected lockfree-requires-cap diag, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn err_form_hashmap_cap_without_lockfree() {
+        // cap = N is only valid with sync = lockfree (other
+        // sync modes grow dynamically).
+        let src = r#"
+            type Entry { name: String; v: Int; }
+            @form(hashmap, sync = serialized, cap = 1024)
+            locus L {
+                capacity { pool entries of Entry indexed_by name; }
+            }
+            fn main() { L { }; }
+        "#;
+        let diags = check(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("`cap = N` is only valid with")
+                      && d.message.contains("sync = lockfree")),
+            "expected cap-only-with-lockfree diag, got: {:?}",
             diags
         );
     }

@@ -2369,9 +2369,14 @@ enum SyncMode {
     /// collisions; readers see writers' publishes via the
     /// acquire-release pair on slot[0]. F.32-1β2.
     Striped,
-    // Lockfree variant (γ) is reserved for the future; the
-    // typechecker accepts the `sync = lockfree` keyword shape
-    // but emits a "deferred" diagnostic until γ ships.
+    /// `sync = lockfree` — fixed-cap, cell-level CAS, NO rwlock
+    /// or mutex anywhere on the hot path. Cache-padded cells.
+    /// User declares `cap = N` upfront; runtime never grows.
+    /// `remove` is unsupported (γ-v1 trades it for raw perf;
+    /// tombstones land in γ-v2 if a workload needs them).
+    /// F.32-1γ-v1 (2026-05-25). The fixed_cap field stores the
+    /// rounded-up power-of-2 capacity emitted at init time.
+    Lockfree { fixed_cap: u64 },
 }
 
 /// v1.x-FORM-2: which form lowering is in play for a capacity slot.
@@ -2807,6 +2812,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // CAS for slot claim.
         self.module
             .add_function("lotus_hashmap_init_striped", hashmap_init_ty, None);
+        // F.32-1γ-v1 (2026-05-25): sync = lockfree variant.
+        // Takes an extra `fixed_cap` i64 arg (user-declared
+        // via `cap = N` on the form annotation; no grow).
+        let hashmap_init_lockfree_ty = void_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into(), i32_t.into(), i64_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_hashmap_init_lockfree", hashmap_init_lockfree_ty, None);
         let hashmap_set_ty =
             void_t.fn_type(&[ptr_t.into(), ptr_t.into(), ptr_t.into()], false);
         self.module
@@ -10781,21 +10795,38 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 // SyncMode variant. Unrecognized / absent →
                 // SyncMode::None (single-pool, no runtime sync).
                 let sync_mode = if matches!(form, Some(SlotForm::Hashmap)) {
-                    l.form
+                    let sync_name = l.form
                         .as_ref()
                         .and_then(|f| {
                             f.args.iter().find(|a| a.name.name == "sync")
                         })
                         .and_then(|a| match &a.value {
-                            Expr::Ident(i) => Some(i.name.as_str()),
+                            Expr::Ident(i) => Some(i.name.as_str().to_string()),
                             _ => None,
-                        })
-                        .map(|name| match name {
-                            "serialized" => SyncMode::Serialized,
-                            "striped" => SyncMode::Striped,
-                            _ => SyncMode::None,
-                        })
-                        .unwrap_or(SyncMode::None)
+                        });
+                    match sync_name.as_deref() {
+                        Some("serialized") => SyncMode::Serialized,
+                        Some("striped") => SyncMode::Striped,
+                        Some("lockfree") => {
+                            // F.32-1γ-v1: lockfree requires
+                            // `cap = N` (validated by typecheck;
+                            // codegen reads the int literal).
+                            let cap = l.form
+                                .as_ref()
+                                .and_then(|f| {
+                                    f.args.iter().find(|a| a.name.name == "cap")
+                                })
+                                .and_then(|a| match &a.value {
+                                    Expr::Literal(Literal::Int(n), _) if *n > 0 => {
+                                        Some(*n as u64)
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            SyncMode::Lockfree { fixed_cap: cap }
+                        }
+                        _ => SyncMode::None,
+                    }
                 } else {
                     SyncMode::None
                 };
@@ -32437,33 +32468,62 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         .context
                         .i32_type()
                         .const_int(key_type_tag, false);
-                    // F.32-1α/β2 (2026-05-24 / 2026-05-25): pick
+                    // F.32-1α/β2/γ (2026-05-24 → 2026-05-25): pick
                     // the init variant from sync_mode. The runtime
                     // `sync_mode` field on lotus_hashmap_t routes
                     // every entry point through the right locking
-                    // discipline at call time — no codegen change
-                    // needed beyond picking the right init.
-                    let init_fn_name = match slot.sync_mode {
-                        SyncMode::None => "lotus_hashmap_init",
-                        SyncMode::Serialized => "lotus_hashmap_init_serialized",
-                        SyncMode::Striped => "lotus_hashmap_init_striped",
-                    };
-                    let init_fn = self
-                        .module
-                        .get_function(init_fn_name)
-                        .expect("lotus_hashmap_init[_serialized|_striped] extern declared");
-                    self.builder
-                        .build_call(
-                            init_fn,
-                            &[
-                                slot_field_ptr.into(),
-                                key_size.into(),
-                                value_size.into(),
-                                key_type_tag_const.into(),
-                            ],
-                            &format!("{}.{}.init", locus_name, slot.name),
-                        )
-                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    // discipline at call time. Lockfree uses a
+                    // different init signature (extra fixed_cap
+                    // arg) — handled in its own branch.
+                    match slot.sync_mode {
+                        SyncMode::Lockfree { fixed_cap } => {
+                            let init_fn = self
+                                .module
+                                .get_function("lotus_hashmap_init_lockfree")
+                                .expect("lotus_hashmap_init_lockfree extern declared");
+                            let cap_const = self
+                                .context
+                                .i64_type()
+                                .const_int(fixed_cap, false);
+                            self.builder
+                                .build_call(
+                                    init_fn,
+                                    &[
+                                        slot_field_ptr.into(),
+                                        key_size.into(),
+                                        value_size.into(),
+                                        key_type_tag_const.into(),
+                                        cap_const.into(),
+                                    ],
+                                    &format!("{}.{}.init", locus_name, slot.name),
+                                )
+                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        }
+                        _ => {
+                            let init_fn_name = match slot.sync_mode {
+                                SyncMode::None => "lotus_hashmap_init",
+                                SyncMode::Serialized => "lotus_hashmap_init_serialized",
+                                SyncMode::Striped => "lotus_hashmap_init_striped",
+                                SyncMode::Lockfree { .. } => unreachable!(),
+                            };
+                            let init_fn = self
+                                .module
+                                .get_function(init_fn_name)
+                                .expect("lotus_hashmap_init[_serialized|_striped] extern declared");
+                            self.builder
+                                .build_call(
+                                    init_fn,
+                                    &[
+                                        slot_field_ptr.into(),
+                                        key_size.into(),
+                                        value_size.into(),
+                                        key_type_tag_const.into(),
+                                    ],
+                                    &format!("{}.{}.init", locus_name, slot.name),
+                                )
+                                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        }
+                    }
                 }
                 None => {
                     // Default F.22 lowering: allocate via
