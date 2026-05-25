@@ -1810,11 +1810,13 @@ fn locus_arena_elidable(l: &LocusDecl) -> bool {
 /// of the struct so they land on the first cache line of `self`,
 /// reducing per-method L1 miss rate.
 ///
-/// Counts LEXICAL occurrences, not runtime invocations: a
-/// `self.x` inside `while i < n { ... }` counts as 1, not N.
-/// Hot-loop weighting is a follow-up; v1's heuristic is "more
-/// places where the code touches the field = more likely it's
-/// hot at runtime."
+/// Counts LEXICAL occurrences, not runtime invocations. The
+/// walk threads a loop-depth counter through `for`/`while`
+/// bodies and weights each access by `10^depth`: an access at
+/// depth 0 counts as 1, depth 1 (inside one loop) as 10, depth
+/// 2 (doubly nested) as 100. Saturating arithmetic protects
+/// against pathological nesting depths; ordering is what
+/// matters for the sort, not absolute magnitudes.
 ///
 /// Includes reads (`self.x`) and writes (`self.x = ...`),
 /// counted equally — both touch the cache line. Self-field
@@ -1832,121 +1834,155 @@ fn count_self_field_accesses_in_locus(l: &LocusDecl) -> std::collections::BTreeM
             _ => None,
         };
         if let Some(body) = body_opt {
-            count_self_fields_in_block(body, &mut counts);
+            count_self_fields_in_block(body, &mut counts, 0);
         }
     }
     counts
 }
 
-fn count_self_fields_in_block(b: &Block, counts: &mut std::collections::BTreeMap<String, u32>) {
+fn weight_for_depth(depth: u32) -> u32 {
+    10u32.saturating_pow(depth)
+}
+
+fn bump_count(counts: &mut std::collections::BTreeMap<String, u32>, name: &str, depth: u32) {
+    let w = weight_for_depth(depth);
+    let slot = counts.entry(name.to_string()).or_insert(0);
+    *slot = slot.saturating_add(w);
+}
+
+fn count_self_fields_in_block(
+    b: &Block,
+    counts: &mut std::collections::BTreeMap<String, u32>,
+    depth: u32,
+) {
     for s in &b.stmts {
-        count_self_fields_in_stmt(s, counts);
+        count_self_fields_in_stmt(s, counts, depth);
     }
 }
 
-fn count_self_fields_in_stmt(s: &Stmt, counts: &mut std::collections::BTreeMap<String, u32>) {
+fn count_self_fields_in_stmt(
+    s: &Stmt,
+    counts: &mut std::collections::BTreeMap<String, u32>,
+    depth: u32,
+) {
     match s {
         Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
-            count_self_fields_in_expr(value, counts);
+            count_self_fields_in_expr(value, counts, depth);
         }
         Stmt::Assign { value, target, .. } => {
-            count_self_fields_in_expr(value, counts);
+            count_self_fields_in_expr(value, counts, depth);
             // Count the LHS head field if the target is `self.field...`.
             // LValue.head is an Ident — check by name.
             if target.head.name == "self" {
                 if let Some(LValueSeg::Field(name)) = target.tail.first() {
-                    *counts.entry(name.name.clone()).or_insert(0) += 1;
+                    bump_count(counts, &name.name, depth);
                 }
             }
             for seg in &target.tail {
                 if let LValueSeg::Index(e) = seg {
-                    count_self_fields_in_expr(e, counts);
+                    count_self_fields_in_expr(e, counts, depth);
                 }
             }
         }
-        Stmt::If(s) => count_self_fields_in_if(s, counts),
-        Stmt::Match(m) => count_self_fields_in_match(m, counts),
+        Stmt::If(s) => count_self_fields_in_if(s, counts, depth),
+        Stmt::Match(m) => count_self_fields_in_match(m, counts, depth),
         Stmt::For { iter, body, .. } => {
-            count_self_fields_in_expr(iter, counts);
-            count_self_fields_in_block(body, counts);
+            // Iter expr executes once at loop entry — keep depth.
+            // Body executes per-iteration — bump depth.
+            count_self_fields_in_expr(iter, counts, depth);
+            count_self_fields_in_block(body, counts, depth.saturating_add(1));
         }
         Stmt::While { cond, body, .. } => {
-            count_self_fields_in_expr(cond, counts);
-            count_self_fields_in_block(body, counts);
+            // Cond executes per-iteration too — bump for both.
+            let inner = depth.saturating_add(1);
+            count_self_fields_in_expr(cond, counts, inner);
+            count_self_fields_in_block(body, counts, inner);
         }
-        Stmt::Return(Some(e), _) => count_self_fields_in_expr(e, counts),
-        Stmt::Fail { value, .. } => count_self_fields_in_expr(value, counts),
-        Stmt::Block(b) => count_self_fields_in_block(b, counts),
+        Stmt::Return(Some(e), _) => count_self_fields_in_expr(e, counts, depth),
+        Stmt::Fail { value, .. } => count_self_fields_in_expr(value, counts, depth),
+        Stmt::Block(b) => count_self_fields_in_block(b, counts, depth),
         Stmt::Recovery { args, .. } => {
-            for a in args { count_self_fields_in_expr(a, counts); }
+            for a in args { count_self_fields_in_expr(a, counts, depth); }
         }
         Stmt::Violate { payload, .. } => {
-            if let Some(p) = payload { count_self_fields_in_expr(p, counts); }
+            if let Some(p) = payload { count_self_fields_in_expr(p, counts, depth); }
         }
         Stmt::Send { subject, value, .. } => {
-            count_self_fields_in_expr(subject, counts);
-            count_self_fields_in_expr(value, counts);
+            count_self_fields_in_expr(subject, counts, depth);
+            count_self_fields_in_expr(value, counts, depth);
         }
-        Stmt::Expr(e) => count_self_fields_in_expr(e, counts),
+        Stmt::Expr(e) => count_self_fields_in_expr(e, counts, depth),
         Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Yield(_) => {}
     }
 }
 
-fn count_self_fields_in_if(s: &IfStmt, counts: &mut std::collections::BTreeMap<String, u32>) {
-    count_self_fields_in_expr(&s.cond, counts);
-    count_self_fields_in_block(&s.then_block, counts);
+fn count_self_fields_in_if(
+    s: &IfStmt,
+    counts: &mut std::collections::BTreeMap<String, u32>,
+    depth: u32,
+) {
+    count_self_fields_in_expr(&s.cond, counts, depth);
+    count_self_fields_in_block(&s.then_block, counts, depth);
     match s.else_block.as_deref() {
         None => {}
-        Some(ElseBranch::Else(b)) => count_self_fields_in_block(b, counts),
-        Some(ElseBranch::ElseIf(inner)) => count_self_fields_in_if(inner, counts),
+        Some(ElseBranch::Else(b)) => count_self_fields_in_block(b, counts, depth),
+        Some(ElseBranch::ElseIf(inner)) => count_self_fields_in_if(inner, counts, depth),
     }
 }
 
-fn count_self_fields_in_match(m: &MatchStmt, counts: &mut std::collections::BTreeMap<String, u32>) {
-    count_self_fields_in_expr(&m.scrutinee, counts);
+fn count_self_fields_in_match(
+    m: &MatchStmt,
+    counts: &mut std::collections::BTreeMap<String, u32>,
+    depth: u32,
+) {
+    count_self_fields_in_expr(&m.scrutinee, counts, depth);
     for a in &m.arms {
         if let Some(g) = &a.guard {
-            count_self_fields_in_expr(g, counts);
+            count_self_fields_in_expr(g, counts, depth);
         }
         match &a.body {
-            MatchArmBody::Expr(e) => count_self_fields_in_expr(e, counts),
-            MatchArmBody::Block(b) => count_self_fields_in_block(b, counts),
+            MatchArmBody::Expr(e) => count_self_fields_in_expr(e, counts, depth),
+            MatchArmBody::Block(b) => count_self_fields_in_block(b, counts, depth),
         }
     }
 }
 
-fn count_self_fields_in_expr(e: &Expr, counts: &mut std::collections::BTreeMap<String, u32>) {
+fn count_self_fields_in_expr(
+    e: &Expr,
+    counts: &mut std::collections::BTreeMap<String, u32>,
+    depth: u32,
+) {
     match e {
         Expr::Field { receiver, name, .. } => {
             if matches!(receiver.as_ref(), Expr::KwSelf(_)) {
-                *counts.entry(name.name.clone()).or_insert(0) += 1;
+                bump_count(counts, &name.name, depth);
             }
-            count_self_fields_in_expr(receiver, counts);
+            count_self_fields_in_expr(receiver, counts, depth);
         }
         Expr::Literal(_, _) | Expr::Ident(_) | Expr::Path(_) | Expr::KwSelf(_) => {}
         Expr::Binary { left, right, .. } => {
-            count_self_fields_in_expr(left, counts);
-            count_self_fields_in_expr(right, counts);
+            count_self_fields_in_expr(left, counts, depth);
+            count_self_fields_in_expr(right, counts, depth);
         }
-        Expr::Unary { operand, .. } => count_self_fields_in_expr(operand, counts),
+        Expr::Unary { operand, .. } => count_self_fields_in_expr(operand, counts, depth),
         Expr::Call { callee, args, .. } => {
-            count_self_fields_in_expr(callee, counts);
-            for a in args { count_self_fields_in_expr(a, counts); }
+            count_self_fields_in_expr(callee, counts, depth);
+            for a in args { count_self_fields_in_expr(a, counts, depth); }
         }
         Expr::Index { receiver, index, .. } => {
-            count_self_fields_in_expr(receiver, counts);
-            count_self_fields_in_expr(index, counts);
+            count_self_fields_in_expr(receiver, counts, depth);
+            count_self_fields_in_expr(index, counts, depth);
         }
-        Expr::Path2 { receiver, .. } => count_self_fields_in_expr(receiver, counts),
+        Expr::Path2 { receiver, .. } => count_self_fields_in_expr(receiver, counts, depth),
         Expr::Tuple(parts, _) | Expr::Array(parts, _) => {
-            for p in parts { count_self_fields_in_expr(p, counts); }
+            for p in parts { count_self_fields_in_expr(p, counts, depth); }
         }
         Expr::Struct { inits, .. } => {
-            for i in inits { count_self_fields_in_expr(&i.value, counts); }
+            for i in inits { count_self_fields_in_expr(&i.value, counts, depth); }
         }
-        Expr::Block(b) => count_self_fields_in_block(b, counts),
-        Expr::If(s) => count_self_fields_in_if(s, counts),
-        Expr::Match(m) => count_self_fields_in_match(m, counts),
+        Expr::Block(b) => count_self_fields_in_block(b, counts, depth),
+        Expr::If(s) => count_self_fields_in_if(s, counts, depth),
+        Expr::Match(m) => count_self_fields_in_match(m, counts, depth),
         // Other expression shapes (closures-as-asserts, Range, Sum/Prod
         // accumulators, Approx, etc.) are uncommon and don't typically
         // appear in hot-path bodies — skipping their interior is a
