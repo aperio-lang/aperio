@@ -358,3 +358,98 @@ fn hashmap_self_dispatch_inside_locus_method() {
     assert!(stdout.contains("ok"), "expected ok, got: {:?}", stdout);
     assert!(!stdout.contains("FAIL"), "unexpected FAIL: {:?}", stdout);
 }
+
+/// Regression for the BookSignalState bigcell leak (2026-05-25
+/// fathom handoff). Anchor-in-place at @form(hashmap).set worked
+/// for flat scalar cells (`f042806`), but cells with a fixed-size
+/// array field still allocated a fresh `[N x elem]` buffer in the
+/// hashmap's arena on every set — the per-field deep-copy path
+/// lacked the `lotus_arena_contains_ptr` same-arena skip that
+/// String/Bytes get from `lotus_str_clone`. apps/mdgw/kraken's
+/// `BookSignalStateMap` (cell carrying 2× `[BookLevel; 100]`) grew
+/// ~200 MB/min until OOM. Lock-in: chunk count for the hashmap's
+/// arena must stay flat across many sets on the same key.
+#[test]
+fn hashmap_set_bigcell_with_array_field_does_not_leak() {
+    let src = r#"
+        type Level { p: Int; q: Int; }
+        type BigCell {
+            id:   Int;
+            bids: [Level; 8];
+            asks: [Level; 8];
+            name: String;
+        }
+        @form(hashmap)
+        locus M { capacity { pool cells of BigCell indexed_by id; } }
+        fn main() {
+            let m = M { };
+            // First set populates the slot's array pointers.
+            m.set(BigCell {
+                id:   1,
+                bids: [Level { p: 0, q: 0 }; 8],
+                asks: [Level { p: 0, q: 0 }; 8],
+                name: "bk",
+            });
+            std::process::dump_arena_residency();
+            // Hot path: RMW the cell — load via get, build a fresh
+            // BigCell, set back. The anchor path must reuse the
+            // existing in-arena array buffers, not allocate fresh
+            // ones each call.
+            let mut i = 0;
+            while i < 400 {
+                let e = m.get(1) or raise;
+                m.set(BigCell {
+                    id:   1,
+                    bids: e.bids,
+                    asks: e.asks,
+                    name: e.name,
+                });
+                i = i + 1;
+            }
+            std::process::dump_arena_residency();
+            println("ok");
+        }
+    "#;
+    let bin = build("bigcell_anchor", src);
+    let out = Command::new(&bin)
+        .env("LOTUS_ARENA_RESIDENCY", "1")
+        .output()
+        .expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ok"), "expected ok, got: {:?}", stdout);
+
+    // Parse stderr for the hashmap arena's chunk count across the
+    // two residency dumps. Dump format:
+    //   [#<id> arena=<ptr> label=<label>] chunks=<n> bytes=<n> ...
+    // We look for label=M (the hashmap locus's arena) twice and
+    // compare. Pre-fix the second count grows by hundreds; post-fix
+    // it's the same.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let chunks: Vec<usize> = stderr
+        .lines()
+        .filter(|ln| ln.contains("label=M ") || ln.contains("label=M]"))
+        .filter_map(|ln| {
+            ln.split("chunks=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .collect();
+    assert!(
+        chunks.len() >= 2,
+        "expected two M-arena residency rows, got {:?} (stderr={})",
+        chunks,
+        stderr
+    );
+    let first = chunks[0];
+    let last = *chunks.last().unwrap();
+    assert!(
+        last <= first + 1,
+        "M arena grew across 400 same-key sets: chunks {} → {} (bigcell anchor regressed). stderr={}",
+        first,
+        last,
+        stderr
+    );
+}

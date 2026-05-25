@@ -930,13 +930,31 @@ reclaim on a real-world long-running workload:
      value's bytes directly into the slot, so the deep-copy's
      outer struct allocation is wasted work. Instead, walk
      the source struct's fields and rewrite each heap-typed
-     field to a `dest_arena`-anchored version (via the existing
-     `lotus_str_clone` / `lotus_bytes_clone` with their
-     same-arena skips); leave scalars untouched. The runtime's
-     memcpy reads from the now-anchored source struct. Net for
-     the canonical `Counter.inc()` / `Gauge.set()` RMW pattern
-     (same-pointer heap fields carried through from
-     `e = store.get(key)`): zero new allocations per call.
+     field to a `dest_arena`-anchored version; leave scalars
+     untouched. The runtime's memcpy reads from the now-
+     anchored source struct. Net for the canonical
+     `Counter.inc()` / `Gauge.set()` RMW pattern (same-pointer
+     heap fields carried through from `e = store.get(key)`):
+     zero new allocations per call.
+
+     The per-field deep-copy routes through the same
+     `lotus_arena_contains_ptr` gate as #4 — implemented by
+     `emit_cross_arena_store_deep_copy_ptr`. For String/Bytes
+     fields the gate degenerates into `lotus_str_clone` /
+     `lotus_bytes_clone`'s own same-arena skip; for pointer-
+     shaped compound fields (`Array`, nested `TypeRef`, `Tuple`,
+     `Interface`, `Enum`) the gate is a runtime arena-membership
+     check on the loaded field pointer — identity-store when
+     the field already lives in `dest_arena`. Until 2026-05-25
+     the compound-field path went straight through the
+     unconditional deep-copy: cells with a fixed-size array
+     field (e.g. `BookSignalState`'s two `[BookLevel; 100]`)
+     allocated a fresh element buffer on every `set` of the
+     same key. Fathom's `apps/mdgw/kraken` long-burn surfaced
+     this as ~3 KB / set × ~100 sets/sec → OOM at the
+     container cap in ~20 min; the field-level gate folded the
+     RMW back to zero allocations once the previously-stored
+     buffer is already in the hashmap's arena.
 
   6. **In-place mutation at `self.X = Struct{...}` and
      `self.X[i] = Struct{...}` assigns.** Locus self-fields

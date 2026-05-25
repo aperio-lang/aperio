@@ -14144,7 +14144,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     ///
     /// Idempotent: a second call on the same struct sees every
     /// heap field already in dest_arena (or pointing to a static
-    /// literal), so every clone short-circuits to identity.
+    /// literal), so every clone short-circuits to identity. For
+    /// String/Bytes the no-op comes from `lotus_str_clone`'s
+    /// same-arena skip (6a56d7c). For pointer-shaped compound
+    /// fields (Array, nested TypeRef, Tuple, Interface, Enum)
+    /// the skip comes from the `lotus_arena_contains_ptr` gate
+    /// in `emit_cross_arena_store_deep_copy_ptr`. Earlier this
+    /// path went straight through `emit_return_value_deep_copy`
+    /// for compound fields, which unconditionally allocates fresh
+    /// storage — that was the bigcell leak the 2026-05-25 fathom
+    /// kraken bench surfaced (`BookSignalState`'s two
+    /// `[BookLevel; 100]` fields realloc'd on every set, ~3 KB
+    /// per set × ~100 sets/sec until OOM).
     fn anchor_struct_fields_in_place(
         &mut self,
         value: BasicValueEnum<'ctx>,
@@ -14196,12 +14207,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     ),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-            // String/Bytes: clone with same-arena skip (6a56d7c).
-            // Nested compound: emit_return_value_deep_copy
-            // allocates fresh nested storage in dest_arena (the
-            // field stores a pointer that must outlive scratch).
-            let anchored = self.emit_return_value_deep_copy(
-                field_val, &fty, dest_arena,
+            // For String/Bytes the helper routes through
+            // emit_return_value_deep_copy → lotus_str_clone, which
+            // already same-arena-skips. For pointer-shaped
+            // compound fields (Array, nested struct, Tuple,
+            // Interface, Enum) the helper emits a runtime
+            // lotus_arena_contains_ptr gate around the deep-copy
+            // — identity when the field's pointer already lives in
+            // dest_arena (Counter.inc RMW pattern, BookEngine
+            // focus→flush RMW pattern), full deep-copy on the
+            // genuinely cross-arena write (first set, fresh-cell
+            // promotion).
+            let anchored = self.emit_cross_arena_store_deep_copy_ptr(
+                field_val,
+                &fty,
+                dest_arena,
+                &format!("{}.anchor.{}.{}", site_name, type_name, fname),
             )?;
             self.builder
                 .build_store(field_slot, anchored)
