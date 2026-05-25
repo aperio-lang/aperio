@@ -26,7 +26,7 @@ hljs.registerLanguage('hale', function (hljs) {
       // Declaration
       'locus type perspective interface topic import const fn module main ' +
       // Locus members
-      'params contract bus capacity mode closure bindings ' +
+      'params contract bus capacity mode closure bindings placement ' +
       // Lifecycle
       'birth accept run drain dissolve on_failure ' +
       // Statement / control flow
@@ -49,7 +49,7 @@ hljs.registerLanguage('hale', function (hljs) {
       // Perspective
       'stable_when serialize_as ' +
       // Fallible
-      'fallible fail or raise ' +
+      'fallible fail or raise discard ' +
       // Capacity slot
       'pool heap indexed_by as_parent_for ' +
       // Reserved
