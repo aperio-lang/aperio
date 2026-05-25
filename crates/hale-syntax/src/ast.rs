@@ -87,7 +87,37 @@ pub struct TopicDecl {
     /// the topic's local name (joined with parent's subject path
     /// at desugar time).
     pub subject: Option<String>,
+    /// Routing-key field (Phase 3 — `spec/semantics.md` §
+    /// "Phase 3: routing keys"). When `Some`, the bus shards
+    /// dispatch by the named payload field's value at the
+    /// `(subject, key)` granularity. Field must exist on
+    /// `payload` and resolve to an int-shaped scalar at
+    /// typecheck. When `None`, the topic is unkeyed and behaves
+    /// as it has since Phase 1.
+    pub keyed_by: Option<Ident>,
+    /// Behavior when a keyed publish finds no subscriber whose
+    /// `where key == X` filter matches. `None` is equivalent to
+    /// `Some(Swallow)` (the default; matches today's no-subscriber
+    /// semantics on unkeyed topics). Has no meaning on unkeyed
+    /// topics — typecheck rejects.
+    pub on_unmatched: Option<UnmatchedPolicy>,
     pub span: Span,
+}
+
+/// Routing-key `on_unmatched` policy. See `spec/semantics.md`
+/// § "Phase 3: routing keys".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmatchedPolicy {
+    /// Drop the message silently. Diag visible only with
+    /// `LOTUS_BUS_LOG_UNMATCHED=1`. Default when omitted.
+    Swallow,
+    /// Publish becomes a fallible expression. Caller must use
+    /// `or raise` / `or handler(err)` / `or discard`.
+    Fail,
+    /// At least one `where key == _` subscriber on the subject
+    /// catches the unmatched message. Resolve-time check
+    /// enforces.
+    Fallback,
 }
 
 /// FUv0.8.2 #7 (2026-05-25): `target <name> { <cap>, ... }`.
@@ -815,6 +845,11 @@ pub enum BusMember {
         /// MUST be `None` for topic-ref form (the topic carries
         /// the payload type). Typecheck enforces this constraint.
         ty: Option<TypeExpr>,
+        /// Routing-key filter (Phase 3). `None` = receive every
+        /// message on the subject (today's behavior). `Some(...)`
+        /// = filter at dispatch time. See `spec/semantics.md` §
+        /// "Phase 3: routing keys".
+        key_filter: Option<KeyFilter>,
         span: Span,
     },
     Publish {
@@ -824,6 +859,28 @@ pub enum BusMember {
         alias: Option<Ident>,
         span: Span,
     },
+}
+
+/// `where key == EXPR` clause on `subscribe`. See
+/// `spec/semantics.md` § "Phase 3: routing keys".
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyFilter {
+    /// `where key == EXPR`. The expression is evaluated at the
+    /// subscribing locus's instantiation; the value is captured
+    /// into the bus registry. v0.1 restricts EXPR to literal /
+    /// const ident / `self.<field>` (typecheck enforces).
+    Specific { expr: Expr, span: Span },
+    /// `where key == _`. Catch-unmatched subscriber. Only legal
+    /// when the topic declares `on_unmatched: fallback`.
+    Unmatched { span: Span },
+}
+
+impl KeyFilter {
+    pub fn span(&self) -> Span {
+        match self {
+            KeyFilter::Specific { span, .. } | KeyFilter::Unmatched { span } => *span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

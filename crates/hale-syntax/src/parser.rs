@@ -548,11 +548,13 @@ impl Parser {
         self.expect(TokenKind::LBrace, "{")?;
         let mut payload: Option<TypeExpr> = None;
         let mut subject: Option<String> = None;
+        let mut keyed_by: Option<Ident> = None;
+        let mut on_unmatched: Option<UnmatchedPolicy> = None;
         while !matches!(self.peek(), TokenKind::RBrace) {
             let field_name = self.expect_ident("topic field name")?;
-            self.expect(TokenKind::Colon, ":")?;
             match field_name.name.as_str() {
                 "payload" => {
+                    self.expect(TokenKind::Colon, ":")?;
                     let ty = self.parse_type_expr()?;
                     if payload.is_some() {
                         return Err(Diag::parse(
@@ -563,6 +565,7 @@ impl Parser {
                     payload = Some(ty);
                 }
                 "subject" => {
+                    self.expect(TokenKind::Colon, ":")?;
                     let tok = self.peek_token().clone();
                     let s = match tok.kind {
                         TokenKind::StringLit(s) => {
@@ -584,12 +587,54 @@ impl Parser {
                     }
                     subject = Some(s);
                 }
+                "keyed_by" => {
+                    // `keyed_by FIELD;` — no colon (reads more
+                    // naturally as a directive). Picks the routing-
+                    // key field on the topic's payload type.
+                    let field = self.expect_ident("keyed_by field name")?;
+                    if keyed_by.is_some() {
+                        return Err(Diag::parse(
+                            field_name.span,
+                            "duplicate `keyed_by` in topic declaration",
+                        ));
+                    }
+                    keyed_by = Some(field);
+                }
+                "on_unmatched" => {
+                    self.expect(TokenKind::Colon, ":")?;
+                    let policy_ident = self
+                        .expect_ident("on_unmatched policy")?;
+                    let policy = match policy_ident.name.as_str() {
+                        "swallow" => UnmatchedPolicy::Swallow,
+                        "fail" => UnmatchedPolicy::Fail,
+                        "fallback" => UnmatchedPolicy::Fallback,
+                        other => {
+                            return Err(Diag::parse(
+                                policy_ident.span,
+                                format!(
+                                    "unknown on_unmatched policy `{}` \
+                                     (expected `swallow`, `fail`, or \
+                                     `fallback`)",
+                                    other
+                                ),
+                            ));
+                        }
+                    };
+                    if on_unmatched.is_some() {
+                        return Err(Diag::parse(
+                            field_name.span,
+                            "duplicate `on_unmatched:` in topic declaration",
+                        ));
+                    }
+                    on_unmatched = Some(policy);
+                }
                 other => {
                     return Err(Diag::parse(
                         field_name.span,
                         format!(
                             "unknown topic field `{}` (recognized: \
-                             `payload:`, `subject:`)",
+                             `payload:`, `subject:`, `keyed_by`, \
+                             `on_unmatched:`)",
                             other
                         ),
                     ));
@@ -609,6 +654,8 @@ impl Parser {
             parent,
             payload,
             subject,
+            keyed_by,
+            on_unmatched,
             span: kw.span.merge(close.span),
         })
     }
@@ -1846,11 +1893,53 @@ impl Parser {
                 } else {
                     None
                 };
+                // Optional `where key == EXPR` (Phase 3).
+                // `where` is already a reserved keyword (used in
+                // form annotations); reuse the same TokenKind.
+                let key_filter = if matches!(self.peek(), TokenKind::Where) {
+                    let where_tok = self.bump();
+                    let key_kw = self.expect_ident("`key`")?;
+                    if key_kw.name != "key" {
+                        return Err(Diag::parse(
+                            key_kw.span,
+                            format!(
+                                "expected `key` after `where` in \
+                                 subscribe filter, got `{}`",
+                                key_kw.name
+                            ),
+                        ));
+                    }
+                    self.expect(TokenKind::EqEq, "==")?;
+                    // `_` sentinel for catch-unmatched, or an EXPR.
+                    // The lexer treats bare `_` as an Ident with
+                    // name "_" (its leading-byte rule accepts
+                    // underscore).
+                    let is_underscore = matches!(
+                        self.peek(),
+                        TokenKind::Ident(s) if s == "_"
+                    );
+                    let filter = if is_underscore {
+                        self.bump();
+                        KeyFilter::Unmatched {
+                            span: where_tok.span,
+                        }
+                    } else {
+                        let expr = self.parse_expr()?;
+                        KeyFilter::Specific {
+                            expr,
+                            span: where_tok.span,
+                        }
+                    };
+                    Some(filter)
+                } else {
+                    None
+                };
                 let semi = self.expect(TokenKind::Semi, ";")?;
                 Ok(BusMember::Subscribe {
                     subject,
                     handler,
                     ty,
+                    key_filter,
                     span: kw.span.merge(semi.span),
                 })
             }
@@ -5608,5 +5697,177 @@ fn main() { L { }; }
         assert!(matches!(prog.items[0], TopDecl::Target(_)));
         assert!(matches!(prog.items[1], TopDecl::Locus(_)));
         assert!(matches!(prog.items[2], TopDecl::Fn(_)));
+    }
+
+    // === Phase 3 routing-key tests (2026-05-25) ============
+
+    #[test]
+    fn parse_topic_with_keyed_by_and_on_unmatched() {
+        let src = r#"
+type L2Data { sym_id: Int; }
+topic KrakenL2 {
+    payload: L2Data;
+    subject: "kraken.l2";
+    keyed_by sym_id;
+    on_unmatched: swallow;
+}
+"#;
+        let prog = parse_str(src).expect("parse failed");
+        let topic = prog.items.iter().find_map(|d| match d {
+            TopDecl::Topic(t) => Some(t),
+            _ => None,
+        }).expect("topic decl");
+        assert_eq!(topic.name.name, "KrakenL2");
+        assert_eq!(
+            topic.keyed_by.as_ref().map(|i| i.name.as_str()),
+            Some("sym_id")
+        );
+        assert_eq!(topic.on_unmatched, Some(UnmatchedPolicy::Swallow));
+    }
+
+    #[test]
+    fn parse_topic_keyed_by_without_on_unmatched_defaults_none() {
+        // `on_unmatched` absent → AST stores None; semantics
+        // layer treats None as Swallow at lowering time.
+        let src = r#"
+type T { id: Int; }
+topic K { payload: T; subject: "k"; keyed_by id; }
+"#;
+        let prog = parse_str(src).expect("parse");
+        let topic = prog.items.iter().find_map(|d| match d {
+            TopDecl::Topic(t) => Some(t),
+            _ => None,
+        }).expect("topic");
+        assert_eq!(topic.keyed_by.as_ref().unwrap().name, "id");
+        assert!(topic.on_unmatched.is_none());
+    }
+
+    #[test]
+    fn parse_topic_on_unmatched_fail_and_fallback() {
+        let src = r#"
+type T { id: Int; }
+topic A { payload: T; subject: "a"; keyed_by id; on_unmatched: fail; }
+topic B { payload: T; subject: "b"; keyed_by id; on_unmatched: fallback; }
+"#;
+        let prog = parse_str(src).expect("parse");
+        let topics: Vec<_> = prog
+            .items
+            .iter()
+            .filter_map(|d| match d {
+                TopDecl::Topic(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0].on_unmatched, Some(UnmatchedPolicy::Fail));
+        assert_eq!(topics[1].on_unmatched, Some(UnmatchedPolicy::Fallback));
+    }
+
+    #[test]
+    fn parse_topic_on_unmatched_unknown_policy_rejected() {
+        let src = r#"
+type T { id: Int; }
+topic K { payload: T; subject: "k"; keyed_by id; on_unmatched: yolo; }
+"#;
+        let err = parse_str(src).err().expect("expected parse error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("yolo") || msg.contains("on_unmatched"),
+            "expected unknown-policy diag, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_subscribe_with_where_key_self_field() {
+        let src = r#"
+type T { id: Int; }
+topic K { payload: T; subject: "k"; keyed_by id; }
+locus Sub {
+    params { my_id: Int = 0; }
+    bus {
+        subscribe K as on_k where key == self.my_id;
+    }
+    fn on_k(t: T) { }
+}
+fn main() { Sub { my_id: 1 }; }
+"#;
+        let prog = parse_str(src).expect("parse");
+        let sub_locus = prog.items.iter().find_map(|d| match d {
+            TopDecl::Locus(l) if l.name.name == "Sub" => Some(l),
+            _ => None,
+        }).expect("locus Sub");
+        let bus = sub_locus.members.iter().find_map(|m| match m {
+            LocusMember::Bus(b) => Some(b),
+            _ => None,
+        }).expect("bus block");
+        let sub = bus.members.iter().find_map(|m| match m {
+            BusMember::Subscribe { key_filter, .. } => Some(key_filter),
+            _ => None,
+        }).expect("subscribe");
+        match sub.as_ref().expect("key_filter") {
+            KeyFilter::Specific { .. } => { /* ok */ }
+            KeyFilter::Unmatched { .. } => panic!("expected Specific"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_with_where_key_underscore_sentinel() {
+        let src = r#"
+type T { id: Int; }
+topic K { payload: T; subject: "k"; keyed_by id; on_unmatched: fallback; }
+locus CatchAll {
+    bus { subscribe K as on_unknown where key == _; }
+    fn on_unknown(t: T) { }
+}
+fn main() { CatchAll { }; }
+"#;
+        let prog = parse_str(src).expect("parse");
+        let locus = prog.items.iter().find_map(|d| match d {
+            TopDecl::Locus(l) if l.name.name == "CatchAll" => Some(l),
+            _ => None,
+        }).expect("CatchAll");
+        let bus = locus.members.iter().find_map(|m| match m {
+            LocusMember::Bus(b) => Some(b),
+            _ => None,
+        }).unwrap();
+        let sub_kf = bus.members.iter().find_map(|m| match m {
+            BusMember::Subscribe { key_filter, .. } => Some(key_filter.clone()),
+            _ => None,
+        }).unwrap();
+        assert!(matches!(
+            sub_kf.as_ref().unwrap(),
+            KeyFilter::Unmatched { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_subscribe_without_key_filter_stays_none() {
+        // Backward-compat: subscribe without `where key ==`
+        // stores key_filter = None. Pre-existing programs are
+        // unaffected.
+        let src = r#"
+type T { n: Int; }
+topic K { payload: T; subject: "k"; }
+locus L {
+    bus { subscribe K as on_k; }
+    fn on_k(t: T) { }
+}
+fn main() { L { }; }
+"#;
+        let prog = parse_str(src).expect("parse");
+        let locus = prog.items.iter().find_map(|d| match d {
+            TopDecl::Locus(l) if l.name.name == "L" => Some(l),
+            _ => None,
+        }).unwrap();
+        let bus = locus.members.iter().find_map(|m| match m {
+            LocusMember::Bus(b) => Some(b),
+            _ => None,
+        }).unwrap();
+        let kf = bus.members.iter().find_map(|m| match m {
+            BusMember::Subscribe { key_filter, .. } => Some(key_filter.clone()),
+            _ => None,
+        }).unwrap();
+        assert!(kf.is_none());
     }
 }

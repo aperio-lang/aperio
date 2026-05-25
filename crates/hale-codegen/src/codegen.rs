@@ -9375,13 +9375,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     .members
                     .iter()
                     .map(|bm| match bm {
-                        BusMember::Subscribe { subject, handler, ty, span } => {
+                        BusMember::Subscribe { subject, handler, ty, key_filter, span } => {
                             BusMember::Subscribe {
                                 subject: subject.clone(),
                                 handler: handler.clone(),
                                 ty: ty.as_ref().map(|t| {
                                     Self::substitute_type_expr(t, subst)
                                 }),
+                                key_filter: key_filter.clone(),
                                 span: span.clone(),
                             }
                         }

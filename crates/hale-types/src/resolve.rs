@@ -609,7 +609,7 @@ fn register_locus(
             LocusMember::Bus(bb) => {
                 for bm in &bb.members {
                     match bm {
-                        BusMember::Subscribe { subject, handler, ty, span } => {
+                        BusMember::Subscribe { subject, handler, ty, span, .. } => {
                             let (subject_str, payload) = resolve_bus_subject(
                                 subject, ty.as_ref(), known, topics, diags, "subscribe",
                             );
