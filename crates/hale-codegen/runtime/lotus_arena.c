@@ -3859,10 +3859,15 @@ void lotus_coop_pool_post(lotus_coop_pool_t *p,
      * the cell almost immediately. Zero-cost on the producer
      * side — single instruction, no stall.
      *
-     * Cooperative-main bus dispatch (`lotus_bus_queue_enqueue`)
-     * gains the same hint at its enqueue site; same-pool drains
-     * tend to be cache-warm already so the win is smaller there. */
+     * Build-flag toggle (2026-05-25): set
+     * LOTUS_DISABLE_PREFETCH=1 in the build environment to
+     * compile this site out. Used by the A/B harness to
+     * isolate the prefetch's perf contribution on
+     * `bus_dispatch_cross_pool`. Default (env unset): prefetch
+     * enabled — matches shipped behavior. */
+#ifndef LOTUS_DISABLE_PREFETCH
     __builtin_prefetch(slot, 1, 3);
+#endif
     pthread_cond_broadcast(&p->not_empty);
     pthread_mutex_unlock(&p->lock);
 }

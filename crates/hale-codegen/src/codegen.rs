@@ -504,6 +504,20 @@ pub fn build_executable_with_options(
         .arg("-Wl,--wrap=realloc")
         .arg("-Wl,--wrap=calloc")
         .arg("-Wl,--wrap=mmap");
+    // F.32-4-prefetch A/B build flag (2026-05-25): set
+    // LOTUS_DISABLE_PREFETCH=1 at build time to compile the C
+    // runtime with the bus-dispatch prefetch hint stubbed out.
+    // Used for measuring the prefetch's contribution against a
+    // baseline build. Default (env unset): prefetch enabled,
+    // matches the shipped behavior. Codegen passes a clang -D
+    // when set; the runtime's __builtin_prefetch call lives
+    // under #ifndef LOTUS_DISABLE_PREFETCH.
+    if std::env::var("LOTUS_DISABLE_PREFETCH")
+        .map(|v| v == "1" || v == "true" || v == "TRUE")
+        .unwrap_or(false)
+    {
+        clang.arg("-DLOTUS_DISABLE_PREFETCH=1");
+    }
     if let Some(p) = ts_shim_path.as_ref() {
         clang.arg(p);
         // Rust staticlibs depend on libdl + libm via libstd.
