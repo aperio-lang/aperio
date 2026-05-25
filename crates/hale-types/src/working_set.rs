@@ -213,6 +213,83 @@ fn nearest_tier(total_bytes: u64) -> Option<CacheTier> {
     None
 }
 
+/// F.32-2 v0.2 (2026-05-25): parse a `--target-cache` value
+/// (case-insensitive `l1` / `l2` / `l3`). Returns `None` for
+/// unrecognized values; the CLI surfaces the diagnostic with
+/// the unknown spelling.
+pub fn parse_cache_tier(s: &str) -> Option<CacheTier> {
+    match s.to_ascii_lowercase().as_str() {
+        "l1" => Some(CacheTier::L1),
+        "l2" => Some(CacheTier::L2),
+        "l3" => Some(CacheTier::L3),
+        _ => None,
+    }
+}
+
+/// F.32-2 v0.2 budget breach record: one locus that exceeds
+/// the named tier's budget. `excess_bytes` is total − budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetBreach {
+    pub locus_name: String,
+    pub total_bytes: u64,
+    pub budget_bytes: u64,
+    pub excess_bytes: u64,
+}
+
+/// F.32-2 v0.2: evaluate every locus in `map` against the
+/// named cache tier's budget. Returns the set of breaches in
+/// alphabetical locus order (matching the report's sort
+/// stability). Empty vec = clean.
+pub fn breaches_against_tier(
+    map: &BTreeMap<String, WorkingSetEstimate>,
+    tier: CacheTier,
+) -> Vec<BudgetBreach> {
+    let budget = tier.budget_bytes();
+    map.iter()
+        .filter_map(|(name, est)| {
+            let total = est.total();
+            if total > budget {
+                Some(BudgetBreach {
+                    locus_name: name.clone(),
+                    total_bytes: total,
+                    budget_bytes: budget,
+                    excess_bytes: total - budget,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// F.32-2 v0.2: format a breach list as a stderr-friendly
+/// diagnostic. `severity` is "error" or "warning" — the
+/// caller picks based on whether `--strict` is set.
+pub fn render_breach_diagnostic(
+    breaches: &[BudgetBreach],
+    tier: CacheTier,
+    severity: &str,
+) -> String {
+    let mut out = String::new();
+    if breaches.is_empty() {
+        return out;
+    }
+    out.push_str(&format!(
+        "{}: {} locus(es) exceed --target-cache={} ({} B budget):\n",
+        severity,
+        breaches.len(),
+        tier.label(),
+        tier.budget_bytes(),
+    ));
+    for b in breaches {
+        out.push_str(&format!(
+            "  {}: estimated {} B (+ {} B over budget)\n",
+            b.locus_name, b.total_bytes, b.excess_bytes,
+        ));
+    }
+    out
+}
+
 struct Index<'a> {
     loci: BTreeMap<&'a str, &'a LocusDecl>,
     types: BTreeMap<&'a str, &'a TypeDecl>,
@@ -695,5 +772,72 @@ mod tests {
         // exact byte count is sensitive to ordering, which is
         // implementation detail.
         assert!(est.total() >= ARENA_OVERHEAD);
+    }
+
+    // === F.32-2 v0.2 strict-gate tests ====================
+
+    #[test]
+    fn parse_cache_tier_recognizes_canonical_labels() {
+        assert_eq!(parse_cache_tier("l1"), Some(CacheTier::L1));
+        assert_eq!(parse_cache_tier("l2"), Some(CacheTier::L2));
+        assert_eq!(parse_cache_tier("l3"), Some(CacheTier::L3));
+        // Case-insensitive — operator likely types "L1".
+        assert_eq!(parse_cache_tier("L1"), Some(CacheTier::L1));
+        assert_eq!(parse_cache_tier("L2"), Some(CacheTier::L2));
+        assert_eq!(parse_cache_tier("L3"), Some(CacheTier::L3));
+        assert_eq!(parse_cache_tier("l4"), None);
+        assert_eq!(parse_cache_tier(""), None);
+        assert_eq!(parse_cache_tier("32k"), None);
+    }
+
+    #[test]
+    fn breaches_against_tier_picks_over_budget_loci() {
+        let src = r#"
+            type Entry { k: Int; v: Int; }
+            @form(hashmap, sync = lockfree, cap = 4096)
+            locus Big {
+                capacity { pool entries of Entry indexed_by k; }
+            }
+            locus Tiny { params { x: Int = 0; } }
+            fn main() { Big { }; Tiny { }; }
+        "#;
+        let p = parse_source(src).expect("parse");
+        let map = compute_program_working_set(&p.items);
+        // Big = 64 arena + 4096 × 16 cell = 65600 B → exceeds
+        // L1 (32K) but fits L2 (512K).
+        let l1 = breaches_against_tier(&map, CacheTier::L1);
+        assert_eq!(l1.len(), 1, "got: {:?}", l1);
+        assert_eq!(l1[0].locus_name, "Big");
+        assert!(l1[0].total_bytes > l1[0].budget_bytes);
+        assert_eq!(l1[0].excess_bytes, l1[0].total_bytes - l1[0].budget_bytes);
+        // Tiny fits all tiers — no breach.
+        let l2 = breaches_against_tier(&map, CacheTier::L2);
+        assert!(l2.is_empty(), "got: {:?}", l2);
+        let l3 = breaches_against_tier(&map, CacheTier::L3);
+        assert!(l3.is_empty(), "got: {:?}", l3);
+    }
+
+    #[test]
+    fn render_breach_diagnostic_uses_severity_label() {
+        let breach = BudgetBreach {
+            locus_name: "Big".to_string(),
+            total_bytes: 100_000,
+            budget_bytes: 32 * 1024,
+            excess_bytes: 100_000 - 32 * 1024,
+        };
+        let err =
+            render_breach_diagnostic(&[breach.clone()], CacheTier::L1, "error");
+        assert!(err.starts_with("error:"), "got: {}", err);
+        assert!(err.contains("L1"), "got: {}", err);
+        assert!(err.contains("Big"), "got: {}", err);
+        let warn =
+            render_breach_diagnostic(&[breach], CacheTier::L1, "warning");
+        assert!(warn.starts_with("warning:"), "got: {}", warn);
+    }
+
+    #[test]
+    fn render_breach_diagnostic_empty_returns_empty_string() {
+        let out = render_breach_diagnostic(&[], CacheTier::L1, "error");
+        assert!(out.is_empty(), "got: {}", out);
     }
 }
