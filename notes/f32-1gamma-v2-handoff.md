@@ -1,0 +1,295 @@
+# F.32-1γ-v2 handoff — lockfree `@form(hashmap)` grow + tombstones
+
+**Date**: 2026-05-26
+**Status**: design + impl deferred. γ-v1 (fixed-cap, no remove) is
+shipped; γ-v2 adds `remove` (tombstones + compaction) and `grow`
+(no upfront `cap = N` requirement) on the lockfree CAS path.
+**Estimated effort**: 3-5 sessions; the long tail is concurrency
+validation infrastructure (tsan + relacy), not the state machine
+itself.
+
+---
+
+## What γ-v1 ships today
+
+`@form(hashmap, sync = lockfree, cap = N)` — pure CAS on a
+3-state per-cell machine (`EMPTY → CLAIMED → COMMITTED`),
+no rwlock, no mutex.
+
+Implementation: `crates/hale-codegen/runtime/lotus_arena.c`
+- `lotus_hashmap_init_lockfree` (line ~2273) — sets
+  `sync_mode = LOTUS_HASHMAP_SYNC_LOCKFREE`, allocates the
+  fixed-size slots buffer based on user's `cap = N` (rounded up
+  to next power of 2 for `& mask` probing).
+- `lotus_hashmap_set_lockfree` (line ~2622) — CAS-claim, memcpy
+  key+value, release-store COMMITTED. Probe-bounded by
+  `m->cap`; cap exhaustion is a silent drop (caller's
+  responsibility to size 2-4× peak).
+- `lotus_hashmap_get_striped` (line ~2708, reused by lockfree) —
+  spins past CLAIMED entries; reads after acquire-load on
+  state byte.
+- `lotus_hashmap_remove` (line ~2848) — for LOCKFREE, **returns 0
+  unconditionally**. The "remove is not supported" contract is
+  documented at the runtime site.
+
+Workload validation: `crates/hale-codegen/tests/fixtures/perf/
+form_hashmap_false_sharing.hl` (referenced by
+`notes/f32-cache-aware-delivery-plan.md`) measures lockfree at
+~1.30× faster than `sync = serialized` and ~2.54× faster than
+`sync = striped` on a 2-pool concurrent-write workload (4
+cores). The bench locks the discipline-picker recommendation
+in `spec/forms.md` § "Sync disciplines."
+
+## What γ-v2 adds
+
+### Tombstones + compaction (the `remove` path)
+
+The minimal extension. Add a fourth cell state
+`LOTUS_CELL_TOMBSTONE` (3) for slots whose entry has been
+removed. The state machine:
+
+```
+EMPTY ─CAS→ CLAIMED ─store→ COMMITTED ─CAS→ TOMBSTONE
+                                             │
+                                             └─CAS→ CLAIMED (reuse on set with new key)
+```
+
+Probe rules under tombstones:
+- `set` (insert path): EMPTY or TOMBSTONE both eligible for
+  claim. Same-key COMMITTED triggers the update path.
+- `get` (probe path): EMPTY terminates the probe ("not
+  present"); TOMBSTONE *continues* probing (an entry with
+  this key may live further down the probe chain, placed
+  before the tombstone was created).
+- `remove`: COMMITTED → CAS to TOMBSTONE; readers that
+  observed COMMITTED before the CAS race continue reading
+  the now-stale value, which is acceptable under the
+  release-store / acquire-load ordering.
+
+The 4-state machine fits the existing single-byte state
+header — no slot-layout change. The runtime `len` counter
+needs to distinguish "live entries" from "occupied slots
+including tombstones" so `is_empty` / `len()` stay correct;
+add a `tombstone_count` companion counter, both atomically
+maintained.
+
+**Compaction.** Backward-shift compaction (the technique
+serialized/striped use today, see `lotus_hashmap_remove_unlocked`
+line ~2725) doesn't compose with lockfree's CAS-only model —
+shifts violate the probe-chain invariant readers depend on
+without a global lock. The right shape for γ-v2 is **lazy
+compaction at grow boundaries**: when `len() + tombstone_count
+> load_factor * cap`, the grow path rebuilds the table
+without tombstones in O(cap) under the grow state machine
+(see next). Between grows, tombstones accumulate; the probe
+distance grows with tombstone density. Pick a load factor
+of 0.6 (vs. 0.7 for the other disciplines) to keep probes
+short.
+
+### Lockfree grow
+
+The interesting half. Cliff Click's
+non-blocking concurrent hashmap (NBHM) is the canonical
+reference; the state machine is:
+
+```
+PHASE 0: Single live table.
+PHASE 1 (initiated by any writer when load_factor exceeds
+threshold): A larger NEW table is allocated; the OLD table's
+slots are marked SENTINEL one CAS at a time. Writers that
+encounter a SENTINEL slot help with the migration (writing
+to NEW) before retrying their own op. Readers fall through
+from OLD to NEW.
+PHASE 2: Once every OLD slot is SENTINEL'd and migrated,
+OLD is reclaimed (epoch-based reclamation or RCU).
+```
+
+The 3-state machine extends to 5: `EMPTY / CLAIMED /
+COMMITTED / TOMBSTONE / SENTINEL`. The SENTINEL state on an
+OLD slot is the "this slot has migrated; consult NEW" signal.
+
+Memory reclamation of the OLD table is the
+non-trivial part. Two options:
+
+1. **Epoch-based reclamation (EBR).** Each writer publishes an
+   epoch counter on entry / exit; reclamation waits for all
+   epochs to advance past the migration's epoch before freeing
+   OLD. Simpler than hazard pointers, but requires every
+   reader to publish.
+2. **Quiescent-state-based reclamation (QSBR).** Reclamation
+   piggybacks on natural quiescence points (cooperative pool
+   yield, mailbox drain). The bus already has these
+   boundaries; a hashmap reclamation could ride alongside.
+   Less universal than EBR but cheaper in the hot path.
+
+QSBR fits the substrate better — the cooperative scheduler
+already has quiescence points the runtime can subscribe to.
+Document the boundaries before committing.
+
+## Why this was deferred from session start
+
+Stated in `notes/f32-session-handoff-2026-05-25.md`: needs
+tsan/relacy validation infrastructure. We don't ship under-
+contention concurrency tests today; γ-v1 went green on
+straight-line workloads and the false-sharing bench, both of
+which exercise probe + CAS but not the migration window or
+remove-races.
+
+γ-v2's state machine has correctness rules that fail
+catastrophically and silently under reorder pressure — exactly
+the class of bug a tsan/relacy run catches and a normal run
+hides for weeks. Shipping the impl without validation
+infrastructure is worse than not shipping it.
+
+## Suggested impl plan (4 sessions)
+
+### Session 1: Tombstones + remove + load factor
+
+Scope:
+- 4-state cell machine (extend `LOTUS_CELL_*` enum).
+- `lotus_hashmap_remove_lockfree` — CAS COMMITTED → TOMBSTONE.
+- `lotus_hashmap_set_lockfree` — accept TOMBSTONE as a claim
+  candidate.
+- `lotus_hashmap_get_striped` (reused for lockfree probe) —
+  continue past TOMBSTONE instead of terminating.
+- New `tombstone_count` field on `lotus_hashmap_t`; update at
+  set (decrement on tombstone-claim) and remove (increment).
+- `len()` returns `m->len - m->tombstone_count`.
+- Probe-bound check: `m->len + m->tombstone_count >= m->cap` →
+  silent drop (same as v1's "cap exhausted" path, just with
+  the tombstone count rolled in).
+
+Tests: regression suite on form_hashmap_lockfree's existing
+shape, plus a new `form_hashmap_lockfree_remove` test that
+exercises a set/remove/set cycle on the same key.
+
+End-of-session state: removes work; grow still needs upfront
+cap; load factor enforced via silent drop.
+
+### Session 2: tsan + relacy harness
+
+Scope (separate from γ-v2 implementation — the dependency
+infrastructure):
+- Pull in `cargo-tsan` (or wrap clang's `-fsanitize=thread`
+  on the runtime build) so the `cargo test --release` run
+  can be replayed with TSAN instrumentation.
+- Build a relacy harness for the lockfree state machine —
+  exhaustive interleaving search of 2-3 thread setups
+  hitting the same slot.
+- Drive existing γ-v1 tests under TSAN; expect to find at
+  least the known case where `len()` (relaxed atomic) is
+  visible-stale. Document or fix.
+- Set up CI to run `cargo test --workspace --features tsan`
+  on a separate job (slow; ~10× normal test time).
+
+End-of-session state: TSAN + relacy infrastructure
+operational; γ-v1 passes; γ-v2 ready to validate.
+
+### Session 3: lockfree grow state machine
+
+Scope:
+- 5-state cell machine (extend with SENTINEL).
+- `lotus_hashmap_grow_lockfree` — allocate OLD-doubled NEW;
+  per-slot migration via CAS-OLD→SENTINEL + write-to-NEW.
+- Writers that encounter SENTINEL: help migrate the OLD slot
+  (one CAS), retry their own op against NEW.
+- Readers that encounter SENTINEL: fall through to NEW.
+- Memory reclamation: stub via "leak on dissolve" for v0 of
+  the grow impl. Real reclamation (EBR or QSBR) is Session 4.
+
+Tests: stress test driving 4 threads × 100k ops at load factor
+hovering around the grow threshold. Validate under TSAN
++ relacy harness from session 2.
+
+End-of-session state: grow works; pre-grow OLD tables leak
+until dissolve.
+
+### Session 4: epoch reclamation
+
+Scope:
+- Wire QSBR through the cooperative scheduler. Each pool's
+  yield point publishes its epoch; the hashmap migration
+  records the epoch at SENTINEL completion; reclamation
+  waits for global epoch to advance past that record.
+- Free OLD on epoch advancement.
+- Bench: confirm sustained-write workload without RSS growth
+  over 60s.
+
+End-of-session state: γ-v2 ships.
+
+## Open design questions
+
+1. **Tombstone density threshold for grow trigger.** The grow
+   path is triggered by `live + tombstones > load_factor *
+   cap`. Setting load_factor too low triggers grow too often
+   (allocator pressure); too high lets tombstones accumulate
+   and probe distances grow. Workload-dependent. Start at 0.6,
+   bench against the false_sharing perf fixture, and
+   document the sensitivity.
+
+2. **Probe ordering under TOMBSTONE.** Today's probe is
+   linear (`i = (i + 1) & mask`). Linear probing under
+   tombstones is well-studied but adversarial input can
+   cluster tombstones. Robin Hood probing or quadratic
+   probing both fix this but neither has been validated
+   under lockfree pressure. Stick with linear for v0.2;
+   revisit if a workload surfaces clustering.
+
+3. **`cap` annotation behavior after grow ships.** Currently
+   `cap = N` is REQUIRED for `sync = lockfree`. After grow
+   ships, `cap = N` becomes an *initial-size hint* like the
+   other disciplines have. Question: keep `cap` required (so
+   user is forced to think about initial size) or make it
+   optional? Lean optional — matches the other disciplines'
+   surface.
+
+4. **Reader's view of removed entries.** A reader that observed
+   COMMITTED before a concurrent CAS to TOMBSTONE returns
+   the value. Documented behavior or bug? Document. The
+   "key was present at the moment we read" semantic is
+   the natural lockfree consistency model.
+
+5. **Compound-key support post-grow.** Today's lockfree
+   restricts to scalar keys (Int / Decimal / Time / etc.)
+   per the routing-key v0.1 surface. The grow / migration
+   path doesn't depend on key shape, but the bench harness
+   should cover at least Int + Decimal keys.
+
+## Where to look
+
+| Concern | File | Approximate lines |
+|---|---|---|
+| Sync mode enum | `crates/hale-codegen/runtime/lotus_arena.c` | 2042 |
+| `lotus_hashmap_init_lockfree` | `crates/hale-codegen/runtime/lotus_arena.c` | 2273 |
+| `lotus_hashmap_set_lockfree` | `crates/hale-codegen/runtime/lotus_arena.c` | 2622 |
+| `lotus_hashmap_get_striped` (shared probe) | `crates/hale-codegen/runtime/lotus_arena.c` | 2708 |
+| `lotus_hashmap_remove` (lockfree no-op stub) | `crates/hale-codegen/runtime/lotus_arena.c` | 2848 |
+| Cell state constants | `crates/hale-codegen/runtime/lotus_arena.c` | search `LOTUS_CELL_EMPTY` |
+| Spec surface | `spec/forms.md` § "Sync disciplines" | 685-739 |
+| Original γ design notes | `notes/f32-cache-aware-delivery-plan.md` § F.32-1γ | 440-503 |
+| Perf bench | `crates/hale-codegen/tests/fixtures/perf/form_hashmap_false_sharing.hl` | — |
+
+## Acceptance criteria
+
+A "fixed" γ-v2 means:
+
+1. `lotus_hashmap_remove` with `sync_mode == LOCKFREE` succeeds
+   on a present key, no-ops on a missing key, and a
+   subsequent `set(K, V)` of the same key works.
+2. `len()` reflects `live - tombstones` correctly under
+   concurrent set/remove.
+3. `cap = N` is optional on `sync = lockfree`; without it,
+   the map starts at the default initial cap and grows as
+   needed. Existing programs declaring `cap = N` get that
+   value as the initial-size hint.
+4. TSAN run over the routing-keys + form_hashmap_lockfree
+   test suite reports zero data races.
+5. Relacy harness for the 5-state machine exhaustively
+   explores 2-3 thread interleavings on the same slot with
+   no liveness violations.
+6. Sustained-write bench (60s at 100k ops/s per pool, 4 pools)
+   stays at flat RSS post-warmup. No OLD-table leaks visible
+   in `lotus_arena_residency_dump`.
+
+When (1)-(6) all hold, ship and remove the "v1: no remove, no
+grow" caveat from `spec/forms.md`.
