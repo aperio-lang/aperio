@@ -281,6 +281,152 @@ fn unkeyed_topic_legacy_dispatch_unchanged() {
     assert!(stdout.contains("B n=7"), "got: {:?}", stdout);
 }
 
+/// `on_unmatched: fallback` policy. A subscriber declared with
+/// `where key == _` catches messages whose key didn't match any
+/// specific-key subscriber. When a specific-key subscriber DOES
+/// match, the catch-unmatched does not fire.
+#[test]
+fn fallback_policy_catches_unmatched_keys() {
+    let src = r#"
+        type Ev { id: Int; tag: String; }
+        topic K {
+            payload: Ev;
+            subject: "k";
+            keyed_by id;
+            on_unmatched: fallback;
+        }
+        locus Specific {
+            params { my_id: Int = 0; }
+            bus { subscribe K as on_k where key == self.my_id; }
+            fn on_k(e: Ev) {
+                println("specific id=", e.id, " tag=", e.tag);
+            }
+        }
+        locus CatchAll {
+            bus { subscribe K as on_unknown where key == _; }
+            fn on_unknown(e: Ev) {
+                println("catchall id=", e.id, " tag=", e.tag);
+            }
+        }
+        main locus App {
+            params {
+                s1: Specific = Specific { my_id: 1 };
+                s2: Specific = Specific { my_id: 2 };
+                catch: CatchAll = CatchAll { };
+            }
+            bus { publish K; }
+            run() {
+                K <- Ev { id: 1, tag: "a" };
+                K <- Ev { id: 999, tag: "stray" };
+                K <- Ev { id: 2, tag: "b" };
+                K <- Ev { id: 42, tag: "rare" };
+            }
+        }
+        fn main() { App { }; }
+    "#;
+    let bin = build("fallback_catches_unmatched", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let specific_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|ln| ln.starts_with("specific "))
+        .collect();
+    let catchall_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|ln| ln.starts_with("catchall "))
+        .collect();
+    // s1 sees id=1, s2 sees id=2 → 2 specific lines total.
+    assert_eq!(
+        specific_lines.len(),
+        2,
+        "specific subs should fire on id=1 and id=2; got {:?}",
+        specific_lines
+    );
+    // catchall sees id=999 and id=42 (the unmatched ones).
+    assert_eq!(
+        catchall_lines.len(),
+        2,
+        "catchall should fire on the 2 unmatched publishes (id=999, \
+         id=42); got {:?}",
+        catchall_lines
+    );
+    // Make sure catchall did NOT fire on the matched publishes.
+    for ln in &catchall_lines {
+        assert!(
+            ln.contains("tag=stray") || ln.contains("tag=rare"),
+            "catchall picked up a matched-key publish: {}",
+            ln
+        );
+    }
+}
+
+/// `where key == _` on a non-fallback topic is rejected at
+/// typecheck. The diag cites the policy mismatch.
+#[test]
+fn fallback_sentinel_rejected_on_non_fallback_topic() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K { payload: Ev; subject: "k"; keyed_by id; }
+        locus L {
+            bus { subscribe K as on_k where key == _; }
+            fn on_k(e: Ev) { }
+        }
+        fn main() { L { }; }
+    "#;
+    // This goes through the typecheck pipeline. The compiler-
+    // level error surface manifests as a build failure with a
+    // diagnostic referencing the policy mismatch.
+    let program = hale_syntax::parse_source(src).expect("parse");
+    let mut programs = std::collections::BTreeMap::new();
+    programs.insert("main".to_string(), &program);
+    let bundle = hale_types::Bundle { programs };
+    let (scope, _) = hale_types::resolve::build_top_scope(&bundle);
+    let diags = hale_types::check::check_bundle(&bundle, &scope);
+    assert!(
+        diags.iter().any(|d| {
+            d.message.contains("where key == _")
+                && d.message.contains("on_unmatched: fallback")
+        }),
+        "expected fallback-policy diag, got: {:?}",
+        diags
+    );
+}
+
+/// `on_unmatched: fallback` topic without any `_` subscriber is
+/// rejected.
+#[test]
+fn fallback_topic_without_catchall_rejected() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K {
+            payload: Ev; subject: "k"; keyed_by id;
+            on_unmatched: fallback;
+        }
+        locus L {
+            params { my_id: Int = 0; }
+            bus { subscribe K as on_k where key == self.my_id; }
+            fn on_k(e: Ev) { }
+        }
+        fn main() { L { my_id: 1 }; }
+    "#;
+    let program = hale_syntax::parse_source(src).expect("parse");
+    let mut programs = std::collections::BTreeMap::new();
+    programs.insert("main".to_string(), &program);
+    let bundle = hale_types::Bundle { programs };
+    let (scope, _) = hale_types::resolve::build_top_scope(&bundle);
+    let diags = hale_types::check::check_bundle(&bundle, &scope);
+    assert!(
+        diags.iter().any(|d| {
+            d.message.contains("on_unmatched: fallback")
+                && d.message.contains("no subscriber declares")
+        }),
+        "expected missing-catchall diag, got: {:?}",
+        diags
+    );
+}
+
 /// Literal-key filter (no self.field involved). `where key == 1`
 /// pins the subscriber to that specific value regardless of
 /// instance state.

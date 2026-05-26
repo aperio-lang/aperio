@@ -7076,19 +7076,16 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         match key_filter {
             None => Ok((0, i64_t.const_zero(), i64_t.const_zero())),
             Some(KeyFilter::Unmatched { .. }) => {
-                // The typecheck for v0.1 of the impl rejects
-                // `on_unmatched: fallback`, so we shouldn't
-                // see `_` filters in practice. If one slips
-                // through (e.g., a fixture written ahead of the
-                // policy impl), reject loudly rather than emit
-                // a half-wired filter.
-                Err(CodegenError::Unsupported(format!(
-                    "subscribe `{}` uses `where key == _` but the \
-                     `on_unmatched: fallback` policy is not yet \
-                     implemented (v0.1 of routing-keys impl ships \
-                     swallow only)",
-                    subject
-                )))
+                // Phase 3 fallback policy (2026-05-25): register
+                // with key_filter_kind=2. The runtime's keyed-
+                // dispatch second-pass fires kind=2 entries when
+                // no specific-key (kind=1) match was found.
+                // Typecheck has already validated that this
+                // subscribe targets a `on_unmatched: fallback`
+                // topic; codegen trusts that contract.
+                let _ = self_ptr;
+                let _ = subject;
+                Ok((2, i64_t.const_zero(), i64_t.const_zero()))
             }
             Some(KeyFilter::Specific { expr, .. }) => {
                 // Lower the EXPR. `lower_expr` reads `self.X`

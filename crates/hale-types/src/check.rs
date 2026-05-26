@@ -173,6 +173,11 @@ pub fn check_bundle(bundle: &Bundle<'_>, top: &TopScope) -> Vec<Diag> {
     //   - bindings entries reference declared topics
     //   - duplicate bindings for the same topic are forbidden
     check_main_and_bindings(bundle, top, &mut diags);
+    // Phase 3 routing-keys (2026-05-25): bundle-level checks
+    //   - `on_unmatched: fallback` topics must have at least one
+    //     `where key == _` subscriber program-wide.
+    //   - `where key == _` is only legal on fallback topics.
+    check_phase3_fallback_subscribers(bundle, &mut diags);
     // F.31 Phase 5: single-threaded-method invariant. Walks
     // method bodies looking for cross-pool `self.X.foo()` calls
     // where X's locus type is placed on a different pool than
@@ -1092,6 +1097,137 @@ fn transport_satisfies(
     }
 }
 
+/// Phase 3 routing-keys (2026-05-25): cross-program checks for
+/// the `fallback` policy.
+///
+/// * Every topic declared `on_unmatched: fallback` must have at
+///   least one `where key == _` subscriber in the program.
+///   Otherwise unmatched-key publishes would have nowhere to go
+///   and the fallback policy is silently degraded to swallow.
+/// * `where key == _` is only legal on topics that explicitly
+///   declared `on_unmatched: fallback`. Using it on swallow or
+///   unkeyed topics catches programmer typos.
+///
+/// Subscribers reference topics by either name (`subscribe K as
+/// h`) or literal subject (`subscribe "k" as h of type T`). We
+/// validate both forms; for literal subjects we look up the topic
+/// by its wire subject string.
+fn check_phase3_fallback_subscribers(
+    bundle: &Bundle<'_>,
+    diags: &mut Vec<Diag>,
+) {
+    // Collect all topics with their on_unmatched policy + wire
+    // subject. Indexed by both topic name and wire subject so
+    // subscribe-by-string can resolve.
+    let mut by_name: BTreeMap<String, (Option<UnmatchedPolicy>, Span)> =
+        BTreeMap::new();
+    let mut by_wire: BTreeMap<String, (Option<UnmatchedPolicy>, Span)> =
+        BTreeMap::new();
+    for program in bundle.programs.values() {
+        for item in &program.items {
+            if let TopDecl::Topic(t) = item {
+                by_name.insert(
+                    t.name.name.clone(),
+                    (t.on_unmatched, t.span),
+                );
+                let wire = t
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| t.name.name.clone());
+                by_wire.insert(wire, (t.on_unmatched, t.span));
+            }
+        }
+    }
+
+    // Walk every subscriber. For each `where key == _` filter,
+    // resolve the topic and validate it's a fallback topic.
+    // Track which fallback topics have at least one `_` sub.
+    let mut fallback_has_catchall: BTreeMap<String, bool> = BTreeMap::new();
+    for (name, (policy, _)) in &by_name {
+        if matches!(policy, Some(UnmatchedPolicy::Fallback)) {
+            fallback_has_catchall.insert(name.clone(), false);
+        }
+    }
+    for program in bundle.programs.values() {
+        for item in &program.items {
+            let TopDecl::Locus(l) = item else { continue };
+            for m in &l.members {
+                let LocusMember::Bus(bb) = m else { continue };
+                for bm in &bb.members {
+                    let BusMember::Subscribe { subject, key_filter, .. } = bm
+                    else {
+                        continue;
+                    };
+                    let Some(kf) = key_filter else { continue };
+                    let is_catchall = matches!(kf, KeyFilter::Unmatched { .. });
+                    if !is_catchall {
+                        continue;
+                    }
+                    let (topic_key, policy) = match subject {
+                        BusSubject::Topic(i) => (
+                            i.name.clone(),
+                            by_name.get(&i.name).map(|x| x.0).flatten(),
+                        ),
+                        BusSubject::Literal { subject: s, .. } => (
+                            s.clone(),
+                            by_wire.get(s).map(|x| x.0).flatten(),
+                        ),
+                        BusSubject::QualifiedTopic(qn) => {
+                            let last = qn
+                                .segments
+                                .last()
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default();
+                            (
+                                last.clone(),
+                                by_name.get(&last).map(|x| x.0).flatten(),
+                            )
+                        }
+                    };
+                    if !matches!(policy, Some(UnmatchedPolicy::Fallback)) {
+                        diags.push(Diag::ty(
+                            kf.span(),
+                            format!(
+                                "`where key == _` is only legal on \
+                                 topics declared `on_unmatched: \
+                                 fallback`; topic `{}` declares {}",
+                                topic_key,
+                                match policy {
+                                    Some(UnmatchedPolicy::Swallow) =>
+                                        "`on_unmatched: swallow`",
+                                    Some(UnmatchedPolicy::Fail) =>
+                                        "`on_unmatched: fail`",
+                                    Some(UnmatchedPolicy::Fallback) =>
+                                        unreachable!(),
+                                    None => "no `on_unmatched` (default: \
+                                             swallow)",
+                                },
+                            ),
+                        ));
+                    } else {
+                        fallback_has_catchall.insert(topic_key, true);
+                    }
+                }
+            }
+        }
+    }
+    for (name, has) in &fallback_has_catchall {
+        if *has {
+            continue;
+        }
+        let span = by_name.get(name).map(|(_, s)| *s).unwrap_or(Span::new(0, 0));
+        diags.push(Diag::ty(
+            span,
+            format!(
+                "topic `{}` declares `on_unmatched: fallback` but \
+                 no subscriber declares `where key == _`; \
+                 unmatched-key publishes would have nowhere to go",
+                name
+            ),
+        ));
+    }
+}
+
 fn check_main_and_bindings(
     bundle: &Bundle<'_>,
     top: &TopScope,
@@ -1535,27 +1671,27 @@ impl<'a> Checker<'a> {
                 // at bus-block and send sites that reference the
                 // topic. Below: Phase-3 specific static checks.
 
-                // (5) / (6): on_unmatched: fail | fallback land in
-                // a follow-up impl slice. Today's impl ships
-                // `swallow` only — match the spec surface but
-                // diagnose pending support so users know what's
-                // wired vs. what's still on the to-do.
+                // (5) on_unmatched: fail — pending impl. The v0.2
+                // policy turns publish into a fallible expression
+                // (`K <- value or raise`); the parser surface for
+                // that grammar extension and the BusUnmatchedKey
+                // err payload synthesis haven't landed yet. Keep
+                // the diag so users don't write fail-topic code
+                // ahead of the impl.
                 match t.on_unmatched {
                     Some(UnmatchedPolicy::Fail) => {
                         self.diags.push(Diag::ty(
                             t.span,
                             "`on_unmatched: fail` is in the v0.1 \
                              spec but not yet implemented; the \
-                             impl ships `swallow` first",
+                             impl ships `swallow` + `fallback` \
+                             first",
                         ));
                     }
                     Some(UnmatchedPolicy::Fallback) => {
-                        self.diags.push(Diag::ty(
-                            t.span,
-                            "`on_unmatched: fallback` is in the \
-                             v0.1 spec but not yet implemented; \
-                             the impl ships `swallow` first",
-                        ));
+                        // (6) Validated below in
+                        // check_fallback_catchall_subscriber after
+                        // we've collected the full subscribe set.
                     }
                     Some(UnmatchedPolicy::Swallow) | None => {}
                 }
