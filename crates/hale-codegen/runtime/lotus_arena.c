@@ -2248,12 +2248,9 @@ typedef struct {
      *     spin-waits for `lf_writers_in_flight` to drain. Once
      *     drained, it owns the table exclusively: allocates NEW,
      *     copies COMMITTED entries (tombstones drop), swaps
-     *     m->slots/cap, stores grow_phase = 0.
-     *   - The old slots buffer is held on `lf_old_slots` and
-     *     freed on the NEXT grow (by which point all readers
-     *     from before THAT grow have drained) or at dissolve.
-     *     Session 4 replaces this stash-then-free with QSBR
-     *     epoch-based reclamation.
+     *     m->slots/cap, frees OLD eagerly (session 4 — the
+     *     drain-wait guarantees no in-flight op references OLD),
+     *     stores grow_phase = 0.
      *
      * Fields:
      *   lf_grow_phase: 0 = idle (hot path lockfree), 1 = grow
@@ -2262,21 +2259,12 @@ typedef struct {
      *                  that hold a stale m->slots / m->cap
      *                  snapshot. Grower waits for this to reach
      *                  zero before swapping.
-     *   lf_old_slots:  previous slots buffer (post-swap). Held
-     *                  one generation so concurrent ops with a
-     *                  stale snapshot don't read freed memory.
-     *                  Freed on next grow or dissolve.
-     *   lf_old_cap:    cap companion for lf_old_slots
-     *                  (informational; freeing only needs the
-     *                  pointer).
      *
      * NONE/SERIALIZED/STRIPED disciplines never touch these
      * fields — they use their own grow paths
      * (`lotus_hashmap_grow` via the lock pair). */
     int lf_grow_phase;
     int64_t lf_writers_in_flight;
-    char *lf_old_slots;
-    size_t lf_old_cap;
 } lotus_hashmap_t;
 
 static size_t lotus_hashmap_entry_size(const lotus_hashmap_t *m) {
@@ -2370,8 +2358,6 @@ void lotus_hashmap_init(void *map_ptr,
      * default; only the lockfree discipline mutates these. */
     m->lf_grow_phase = 0;
     m->lf_writers_in_flight = 0;
-    m->lf_old_slots = NULL;
-    m->lf_old_cap = 0;
 }
 
 /* F.32-1α (2026-05-24): sync = serialized variant. Same init
@@ -2882,22 +2868,39 @@ static void lotus_hashmap_grow_lockfree(lotus_hashmap_t *m) {
     /* Atomic-store the new slots/cap so any future reader
      * loading via __atomic_load_n sees a consistent pair.
      * (No in-flight reader exists right now; the stores are
-     * just for memory-ordering correctness on later loads.) */
+     * just for memory-ordering correctness on later loads —
+     * lf_enter's grow_phase re-check guarantees subsequent
+     * ops see grow_phase=0 only AFTER they'd see the new
+     * slots/cap via the release-store sequencing.) */
     __atomic_store_n(&m->slots, new_slots, __ATOMIC_RELEASE);
     __atomic_store_n(&m->cap, new_cap, __ATOMIC_RELEASE);
     /* Iterator cursor is invalidated by the rebuild — its
      * cached slot index no longer maps onto m->slots. */
     m->cursor_i = -1;
     m->cursor_slot = 0;
-    /* One-generation hold on OLD: free the PREVIOUS stash (no
-     * op from before THAT grow can still be in flight, since
-     * its drain-wait completed before THIS grow even started).
-     * Stash the current OLD for the next grow / dissolve. */
-    if (m->lf_old_slots) {
-        free(m->lf_old_slots);
-    }
-    m->lf_old_slots = old_slots;
-    m->lf_old_cap = old_cap;
+    /* F.32-1γ-v2 session 4 (2026-05-26): free OLD eagerly.
+     *
+     * Initially session 3 stashed OLD on `lf_old_slots` and
+     * freed it at the NEXT grow (one-generation hold). The
+     * stash was defensive: if any in-flight op could still
+     * hold a stale pointer to OLD, freeing immediately would
+     * be use-after-free. But the writers_in_flight drain above
+     * already guarantees no such op exists — every lockfree
+     * entry point brackets itself with lf_enter/lf_exit, and
+     * the drain spun until the counter reached zero. After
+     * the drain, OLD has zero live references.
+     *
+     * Removing the stash means a sustained-write workload
+     * that triggers multiple grows holds only the CURRENT
+     * table (no extra cap/2 bytes carried per generation).
+     * RSS stays bounded by the current table size + the
+     * brief peak during migration (OLD + NEW both alive for
+     * the duration of `lf_migrate`). This is the result the
+     * handoff doc's QSBR design was reaching for — our
+     * simpler single-grower protocol gives it directly,
+     * without epoch tracking through the cooperative
+     * scheduler. */
+    free(old_slots);
     __atomic_store_n(&m->lf_grow_phase, 0, __ATOMIC_RELEASE);
 }
 
@@ -3598,20 +3601,6 @@ void lotus_hashmap_destroy(void *map_ptr) {
             break;
         default:
             break;
-    }
-    /* F.32-1γ-v2 session 3 (2026-05-26): free the stashed OLD
-     * slots buffer held one generation by the grow path. Safe
-     * to free here unconditionally — by dissolve time no
-     * lockfree op can be in flight (the locus owns the map and
-     * dissolve happens after all locus methods return). For
-     * non-lockfree disciplines lf_old_slots stays NULL and
-     * the free is a no-op. Session 4 replaces this with QSBR
-     * epoch-based reclamation across grow boundaries; the
-     * dissolve-time free of the most-recent OLD remains. */
-    if (m->lf_old_slots) {
-        free(m->lf_old_slots);
-        m->lf_old_slots = NULL;
-        m->lf_old_cap = 0;
     }
     m->sync_mode = LOTUS_HASHMAP_SYNC_NONE;
     free(m->slots);

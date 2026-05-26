@@ -11387,8 +11387,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     //   tombstone_count: i64 — lockfree tombstones (F.32-1γ-v2 session 1)
                     //   lf_grow_phase: i32 — lockfree grow phase 0/1 (F.32-1γ-v2 session 3)
                     //   lf_writers_in_flight: i64 — in-flight lockfree op count
-                    //   lf_old_slots: ptr  — stash for previous OLD table (4-byte pad before)
-                    //   lf_old_cap: i64    — companion for lf_old_slots
                     //
                     // Plain @form(hashmap) zeros sync_mode / mu /
                     // mu_grow at init; sets cell_stride to the
@@ -11412,8 +11410,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                             i64_t.into(),  // tombstone_count (F.32-1γ-v2 session 1)
                             i32_t.into(),  // lf_grow_phase (F.32-1γ-v2 session 3)
                             i64_t.into(),  // lf_writers_in_flight (4-byte pad inserted before)
-                            ptr_t.into(),  // lf_old_slots
-                            i64_t.into(),  // lf_old_cap
                         ],
                         false,
                     );

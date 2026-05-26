@@ -766,11 +766,17 @@ load + branch-not-taken — measurably cheaper than the
 NBHM-style 5-state CAS-on-every-probe. The trade-off is
 tail latency on the writer that triggers grow (bounded by
 the migration's O(cap) walk, ~ms for caps up to ~100k) and
-brief stalls on all concurrent ops during that window. The
-old slots buffer is held one generation and freed at the
-next grow or at locus dissolve (session 4 will replace this
-with QSBR epoch reclamation for a flat-RSS sustained-write
-profile).
+brief stalls on all concurrent ops during that window.
+
+The OLD slots buffer is freed eagerly at the end of the
+migration (γ-v2 session 4). The drain-wait already guarantees
+no in-flight op holds a stale pointer to OLD when grow
+completes, so the use-after-free risk that the handoff doc's
+QSBR design was meant to solve doesn't exist in this single-
+grower variant — QSBR epoch tracking would be redundant. RSS
+post-warmup is bounded by the current table size plus the
+brief migration-window peak (OLD + NEW both alive for the
+~ms duration of `lf_migrate`).
 
 Cross-pool method calls into a `@form(hashmap, sync = ...)`
 receiver are accepted without diagnostic — the chosen

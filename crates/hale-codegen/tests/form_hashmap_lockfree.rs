@@ -504,3 +504,59 @@ fn lockfree_grow_drops_tombstones() {
     assert!(stdout.contains("v99=1099"), "re-inserted entry must take new value; got: {:?}", stdout);
     assert!(stdout.contains("v150=150"), "preserved entry from initial insert; got: {:?}", stdout);
 }
+
+#[test]
+fn lockfree_many_grow_cycles_no_use_after_free() {
+    // γ-v2 session 4: with the simplified grow design (OLD freed
+    // eagerly after migration), a sustained-write workload that
+    // triggers many grow cycles must not crash, leak, or lose
+    // entries. The drain-wait in grow guarantees no in-flight op
+    // references OLD at free time, so the eager-free is safe.
+    //
+    // 10k entries into cap=8 forces ~10 grow cycles (8 → 16 → 32
+    // → 64 → ... → 16384). At each grow the OLD buffer is
+    // free()'d before the grower releases lf_grow_phase. RSS
+    // stays bounded by the current table size + the brief peak
+    // during migration (OLD + NEW both live for the duration of
+    // lf_migrate, ~ms).
+    let src = r#"
+        type Counter { id: Int; v: Int; }
+
+        @form(hashmap, sync = lockfree, cap = 8)
+        locus Registry {
+            capacity { pool entries of Counter indexed_by id; }
+        }
+
+        main locus App {
+            params { reg: Registry = Registry { }; }
+            run() {
+                let mut i = 0;
+                while i < 10000 {
+                    self.reg.set(Counter { id: i, v: i });
+                    i = i + 1;
+                }
+                print("len="); println(self.reg.len());
+                // Sweep all entries to confirm none lost across grows.
+                let mut j = 0;
+                let mut sum = 0;
+                while j < 10000 {
+                    let e = self.reg.get(j) or raise;
+                    sum = sum + e.v;
+                    j = j + 1;
+                }
+                print("sum="); println(sum);
+            }
+        }
+
+        fn main() { App { }; }
+    "#;
+    let (stdout, status) = build_and_run("many_grows", src);
+    assert!(
+        status.success(),
+        "binary exited non-zero (probable use-after-free): {:?}\nstdout: {}",
+        status, stdout,
+    );
+    assert!(stdout.contains("len=10000"), "all entries preserved across grows; got: {:?}", stdout);
+    // Sum of i for i in 0..10000 = 10000 * 9999 / 2 = 49995000.
+    assert!(stdout.contains("sum=49995000"), "values preserved across grows; got: {:?}", stdout);
+}
