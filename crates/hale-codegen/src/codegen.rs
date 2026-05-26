@@ -7336,6 +7336,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // (#68 — IoError flip). Mirror of the typecheck-side
         // injection alongside the other error types.
         self.declare_builtin_io_error_type();
+        // Phase 3 routing-keys v0.2 (2026-05-26): BusUnmatchedKey
+        // err payload for `on_unmatched: fail` publishes that
+        // route through `or handler(err)` / `or fail <p>` /
+        // `or <substitute>` dispositions.
+        self.declare_builtin_bus_unmatched_key_type();
         // 2026-05-17 — `ParseError` payload for the
         // `std::str::parse_int` / `parse_float` fallible flip.
         self.declare_builtin_parse_error_type();
@@ -9115,6 +9120,48 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         struct_ty.set_body(&llvm_field_tys, false);
         self.user_types.insert(
             "KeyError".to_string(),
+            TypeInfo {
+                struct_ty,
+                fields,
+                field_order,
+                defaults: BTreeMap::new(),
+            },
+        );
+    }
+
+    /// Phase 3 routing-keys v0.2 (2026-05-26): register the
+    /// built-in `BusUnmatchedKey` record. Fields:
+    ///   - subject: String  (the wire subject of the publish)
+    ///   - key_lo: Int      (low 64 bits of the unmatched key)
+    ///   - key_hi: Int      (high 64 bits; 0 for i64 keys)
+    /// Allocated in the failing publish's `or handler(err)` /
+    /// `or fail <p>` codegen branch when
+    /// lotus_bus_dispatch_keyed_fallible returns 0. Mirror of
+    /// `inject_bus_unmatched_key_type` in
+    /// hale-types/src/resolve.rs.
+    fn declare_builtin_bus_unmatched_key_type(&mut self) {
+        if self.user_types.contains_key("BusUnmatchedKey") {
+            return;
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let mut fields: BTreeMap<String, (u32, CodegenTy)> = BTreeMap::new();
+        fields.insert("subject".into(), (0, CodegenTy::String));
+        fields.insert("key_lo".into(), (1, CodegenTy::Int));
+        fields.insert("key_hi".into(), (2, CodegenTy::Int));
+        let field_order = vec![
+            "subject".to_string(),
+            "key_lo".to_string(),
+            "key_hi".to_string(),
+        ];
+        let llvm_field_tys: Vec<inkwell::types::BasicTypeEnum> =
+            vec![ptr_t.into(), i64_t.into(), i64_t.into()];
+        let struct_ty = self
+            .context
+            .opaque_struct_type("type.BusUnmatchedKey");
+        struct_ty.set_body(&llvm_field_tys, false);
+        self.user_types.insert(
+            "BusUnmatchedKey".to_string(),
             TypeInfo {
                 struct_ty,
                 fields,
@@ -20441,6 +20488,84 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .build_store(kind_field_ptr, kind_str_ptr)
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
 
+        Ok(alloc_ptr)
+    }
+
+    /// Phase 3 routing-keys v0.2 (2026-05-26): allocate a
+    /// `BusUnmatchedKey { subject: String, key_lo: Int, key_hi:
+    /// Int }` in the current arena, populated with the publish
+    /// site's subject + key values. Used by `lower_send`'s fail-
+    /// policy `or handler(err)` / `or fail <p>` codegen branches
+    /// to materialize the err payload before lowering the
+    /// disposition expression with `err` bound in scope.
+    fn build_alloc_bus_unmatched_key(
+        &mut self,
+        subject_ptr: PointerValue<'ctx>,
+        key_lo: IntValue<'ctx>,
+        key_hi: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, CodegenError> {
+        let info = self
+            .user_types
+            .get("BusUnmatchedKey")
+            .cloned()
+            .expect("BusUnmatchedKey declared by declare_builtin_*");
+        let size = info
+            .struct_ty
+            .size_of()
+            .expect("BusUnmatchedKey has known size");
+        let alloc_ptr =
+            self.arena_alloc(size, "BusUnmatchedKey.alloc")?;
+        let (subj_idx, _) = info
+            .fields
+            .get("subject")
+            .cloned()
+            .expect("BusUnmatchedKey.subject field");
+        let subj_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                subj_idx,
+                "BusUnmatchedKey.subject.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(subj_field_ptr, subject_ptr)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let (lo_idx, _) = info
+            .fields
+            .get("key_lo")
+            .cloned()
+            .expect("BusUnmatchedKey.key_lo field");
+        let lo_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                lo_idx,
+                "BusUnmatchedKey.key_lo.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(lo_field_ptr, key_lo)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let (hi_idx, _) = info
+            .fields
+            .get("key_hi")
+            .cloned()
+            .expect("BusUnmatchedKey.key_hi field");
+        let hi_field_ptr = self
+            .builder
+            .build_struct_gep(
+                info.struct_ty,
+                alloc_ptr,
+                hi_idx,
+                "BusUnmatchedKey.key_hi.ptr",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_store(hi_field_ptr, key_hi)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(alloc_ptr)
     }
 
@@ -39923,15 +40048,196 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         // the return value.
                         let _ = matched;
                     }
-                    Some(OrDisposition::Substitute(_))
-                    | Some(OrDisposition::Fail(_, _)) => {
-                        return Err(CodegenError::Unsupported(
-                            "v0.1 of routing-key fail policy only \
-                             supports `or raise` and `or discard` \
-                             dispositions; typecheck should have \
-                             caught this"
-                                .to_string(),
-                        ));
+                    Some(OrDisposition::Substitute(rhs)) => {
+                        // v0.2 (2026-05-26): on no-match, allocate
+                        // a BusUnmatchedKey err payload, bind it
+                        // as `err` in scope, and lower the RHS as
+                        // a statement (Send is statement-level so
+                        // the substitute's value is discarded).
+                        let cond = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                matched,
+                                i32_t.const_zero(),
+                                "bus.fail.no_match",
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let current_fn = self
+                            .builder
+                            .get_insert_block()
+                            .and_then(|bb| bb.get_parent())
+                            .expect("inside a function");
+                        let nomatch_bb = self.context.append_basic_block(
+                            current_fn,
+                            "bus.fail.substitute",
+                        );
+                        let cont_bb = self.context.append_basic_block(
+                            current_fn,
+                            "bus.fail.cont",
+                        );
+                        self.builder
+                            .build_conditional_branch(
+                                cond, nomatch_bb, cont_bb,
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder.position_at_end(nomatch_bb);
+                        let err_struct_ptr = self
+                            .build_alloc_bus_unmatched_key(
+                                subj_val.into_pointer_value(),
+                                key_lo,
+                                key_hi,
+                            )?;
+                        // Scope locals for TypeRef expect a slot
+                        // alloca that HOLDS the struct pointer
+                        // (one level of indirection), not the
+                        // struct pointer directly. Allocate a
+                        // pointer-slot and store the struct ptr
+                        // into it.
+                        let err_slot = self.alloca_for(
+                            &CodegenTy::TypeRef(
+                                "BusUnmatchedKey".to_string(),
+                            ),
+                            "bus.fail.err.slot",
+                        )?;
+                        self.builder
+                            .build_store(err_slot, err_struct_ptr)
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let mut sub_scope = Scope {
+                            locals: scope.locals.clone(),
+                        };
+                        sub_scope.locals.insert(
+                            "err".to_string(),
+                            (
+                                err_slot,
+                                CodegenTy::TypeRef(
+                                    "BusUnmatchedKey".to_string(),
+                                ),
+                            ),
+                        );
+                        let rhs_stmt = Stmt::Expr((**rhs).clone());
+                        self.lower_stmt(&rhs_stmt, &mut sub_scope)?;
+                        self.builder
+                            .build_unconditional_branch(cont_bb)
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder.position_at_end(cont_bb);
+                    }
+                    Some(OrDisposition::Fail(payload_expr, _)) => {
+                        // v0.2: on no-match, divert into the
+                        // enclosing fallible fn's err path with
+                        // the payload expression evaluated against
+                        // `err: BusUnmatchedKey`. The existing
+                        // `current_user_fn_fallible` infra
+                        // (declared err_alloca + path_alloca +
+                        // exit_bb) carries the divert.
+                        let enclosing = self
+                            .current_user_fn_fallible
+                            .clone()
+                            .ok_or_else(|| {
+                                CodegenError::Unsupported(
+                                    "`or fail X` on bus send: \
+                                     enclosing fn must be \
+                                     fallible(E)"
+                                        .to_string(),
+                                )
+                            })?;
+                        let cond = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                matched,
+                                i32_t.const_zero(),
+                                "bus.fail.no_match",
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let current_fn = self
+                            .builder
+                            .get_insert_block()
+                            .and_then(|bb| bb.get_parent())
+                            .expect("inside a function");
+                        let nomatch_bb = self.context.append_basic_block(
+                            current_fn,
+                            "bus.fail.fail_divert",
+                        );
+                        let cont_bb = self.context.append_basic_block(
+                            current_fn,
+                            "bus.fail.cont",
+                        );
+                        self.builder
+                            .build_conditional_branch(
+                                cond, nomatch_bb, cont_bb,
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder.position_at_end(nomatch_bb);
+                        let err_struct_ptr = self
+                            .build_alloc_bus_unmatched_key(
+                                subj_val.into_pointer_value(),
+                                key_lo,
+                                key_hi,
+                            )?;
+                        let err_slot = self.alloca_for(
+                            &CodegenTy::TypeRef(
+                                "BusUnmatchedKey".to_string(),
+                            ),
+                            "bus.fail.err.slot",
+                        )?;
+                        self.builder
+                            .build_store(err_slot, err_struct_ptr)
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let mut sub_scope = Scope {
+                            locals: scope.locals.clone(),
+                        };
+                        sub_scope.locals.insert(
+                            "err".to_string(),
+                            (
+                                err_slot,
+                                CodegenTy::TypeRef(
+                                    "BusUnmatchedKey".to_string(),
+                                ),
+                            ),
+                        );
+                        let (payload_val, _) =
+                            self.lower_expr(payload_expr, &sub_scope)?;
+                        self.builder
+                            .build_store(
+                                enclosing.err_alloca,
+                                payload_val,
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let bool_t = self.context.bool_type();
+                        self.builder
+                            .build_store(
+                                enclosing.path_alloca,
+                                bool_t.const_int(1, false),
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let exit_bb = self
+                            .current_user_fn_exit_bb
+                            .expect("exit_bb set inside fn body");
+                        self.builder
+                            .build_unconditional_branch(exit_bb)
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder.position_at_end(cont_bb);
                     }
                     None => {
                         return Err(CodegenError::Unsupported(

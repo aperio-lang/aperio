@@ -585,6 +585,121 @@ fn or_disposition_rejected_on_non_fail_topic() {
     );
 }
 
+/// v0.2 (2026-05-26): `or handler(err)` on a fail-topic publish.
+/// The substitute expression runs on no-match with `err:
+/// BusUnmatchedKey` in scope, so the handler can read the subject
+/// + key and react (logging, metrics, etc.). The substitute's
+/// value is discarded — Send is statement-level.
+#[test]
+fn fail_policy_or_handler_binds_unmatched_key_err() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K {
+            payload: Ev; subject: "k"; keyed_by id;
+            on_unmatched: fail;
+        }
+        locus Sub {
+            params { my_id: Int = 0; }
+            bus { subscribe K as on_k where key == self.my_id; }
+            fn on_k(e: Ev) { println("got id=", e.id); }
+        }
+        fn log_unmatched(err: BusUnmatchedKey) {
+            println("unmatched subj=", err.subject,
+                    " key_lo=", err.key_lo,
+                    " key_hi=", err.key_hi);
+        }
+        main locus App {
+            params { a: Sub = Sub { my_id: 1 }; }
+            bus { publish K; }
+            run() {
+                K <- Ev { id: 1 } or log_unmatched(err);
+                K <- Ev { id: 999 } or log_unmatched(err);
+                K <- Ev { id: 42 } or log_unmatched(err);
+                println("done");
+            }
+        }
+        fn main() { App { }; }
+    "#;
+    let bin = build("fail_or_handler", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let handler_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|ln| ln.starts_with("unmatched "))
+        .collect();
+    assert_eq!(
+        handler_lines.len(),
+        2,
+        "handler should fire on the 2 unmatched publishes; got {:?}",
+        handler_lines
+    );
+    for ln in &handler_lines {
+        assert!(
+            ln.contains("subj=k "),
+            "handler line missing subject: {}",
+            ln
+        );
+    }
+    let saw_999 = handler_lines.iter().any(|ln| ln.contains("key_lo=999 "));
+    let saw_42 = handler_lines.iter().any(|ln| ln.contains("key_lo=42 "));
+    assert!(saw_999, "missing key=999 in handler lines: {:?}", handler_lines);
+    assert!(saw_42, "missing key=42 in handler lines: {:?}", handler_lines);
+    assert!(stdout.contains("done"), "got: {:?}", stdout);
+}
+
+/// v0.2 (2026-05-26): `or fail <payload>` inside a fallible fn.
+/// On no-match, the publish diverts through the fn's err path
+/// using the constructed payload, instead of panicking.
+#[test]
+fn fail_policy_or_fail_propagates_to_enclosing_fn() {
+    let src = r#"
+        type Ev { id: Int; }
+        type RouteErr { reason: String; }
+        topic K {
+            payload: Ev; subject: "k"; keyed_by id;
+            on_unmatched: fail;
+        }
+        locus Sub {
+            params { my_id: Int = 0; }
+            bus { subscribe K as on_k where key == self.my_id; }
+            fn on_k(e: Ev) { println("got id=", e.id); }
+        }
+        fn route(id: Int) -> () fallible(RouteErr) {
+            K <- Ev { id: id } or fail RouteErr {
+                reason: "no subscriber for sym " + err.subject,
+            };
+        }
+        main locus App {
+            params { a: Sub = Sub { my_id: 1 }; }
+            bus { publish K; }
+            run() {
+                route(1) or println("err1: ", err.reason);
+                route(999) or println("err2: ", err.reason);
+                println("done");
+            }
+        }
+        fn main() { App { }; }
+    "#;
+    let bin = build("fail_or_fail_propagates", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("err1:"),
+        "route(1) matched; should not divert; got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("err2: no subscriber for sym k"),
+        "expected fail-divert with subject; got: {:?}",
+        stdout
+    );
+    assert!(stdout.contains("done"), "got: {:?}", stdout);
+}
+
 /// Literal-key filter (no self.field involved). `where key == 1`
 /// pins the subscriber to that specific value regardless of
 /// instance state.

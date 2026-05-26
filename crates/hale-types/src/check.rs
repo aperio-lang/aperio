@@ -3459,31 +3459,73 @@ impl<'a> Checker<'a> {
                 ));
             }
             (Some(UnmatchedPolicy::Fail), Some(disp)) => {
-                // v0.1 of the impl ships `or raise` (panic on no
-                // match) + `or discard` (silently swallow). The
-                // err-payload-carrying variants (`or handler(err)`
-                // / `or fail <expr>` / `or <substitute>`) need the
-                // BusUnmatchedKey stdlib type + the full
-                // fallible-disposition routing; deferred to v0.2.
+                // v0.2 (2026-05-26): all four dispositions wired.
+                //   - Raise / Discard: as v0.1 — no err-payload
+                //     needed, codegen panics or no-ops.
+                //   - Substitute: `err: BusUnmatchedKey` in scope
+                //     on the RHS; expression evaluated for side
+                //     effects (Send is a statement, no value
+                //     binding to type-match).
+                //   - Fail: `err: BusUnmatchedKey` in scope on
+                //     the payload expr; payload type must match
+                //     the enclosing fallible fn's declared err.
                 match disp {
                     OrDisposition::Raise(_) | OrDisposition::Discard(_) => {}
-                    OrDisposition::Substitute(_) => {
-                        self.diags.push(Diag::ty(
-                            span,
-                            "`or <substitute>` on bus send is not \
-                             meaningful: Send produces no value to \
-                             substitute. Use `or raise` or \
-                             `or discard`.",
-                        ));
+                    OrDisposition::Substitute(rhs) => {
+                        let err_ty =
+                            Ty::Named("BusUnmatchedKey".to_string());
+                        self.locals.push();
+                        self.locals.insert(
+                            "err",
+                            LocalSym {
+                                ty: err_ty,
+                                is_mut: false,
+                            },
+                        );
+                        let _ = self.check_expr(rhs);
+                        self.locals.pop();
                     }
-                    OrDisposition::Fail(_, sp) => {
-                        self.diags.push(Diag::ty(
-                            *sp,
-                            "`or fail <payload>` on bus send is \
-                             reserved for v0.2 of the impl (needs \
-                             the BusUnmatchedKey err type). Use \
-                             `or raise` today.",
-                        ));
+                    OrDisposition::Fail(payload_expr, sp) => {
+                        let err_ty =
+                            Ty::Named("BusUnmatchedKey".to_string());
+                        self.locals.push();
+                        self.locals.insert(
+                            "err",
+                            LocalSym {
+                                ty: err_ty,
+                                is_mut: false,
+                            },
+                        );
+                        let new_payload_ty =
+                            self.check_expr_addressed(payload_expr);
+                        self.locals.pop();
+                        match &self.fallible_ctx {
+                            None => self.diags.push(Diag::ty(
+                                *sp,
+                                "`or fail X`: only valid inside a \
+                                 fallible fn body (declared with \
+                                 `fallible(T)`). Use `or raise` to \
+                                 propagate the no-match as a panic, \
+                                 or `or <expr>` to side-effect a \
+                                 handler.",
+                            )),
+                            Some((_, expected_payload)) => {
+                                if !expected_payload
+                                    .assignable_from(&new_payload_ty)
+                                {
+                                    self.diags.push(Diag::ty(
+                                        payload_expr.span(),
+                                        format!(
+                                            "`or fail`: expected \
+                                             payload type `{}`, got \
+                                             `{}`",
+                                            expected_payload.display(),
+                                            new_payload_ty.display()
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }

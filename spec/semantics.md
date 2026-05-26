@@ -974,15 +974,41 @@ and the dispatch dispatches uniformly. Existing programs need
 no source change to keep working; new programs opt in
 per-topic.
 
-**Deferred to v0.2 of the impl (spec stays as-is, surface lands later):**
+**v0.2 (2026-05-26) — err-payload Send dispositions.**
 
-- Err-payload Send dispositions on `fail` topics:
-  `or handler(err)` / `or fail <payload>`. v0.1 ships `or raise`
-  + `or discard` only. v0.2 synthesizes `BusUnmatchedKey {
-  subject: String, key_lo: Int, key_hi: Int }` as a stdlib
-  type (mirror of `KeyError` / `IndexError`) and plumbs it
-  through the existing fallible-disposition machinery —
-  mechanical work once the err type is wired.
+On `on_unmatched: fail` topics, all four `or` disposition shapes
+are now supported:
+
+- `or raise` — no-match panics via `lotus_root_panic` (v0.1
+  shape; unchanged).
+- `or discard` — no-match silently swallowed (v0.1 shape;
+  unchanged).
+- `or <expr>` — evaluates `<expr>` for side effects on no-match,
+  with `err: BusUnmatchedKey` in scope. The expression's value
+  is discarded (Send is statement-level). Canonical use:
+  `or log_unmatched(err)` — a free fn that takes the err
+  payload and logs / metrics / etc.
+- `or fail <payload>` — only legal inside an enclosing
+  `fallible(E)` fn. On no-match, evaluates `<payload>` (with
+  `err: BusUnmatchedKey` in scope), stores it into the
+  enclosing fn's err slot, and diverts to the fn's err-exit
+  path. Symmetric to `or fail` on fallible-method calls.
+
+`BusUnmatchedKey` is a synthesized stdlib type, injected into
+scope when any topic declares `on_unmatched: fail`. Layout:
+
+```hale
+type BusUnmatchedKey {
+    subject: String;     // wire subject of the failing publish
+    key_lo:  Int;        // low 64 bits of the unmatched key
+    key_hi:  Int;        // high 64 bits (0 for i64 keys)
+}
+```
+
+Codegen allocates a fresh `BusUnmatchedKey` in the current
+arena on the no-match branch and binds it as `err` for the
+disposition expression's lowering. Mirror of the existing
+`KeyError` / `IndexError` / `IoError` synthesis pattern.
 
 **Out of scope at v0.1 (explicit non-goals):**
 
@@ -1006,8 +1032,11 @@ per-topic.
   v0.1 ships keyed dispatch for the intra-process bus only;
   remote subscribers still fanout per-subject and filter in
   their own bus router after deserialize.
-- `or <substitute>` on Send. Send produces no value; substitution
-  has no target. Permanently rejected (not v0.2-deferred).
+- `or <substitute>` on Send for SUCCESS-value substitution.
+  Send produces no value to substitute. v0.2's `or <expr>`
+  disposition on fail topics is a side-effect handler call
+  (evaluates `<expr>` with `err` in scope, discards the value),
+  not a value substitution.
 
 ## Placement block (F.31)
 

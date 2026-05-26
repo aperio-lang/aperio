@@ -61,6 +61,14 @@ pub fn build_top_scope(bundle: &Bundle<'_>) -> (TopScope, Vec<Diag>) {
             .entry("EmptyError".to_string())
             .or_insert(zero);
     }
+    // Phase 3 routing-keys v0.2 (2026-05-26): pre-register
+    // BusUnmatchedKey when any topic declares `on_unmatched:
+    // fail`. Same idempotent pattern as the form-stdlib names.
+    if bundle_uses_fail_topics(bundle) {
+        known_names
+            .entry("BusUnmatchedKey".to_string())
+            .or_insert(Span::new(0, 0));
+    }
 
     // Pre-pass: build a name → ResolvedTopic table for every
     // declared topic, including parent chain + wire subject.
@@ -93,6 +101,15 @@ pub fn build_top_scope(bundle: &Bundle<'_>) -> (TopScope, Vec<Diag>) {
     if bundle_uses_form_machinery(bundle) {
         inject_form_stdlib_types(&mut scope);
     }
+    // Phase 3 routing-keys v0.2 (2026-05-26): inject
+    // BusUnmatchedKey for `on_unmatched: fail` topics whose
+    // publishes use `or handler(err)` / `or fail <payload>`
+    // dispositions. Gated to keep the name out of scope for
+    // programs that don't use fail-policy topics. Idempotent:
+    // user-declared BusUnmatchedKey wins.
+    if bundle_uses_fail_topics(bundle) {
+        inject_bus_unmatched_key_type(&mut scope);
+    }
     // FUv0.8.2 #1 (2026-05-25): if the user has declared a
     // type whose name shadows a stdlib error type but with
     // a different shape AND the program actually uses a
@@ -123,6 +140,63 @@ fn bundle_uses_form_machinery(bundle: &Bundle<'_>) -> bool {
         })
     }
     bundle.programs.values().any(|p| scan_items(&p.items))
+}
+
+/// True when at least one topic in the bundle declares
+/// `on_unmatched: fail`. Used to gate BusUnmatchedKey injection
+/// — keeps the stdlib name out of scope for programs that
+/// don't use fail-policy topics.
+fn bundle_uses_fail_topics(bundle: &Bundle<'_>) -> bool {
+    fn scan_items(items: &[TopDecl]) -> bool {
+        items.iter().any(|item| match item {
+            TopDecl::Topic(t) => matches!(
+                t.on_unmatched,
+                Some(hale_syntax::ast::UnmatchedPolicy::Fail)
+            ),
+            TopDecl::Module(m) => scan_items(&m.items),
+            _ => false,
+        })
+    }
+    bundle.programs.values().any(|p| scan_items(&p.items))
+}
+
+/// Phase 3 routing-keys v0.2 (2026-05-26): synthesize the
+/// `BusUnmatchedKey` stdlib type so `on_unmatched: fail` topic
+/// publishes can carry err payloads through
+/// `or handler(err)` / `or fail <payload>` dispositions.
+/// Mirrors `inject_form_stdlib_types`'s idempotent pattern.
+pub(crate) fn inject_bus_unmatched_key_type(scope: &mut TopScope) {
+    let zero = Span::new(0, 0);
+    if scope.symbols.contains_key("BusUnmatchedKey") {
+        return;
+    }
+    scope.symbols.insert(
+        "BusUnmatchedKey".to_string(),
+        TopSymbol::Type(TypeInfo {
+            name: "BusUnmatchedKey".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "subject".to_string(),
+                    ty: Ty::Prim(PrimType::String),
+                    has_default: false,
+                    span: zero,
+                },
+                FieldInfo {
+                    name: "key_lo".to_string(),
+                    ty: Ty::Prim(PrimType::Int),
+                    has_default: false,
+                    span: zero,
+                },
+                FieldInfo {
+                    name: "key_hi".to_string(),
+                    ty: Ty::Prim(PrimType::Int),
+                    has_default: false,
+                    span: zero,
+                },
+            ]),
+            span: zero,
+        }),
+    );
 }
 
 fn collect_type_names(
