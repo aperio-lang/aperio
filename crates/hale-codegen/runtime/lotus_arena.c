@@ -102,17 +102,14 @@
  * so any regression resurfaces.
  *
  * `race:lotus_arena_destroy` + `race:lotus_coop_pool_worker`
- * remain suppressed. The codegen-side shutdown_all was hoisted
- * to run before main's arena_destroy (2026-05-26), which is
- * the right ordering, but the underlying race is in the
- * arena's parent/child bookkeeping: when two threads
- * concurrently destroy DIFFERENT child arenas (the worker
- * destroying its handler-scratch arena vs. main destroying
- * the App arena that owns it), both touch the parent's
- * child-slot freelist without synchronization. Fix needs
- * either an arena mutex or an atomic freelist on the
- * sub-region tracker — non-trivial substrate work for a
- * future session.
+ * were suppressed in F.32-1γ-v2 session 2 + the first
+ * substrate-race-fixes pass; both fixed (2026-05-26) by
+ * adding a `pthread_mutex_t subregion_lock` to the arena
+ * struct that protects the parent's child-slot freelist
+ * across concurrent create_subregion / destroy. The mutex
+ * is also taken at destroy-time around the freelist free()
+ * to synchronize-with any final concurrent push from a worker
+ * thread. Both suppressions removed.
  *
  * Each pattern is an EXISTING race in code that has been in
  * production since well before γ-v2; logged here as a deferred
@@ -129,8 +126,6 @@
 const char *__tsan_default_suppressions(void) {
     return
         "race:lotus_arena_new_chunk_for\n"
-        "race:lotus_arena_destroy\n"
-        "race:lotus_coop_pool_worker\n"
         "race:lotus_chunk_pool_prefill_count\n";
 }
 #endif
@@ -271,6 +266,27 @@ typedef struct lotus_arena {
     /* Human-readable name for the cap diagnostic. NULL means use
      * the generic message. */
     const char          *cap_diag_name;
+    /* 2026-05-26 substrate-race fix: mutex protecting the
+     * sub-region tracker (`free_list`, `free_count`, `free_cap`,
+     * `next_slot`). When two threads concurrently create or
+     * destroy children of the SAME parent — common under
+     * cross-pool cooperative placement where the worker's
+     * handler scratch is a sub-region of the main App arena —
+     * unsynchronized reads + writes to the freelist would race
+     * (concurrent realloc, double-pop, slot duplication, etc.).
+     * The lock is held only across the (small, O(1)) freelist
+     * mutation; chunk allocation/copy still runs lock-free on
+     * the child's own state.
+     *
+     * Every arena carries the mutex because ANY arena can become
+     * a parent the moment it's passed to
+     * `lotus_arena_create_subregion`. Cost: one
+     * `pthread_mutex_t` (~40 B) per arena struct + one init/
+     * destroy pair. Sub-regions never acquire their OWN lock
+     * (they only touch their PARENT's lock), but they carry
+     * one anyway for the case they themselves become a parent
+     * via a nested sub-region. */
+    pthread_mutex_t      subregion_lock;
 } lotus_arena_t;
 
 /* Per-thread freelist of default-sized chunks (2026-05-21
@@ -1154,6 +1170,11 @@ static lotus_arena_t *lotus_arena_alloc_struct(void) {
     a->chunk_byte_total = 0;
     a->chunk_byte_cap   = 0;
     a->cap_diag_name    = NULL;
+    /* 2026-05-26 substrate-race fix: subregion freelist mutex.
+     * Used by create_subregion / destroy via the PARENT arena's
+     * pointer; arenas with no children never acquire the lock,
+     * so the init overhead is the only cost in that case. */
+    pthread_mutex_init(&a->subregion_lock, NULL);
     return a;
 }
 
@@ -1239,11 +1260,21 @@ lotus_arena_t *lotus_arena_create_subregion(lotus_arena_t *parent) {
     lotus_arena_t *a = lotus_arena_alloc_struct();
     if (!a) return NULL;
     a->parent = parent;
+    /* 2026-05-26 substrate-race fix: lock the parent's
+     * subregion tracker. Without this, two threads
+     * concurrently creating sub-regions of the same parent
+     * would race on the free_list pop OR on next_slot++,
+     * potentially handing the same slot index to both
+     * children. The lock window is O(1) — a freelist pop or
+     * an int increment — so contention is bounded even with
+     * many concurrent producers. */
+    pthread_mutex_lock(&parent->subregion_lock);
     if (parent->free_count > 0) {
         a->slot = parent->free_list[--parent->free_count];
     } else {
         a->slot = parent->next_slot++;
     }
+    pthread_mutex_unlock(&parent->subregion_lock);
     return a;
 }
 
@@ -1359,9 +1390,19 @@ void lotus_arena_destroy(lotus_arena_t *a) {
      * parent's free-list so a future create_subregion can reuse
      * it. Grow the free_list capacity as needed (doubling).
      * The parent itself stays alive — only the SUB-region's
-     * chunks + struct go away here. */
+     * chunks + struct go away here.
+     *
+     * 2026-05-26 substrate-race fix: lock the parent's
+     * subregion tracker around the freelist push + realloc.
+     * Without this, two threads concurrently destroying
+     * sub-regions of the same parent would race on the
+     * realloc (one's free might run on the same pointer the
+     * other's realloc returned), on the cap doubling, and
+     * on the freelist write. The lock window is O(1) (the
+     * realloc happens at most every 2^N grows). */
     if (a->parent) {
         lotus_arena_t *p = a->parent;
+        pthread_mutex_lock(&p->subregion_lock);
         if (p->free_count == p->free_cap) {
             size_t new_cap = p->free_cap == 0 ? 8 : p->free_cap * 2;
             int *new_list  = (int *)realloc(p->free_list,
@@ -1378,6 +1419,7 @@ void lotus_arena_destroy(lotus_arena_t *a) {
         if (p->free_count < p->free_cap) {
             p->free_list[p->free_count++] = a->slot;
         }
+        pthread_mutex_unlock(&p->subregion_lock);
     }
 
     /* LOTUS_ARENA_RESIDENCY: drop the registry entry (if any)
@@ -1394,7 +1436,26 @@ void lotus_arena_destroy(lotus_arena_t *a) {
         lotus_arena_release_chunk(c);
         c = next;
     }
-    if (a->free_list) free(a->free_list);
+    /* 2026-05-26 substrate-race fix: a->free_list may have been
+     * realloc'd by a concurrent child destroy on another thread
+     * just before we got here. Take the subregion lock once to
+     * synchronize-with that write before we free the buffer.
+     * Holding/releasing the lock immediately is a "happens-before
+     * barrier" — it doesn't keep new children from arriving (the
+     * caller is responsible for that ordering via
+     * lotus_coop_pool_shutdown_all), but it ensures we see the
+     * final committed value of free_list. */
+    pthread_mutex_lock(&a->subregion_lock);
+    int *fl = a->free_list;
+    a->free_list = NULL;
+    pthread_mutex_unlock(&a->subregion_lock);
+    if (fl) free(fl);
+    /* Tear down the per-arena subregion lock. By the time we
+     * reach here the parent's lock (if any) has already been
+     * released and no future caller can reach this arena's
+     * lock — the destroying thread is exclusive on its own
+     * arena struct. */
+    pthread_mutex_destroy(&a->subregion_lock);
     free(a);
 }
 
