@@ -87,10 +87,6 @@
  *                                            initialization
  *                                            race (lazy global
  *                                            init guard).
- *   race:lotus_bus_queue_drain             — concurrent
- *                                            head/tail reads
- *                                            on the bus queue
- *                                            struct.
  *   race:lotus_arena_destroy               — concurrent reads
  *                                            of arena state at
  *                                            shutdown.
@@ -98,6 +94,25 @@
  *                                            handshake.
  *   race:lotus_chunk_pool_prefill_count    — backing static for
  *                                            the prefill counter.
+ *
+ * `race:lotus_bus_queue_drain` was suppressed in the original
+ * session-2 commit; that race was fixed (2026-05-26) by
+ * extending `g_bus_has_pinned` to also fire when cooperative
+ * pool workers are spawned. Removed from the suppression list
+ * so any regression resurfaces.
+ *
+ * `race:lotus_arena_destroy` + `race:lotus_coop_pool_worker`
+ * remain suppressed. The codegen-side shutdown_all was hoisted
+ * to run before main's arena_destroy (2026-05-26), which is
+ * the right ordering, but the underlying race is in the
+ * arena's parent/child bookkeeping: when two threads
+ * concurrently destroy DIFFERENT child arenas (the worker
+ * destroying its handler-scratch arena vs. main destroying
+ * the App arena that owns it), both touch the parent's
+ * child-slot freelist without synchronization. Fix needs
+ * either an arena mutex or an atomic freelist on the
+ * sub-region tracker — non-trivial substrate work for a
+ * future session.
  *
  * Each pattern is an EXISTING race in code that has been in
  * production since well before γ-v2; logged here as a deferred
@@ -114,7 +129,6 @@
 const char *__tsan_default_suppressions(void) {
     return
         "race:lotus_arena_new_chunk_for\n"
-        "race:lotus_bus_queue_drain\n"
         "race:lotus_arena_destroy\n"
         "race:lotus_coop_pool_worker\n"
         "race:lotus_chunk_pool_prefill_count\n";
@@ -3765,20 +3779,32 @@ typedef struct lotus_bus_queue {
 
 #define LOTUS_BUS_QUEUE_INITIAL_CAP 64
 
-/* Pure-cooperative fast path. Set to non-zero before any pinned
- * thread starts; codegen emits a call to `lotus_bus_mark_pinned`
- * at every pinned-locus instantiation (sync, before pthread_create,
- * so the new thread can never observe the flag unset on its
- * publish path). When zero, every enqueue and pop happens on a
- * single thread (the cooperative scheduler's main), so the queue
- * mutex is dead overhead — ~20-40ns/event on uncontended lock+
- * unlock pair. The flag is monotonic 0→1; once any pinned locus
- * exists, contention is possible and we lock normally for the
- * rest of the program. */
+/* Single-thread fast path. Set to non-zero before any thread
+ * beyond main can touch the bus queue. Set by:
+ *   - `lotus_bus_mark_pinned` — codegen emits a call at every
+ *     pinned-locus instantiation (sync, before pthread_create,
+ *     so the new thread can never observe the flag unset on
+ *     its publish path).
+ *   - `lotus_coop_pool_start_all` — cooperative pool workers
+ *     are their own threads too; main + ≥1 worker = multi-
+ *     threaded bus access. (Originally this case was missed,
+ *     producing a TSAN race in `lotus_bus_queue_drain` whenever
+ *     two cooperative pools both drained the shared queue.
+ *     2026-05-26 fix.)
+ *
+ * When zero, every enqueue and pop happens on a single thread
+ * so the queue mutex is dead overhead — ~20-40ns/event on
+ * uncontended lock+unlock pair. The flag is monotonic 0→1;
+ * once set, contention is possible and we lock normally for
+ * the rest of the program.
+ *
+ * The flag is atomic — readers on the bus hot path use
+ * `__atomic_load_n` with acquire ordering; writers
+ * (mark_pinned / pool_start_all) use release ordering. */
 static int g_bus_has_pinned = 0;
 
 void lotus_bus_mark_pinned(void) {
-    g_bus_has_pinned = 1;
+    __atomic_store_n(&g_bus_has_pinned, 1, __ATOMIC_RELEASE);
 }
 
 lotus_bus_queue_t *lotus_bus_queue_create(void) {
@@ -3820,7 +3846,7 @@ void lotus_bus_queue_enqueue(lotus_bus_queue_t *q,
          * better-than-corrupting. */
         return;
     }
-    int locked = g_bus_has_pinned;
+    int locked = __atomic_load_n(&g_bus_has_pinned, __ATOMIC_ACQUIRE);
     if (locked) pthread_mutex_lock(&q->lock);
     if (q->tail == q->cap) {
         /* Compact first: slide live cells to the front. */
@@ -3894,7 +3920,7 @@ typedef void (*lotus_handler_fn)(void *self, void *payload);
 
 void lotus_bus_queue_drain(lotus_bus_queue_t *q) {
     if (!q) return;
-    int locked = g_bus_has_pinned;
+    int locked = __atomic_load_n(&g_bus_has_pinned, __ATOMIC_ACQUIRE);
     if (locked) {
         /* Concurrent producers possible — must snapshot each cell
          * under the lock so the cells array can't be realloc'd out
@@ -4382,6 +4408,17 @@ static void *lotus_coop_pool_worker(void *arg) {
 }
 
 void lotus_coop_pool_start_all(void) {
+    /* Flip the bus-queue multi-thread flag BEFORE spawning any
+     * worker. pthread_create's release semantics make the store
+     * visible to the new thread, so the worker never observes
+     * the flag unset on its first bus interaction. Required for
+     * correctness on cross-pool cooperative workloads — without
+     * this, two cooperative threads both took the unlocked
+     * bus_queue_drain path and TSAN-raced on head/tail.
+     * (2026-05-26 substrate-race fix.) */
+    if (g_coop_pool_count > 0) {
+        __atomic_store_n(&g_bus_has_pinned, 1, __ATOMIC_RELEASE);
+    }
     for (size_t i = 0; i < g_coop_pool_count; i++) {
         lotus_coop_pool_t *p = g_coop_pools[i];
         if (p->worker_started) continue;

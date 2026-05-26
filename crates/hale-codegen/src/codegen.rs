@@ -5091,14 +5091,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// m45-followup: also tears down the C-runtime bus router's
     /// entries vec so the heap allocation is freed alongside the
     /// queue's. Bus state lives entirely in the C runtime now.
-    fn emit_bus_queue_destroy(&mut self) -> Result<(), CodegenError> {
-        let ptr_t = self.context.ptr_type(AddressSpace::default());
-        // F.31 Phase 4: signal cooperative-pool workers to drain
-        // their pending cells and exit, then join. Must happen
-        // BEFORE bus_router_destroy because pool handlers may
-        // dispatch (via "subj" <-) to other pools/queues; if the
-        // router is gone first the handler reads freed memory.
-        // Idempotent + no-op when no pools were registered.
+    /// Emit `lotus_coop_pool_shutdown_all()` — signals every
+    /// cooperative pool worker to drain pending cells + exit,
+    /// then joins them. Must run BEFORE arena_destroy (worker
+    /// threads may still be executing locus methods that touch
+    /// arena state) and BEFORE bus_router_destroy (pool handlers
+    /// may dispatch via `"subj" <-`). 2026-05-26 substrate-race
+    /// fix: hoisted out of `emit_bus_queue_destroy` to fix a
+    /// TSAN race in `lotus_arena_destroy` where main was
+    /// destroying the arena concurrently with still-active
+    /// worker threads. Idempotent + no-op when no pools were
+    /// registered.
+    fn emit_coop_pool_shutdown_all(&mut self) -> Result<(), CodegenError> {
         if !self.main_cooperative_pools.is_empty() {
             let shutdown_fn = self
                 .module
@@ -5108,6 +5112,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .build_call(shutdown_fn, &[], "coop_pool.shutdown_all")
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    fn emit_bus_queue_destroy(&mut self) -> Result<(), CodegenError> {
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
         let queue_global = self
             .module
             .get_global("lotus.bus_queue.global")
@@ -8089,6 +8098,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // closed and writing more IR is unsound.
         if end == BlockEnd::Open {
             self.flush_dissolve_frame()?;
+            // Join cooperative-pool workers BEFORE arena_destroy.
+            // Workers may still be running locus methods that
+            // touch arena state — racing with main's
+            // arena_destroy was the substrate-level TSAN race
+            // suppressed in F.32-1γ-v2 session 2 and fixed here
+            // (2026-05-26).
+            self.emit_coop_pool_shutdown_all()?;
             // Tear down the arena before exit. exit(0) via `ret`
             // would drop the chunk linked list either way (process
             // exit reclaims everything), but going through
@@ -23742,6 +23758,11 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             // long-lived loci wind down before the process exits,
             // then tear down the arena.
             self.flush_dissolve_frame()?;
+            // Join cooperative-pool workers BEFORE arena_destroy —
+            // see the matching block in `lower_program`'s main-
+            // exit path for rationale. (2026-05-26 substrate-race
+            // fix.)
+            self.emit_coop_pool_shutdown_all()?;
             self.emit_arena_destroy()?;
             self.emit_bus_queue_destroy()?;
             // Re-open an empty frame so the post-flush bookkeeping
