@@ -1417,6 +1417,13 @@ struct RoutingKeySubjectInfo {
     /// Validated to exist + be int-eligible at typecheck; codegen
     /// trusts the field is present and key_value_to_i64_pair-able.
     keyed_by_field: String,
+    /// Phase 3 on_unmatched policy (2026-05-25). `Fail` routes
+    /// the publish through `lotus_bus_dispatch_keyed_fallible`
+    /// and dispatches the Send's `or` disposition on no-match.
+    /// `Swallow` / `Fallback` / None go through the regular
+    /// `lotus_bus_dispatch_keyed` path (kind=2 fallback
+    /// subscribers, if any, fire from inside the runtime).
+    policy: Option<hale_syntax::ast::UnmatchedPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -3700,6 +3707,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_bus_dispatch_keyed",
             bus_dispatch_keyed_ty,
+            None,
+        );
+        // Phase 3 fail policy (2026-05-25): same signature as
+        // _keyed but returns i32 (1 = matched, 0 = no specific
+        // match). Codegen for `K <- value or raise` branches on
+        // the return value to call lotus_root_panic.
+        let bus_dispatch_keyed_fallible_ty = i32_t.fn_type(
+            &[
+                ptr_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+                i64_t.into(),
+                ptr_t.into(),
+                i64_t.into(),
+                i64_t.into(),
+            ],
+            false,
+        );
+        self.module.add_function(
+            "lotus_bus_dispatch_keyed_fallible",
+            bus_dispatch_keyed_fallible_ty,
             None,
         );
         // F.31 Phase 4: cooperative-pool worker surface.
@@ -8166,6 +8194,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     RoutingKeySubjectInfo {
                         payload_type_name: payload_name,
                         keyed_by_field: keyed_field,
+                        policy: t.on_unmatched,
                     },
                 );
             }
@@ -21367,8 +21396,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     ))),
                 }
             }
-            Stmt::Send { subject, value, .. } => {
-                self.lower_send(subject, value, scope)?;
+            Stmt::Send { subject, value, or_disposition, .. } => {
+                self.lower_send(subject, value, or_disposition.as_ref(), scope)?;
                 Ok(BlockEnd::Open)
             }
             // v1.x-VIOLATE (F.27): inline structural failure.
@@ -39532,6 +39561,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         &mut self,
         subject: &Expr,
         value: &Expr,
+        or_disposition: Option<&OrDisposition>,
         scope: &Scope<'ctx>,
     ) -> Result<(), CodegenError> {
         // Form K4c (2026-05-20): shm_ring short-circuit. If the
@@ -39788,6 +39818,133 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         info.payload_type_name, info.keyed_by_field, field_ty
                     ))
                 })?;
+            // Phase 3 fail policy (2026-05-25): `on_unmatched:
+            // fail` routes through the fallible dispatch variant
+            // and branches on the no-match return path into the
+            // `or` disposition. Typecheck has already validated
+            // that this Send carries `or raise` or `or discard`
+            // for fail topics; v0.2 extends to the err-payload
+            // dispositions.
+            if matches!(
+                info.policy,
+                Some(hale_syntax::ast::UnmatchedPolicy::Fail)
+            ) {
+                let dispatch_fallible_fn = self
+                    .module
+                    .get_function("lotus_bus_dispatch_keyed_fallible")
+                    .expect("lotus_bus_dispatch_keyed_fallible declared");
+                let i32_t = self.context.i32_type();
+                let matched = self
+                    .builder
+                    .build_call(
+                        dispatch_fallible_fn,
+                        &[
+                            queue_ptr.into(),
+                            subj_val.into(),
+                            payload_val.into(),
+                            payload_size_iv.into(),
+                            ser_fn.as_global_value().as_pointer_value().into(),
+                            key_lo.into(),
+                            key_hi.into(),
+                        ],
+                        "bus.dispatch_keyed_fallible.call",
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("dispatch_keyed_fallible returns i32")
+                    .into_int_value();
+                match or_disposition {
+                    Some(OrDisposition::Raise(_)) => {
+                        // No match → panic with a BusUnmatchedKey
+                        // message naming subject + key.
+                        let cond = self
+                            .builder
+                            .build_int_compare(
+                                inkwell::IntPredicate::EQ,
+                                matched,
+                                i32_t.const_zero(),
+                                "bus.fail.no_match",
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        let current_fn = self
+                            .builder
+                            .get_insert_block()
+                            .and_then(|bb| bb.get_parent())
+                            .expect("inside a function");
+                        let panic_bb = self.context.append_basic_block(
+                            current_fn,
+                            "bus.fail.raise",
+                        );
+                        let cont_bb = self.context.append_basic_block(
+                            current_fn,
+                            "bus.fail.cont",
+                        );
+                        self.builder
+                            .build_conditional_branch(cond, panic_bb, cont_bb)
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder.position_at_end(panic_bb);
+                        let panic_fn = self
+                            .module
+                            .get_function("lotus_root_panic")
+                            .expect("lotus_root_panic declared");
+                        let typename_str = self.global_string(
+                            "BusUnmatchedKey (no specific-key subscriber matched the keyed publish)",
+                        );
+                        let null_payload = ptr_t.const_null();
+                        let zero_size = i64_t.const_zero();
+                        self.builder
+                            .build_call(
+                                panic_fn,
+                                &[
+                                    null_payload.into(),
+                                    zero_size.into(),
+                                    typename_str.into(),
+                                ],
+                                "bus.fail.raise.call",
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder
+                            .build_unreachable()
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        self.builder.position_at_end(cont_bb);
+                    }
+                    Some(OrDisposition::Discard(_)) => {
+                        // Silently swallow on no-match. The
+                        // dispatch already happened; just ignore
+                        // the return value.
+                        let _ = matched;
+                    }
+                    Some(OrDisposition::Substitute(_))
+                    | Some(OrDisposition::Fail(_, _)) => {
+                        return Err(CodegenError::Unsupported(
+                            "v0.1 of routing-key fail policy only \
+                             supports `or raise` and `or discard` \
+                             dispositions; typecheck should have \
+                             caught this"
+                                .to_string(),
+                        ));
+                    }
+                    None => {
+                        return Err(CodegenError::Unsupported(
+                            "fail-topic publish without `or` \
+                             disposition reached codegen; typecheck \
+                             should have rejected"
+                                .to_string(),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+
             let dispatch_keyed_fn = self
                 .module
                 .get_function("lotus_bus_dispatch_keyed")

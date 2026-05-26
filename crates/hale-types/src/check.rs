@@ -1671,30 +1671,16 @@ impl<'a> Checker<'a> {
                 // at bus-block and send sites that reference the
                 // topic. Below: Phase-3 specific static checks.
 
-                // (5) on_unmatched: fail — pending impl. The v0.2
-                // policy turns publish into a fallible expression
-                // (`K <- value or raise`); the parser surface for
-                // that grammar extension and the BusUnmatchedKey
-                // err payload synthesis haven't landed yet. Keep
-                // the diag so users don't write fail-topic code
-                // ahead of the impl.
-                match t.on_unmatched {
-                    Some(UnmatchedPolicy::Fail) => {
-                        self.diags.push(Diag::ty(
-                            t.span,
-                            "`on_unmatched: fail` is in the v0.1 \
-                             spec but not yet implemented; the \
-                             impl ships `swallow` + `fallback` \
-                             first",
-                        ));
-                    }
-                    Some(UnmatchedPolicy::Fallback) => {
-                        // (6) Validated below in
-                        // check_fallback_catchall_subscriber after
-                        // we've collected the full subscribe set.
-                    }
-                    Some(UnmatchedPolicy::Swallow) | None => {}
-                }
+                // (5) / (6) on_unmatched policy validation:
+                //   - swallow / None: nothing to check here.
+                //   - fail: Send sites for this topic must carry
+                //     an `or raise` / `or discard` disposition;
+                //     validated at the Send site in check_send.
+                //   - fallback: a program-wide `where key == _`
+                //     subscriber must exist; validated in
+                //     check_phase3_fallback_subscribers (bundle
+                //     pass).
+                let _ = t.on_unmatched;
 
                 // (1) keyed_by field must exist on the payload
                 // type and resolve to an int-shaped scalar
@@ -3176,8 +3162,8 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Stmt::Send { subject, value, span } => {
-                self.check_send(subject, value, *span);
+            Stmt::Send { subject, value, span, or_disposition } => {
+                self.check_send(subject, value, or_disposition.as_ref(), *span);
             }
             Stmt::If(if_stmt) => self.check_if(if_stmt),
             Stmt::Match(m) => self.check_match(m),
@@ -3427,8 +3413,92 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_send(&mut self, subject: &Expr, value: &Expr, span: Span) {
+    fn check_send(
+        &mut self,
+        subject: &Expr,
+        value: &Expr,
+        or_disposition: Option<&OrDisposition>,
+        span: Span,
+    ) {
         let payload_ty = self.check_expr(value);
+        // Phase 3 routing keys (2026-05-25): the `or DISPOSITION`
+        // clause on Send is legal only when the target topic
+        // declares `on_unmatched: fail`. Conversely, fail topics
+        // REQUIRE the clause — a fail-policy publish without an
+        // or-disposition leaves the no-match err unhandled. We
+        // resolve the topic by name/literal-subject and validate
+        // both directions.
+        let target_policy = match subject {
+            Expr::Literal(Literal::String(s), _) => self
+                .top
+                .symbols
+                .values()
+                .find_map(|sym| match sym {
+                    TopSymbol::Topic(ti)
+                        if ti.subject == *s
+                            || ti.wire_subject == *s
+                            || ti.name == *s =>
+                    {
+                        Some(ti.on_unmatched)
+                    }
+                    _ => None,
+                }),
+            Expr::Ident(id) => match self.top.lookup(&id.name) {
+                Some(TopSymbol::Topic(ti)) => Some(ti.on_unmatched),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (target_policy.flatten(), or_disposition) {
+            (Some(UnmatchedPolicy::Fail), None) => {
+                self.diags.push(Diag::ty(
+                    span,
+                    "publish to topic with `on_unmatched: fail` must \
+                     carry an `or` disposition — e.g. \
+                     `Subject <- value or raise`",
+                ));
+            }
+            (Some(UnmatchedPolicy::Fail), Some(disp)) => {
+                // v0.1 of the impl ships `or raise` (panic on no
+                // match) + `or discard` (silently swallow). The
+                // err-payload-carrying variants (`or handler(err)`
+                // / `or fail <expr>` / `or <substitute>`) need the
+                // BusUnmatchedKey stdlib type + the full
+                // fallible-disposition routing; deferred to v0.2.
+                match disp {
+                    OrDisposition::Raise(_) | OrDisposition::Discard(_) => {}
+                    OrDisposition::Substitute(_) => {
+                        self.diags.push(Diag::ty(
+                            span,
+                            "`or <substitute>` on bus send is not \
+                             meaningful: Send produces no value to \
+                             substitute. Use `or raise` or \
+                             `or discard`.",
+                        ));
+                    }
+                    OrDisposition::Fail(_, sp) => {
+                        self.diags.push(Diag::ty(
+                            *sp,
+                            "`or fail <payload>` on bus send is \
+                             reserved for v0.2 of the impl (needs \
+                             the BusUnmatchedKey err type). Use \
+                             `or raise` today.",
+                        ));
+                    }
+                }
+            }
+            (_, Some(_)) => {
+                self.diags.push(Diag::ty(
+                    span,
+                    "`or` disposition on a bus send is only legal \
+                     when the target topic declares \
+                     `on_unmatched: fail`",
+                ));
+            }
+            (_, None) => {
+                // Default path — unkeyed / swallow / fallback.
+            }
+        }
         // Subject extraction. Two static forms produce a fixed
         // wire-format subject string: a literal `"S" <- expr` and
         // a topic-ref `Foo <- expr` where Foo names a `topic`

@@ -4469,6 +4469,64 @@ void lotus_bus_dispatch_wire_keyed(const char *subject,
                                     uint64_t key_lo,
                                     uint64_t key_hi);
 
+/* Phase 3 fail policy (2026-05-25): same shape as
+ * lotus_bus_dispatch_keyed but returns the match-count signal
+ * caller-side codegen can branch on. Returns 1 when at least one
+ * specific-key (kind=1) subscriber fired, 0 when none did. The
+ * fail-policy `or raise` codegen branch checks this and routes
+ * to `lotus_root_panic` on 0; the `or discard` branch ignores
+ * the result.
+ *
+ * `or handler(err)` / `or fail <payload>` (which would need
+ * BusUnmatchedKey err payload synthesis) is deferred to v0.2 of
+ * the impl. */
+int lotus_bus_dispatch_keyed_fallible(lotus_bus_queue_t *queue,
+                                       const char *subject,
+                                       const void *struct_payload,
+                                       size_t struct_size,
+                                       lotus_serialize_fn serialize_fn,
+                                       uint64_t key_lo,
+                                       uint64_t key_hi);
+
+/* Forward decl so the fallible variant's body can delegate to
+ * the unkeyed-only-dispatch path without C complaining about
+ * implicit declaration. Body lives below. */
+void lotus_bus_dispatch_keyed(lotus_bus_queue_t *queue,
+                              const char *subject,
+                              const void *struct_payload,
+                              size_t struct_size,
+                              lotus_serialize_fn serialize_fn,
+                              uint64_t key_lo,
+                              uint64_t key_hi);
+
+int lotus_bus_dispatch_keyed_fallible(lotus_bus_queue_t *queue,
+                                       const char *subject,
+                                       const void *struct_payload,
+                                       size_t struct_size,
+                                       lotus_serialize_fn serialize_fn,
+                                       uint64_t key_lo,
+                                       uint64_t key_hi) {
+    /* Pre-walk for the match signal. Same logic as the dispatch
+     * itself but without the actual fire — we just need to know
+     * "would anyone fire?" so the caller can route the no-match
+     * branch. The dispatch then proceeds normally below. */
+    int matched = 0;
+    for (size_t i = 0; i < g_bus_count; i++) {
+        lotus_bus_entry_t *e = &g_bus_entries[i];
+        if (!e->subject) continue;
+        if (!lotus_subject_match(e->subject, subject)) continue;
+        if (e->key_filter_kind == 1
+            && e->key_lo == key_lo
+            && e->key_hi == key_hi) {
+            matched = 1;
+            break;
+        }
+    }
+    lotus_bus_dispatch_keyed(queue, subject, struct_payload,
+                              struct_size, serialize_fn, key_lo, key_hi);
+    return matched;
+}
+
 void lotus_bus_dispatch_keyed(lotus_bus_queue_t *queue,
                               const char *subject,
                               const void *struct_payload,

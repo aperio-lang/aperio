@@ -3287,12 +3287,26 @@ impl Parser {
         let expr = self.parse_expr()?;
         if matches!(self.peek(), TokenKind::LeftArrow) {
             self.bump();
-            let value = self.parse_expr()?;
+            // Phase 3 routing keys (2026-05-25): `K <- value or X`
+            // means "publish, and on no-match disposition X" —
+            // the `or` attaches to the Send statement, NOT to
+            // the value expression. parse_expr would greedily
+            // consume `or` and wrap the value as Expr::Or; we
+            // strip it back off into the Send's or_disposition
+            // so the value is just the payload.
+            let raw_value = self.parse_expr()?;
+            let (value, or_disposition) = match raw_value {
+                Expr::Or { inner, disposition, .. } => {
+                    (*inner, Some(disposition))
+                }
+                other => (other, None),
+            };
             let semi = self.expect(TokenKind::Semi, ";")?;
             stmts.push(Stmt::Send {
                 span: expr.span().merge(semi.span),
                 subject: expr,
                 value,
+                or_disposition,
             });
             return Ok(None);
         }
@@ -3381,38 +3395,43 @@ impl Parser {
         if !is_or {
             return Ok(lhs);
         }
-        self.bump(); // consume `or`
-        let is_raise = matches!(self.peek(), TokenKind::Ident(s) if s == "raise");
-        let is_discard = matches!(self.peek(), TokenKind::Ident(s) if s == "discard");
-        // B3 / G6 — `or fail <payload>` as an or_clause RHS. `fail`
-        // is a contextual ident (same narrowing pattern as `raise`
-        // / `discard`); recognized here in expression position.
-        let is_fail = matches!(self.peek(), TokenKind::Ident(s) if s == "fail");
-        let (disposition, end_span) = if is_raise {
-            let raise_tok = self.bump();
-            (OrDisposition::Raise(raise_tok.span), raise_tok.span)
-        } else if is_discard {
-            let discard_tok = self.bump();
-            (OrDisposition::Discard(discard_tok.span), discard_tok.span)
-        } else if is_fail {
-            let fail_tok = self.bump();
-            let payload = self.parse_expr()?;
-            let span = fail_tok.span.merge(payload.span());
-            (OrDisposition::Fail(Box::new(payload), span), span)
-        } else {
-            // Substitute: RHS is itself a full expression (which
-            // may chain another `or` — that's how we get
-            // right-associativity).
-            let rhs = self.parse_expr()?;
-            let rhs_span = rhs.span();
-            (OrDisposition::Substitute(Box::new(rhs)), rhs_span)
-        };
+        let (disposition, end_span) = self.parse_or_disposition()?;
         let span = lhs.span().merge(end_span);
         Ok(Expr::Or {
             inner: Box::new(lhs),
             disposition,
             span,
         })
+    }
+
+    /// Parse a bare `or DISPOSITION` clause (no LHS). Caller is
+    /// expected to peek for `or` first; bumps past it on entry.
+    /// Returns the disposition + the span of the disposition's
+    /// tail (used by the caller to merge into a wrapping span).
+    /// Phase 3 routing keys (2026-05-25): `Stmt::Send` reuses this
+    /// for the fallible-publish `K <- value or DISPOSITION` form
+    /// on `on_unmatched: fail` topics.
+    fn parse_or_disposition(&mut self) -> Result<(OrDisposition, Span), Diag> {
+        self.bump(); // consume `or`
+        let is_raise = matches!(self.peek(), TokenKind::Ident(s) if s == "raise");
+        let is_discard = matches!(self.peek(), TokenKind::Ident(s) if s == "discard");
+        let is_fail = matches!(self.peek(), TokenKind::Ident(s) if s == "fail");
+        if is_raise {
+            let raise_tok = self.bump();
+            Ok((OrDisposition::Raise(raise_tok.span), raise_tok.span))
+        } else if is_discard {
+            let discard_tok = self.bump();
+            Ok((OrDisposition::Discard(discard_tok.span), discard_tok.span))
+        } else if is_fail {
+            let fail_tok = self.bump();
+            let payload = self.parse_expr()?;
+            let span = fail_tok.span.merge(payload.span());
+            Ok((OrDisposition::Fail(Box::new(payload), span), span))
+        } else {
+            let rhs = self.parse_expr()?;
+            let rhs_span = rhs.span();
+            Ok((OrDisposition::Substitute(Box::new(rhs)), rhs_span))
+        }
     }
 
     /// Pratt-style parse with a minimum binding power. Returns

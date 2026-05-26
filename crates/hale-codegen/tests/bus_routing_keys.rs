@@ -427,6 +427,164 @@ fn fallback_topic_without_catchall_rejected() {
     );
 }
 
+/// `on_unmatched: fail` policy with `or raise`. A publish whose
+/// routing key matches no specific-key subscriber panics via
+/// lotus_root_panic with a BusUnmatchedKey marker; matched
+/// publishes proceed normally.
+#[test]
+fn fail_policy_or_raise_panics_on_no_match() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K {
+            payload: Ev; subject: "k"; keyed_by id;
+            on_unmatched: fail;
+        }
+        locus Sub {
+            params { my_id: Int = 0; }
+            bus { subscribe K as on_k where key == self.my_id; }
+            fn on_k(e: Ev) { println("got id=", e.id); }
+        }
+        main locus App {
+            params { a: Sub = Sub { my_id: 1 }; }
+            bus { publish K; }
+            run() {
+                K <- Ev { id: 1 } or raise;
+                println("after matched");
+                K <- Ev { id: 999 } or raise;
+                println("after unmatched");
+            }
+        }
+        fn main() { App { }; }
+    "#;
+    let bin = build("fail_or_raise", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Exit non-zero (panic).
+    assert!(
+        !out.status.success(),
+        "expected panic-exit; got success. stdout={:?}",
+        stdout
+    );
+    // The first publish (id=1) matched, so dispatch_keyed_fallible
+    // returned 1 and execution continued — "after matched" prints.
+    // (The handler itself is enqueued to the cooperative queue and
+    // wouldn't drain until run() returns; the panic on the second
+    // publish kills the process before that drain. That's expected
+    // semantics for `or raise`.)
+    assert!(stdout.contains("after matched"), "stdout={:?}", stdout);
+    // The second publish (id=999) should panic — execution must
+    // not reach "after unmatched".
+    assert!(
+        !stdout.contains("after unmatched"),
+        "panic must occur before this line; stdout={:?}",
+        stdout
+    );
+    assert!(
+        stderr.contains("BusUnmatchedKey"),
+        "panic message missing; stderr={:?}",
+        stderr
+    );
+}
+
+/// `on_unmatched: fail` with `or discard` — no-match is silently
+/// swallowed (publish-side equivalent of the swallow policy, but
+/// per-call rather than per-topic).
+#[test]
+fn fail_policy_or_discard_swallows() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K {
+            payload: Ev; subject: "k"; keyed_by id;
+            on_unmatched: fail;
+        }
+        locus Sub {
+            params { my_id: Int = 0; }
+            bus { subscribe K as on_k where key == self.my_id; }
+            fn on_k(e: Ev) { println("got id=", e.id); }
+        }
+        main locus App {
+            params { a: Sub = Sub { my_id: 1 }; }
+            bus { publish K; }
+            run() {
+                K <- Ev { id: 1 } or discard;
+                K <- Ev { id: 999 } or discard;
+                println("done");
+            }
+        }
+        fn main() { App { }; }
+    "#;
+    let bin = build("fail_or_discard", src);
+    let out = Command::new(&bin).output().expect("run");
+    let _ = std::fs::remove_file(&bin);
+    assert!(out.status.success(), "non-zero exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("got id=1"), "got: {:?}", stdout);
+    assert!(stdout.contains("done"), "got: {:?}", stdout);
+    assert!(!stdout.contains("got id=999"), "got: {:?}", stdout);
+}
+
+/// Typecheck: publish to a fail topic without `or` is rejected.
+#[test]
+fn fail_topic_requires_or_disposition() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K {
+            payload: Ev; subject: "k"; keyed_by id;
+            on_unmatched: fail;
+        }
+        main locus L {
+            bus { publish K; }
+            run() { K <- Ev { id: 1 }; }
+        }
+        fn main() { L { }; }
+    "#;
+    let program = hale_syntax::parse_source(src).expect("parse");
+    let mut programs = std::collections::BTreeMap::new();
+    programs.insert("main".to_string(), &program);
+    let bundle = hale_types::Bundle { programs };
+    let (scope, _) = hale_types::resolve::build_top_scope(&bundle);
+    let diags = hale_types::check::check_bundle(&bundle, &scope);
+    assert!(
+        diags.iter().any(|d| {
+            d.message.contains("on_unmatched: fail")
+                && d.message.contains("or` disposition")
+        }),
+        "expected fail-requires-or diag, got: {:?}",
+        diags
+    );
+}
+
+/// Typecheck: `or` disposition on a non-fail topic is rejected.
+#[test]
+fn or_disposition_rejected_on_non_fail_topic() {
+    let src = r#"
+        type Ev { id: Int; }
+        topic K { payload: Ev; subject: "k"; keyed_by id; }
+        main locus L {
+            bus { publish K; }
+            run() { K <- Ev { id: 1 } or raise; }
+        }
+        fn main() { L { }; }
+    "#;
+    let program = hale_syntax::parse_source(src).expect("parse");
+    let mut programs = std::collections::BTreeMap::new();
+    programs.insert("main".to_string(), &program);
+    let bundle = hale_types::Bundle { programs };
+    let (scope, _) = hale_types::resolve::build_top_scope(&bundle);
+    let diags = hale_types::check::check_bundle(&bundle, &scope);
+    assert!(
+        diags.iter().any(|d| {
+            d.message.contains("only legal when the target topic \
+                                declares")
+                && d.message.contains("fail")
+        }),
+        "expected or-on-non-fail-topic diag, got: {:?}",
+        diags
+    );
+}
+
 /// Literal-key filter (no self.field involved). `where key == 1`
 /// pins the subscriber to that specific value regardless of
 /// instance state.

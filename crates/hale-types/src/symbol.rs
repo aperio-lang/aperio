@@ -66,6 +66,17 @@ pub struct TopicInfo {
     pub parent: Option<String>,
     pub subject: String,
     pub wire_subject: String,
+    /// Phase 3 routing keys (2026-05-25): the payload field
+    /// that holds the routing key, if declared. None for
+    /// unkeyed topics.
+    pub keyed_by: Option<String>,
+    /// Phase 3 routing keys (2026-05-25): policy for keyed
+    /// publishes that don't match any subscriber's filter.
+    /// None means the topic is unkeyed (no policy
+    /// meaningful) OR keyed with the default `swallow`
+    /// policy. Codegen treats None as Swallow at lowering
+    /// time.
+    pub on_unmatched: Option<hale_syntax::ast::UnmatchedPolicy>,
     pub span: Span,
 }
 

@@ -1246,9 +1246,18 @@ pub enum Stmt {
     /// resolve to a string-typed value naming a publish-declared
     /// channel; the value's type must match the channel's declared
     /// payload type. The compiler verifies both at type-check time.
+    ///
+    /// Phase 3 routing keys (2026-05-25): when the targeted topic
+    /// declares `on_unmatched: fail`, the publish becomes a
+    /// fallible expression — `K <- value or raise` /
+    /// `or handler(err)` / `or discard` / `or fail <payload>` —
+    /// and the optional `or_disposition` carries the handler. The
+    /// typechecker requires it on fail-topic publishes and
+    /// rejects it on swallow/fallback/unkeyed publishes.
     Send {
         subject: Expr,
         value: Expr,
+        or_disposition: Option<OrDisposition>,
         span: Span,
     },
     Expr(Expr),

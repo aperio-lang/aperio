@@ -475,6 +475,8 @@ fn register_topic(
         parent: r.parent,
         subject: r.subject,
         wire_subject: r.wire_subject,
+        keyed_by: decl.keyed_by.as_ref().map(|i| i.name.clone()),
+        on_unmatched: decl.on_unmatched,
         span: decl.span,
     };
     register_symbol(

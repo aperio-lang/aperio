@@ -702,7 +702,7 @@ fn intra_rewrite_stmt(
     locus_name: &str,
     eligible: &BTreeMap<String, EligibleRewrite>,
 ) {
-    if let Stmt::Send { subject, value, span } = s {
+    if let Stmt::Send { subject, value, span, .. } = s {
         if let Expr::Ident(id) = subject {
             if let Some(rw) = eligible.get(&id.name) {
                 if rw.publisher_locus == locus_name {
