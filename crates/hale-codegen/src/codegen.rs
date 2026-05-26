@@ -799,6 +799,7 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "json", "ArrayIter"], "__JsonArrayIter"),
     (&["std", "json", "ArrayIterSpan"], "__JsonArrayIterSpan"),
     (&["std", "json", "Builder"], "__StdJsonBuilder"),
+    (&["std", "json", "JsonFieldRange"], "__JsonFieldRange"),
     (&["std", "lang", "Lang"], "__StdLangLang"),
     (&["std", "lang", "Morpheme"], "__StdLangMorpheme"),
     (&["std", "log", "LogEvent"], "__StdLogEvent"),
@@ -4601,6 +4602,64 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         self.module.add_function(
             "lotus_str_can_parse_decimal",
             can_parse_decimal_ty,
+            None,
+        );
+
+        // 2026-05-26: range-bounded variants of the str parsers
+        // for the allocation-free JSON-walk path. Each takes
+        // (json: ptr, start: i64, end_exclusive: i64) plus the
+        // existing out / target args.
+        // declare i32 @lotus_str_range_eq(ptr s, i64 start, i64 end, ptr t)
+        let range_eq_ty = i32_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_str_range_eq", range_eq_ty, None);
+        // declare i64 @lotus_str_parse_int_range(ptr s, i64 start, i64 end)
+        let parse_int_range_ty = i64_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_str_parse_int_range",
+            parse_int_range_ty,
+            None,
+        );
+        // declare i32 @lotus_str_can_parse_int_range(ptr s, i64 start, i64 end)
+        let can_parse_int_range_ty = i32_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_str_can_parse_int_range",
+            can_parse_int_range_ty,
+            None,
+        );
+        // declare void @lotus_str_parse_decimal_range(ptr s, i64 start, i64 end, ptr out_hi, ptr out_lo)
+        let parse_decimal_range_ty = self.context.void_type().fn_type(
+            &[
+                ptr_t.into(),
+                i64_t.into(),
+                i64_t.into(),
+                ptr_t.into(),
+                ptr_t.into(),
+            ],
+            false,
+        );
+        self.module.add_function(
+            "lotus_str_parse_decimal_range",
+            parse_decimal_range_ty,
+            None,
+        );
+        // declare i32 @lotus_str_can_parse_decimal_range(ptr s, i64 start, i64 end)
+        let can_parse_decimal_range_ty = i32_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_str_can_parse_decimal_range",
+            can_parse_decimal_range_ty,
             None,
         );
 
@@ -16356,6 +16415,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "str", "parse_decimal"] => Ok(Some(
                 self.lower_std_str_parse_decimal_fallible(args, scope)?,
             )),
+            // 2026-05-26: range-bounded variants for allocation-
+            // free JSON walks. Take (json, start, end_exclusive)
+            // instead of an owned substring.
+            ["std", "str", "range_parse_int"] => Ok(Some(
+                self.lower_std_str_range_parse_int_fallible(args, scope)?,
+            )),
+            ["std", "str", "range_parse_decimal"] => Ok(Some(
+                self.lower_std_str_range_parse_decimal_fallible(args, scope)?,
+            )),
             // C4 (pond/crypto follow-up): CSPRNG getrandom.
             ["std", "os", "getrandom"] => Ok(Some(
                 self.lower_std_os_getrandom_fallible(args, scope)?,
@@ -17079,6 +17147,293 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some((value_i128.into(), CodegenTy::Decimal)),
             "str.parse_decimal",
         )
+    }
+
+    /// 2026-05-26 — `std::str::range_parse_int(json: String, start: Int,
+    /// end_exclusive: Int) -> Int fallible(ParseError)`. Range-
+    /// bounded variant of parse_int — no need to materialize the
+    /// substring as an owned String. Used by the JSON walk to
+    /// dodge per-field allocations.
+    fn lower_std_str_range_parse_int_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_int takes 3 args \
+                 (json, start, end_exclusive), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_int: json must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let s_val = self.unpack_view_if_needed(s_val, &s_ty)?;
+        let (start_val, start_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(start_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_int: start must be Int, got {:?}",
+                start_ty
+            )));
+        }
+        let (end_val, end_ty) = self.lower_expr(&args[2], scope)?;
+        if !matches!(end_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_int: end_exclusive must be Int, got {:?}",
+                end_ty
+            )));
+        }
+        let can_fn = self
+            .module
+            .get_function("lotus_str_can_parse_int_range")
+            .expect("lotus_str_can_parse_int_range declared");
+        let can_i32 = self
+            .builder
+            .build_call(
+                can_fn,
+                &[s_val.into(), start_val.into(), end_val.into()],
+                "range_parse_int.can",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                can_i32,
+                self.context.i32_type().const_zero(),
+                "range_parse_int.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let parse_fn = self
+            .module
+            .get_function("lotus_str_parse_int_range")
+            .expect("lotus_str_parse_int_range declared");
+        let value_i64 = self
+            .builder
+            .build_call(
+                parse_fn,
+                &[s_val.into(), start_val.into(), end_val.into()],
+                "range_parse_int.value",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        self.complete_parse_fallible_call(
+            is_err,
+            s_val,
+            "range_parse_int",
+            Some((value_i64, CodegenTy::Int)),
+            "str.range_parse_int",
+        )
+    }
+
+    /// 2026-05-26 — `std::str::range_parse_decimal(json: String,
+    /// start: Int, end_exclusive: Int) -> Decimal
+    /// fallible(ParseError)`. Range-bounded parse_decimal.
+    fn lower_std_str_range_parse_decimal_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_decimal takes 3 args \
+                 (json, start, end_exclusive), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_decimal: json must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let s_val = self.unpack_view_if_needed(s_val, &s_ty)?;
+        let (start_val, start_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(start_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_decimal: start must be Int, got {:?}",
+                start_ty
+            )));
+        }
+        let (end_val, end_ty) = self.lower_expr(&args[2], scope)?;
+        if !matches!(end_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_parse_decimal: end_exclusive must be Int, got {:?}",
+                end_ty
+            )));
+        }
+        let i64_t = self.context.i64_type();
+        let i128_t = self.context.i128_type();
+        let can_fn = self
+            .module
+            .get_function("lotus_str_can_parse_decimal_range")
+            .expect("lotus_str_can_parse_decimal_range declared");
+        let can_i32 = self
+            .builder
+            .build_call(
+                can_fn,
+                &[s_val.into(), start_val.into(), end_val.into()],
+                "range_parse_decimal.can",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                can_i32,
+                self.context.i32_type().const_zero(),
+                "range_parse_decimal.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let hi_slot = self.alloca_in_entry(i64_t.into(), "range_parse_decimal.hi")?;
+        let lo_slot = self.alloca_in_entry(i64_t.into(), "range_parse_decimal.lo")?;
+        let parse_fn = self
+            .module
+            .get_function("lotus_str_parse_decimal_range")
+            .expect("lotus_str_parse_decimal_range declared");
+        self.builder
+            .build_call(
+                parse_fn,
+                &[
+                    s_val.into(),
+                    start_val.into(),
+                    end_val.into(),
+                    hi_slot.into(),
+                    lo_slot.into(),
+                ],
+                "range_parse_decimal.split",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let hi_i64 = self
+            .builder
+            .build_load(i64_t, hi_slot, "range_parse_decimal.hi.load")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let lo_i64 = self
+            .builder
+            .build_load(i64_t, lo_slot, "range_parse_decimal.lo.load")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let hi_wide = self
+            .builder
+            .build_int_s_extend(hi_i64, i128_t, "range_parse_decimal.hi.sext")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let lo_wide = self
+            .builder
+            .build_int_z_extend(lo_i64, i128_t, "range_parse_decimal.lo.zext")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let shift = i128_t.const_int(64, false);
+        let hi_shifted = self
+            .builder
+            .build_left_shift(hi_wide, shift, "range_parse_decimal.hi.shl")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let value_i128 = self
+            .builder
+            .build_or(hi_shifted, lo_wide, "range_parse_decimal.value")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_parse_fallible_call(
+            is_err,
+            s_val,
+            "range_parse_decimal",
+            Some((value_i128.into(), CodegenTy::Decimal)),
+            "str.range_parse_decimal",
+        )
+    }
+
+    /// 2026-05-26 — `std::str::range_eq(json: String, start: Int,
+    /// end_exclusive: Int, expected: String) -> Bool`. True iff
+    /// json[start..end_exclusive] == expected, byte-for-byte. No
+    /// substring materialization.
+    fn lower_std_str_range_eq(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 4 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_eq takes 4 args \
+                 (json, start, end_exclusive, expected), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_eq: json must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let s_val = self.unpack_view_if_needed(s_val, &s_ty)?;
+        let (start_val, start_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(start_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_eq: start must be Int, got {:?}",
+                start_ty
+            )));
+        }
+        let (end_val, end_ty) = self.lower_expr(&args[2], scope)?;
+        if !matches!(end_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_eq: end_exclusive must be Int, got {:?}",
+                end_ty
+            )));
+        }
+        let (t_val, t_ty) = self.lower_expr(&args[3], scope)?;
+        if !matches!(t_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::range_eq: expected must be String, got {:?}",
+                t_ty
+            )));
+        }
+        let t_val = self.unpack_view_if_needed(t_val, &t_ty)?;
+        let f = self
+            .module
+            .get_function("lotus_str_range_eq")
+            .expect("lotus_str_range_eq declared");
+        let i32_v = self
+            .builder
+            .build_call(
+                f,
+                &[
+                    s_val.into(),
+                    start_val.into(),
+                    end_val.into(),
+                    t_val.into(),
+                ],
+                "str.range_eq.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        // Convert i32 → i1 (Bool ABI) via ne-zero.
+        let b = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                i32_v,
+                self.context.i32_type().const_zero(),
+                "str.range_eq.bool",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((b.into(), CodegenTy::Bool))
     }
 
     /// `std::io::fs::read_file(path) -> String fallible(IoError)`.
@@ -27323,6 +27678,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_index_of(args, scope)?;
                 Ok(())
             }
+            ["std", "str", "range_eq"] => {
+                let _ = self.lower_std_str_range_eq(args, scope)?;
+                Ok(())
+            }
             ["std", "str", "can_parse_float"] => {
                 let _ = self.lower_std_str_can_parse_float(args, scope)?;
                 Ok(())
@@ -27946,6 +28305,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "str", "index_of"] => {
                 self.lower_std_str_index_of(args, scope)
             }
+            ["std", "str", "range_eq"] => {
+                self.lower_std_str_range_eq(args, scope)
+            }
             ["std", "str", "can_parse_float"] => {
                 self.lower_std_str_can_parse_float(args, scope)
             }
@@ -28119,6 +28481,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let result = self.lower_user_fn_call("__json_iter_find_string_field", args, scope)?;
                 result.ok_or_else(|| CodegenError::Unsupported(
                     "std::json::iter_find_string_field returns String but called in a position that expects no value".to_string()))
+            }
+            // 2026-05-26 — range-bearing iter_find variants. Return
+            // a JsonFieldRange {ok, start, end_pos} instead of an
+            // owned-String substring; paired with
+            // std::str::range_eq / range_parse_* this runs the
+            // full JSON walk allocation-free.
+            ["std", "json", "iter_find_field_range"] => {
+                let result = self.lower_user_fn_call("__json_iter_find_field_range", args, scope)?;
+                result.ok_or_else(|| CodegenError::Unsupported(
+                    "std::json::iter_find_field_range returns JsonFieldRange but called in a position that expects no value".to_string()))
+            }
+            ["std", "json", "iter_find_string_field_range"] => {
+                let result = self.lower_user_fn_call("__json_iter_find_string_field_range", args, scope)?;
+                result.ok_or_else(|| CodegenError::Unsupported(
+                    "std::json::iter_find_string_field_range returns JsonFieldRange but called in a position that expects no value".to_string()))
+            }
+            ["std", "json", "find_field_range_in"] => {
+                let result = self.lower_user_fn_call("__json_find_field_range_in", args, scope)?;
+                result.ok_or_else(|| CodegenError::Unsupported(
+                    "std::json::find_field_range_in returns JsonFieldRange but called in a position that expects no value".to_string()))
             }
             ["std", "json", "iter_find_int_field"] => {
                 let result = self.lower_user_fn_call("__json_iter_find_int_field", args, scope)?;

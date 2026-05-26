@@ -1842,7 +1842,12 @@ fn mark_stdlib_error_from_path(
     if segs.len() >= 3 && segs[0] == "std" {
         match segs[1] {
             "str" => {
-                if segs[2].starts_with("parse_") {
+                // parse_int, parse_float, parse_decimal, plus the
+                // 2026-05-26 range-bounded variants
+                // range_parse_int / range_parse_decimal.
+                if segs[2].starts_with("parse_")
+                    || segs[2].starts_with("range_parse_")
+                {
                     out.parse_error = true;
                 }
             }

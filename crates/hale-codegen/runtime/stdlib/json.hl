@@ -783,6 +783,184 @@ fn __json_iter_substring(it: std::json::ArrayIterSpan, json: String) -> String {
     return json[it.cur_start..it.cur_end];
 }
 
+// 2026-05-26 — range-bearing iter_find variants. The existing
+// iter_find_field_raw / iter_find_string_field helpers each
+// allocate an owned-String substring at return (an
+// O(value_size) per-call cost that dominates arena pressure on
+// JSON-walk workloads with 100k+ elements). The _range variants
+// return (start, end_exclusive) positions inside the source
+// `json` String instead — paired with std::str::range_eq /
+// range_parse_int / range_parse_decimal, the full JSON-walk
+// runs allocation-free.
+//
+// Caller pattern:
+//
+//   while !it.done {
+//       let side_r = std::json::iter_find_string_field_range(
+//           it, json, "side"
+//       );
+//       if std::str::range_eq(json, side_r.start, side_r.end_pos, "bid") {
+//           ...
+//       }
+//       let price_r = std::json::iter_find_field_range(it, json, "price");
+//       let price = std::str::range_parse_decimal(
+//           json, price_r.start, price_r.end_pos
+//       ) or raise;
+//       it = std::json::array_next_span(it, json);
+//   }
+type __JsonFieldRange {
+    ok: Bool;         // false if field absent / malformed / iter exhausted
+    start: Int;       // inclusive byte offset within json
+    end_pos: Int;     // exclusive byte offset within json
+                      // string fields: span EXCLUDES the surrounding quotes
+                      // numeric / bool fields: span IS the literal token
+}
+
+// Range-bearing variant of iter_find_field_raw. Returns ok=false
+// when the iter is exhausted, the field is absent, or the value
+// is malformed. On ok=true, [start, end_pos) is the field's
+// value span within `json` — for "field": "bid" the span is the
+// 5 bytes `"bid"` INCLUDING quotes; use iter_find_string_field_range
+// instead if you want the inner 3 bytes `bid`.
+fn __json_iter_find_field_range(it: std::json::ArrayIterSpan, json: String, name: String)
+    -> std::json::JsonFieldRange
+{
+    if it.done {
+        return std::json::JsonFieldRange { ok: false, start: 0, end_pos: 0 };
+    }
+    return __json_find_field_range_in(json, name, it.cur_start, it.cur_end);
+}
+
+// String-field variant: same scan as iter_find_field_range but
+// the returned span EXCLUDES the surrounding quotes when the
+// value is a properly-quoted string literal. The span is empty
+// (ok=false) on malformed input. NOTE: this DOES NOT unescape;
+// callers needing unescaped content with backslash sequences
+// must use iter_find_string_field (the allocating variant).
+fn __json_iter_find_string_field_range(it: std::json::ArrayIterSpan, json: String, name: String)
+    -> std::json::JsonFieldRange
+{
+    let r = __json_iter_find_field_range(it, json, name);
+    if !r.ok {
+        return r;
+    }
+    let n = r.end_pos - r.start;
+    if n < 2 {
+        return r;
+    }
+    let bs = std::bytes::from_string(json);
+    let first = std::bytes::at(bs, r.start) or 0;
+    let last = std::bytes::at(bs, r.end_pos - 1) or 0;
+    // 34 = '"'. Both ends must be quotes for the strip.
+    if first != 34 || last != 34 {
+        return r;
+    }
+    return std::json::JsonFieldRange {
+        ok: true,
+        start: r.start + 1,
+        end_pos: r.end_pos - 1
+    };
+}
+
+// Internal: same scan logic as __json_find_field_raw_in but
+// returns the (start, end_exclusive) range instead of an owned
+// substring. The two share their scanning code via this helper;
+// the legacy String-returning helpers slice the source at the
+// end.
+fn __json_find_field_range_in(json: String, name: String, start: Int, end_exclusive: Int)
+    -> std::json::JsonFieldRange
+{
+    let miss = std::json::JsonFieldRange { ok: false, start: 0, end_pos: 0 };
+    if start < 0 { return miss; }
+    if end_exclusive <= start { return miss; }
+    let total = len(json);
+    let bound = if end_exclusive < total { end_exclusive } else { total };
+    let bs = std::bytes::from_string(json);
+    let name_len = len(name);
+    let needle_len = name_len + 2;
+    let mut p = start;
+    let scan_limit = bound - needle_len;
+    if scan_limit < start { return miss; }
+    while p <= scan_limit {
+        let c0 = std::bytes::at(bs, p) or 0;
+        if c0 == 34 {
+            let mut ok_match = true;
+            let name_bs = std::bytes::from_string(name);
+            let mut k = 0;
+            while k < name_len {
+                let want = std::bytes::at(name_bs, k) or 0;
+                let got = std::bytes::at(bs, p + 1 + k) or 0;
+                if want != got { ok_match = false; }
+                k = k + 1;
+            }
+            if ok_match {
+                let close_q = std::bytes::at(bs, p + 1 + name_len) or 0;
+                if close_q == 34 {
+                    let mut q = p + needle_len;
+                    while q < bound {
+                        let ch = std::bytes::at(bs, q) or 0;
+                        if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+                            q = q + 1;
+                        } else { break; }
+                    }
+                    if q < bound {
+                        let colon = std::bytes::at(bs, q) or 0;
+                        if colon == 58 {
+                            q = q + 1;
+                            while q < bound {
+                                let ch = std::bytes::at(bs, q) or 0;
+                                if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+                                    q = q + 1;
+                                } else { break; }
+                            }
+                            // q is at the start of the value. Scan
+                            // to its end with depth-tracking + quoted
+                            // string handling, mirroring
+                            // __json_find_field_raw_in's value scan.
+                            let val_start = q;
+                            let mut depth = 0;
+                            let mut in_str = false;
+                            while q < bound {
+                                let ch = std::bytes::at(bs, q) or 0;
+                                if in_str {
+                                    if ch == 92 { q = q + 2; continue; }
+                                    if ch == 34 { in_str = false; }
+                                    q = q + 1;
+                                    continue;
+                                }
+                                if ch == 34 { in_str = true; q = q + 1; continue; }
+                                if ch == 123 || ch == 91 {
+                                    depth = depth + 1;
+                                    q = q + 1;
+                                    continue;
+                                }
+                                if ch == 125 || ch == 93 {
+                                    if depth == 0 { break; }
+                                    depth = depth - 1;
+                                    q = q + 1;
+                                    continue;
+                                }
+                                if ch == 44 && depth == 0 { break; }
+                                q = q + 1;
+                            }
+                            if q > val_start {
+                                return std::json::JsonFieldRange {
+                                    ok: true,
+                                    start: val_start,
+                                    end_pos: q
+                                };
+                            }
+                            return miss;
+                        }
+                    }
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return miss;
+}
+
 // Range-bounded `find_field_raw`. Same scanner as the unbounded
 // variant but stops at `end_exclusive` rather than len(json).
 // Searches for `"<name>":` only within [start, end_exclusive).

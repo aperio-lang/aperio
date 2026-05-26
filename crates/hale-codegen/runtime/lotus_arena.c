@@ -7730,6 +7730,111 @@ int lotus_str_can_parse_decimal(const char *s) {
 }
 
 /*
+ * 2026-05-26 — range-aware variants of the str helpers. These
+ * accept a String + (start, end_exclusive) and operate only on
+ * the byte range [start, end_exclusive), without requiring the
+ * substring to be NUL-terminated. Used by std::str::range_eq /
+ * range_parse_int / range_parse_decimal to enable allocation-
+ * free JSON walks (the fathom workload identified
+ * `iter_find_string_field` returning an owned String per field
+ * lookup as the dominant arena-pressure source).
+ *
+ * Bounds: `start` must be >= 0; `end_exclusive` must be <=
+ * strlen(s); end_exclusive < start returns the "empty range"
+ * result (eq false, parse error). The caller (typically Hale
+ * stdlib) is responsible for the bounds — these helpers do not
+ * walk past `end_exclusive` even on malformed numeric input,
+ * so a substring containing trailing garbage that's outside
+ * the range doesn't reject the parse spuriously.
+ */
+int lotus_str_range_eq(const char *s, int64_t start, int64_t end_exclusive,
+                       const char *t)
+{
+    if (!s || !t) return 0;
+    if (start < 0 || end_exclusive < start) return 0;
+    size_t n = (size_t)(end_exclusive - start);
+    size_t tn = strlen(t);
+    if (n != tn) return 0;
+    return memcmp(s + start, t, n) == 0 ? 1 : 0;
+}
+
+/* Range-bounded int parse. Same shape as lotus_str_parse_int but
+ * with explicit [start, end_exclusive) bounds; returns 0 on
+ * empty / malformed / out-of-range — gate via the can-variant
+ * for the strict path. */
+static int64_t parse_int_in_range(const char *s, int64_t start,
+                                   int64_t end_exclusive, int *ok)
+{
+    *ok = 0;
+    if (!s || start < 0 || end_exclusive <= start) return 0;
+    size_t n = (size_t)(end_exclusive - start);
+    /* strtoll wants NUL-terminated input. Copy into a small
+     * stack buffer; bound it at 64 bytes (longer than any
+     * representable int64 in decimal — 19 digits + sign + NUL =
+     * 21). Refuse longer than 63 chars. */
+    if (n >= 64) return 0;
+    char buf[64];
+    memcpy(buf, s + start, n);
+    buf[n] = '\0';
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(buf, &end, 10);
+    if (errno != 0 || !end || *end != '\0') return 0;
+    *ok = 1;
+    return (int64_t)v;
+}
+
+int64_t lotus_str_parse_int_range(const char *s, int64_t start,
+                                   int64_t end_exclusive)
+{
+    int ok = 0;
+    return parse_int_in_range(s, start, end_exclusive, &ok);
+}
+
+int lotus_str_can_parse_int_range(const char *s, int64_t start,
+                                   int64_t end_exclusive)
+{
+    int ok = 0;
+    (void)parse_int_in_range(s, start, end_exclusive, &ok);
+    return ok;
+}
+
+/* Range-bounded Decimal parse. Reuses parse_decimal_to_i128's
+ * digit-walk by copying the substring into a small bounded
+ * buffer first; Decimal source spellings are short
+ * (mantissa + optional sign + dot + optional 'd' suffix), so a
+ * 128-byte stack buffer covers any realistic input. */
+static int parse_decimal_to_i128_range(const char *s, int64_t start,
+                                        int64_t end_exclusive,
+                                        __int128 *out)
+{
+    if (!s || start < 0 || end_exclusive <= start) return 0;
+    size_t n = (size_t)(end_exclusive - start);
+    if (n >= 128) return 0;
+    char buf[128];
+    memcpy(buf, s + start, n);
+    buf[n] = '\0';
+    return parse_decimal_to_i128(buf, out);
+}
+
+void lotus_str_parse_decimal_range(const char *s, int64_t start,
+                                    int64_t end_exclusive,
+                                    int64_t *out_hi, int64_t *out_lo)
+{
+    __int128 m = 0;
+    (void)parse_decimal_to_i128_range(s, start, end_exclusive, &m);
+    *out_lo = (int64_t)(uint64_t)m;
+    *out_hi = (int64_t)(m >> 64);
+}
+
+int lotus_str_can_parse_decimal_range(const char *s, int64_t start,
+                                       int64_t end_exclusive)
+{
+    __int128 m = 0;
+    return parse_decimal_to_i128_range(s, start, end_exclusive, &m);
+}
+
+/*
  * m58: deployment-config subject binding.
  *
  * Layered on top of the m57 AF_UNIX transport: a startup config
