@@ -3084,6 +3084,140 @@ v1 commitment.
 
 
 
+### F.33 Fallible user-supplied bus adapters (sketch)
+
+**Status: design sketch.** No grammar surface, no compiler
+behavior shipped. Captured here because the Phase-3 routing-
+keys `on_unmatched: fail` impl (2026-05-25) opened a path that
+this extension fits into cleanly; documenting now so a future
+session can pick it up without re-deriving the shape.
+
+**The observation.** A user-supplied bus adapter (`bindings {
+Topic: MyAdapter { ... }; }` in main locus) today declares an
+infallible `send`:
+
+```hale
+locus MyNatsAdapter {
+    params { url: String = ""; }
+    fn send(subject: String, bytes: Bytes) {
+        // network — failures must be swallowed or panic'd
+        // internally; no way to surface to the publisher
+    }
+}
+```
+
+If the underlying transport fails (broker down, queue full,
+network unreachable, write timeout), the adapter has nowhere
+to put the error: the contract says `send` returns nothing,
+the publisher's `Topic <- value;` statement is non-fallible,
+and Hale has no general "best-effort, may silently drop"
+metadata. So adapters either swallow errors (publishers
+unaware), retry internally (latency unpredictable), or call
+`lotus_root_panic` (process death on any transport hiccup).
+
+**The opening.** Phase-3 routing-keys shipped `on_unmatched:
+fail` — a topic-level policy that makes the publish-side `<-`
+expression fallible-required (`K <- value or raise / or
+discard`). Same vocabulary, same disposition machinery, same
+typecheck enforcement that fallible-method calls have used
+since v1.x-FORM-1. Extending that mechanism to surface
+transport failures from user-supplied adapters reuses the
+same plumbing:
+
+```hale
+locus MyNatsAdapter {
+    params { url: String = ""; retries: Int = 3; }
+    fn send(subject: String, bytes: Bytes) fallible(NatsError) {
+        // ... may return err
+    }
+}
+
+main locus App {
+    bindings { Login: MyNatsAdapter { url: "nats://..."; }; }
+}
+
+locus Worker {
+    bus { publish Login; }
+    fn process(c: Credentials) {
+        Login <- c or handler(on_nats_err);
+        //         ^^^^^^^^^^^^^^^^^^^^^^
+        //         fires on NatsError from adapter.send
+    }
+}
+```
+
+The Send statement becomes a fallible expression when the
+target topic's binding routes to an adapter whose `send` is
+declared fallible. The typecheck enforces the `or` disposition
+the same way `on_unmatched: fail` does.
+
+**Two design choices to pin down at impl time.**
+
+1. **Derived (auto) vs. explicit (`on_transport_failure: fail`
+   on the topic decl).** The routing-key `on_unmatched`
+   policy is *intrinsic to the topic* — "no in-process
+   subscriber matched my key" is a logical condition the topic
+   author can reason about up-front. Transport failure is
+   different: it's *intrinsic to the binding*, and the same
+   library compiles against different bindings in different
+   binaries (the F.31 deployment-seam point). Two paths:
+
+   - **Derived.** Typecheck walks `bindings → adapter → send`
+     at compile time; if the bound adapter's send is fallible,
+     publishes on that topic require `or`. Pro: ergonomic; the
+     topic decl doesn't have to anticipate every transport.
+     Con: same library compiles differently against different
+     bindings — could surprise a reader who didn't check the
+     main locus's bindings.
+
+   - **Explicit on topic decl.** A new clause like
+     `on_transport_failure: fail` (symmetric with
+     `on_unmatched: fail`). The topic author commits up-front;
+     adapters that don't match the contract are rejected at
+     bindings-typecheck. Pro: contract visible at topic decl,
+     symmetric with routing keys. Con: more boilerplate;
+     forces topic authors to anticipate transport fallibility
+     across all bindings.
+
+   **Lean toward derived.** The deployment-seam philosophy
+   (same library + different bindings → different binary
+   behavior) wants the binding decision to drive the publish-
+   side type. The reader who's confused by the divergence
+   should be reading the bindings block anyway — that's where
+   deployment shape lives.
+
+2. **Substrate transports stay infallible at the language
+   surface.** `unix(...)` and `shm_ring(...)` already swallow
+   IO errors (with `on_overflow: discard|panic|...` as the
+   shm_ring back-pressure escape hatch). Re-routing them
+   through the fallible-publish surface would force every
+   existing `<- value;` site to carry `or` — a sweeping
+   breaking change with no clear win. Keep them as today; the
+   new fallibility is opt-in by *user-supplied* adapters
+   declaring fallible-typed send.
+
+**Composition with routing-key `on_unmatched: fail`.** A
+topic that's both keyed-with-fail-policy AND bound to a
+fallible adapter has two error sources — "no in-process
+match" and "transport delivery failed." The cleanest answer
+is to synthesize a per-topic union err type at codegen
+(`BusSendError = BusUnmatchedKey | <AdapterErr>`), have the
+`or` disposition address the union, and destructure in the
+handler. The codegen pattern mirrors the existing fallible-
+method err-union handling.
+
+**Sequencing.** This is a v0.3 follow-on, not v0.2 of routing
+keys. v0.2 of routing keys is "ship `or handler(err)` / `or
+fail <p>` for the routing-key `BusUnmatchedKey` case" — needs
+`BusUnmatchedKey` stdlib type synthesis, mechanical from the
+existing fallible-disposition machinery (commit message of
+`bus-routing-keys-fail-fallback` calls this out). F.33
+(fallible adapters) wants v0.2 already in for the err-union
+composition path; without `BusUnmatchedKey` synth working,
+the multi-source case can't be modeled cleanly.
+
+
+
 The grammar in v0 does **not** specify:
 
 - **Trait system.** No `trait` keyword in v0 (reserved). The
