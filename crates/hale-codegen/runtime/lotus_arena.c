@@ -6548,6 +6548,170 @@ int lotus_udp_close(int fd) {
     return close(fd);
 }
 
+/* 2026-05-26 — UDP multicast surface (P1). Each fn maps directly
+ * to a single setsockopt call. `iface` may be NULL or empty to
+ * mean INADDR_ANY (the kernel picks an interface). Errors
+ * return -1 with errno set, matching the rest of the
+ * lotus_udp_* family.
+ *
+ * `group` must be an IPv4 dotted-quad string in the 224.0.0.0/4
+ * range; IPv6 multicast support is a separate follow-on
+ * (`lotus_udp6_join_group` will mirror this shape on
+ * `IPV6_JOIN_GROUP`). */
+int lotus_udp_join_group(int fd, const char *group, const char *iface) {
+    if (fd < 0 || !group) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct ip_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    if (inet_pton(AF_INET, group, &mreq.imr_multiaddr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!iface || *iface == '\0') {
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, iface, &mreq.imr_interface) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    return setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                      &mreq, sizeof(mreq));
+}
+
+int lotus_udp_leave_group(int fd, const char *group, const char *iface) {
+    if (fd < 0 || !group) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct ip_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    if (inet_pton(AF_INET, group, &mreq.imr_multiaddr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!iface || *iface == '\0') {
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, iface, &mreq.imr_interface) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    return setsockopt(fd, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                      &mreq, sizeof(mreq));
+}
+
+int lotus_udp_set_multicast_ttl(int fd, int ttl) {
+    if (fd < 0) { errno = EINVAL; return -1; }
+    if (ttl < 0 || ttl > 255) { errno = EINVAL; return -1; }
+    unsigned char ttl_u8 = (unsigned char)ttl;
+    return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL,
+                      &ttl_u8, sizeof(ttl_u8));
+}
+
+int lotus_udp_set_multicast_loop(int fd, int enabled) {
+    if (fd < 0) { errno = EINVAL; return -1; }
+    unsigned char on = enabled ? 1 : 0;
+    return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP,
+                      &on, sizeof(on));
+}
+
+int lotus_udp_set_multicast_iface(int fd, const char *addr) {
+    if (fd < 0 || !addr) { errno = EINVAL; return -1; }
+    struct in_addr in;
+    memset(&in, 0, sizeof(in));
+    if (!*addr) {
+        in.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, addr, &in) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    return setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
+                      &in, sizeof(in));
+}
+
+/* 2026-05-26 — transparent setsockopt / getsockopt pass-through
+ * (P2). Apps that know setsockopt from the Linux man pages can
+ * tune any option without us pre-deciding the curated surface.
+ * level/name come from named Int constants in the
+ * std::io::sockopt module (e.g. SOL_SOCKET = 1, SO_RCVBUF = 8 on
+ * Linux); the C primitives don't validate them — invalid combos
+ * surface as the kernel's EINVAL / ENOPROTOOPT. */
+int lotus_udp_setsockopt_int(int fd, int level, int name, int value) {
+    if (fd < 0) { errno = EINVAL; return -1; }
+    return setsockopt(fd, level, name, &value, sizeof(value));
+}
+
+int lotus_udp_setsockopt_bool(int fd, int level, int name, int enabled) {
+    if (fd < 0) { errno = EINVAL; return -1; }
+    int on = enabled ? 1 : 0;
+    return setsockopt(fd, level, name, &on, sizeof(on));
+}
+
+/* Returns the int-typed option value on success; INT_MIN on
+ * error (callers that need to distinguish a genuine INT_MIN
+ * value from an error should use the upcoming
+ * lotus_udp_getsockopt_int_out variant — for the common case
+ * (buffer sizes, TTLs, byte counts) INT_MIN is a clean
+ * sentinel). */
+int lotus_udp_getsockopt_int(int fd, int level, int name) {
+    if (fd < 0) { errno = EINVAL; return INT_MIN; }
+    int value = 0;
+    socklen_t sz = sizeof(value);
+    if (getsockopt(fd, level, name, &value, &sz) < 0) {
+        return INT_MIN;
+    }
+    return value;
+}
+
+/* 2026-05-26 — `std::io::sockopt::*` named-constant getters.
+ * Each returns the platform's actual numeric value of the
+ * corresponding setsockopt level / name / TOS / flag, so apps
+ * can write
+ *
+ *     std::io::udp::set_option_int(fd,
+ *         std::io::sockopt::SOL_SOCKET(),
+ *         std::io::sockopt::SO_RCVBUF(),
+ *         4 * 1024 * 1024) or raise;
+ *
+ * without us pre-deciding the curated UDP surface. Values
+ * come from <sys/socket.h> / <netinet/in.h>, so they track
+ * the platform (Linux constants differ from BSD / macOS;
+ * Hale's already Linux-centric for cooperative scheduling
+ * primitives, but the getter abstraction keeps the door open).
+ */
+#define LOTUS_SOCKOPT_GETTER(NAME) \
+    int lotus_sockopt_##NAME(void) { return (int)NAME; }
+
+LOTUS_SOCKOPT_GETTER(SOL_SOCKET)
+LOTUS_SOCKOPT_GETTER(IPPROTO_IP)
+LOTUS_SOCKOPT_GETTER(IPPROTO_IPV6)
+LOTUS_SOCKOPT_GETTER(IPPROTO_TCP)
+LOTUS_SOCKOPT_GETTER(IPPROTO_UDP)
+LOTUS_SOCKOPT_GETTER(SO_REUSEADDR)
+LOTUS_SOCKOPT_GETTER(SO_REUSEPORT)
+LOTUS_SOCKOPT_GETTER(SO_RCVBUF)
+LOTUS_SOCKOPT_GETTER(SO_SNDBUF)
+LOTUS_SOCKOPT_GETTER(SO_RCVTIMEO)
+LOTUS_SOCKOPT_GETTER(SO_SNDTIMEO)
+LOTUS_SOCKOPT_GETTER(SO_BROADCAST)
+LOTUS_SOCKOPT_GETTER(SO_KEEPALIVE)
+LOTUS_SOCKOPT_GETTER(SO_LINGER)
+LOTUS_SOCKOPT_GETTER(SO_PRIORITY)
+LOTUS_SOCKOPT_GETTER(IP_TTL)
+LOTUS_SOCKOPT_GETTER(IP_TOS)
+LOTUS_SOCKOPT_GETTER(IP_MULTICAST_TTL)
+LOTUS_SOCKOPT_GETTER(IP_MULTICAST_LOOP)
+LOTUS_SOCKOPT_GETTER(IP_MULTICAST_IF)
+LOTUS_SOCKOPT_GETTER(IP_ADD_MEMBERSHIP)
+LOTUS_SOCKOPT_GETTER(IP_DROP_MEMBERSHIP)
+LOTUS_SOCKOPT_GETTER(IP_PKTINFO)
+#ifdef SO_BINDTODEVICE
+LOTUS_SOCKOPT_GETTER(SO_BINDTODEVICE)
+#else
+int lotus_sockopt_SO_BINDTODEVICE(void) { return -1; }
+#endif
+#undef LOTUS_SOCKOPT_GETTER
+
 /* Hale-side wrappers that adapt the raw primitives to the
  * String / Bytes ABI. The String variant of sendto takes a
  * NUL-terminated string and computes its length internally;

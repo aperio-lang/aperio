@@ -778,6 +778,40 @@ const STDLIB_AP_SOURCE: &str = concat!(
 /// looking it up in `user_loci` / `user_types` — this table
 /// is just the path → name mapping. Keep sorted by path for
 /// review.
+/// 2026-05-26 — named socket-option constants exposed via
+/// `std::io::sockopt::<NAME>()`. Each value is fetched at runtime
+/// from a C getter (so platform-correct: Linux SOL_SOCKET=1,
+/// macOS SOL_SOCKET=0xffff, etc.). Keep alphabetized; add new
+/// entries here AND in `lotus_arena.c`'s LOTUS_SOCKOPT_GETTER
+/// block. Used by both the extern-declaration loop and the
+/// path-call dispatch matcher.
+const SOCKOPT_NAMES: &[&str] = &[
+    "IPPROTO_IP",
+    "IPPROTO_IPV6",
+    "IPPROTO_TCP",
+    "IPPROTO_UDP",
+    "IP_ADD_MEMBERSHIP",
+    "IP_DROP_MEMBERSHIP",
+    "IP_MULTICAST_IF",
+    "IP_MULTICAST_LOOP",
+    "IP_MULTICAST_TTL",
+    "IP_PKTINFO",
+    "IP_TOS",
+    "IP_TTL",
+    "SOL_SOCKET",
+    "SO_BINDTODEVICE",
+    "SO_BROADCAST",
+    "SO_KEEPALIVE",
+    "SO_LINGER",
+    "SO_PRIORITY",
+    "SO_RCVBUF",
+    "SO_RCVTIMEO",
+    "SO_REUSEADDR",
+    "SO_REUSEPORT",
+    "SO_SNDBUF",
+    "SO_SNDTIMEO",
+];
+
 const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "bus", "Adapter"], "__StdBusAdapter"),
     (&["std", "bytes", "BytesBuilder"], "__StdBytesBytesBuilder"),
@@ -4198,6 +4232,86 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         let udp_close_ty = i32_t.fn_type(&[i32_t.into()], false);
         self.module
             .add_function("lotus_udp_close", udp_close_ty, None);
+
+        // 2026-05-26: UDP multicast surface (P1) + transparent
+        // setsockopt pass-through (P2). All take an fd as first
+        // arg; named knobs map to single setsockopt calls. The
+        // setsockopt_int / getsockopt_int / setsockopt_bool
+        // pass-throughs accept level + name from
+        // std::io::sockopt's named Int constants.
+        // declare i32 @lotus_udp_join_group(i32 fd, ptr group, ptr iface)
+        let udp_group_ty = i32_t.fn_type(
+            &[i32_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module
+            .add_function("lotus_udp_join_group", udp_group_ty, None);
+        self.module
+            .add_function("lotus_udp_leave_group", udp_group_ty, None);
+        // declare i32 @lotus_udp_set_multicast_ttl(i32 fd, i32 ttl)
+        let udp_set_int_ty = i32_t.fn_type(
+            &[i32_t.into(), i32_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_udp_set_multicast_ttl",
+            udp_set_int_ty,
+            None,
+        );
+        self.module.add_function(
+            "lotus_udp_set_multicast_loop",
+            udp_set_int_ty,
+            None,
+        );
+        // declare i32 @lotus_udp_set_multicast_iface(i32 fd, ptr addr)
+        let udp_set_iface_ty = i32_t.fn_type(
+            &[i32_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_udp_set_multicast_iface",
+            udp_set_iface_ty,
+            None,
+        );
+        // declare i32 @lotus_udp_setsockopt_int(i32 fd, i32 level, i32 name, i32 value)
+        let udp_setsockopt_ty = i32_t.fn_type(
+            &[i32_t.into(), i32_t.into(), i32_t.into(), i32_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_udp_setsockopt_int",
+            udp_setsockopt_ty,
+            None,
+        );
+        self.module.add_function(
+            "lotus_udp_setsockopt_bool",
+            udp_setsockopt_ty,
+            None,
+        );
+        // declare i32 @lotus_udp_getsockopt_int(i32 fd, i32 level, i32 name)
+        let udp_getsockopt_ty = i32_t.fn_type(
+            &[i32_t.into(), i32_t.into(), i32_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_udp_getsockopt_int",
+            udp_getsockopt_ty,
+            None,
+        );
+
+        // std::io::sockopt::* named-constant getters. Each is a
+        // zero-arg int-returning fn that returns the platform's
+        // numeric value of the corresponding setsockopt
+        // level / name. Dispatched via path-call lowering below
+        // (under `std::io::sockopt::<NAME>`).
+        let sockopt_getter_ty = i32_t.fn_type(&[], false);
+        for name in SOCKOPT_NAMES {
+            self.module.add_function(
+                &format!("lotus_sockopt_{}", name),
+                sockopt_getter_ty,
+                None,
+            );
+        }
 
         // Held-open file substrate (std::io::file::File). Mirrors
         // the lotus_tcp_* split shape — primitives hand a raw fd
@@ -16471,6 +16585,32 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "io", "udp", "recv"] => Ok(Some(
                 self.lower_std_io_udp_recv_fallible(args, scope)?,
             )),
+            // 2026-05-26: UDP multicast (P1) + setsockopt
+            // pass-through (P2).
+            ["std", "io", "udp", "join_group"] => Ok(Some(
+                self.lower_std_io_udp_join_group_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "leave_group"] => Ok(Some(
+                self.lower_std_io_udp_leave_group_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "set_multicast_ttl"] => Ok(Some(
+                self.lower_std_io_udp_set_multicast_ttl_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "set_multicast_loop"] => Ok(Some(
+                self.lower_std_io_udp_set_multicast_loop_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "set_multicast_iface"] => Ok(Some(
+                self.lower_std_io_udp_set_multicast_iface_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "set_option_int"] => Ok(Some(
+                self.lower_std_io_udp_set_option_int_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "set_option_bool"] => Ok(Some(
+                self.lower_std_io_udp_set_option_bool_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "get_option_int"] => Ok(Some(
+                self.lower_std_io_udp_get_option_int_fallible(args, scope)?,
+            )),
             // File primitives: only the `__`-prefixed forms map
             // here. The user-facing `open` / `write_bytes` / `seek`
             // resolve via STDLIB_FN_RENAMES to the Hale-level
@@ -17166,6 +17306,42 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some((value_i128.into(), CodegenTy::Decimal)),
             "str.parse_decimal",
         )
+    }
+
+    /// 2026-05-26 — `std::io::sockopt::<NAME>() -> Int`. Each
+    /// named constant resolves to a zero-arg call into the
+    /// matching C getter (`lotus_sockopt_<NAME>`) which returns
+    /// the platform's numeric value. Used as the level / name
+    /// args to `std::io::udp::set_option_int` / friends.
+    fn lower_std_io_sockopt_getter(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::sockopt::{} takes 0 args, got {}",
+                name,
+                args.len()
+            )));
+        }
+        let f = self
+            .module
+            .get_function(&format!("lotus_sockopt_{}", name))
+            .expect("sockopt getter declared");
+        let v = self
+            .builder
+            .build_call(f, &[], &format!("sockopt.{}.ret", name))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let v_i64 = self
+            .builder
+            .build_int_s_extend(v, self.context.i64_type(), "sockopt.i64")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        Ok((v_i64.into(), CodegenTy::Int))
     }
 
     /// 2026-05-26 — `std::str::byte_at_unchecked(s: String, i: Int)
@@ -18662,6 +18838,532 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             label_ptr.into(),
             Some((blob_ptr.into(), CodegenTy::Bytes)),
             "udp.recv",
+        )
+    }
+
+    /// 2026-05-26 — UDP multicast `join_group(fd: Int,
+    /// group: String, iface: String) -> () fallible(IoError)`.
+    /// iface = "" means INADDR_ANY (kernel picks).
+    fn lower_std_io_udp_join_group_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        self.lower_udp_group_fallible(
+            args, scope,
+            "lotus_udp_join_group",
+            "join_group",
+        )
+    }
+
+    fn lower_std_io_udp_leave_group_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        self.lower_udp_group_fallible(
+            args, scope,
+            "lotus_udp_leave_group",
+            "leave_group",
+        )
+    }
+
+    /// Shared body for join_group / leave_group — both have the
+    /// (fd, group, iface) signature and call the same shape of
+    /// `setsockopt` underneath.
+    fn lower_udp_group_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        c_name: &str,
+        label: &str,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{} takes 3 args (fd, group, iface), got {}",
+                label, args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: fd must be Int, got {:?}",
+                label, fd_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let (group_val, group_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(group_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: group must be String, got {:?}",
+                label, group_ty
+            )));
+        }
+        let group_val = self.unpack_view_if_needed(group_val, &group_ty)?;
+        let (iface_val, iface_ty) = self.lower_expr(&args[2], scope)?;
+        if !matches!(iface_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: iface must be String, got {:?}",
+                label, iface_ty
+            )));
+        }
+        let iface_val = self.unpack_view_if_needed(iface_val, &iface_ty)?;
+        let f = self
+            .module
+            .get_function(c_name)
+            .expect("lotus_udp_*_group declared");
+        let ret_i32 = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), group_val.into(), iface_val.into()],
+                &format!("udp.{}.ret", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret_i32,
+                i32_t.const_zero(),
+                &format!("udp.{}.is_err", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            group_val,
+            None,
+            &format!("udp.{}", label),
+        )
+    }
+
+    /// 2026-05-26 — `set_multicast_ttl(fd: Int, ttl: Int) -> ()
+    /// fallible(IoError)`. ttl in 0..255; out-of-range surfaces
+    /// EINVAL via IoError.
+    fn lower_std_io_udp_set_multicast_ttl_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        self.lower_udp_set_int_fallible(
+            args, scope,
+            "lotus_udp_set_multicast_ttl",
+            "set_multicast_ttl",
+        )
+    }
+
+    /// 2026-05-26 — `set_multicast_loop(fd: Int, enabled: Bool)
+    /// -> () fallible(IoError)`. Whether the sender receives
+    /// its own multicast packets.
+    fn lower_std_io_udp_set_multicast_loop_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        self.lower_udp_set_int_fallible(
+            args, scope,
+            "lotus_udp_set_multicast_loop",
+            "set_multicast_loop",
+        )
+    }
+
+    /// Shared body for the (fd: Int, value: Int|Bool) shape.
+    /// Both Int and Bool arg types are accepted at this layer —
+    /// the C primitive is the same in both cases (the value is
+    /// coerced to int).
+    fn lower_udp_set_int_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        c_name: &str,
+        label: &str,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{} takes 2 args (fd, value), got {}",
+                label, args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: fd must be Int, got {:?}",
+                label, fd_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let (val_val, val_ty) = self.lower_expr(&args[1], scope)?;
+        let val_i32 = match val_ty {
+            CodegenTy::Int => self
+                .builder
+                .build_int_truncate(val_val.into_int_value(), i32_t, "udp.val.i32")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?,
+            CodegenTy::Bool => self
+                .builder
+                .build_int_z_extend(
+                    val_val.into_int_value(),
+                    i32_t,
+                    "udp.val.zext",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?,
+            other => {
+                return Err(CodegenError::Unsupported(format!(
+                    "std::io::udp::{}: value must be Int or Bool, got {:?}",
+                    label, other
+                )));
+            }
+        };
+        let f = self
+            .module
+            .get_function(c_name)
+            .expect("lotus_udp_set_* declared");
+        let ret_i32 = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), val_i32.into()],
+                &format!("udp.{}.ret", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret_i32,
+                i32_t.const_zero(),
+                &format!("udp.{}.is_err", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // IoError.path field gets the operation name as a
+        // diagnostic anchor (no real path for setsockopt knobs).
+        let path_anchor = self.global_string(label);
+        self.complete_io_fallible_call(
+            is_err,
+            path_anchor.into(),
+            None,
+            &format!("udp.{}", label),
+        )
+    }
+
+    /// 2026-05-26 — `set_multicast_iface(fd: Int, addr: String)
+    /// -> () fallible(IoError)`. addr = "" means INADDR_ANY.
+    fn lower_std_io_udp_set_multicast_iface_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::set_multicast_iface takes 2 args \
+                 (fd, addr), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::set_multicast_iface: fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let (addr_val, addr_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(addr_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::set_multicast_iface: addr must be String, got {:?}",
+                addr_ty
+            )));
+        }
+        let addr_val = self.unpack_view_if_needed(addr_val, &addr_ty)?;
+        let f = self
+            .module
+            .get_function("lotus_udp_set_multicast_iface")
+            .expect("lotus_udp_set_multicast_iface declared");
+        let ret_i32 = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), addr_val.into()],
+                "udp.set_multicast_iface.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret_i32,
+                i32_t.const_zero(),
+                "udp.set_multicast_iface.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.complete_io_fallible_call(
+            is_err,
+            addr_val,
+            None,
+            "udp.set_multicast_iface",
+        )
+    }
+
+    /// 2026-05-26 — `set_option_int(fd: Int, level: Int,
+    /// name: Int, value: Int) -> () fallible(IoError)`. Raw
+    /// setsockopt pass-through; level/name come from
+    /// std::io::sockopt's named Int constants.
+    fn lower_std_io_udp_set_option_int_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        self.lower_udp_setsockopt_fallible(
+            args, scope,
+            "lotus_udp_setsockopt_int",
+            "set_option_int",
+            /* value_is_bool */ false,
+        )
+    }
+
+    /// 2026-05-26 — `set_option_bool(fd: Int, level: Int,
+    /// name: Int, enabled: Bool) -> () fallible(IoError)`.
+    fn lower_std_io_udp_set_option_bool_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        self.lower_udp_setsockopt_fallible(
+            args, scope,
+            "lotus_udp_setsockopt_bool",
+            "set_option_bool",
+            /* value_is_bool */ true,
+        )
+    }
+
+    /// Shared body for set_option_int / set_option_bool. Both
+    /// take (fd, level, name, value) — only the C function
+    /// chosen and the value's expected type differ.
+    fn lower_udp_setsockopt_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        c_name: &str,
+        label: &str,
+        value_is_bool: bool,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 4 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{} takes 4 args (fd, level, name, value), got {}",
+                label, args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: fd must be Int, got {:?}",
+                label, fd_ty
+            )));
+        }
+        let (level_val, level_ty) = self.lower_expr(&args[1], scope)?;
+        if level_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: level must be Int, got {:?}",
+                label, level_ty
+            )));
+        }
+        let (name_val, name_ty) = self.lower_expr(&args[2], scope)?;
+        if name_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: name must be Int, got {:?}",
+                label, name_ty
+            )));
+        }
+        let (val_val, val_ty) = self.lower_expr(&args[3], scope)?;
+        let expected_val_ty = if value_is_bool {
+            CodegenTy::Bool
+        } else {
+            CodegenTy::Int
+        };
+        if val_ty != expected_val_ty {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: value must be {:?}, got {:?}",
+                label, expected_val_ty, val_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let level_i32 = self
+            .builder
+            .build_int_truncate(level_val.into_int_value(), i32_t, "udp.level.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let name_i32 = self
+            .builder
+            .build_int_truncate(name_val.into_int_value(), i32_t, "udp.name.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let val_i32 = if value_is_bool {
+            self.builder
+                .build_int_z_extend(
+                    val_val.into_int_value(),
+                    i32_t,
+                    "udp.val.zext",
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        } else {
+            self.builder
+                .build_int_truncate(val_val.into_int_value(), i32_t, "udp.val.i32")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        let f = self
+            .module
+            .get_function(c_name)
+            .expect("lotus_udp_setsockopt_* declared");
+        let ret_i32 = self
+            .builder
+            .build_call(
+                f,
+                &[
+                    fd_i32.into(),
+                    level_i32.into(),
+                    name_i32.into(),
+                    val_i32.into(),
+                ],
+                &format!("udp.{}.ret", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret_i32,
+                i32_t.const_zero(),
+                &format!("udp.{}.is_err", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let path_anchor = self.global_string(label);
+        self.complete_io_fallible_call(
+            is_err,
+            path_anchor.into(),
+            None,
+            &format!("udp.{}", label),
+        )
+    }
+
+    /// 2026-05-26 — `get_option_int(fd: Int, level: Int,
+    /// name: Int) -> Int fallible(IoError)`. Sentinel on
+    /// error: the C primitive returns INT_MIN.
+    fn lower_std_io_udp_get_option_int_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 3 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::get_option_int takes 3 args \
+                 (fd, level, name), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::get_option_int: fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let (level_val, level_ty) = self.lower_expr(&args[1], scope)?;
+        if level_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::get_option_int: level must be Int, got {:?}",
+                level_ty
+            )));
+        }
+        let (name_val, name_ty) = self.lower_expr(&args[2], scope)?;
+        if name_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::get_option_int: name must be Int, got {:?}",
+                name_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let level_i32 = self
+            .builder
+            .build_int_truncate(level_val.into_int_value(), i32_t, "udp.level.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let name_i32 = self
+            .builder
+            .build_int_truncate(name_val.into_int_value(), i32_t, "udp.name.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_udp_getsockopt_int")
+            .expect("lotus_udp_getsockopt_int declared");
+        let ret_i32 = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), level_i32.into(), name_i32.into()],
+                "udp.get_option_int.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let int_min = i32_t.const_int(0x80000000u64, false);
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::EQ,
+                ret_i32,
+                int_min,
+                "udp.get_option_int.is_err",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let ret_i64 = self
+            .builder
+            .build_int_s_extend(
+                ret_i32,
+                self.context.i64_type(),
+                "udp.get_option_int.i64",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let path_anchor = self.global_string("get_option_int");
+        self.complete_io_fallible_call(
+            is_err,
+            path_anchor.into(),
+            Some((ret_i64.into(), CodegenTy::Int)),
+            "udp.get_option_int",
         )
     }
 
@@ -27755,6 +28457,12 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_byte_at_unchecked(args, scope)?;
                 Ok(())
             }
+            ["std", "io", "sockopt", name]
+                if SOCKOPT_NAMES.contains(name) =>
+            {
+                let _ = self.lower_std_io_sockopt_getter(name, args)?;
+                Ok(())
+            }
             ["std", "str", "can_parse_float"] => {
                 let _ = self.lower_std_str_can_parse_float(args, scope)?;
                 Ok(())
@@ -28098,7 +28806,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "io", "udp", "__send"]
             | ["std", "io", "udp", "send"]
             | ["std", "io", "udp", "__recv"]
-            | ["std", "io", "udp", "recv"] => {
+            | ["std", "io", "udp", "recv"]
+            | ["std", "io", "udp", "join_group"]
+            | ["std", "io", "udp", "leave_group"]
+            | ["std", "io", "udp", "set_multicast_ttl"]
+            | ["std", "io", "udp", "set_multicast_loop"]
+            | ["std", "io", "udp", "set_multicast_iface"]
+            | ["std", "io", "udp", "set_option_int"]
+            | ["std", "io", "udp", "set_option_bool"]
+            | ["std", "io", "udp", "get_option_int"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",
@@ -28383,6 +29099,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "byte_at_unchecked"] => {
                 self.lower_std_str_byte_at_unchecked(args, scope)
+            }
+            // 2026-05-26 — named socket-option constants. Each
+            // resolves to a zero-arg call into the matching C
+            // getter, which returns the platform's numeric
+            // value for that level / option name.
+            ["std", "io", "sockopt", name]
+                if SOCKOPT_NAMES.contains(name) =>
+            {
+                self.lower_std_io_sockopt_getter(name, args)
             }
             ["std", "str", "can_parse_float"] => {
                 self.lower_std_str_can_parse_float(args, scope)
@@ -28859,7 +29584,15 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "io", "udp", "__send"]
             | ["std", "io", "udp", "send"]
             | ["std", "io", "udp", "__recv"]
-            | ["std", "io", "udp", "recv"] => {
+            | ["std", "io", "udp", "recv"]
+            | ["std", "io", "udp", "join_group"]
+            | ["std", "io", "udp", "leave_group"]
+            | ["std", "io", "udp", "set_multicast_ttl"]
+            | ["std", "io", "udp", "set_multicast_loop"]
+            | ["std", "io", "udp", "set_multicast_iface"]
+            | ["std", "io", "udp", "set_option_int"]
+            | ["std", "io", "udp", "set_option_bool"]
+            | ["std", "io", "udp", "get_option_int"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",
