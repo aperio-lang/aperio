@@ -4313,6 +4313,45 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             );
         }
 
+        // 2026-05-26 — UDP P4 (recv_with_source + timeouts).
+        // declare ptr @lotus_udp_recv_bytes_with_source(i32 fd, i32 max_bytes)
+        let udp_recv_src_ty =
+            ptr_t.fn_type(&[i32_t.into(), i32_t.into()], false);
+        self.module.add_function(
+            "lotus_udp_recv_bytes_with_source",
+            udp_recv_src_ty,
+            None,
+        );
+        // declare ptr @lotus_udp_last_source_host()
+        let udp_last_host_ty = ptr_t.fn_type(&[], false);
+        self.module.add_function(
+            "lotus_udp_last_source_host",
+            udp_last_host_ty,
+            None,
+        );
+        // declare i64 @lotus_udp_last_source_port()
+        let udp_last_port_ty = i64_t.fn_type(&[], false);
+        self.module.add_function(
+            "lotus_udp_last_source_port",
+            udp_last_port_ty,
+            None,
+        );
+        // declare i32 @lotus_udp_set_recv_timeout_ns(i32 fd, i64 ns)
+        let udp_set_timeout_ty = i32_t.fn_type(
+            &[i32_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_udp_set_recv_timeout_ns",
+            udp_set_timeout_ty,
+            None,
+        );
+        self.module.add_function(
+            "lotus_udp_set_send_timeout_ns",
+            udp_set_timeout_ty,
+            None,
+        );
+
         // Held-open file substrate (std::io::file::File). Mirrors
         // the lotus_tcp_* split shape — primitives hand a raw fd
         // back to the Hale-side locus, which stashes it on
@@ -16611,6 +16650,23 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "io", "udp", "get_option_int"] => Ok(Some(
                 self.lower_std_io_udp_get_option_int_fallible(args, scope)?,
             )),
+            ["std", "io", "udp", "recv_with_source"] => Ok(Some(
+                self.lower_std_io_udp_recv_with_source_fallible(args, scope)?,
+            )),
+            ["std", "io", "udp", "set_recv_timeout"] => Ok(Some(
+                self.lower_std_io_udp_set_timeout_fallible(
+                    args, scope,
+                    "lotus_udp_set_recv_timeout_ns",
+                    "set_recv_timeout",
+                )?,
+            )),
+            ["std", "io", "udp", "set_send_timeout"] => Ok(Some(
+                self.lower_std_io_udp_set_timeout_fallible(
+                    args, scope,
+                    "lotus_udp_set_send_timeout_ns",
+                    "set_send_timeout",
+                )?,
+            )),
             // File primitives: only the `__`-prefixed forms map
             // here. The user-facing `open` / `write_bytes` / `seek`
             // resolve via STDLIB_FN_RENAMES to the Hale-level
@@ -18839,6 +18895,204 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             Some((blob_ptr.into(), CodegenTy::Bytes)),
             "udp.recv",
         )
+    }
+
+    /// 2026-05-26 — UDP P4 `recv_with_source(fd: Int,
+    /// max_bytes: Int) -> Bytes fallible(IoError)`. Like `recv`
+    /// but ALSO captures the sender's IP + port into thread-
+    /// local storage; callers read them via
+    /// `std::io::udp::last_source_host()` / `last_source_port()`.
+    /// Same Bytes ABI as `recv`.
+    fn lower_std_io_udp_recv_with_source_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::recv_with_source takes 2 args \
+                 (fd, max_bytes), got {}",
+                args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::recv_with_source: fd must be Int, got {:?}",
+                fd_ty
+            )));
+        }
+        let (max_val, max_ty) = self.lower_expr(&args[1], scope)?;
+        if max_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::recv_with_source: max_bytes must be Int, got {:?}",
+                max_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let max_i32 = self
+            .builder
+            .build_int_truncate(max_val.into_int_value(), i32_t, "udp.max.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function("lotus_udp_recv_bytes_with_source")
+            .expect("lotus_udp_recv_bytes_with_source declared");
+        let blob_ptr = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), max_i32.into()],
+                "udp.recv_with_source.blob",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr")
+            .into_pointer_value();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let is_err = self
+            .builder
+            .build_is_null(blob_ptr, "udp.recv_with_source.is_err")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let label_ptr = self.global_string("udp.recv_with_source");
+        let _ = ptr_t;
+        self.complete_io_fallible_call(
+            is_err,
+            label_ptr.into(),
+            Some((blob_ptr.into(), CodegenTy::Bytes)),
+            "udp.recv_with_source",
+        )
+    }
+
+    /// 2026-05-26 — UDP P4 `set_recv_timeout(fd: Int,
+    /// d: Duration) -> () fallible(IoError)` and its
+    /// `set_send_timeout` sibling. Both take a Duration (i64
+    /// nanoseconds at the ABI level) and convert to struct
+    /// timeval inside the C primitive. d == 0 means "no
+    /// timeout" (the default; blocking).
+    fn lower_std_io_udp_set_timeout_fallible(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+        c_name: &str,
+        label: &str,
+    ) -> Result<FallibleCallResult<'ctx>, CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{} takes 2 args (fd, d), got {}",
+                label, args.len()
+            )));
+        }
+        let (fd_val, fd_ty) = self.lower_expr(&args[0], scope)?;
+        if fd_ty != CodegenTy::Int {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: fd must be Int, got {:?}",
+                label, fd_ty
+            )));
+        }
+        let (d_val, d_ty) = self.lower_expr(&args[1], scope)?;
+        if d_ty != CodegenTy::Duration {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::{}: d must be Duration, got {:?}",
+                label, d_ty
+            )));
+        }
+        let i32_t = self.context.i32_type();
+        let fd_i32 = self
+            .builder
+            .build_int_truncate(fd_val.into_int_value(), i32_t, "udp.fd.i32")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let f = self
+            .module
+            .get_function(c_name)
+            .expect("lotus_udp_set_*_timeout_ns declared");
+        let ret_i32 = self
+            .builder
+            .build_call(
+                f,
+                &[fd_i32.into(), d_val.into()],
+                &format!("udp.{}.ret", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i32")
+            .into_int_value();
+        let is_err = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::SLT,
+                ret_i32,
+                i32_t.const_zero(),
+                &format!("udp.{}.is_err", label),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let path_anchor = self.global_string(label);
+        self.complete_io_fallible_call(
+            is_err,
+            path_anchor.into(),
+            None,
+            &format!("udp.{}", label),
+        )
+    }
+
+    /// 2026-05-26 — `std::io::udp::last_source_host() -> String`.
+    /// Reads the thread-local source-IP cache populated by the
+    /// last `recv_with_source` call. Returns "" if no
+    /// recv_with_source has run on this thread yet.
+    fn lower_std_io_udp_last_source_host(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::last_source_host takes 0 args, got {}",
+                args.len()
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_udp_last_source_host")
+            .expect("lotus_udp_last_source_host declared");
+        let v = self
+            .builder
+            .build_call(f, &[], "udp.last_source_host.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns ptr");
+        Ok((v, CodegenTy::String))
+    }
+
+    /// 2026-05-26 — `std::io::udp::last_source_port() -> Int`.
+    /// Reads the thread-local source-port cache.
+    fn lower_std_io_udp_last_source_port(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "std::io::udp::last_source_port takes 0 args, got {}",
+                args.len()
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_udp_last_source_port")
+            .expect("lotus_udp_last_source_port declared");
+        let v = self
+            .builder
+            .build_call(f, &[], "udp.last_source_port.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((v, CodegenTy::Int))
     }
 
     /// 2026-05-26 — UDP multicast `join_group(fd: Int,
@@ -28463,6 +28717,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_io_sockopt_getter(name, args)?;
                 Ok(())
             }
+            ["std", "io", "udp", "last_source_host"] => {
+                let _ = self.lower_std_io_udp_last_source_host(args)?;
+                Ok(())
+            }
+            ["std", "io", "udp", "last_source_port"] => {
+                let _ = self.lower_std_io_udp_last_source_port(args)?;
+                Ok(())
+            }
             ["std", "str", "can_parse_float"] => {
                 let _ = self.lower_std_str_can_parse_float(args, scope)?;
                 Ok(())
@@ -28814,7 +29076,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "io", "udp", "set_multicast_iface"]
             | ["std", "io", "udp", "set_option_int"]
             | ["std", "io", "udp", "set_option_bool"]
-            | ["std", "io", "udp", "get_option_int"] => {
+            | ["std", "io", "udp", "get_option_int"]
+            | ["std", "io", "udp", "recv_with_source"]
+            | ["std", "io", "udp", "set_recv_timeout"]
+            | ["std", "io", "udp", "set_send_timeout"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",
@@ -29108,6 +29373,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 if SOCKOPT_NAMES.contains(name) =>
             {
                 self.lower_std_io_sockopt_getter(name, args)
+            }
+            // 2026-05-26 — UDP P4: getters for the source IP +
+            // port of the last `recv_with_source` on this thread.
+            ["std", "io", "udp", "last_source_host"] => {
+                self.lower_std_io_udp_last_source_host(args)
+            }
+            ["std", "io", "udp", "last_source_port"] => {
+                self.lower_std_io_udp_last_source_port(args)
             }
             ["std", "str", "can_parse_float"] => {
                 self.lower_std_str_can_parse_float(args, scope)
@@ -29592,7 +29865,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             | ["std", "io", "udp", "set_multicast_iface"]
             | ["std", "io", "udp", "set_option_int"]
             | ["std", "io", "udp", "set_option_bool"]
-            | ["std", "io", "udp", "get_option_int"] => {
+            | ["std", "io", "udp", "get_option_int"]
+            | ["std", "io", "udp", "recv_with_source"]
+            | ["std", "io", "udp", "set_recv_timeout"]
+            | ["std", "io", "udp", "set_send_timeout"] => {
                 Err(CodegenError::Unsupported(format!(
                     "`{}` returns a fallible value — address the error with \
                      `or raise`, `or <substitute>`, or `or self.handle(err)`",

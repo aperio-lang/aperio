@@ -6712,6 +6712,113 @@ int lotus_sockopt_SO_BINDTODEVICE(void) { return -1; }
 #endif
 #undef LOTUS_SOCKOPT_GETTER
 
+/* 2026-05-26 — UDP P4: recv_with_source + set_*_timeout.
+ *
+ * `recv_with_source` captures the sender's IP + port into
+ * thread-local storage and returns the datagram bytes. Two
+ * companion getters (`last_source_host`, `last_source_port`)
+ * read the TLS slots. Pattern mirrors C's errno + strerror
+ * — apps know to read the source IMMEDIATELY after the recv.
+ * The TLS is reset to "0.0.0.0:0" if a subsequent recv fails;
+ * holding the source across an unrelated stdlib call is
+ * caller's responsibility (the slots are stable across any
+ * call that doesn't itself touch them, but the contract is
+ * "read right after recv").
+ *
+ * Buffer sizes: INET_ADDRSTRLEN = 16 covers any IPv4 dotted-
+ * quad; INET6_ADDRSTRLEN = 46 leaves headroom for the v6
+ * follow-on. */
+static __thread char g_udp_last_source_host[64] = "0.0.0.0";
+static __thread int64_t g_udp_last_source_port = 0;
+
+void *lotus_udp_recv_bytes_with_source(int fd, int max_bytes) {
+    if (fd < 0 || max_bytes <= 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    char stack_buf[65536];
+    size_t cap = (size_t)max_bytes;
+    if (cap > sizeof(stack_buf)) cap = sizeof(stack_buf);
+    struct sockaddr_in src;
+    socklen_t src_len = sizeof(src);
+    memset(&src, 0, sizeof(src));
+    ssize_t n = recvfrom(fd, stack_buf, cap, 0,
+                         (struct sockaddr *)&src, &src_len);
+    if (n < 0) {
+        /* Reset source TLS so a stale value isn't read by a
+         * caller that ignores the err path. */
+        g_udp_last_source_host[0] = '0';
+        g_udp_last_source_host[1] = '.';
+        g_udp_last_source_host[2] = '0';
+        g_udp_last_source_host[3] = '.';
+        g_udp_last_source_host[4] = '0';
+        g_udp_last_source_host[5] = '.';
+        g_udp_last_source_host[6] = '0';
+        g_udp_last_source_host[7] = '\0';
+        g_udp_last_source_port = 0;
+        return NULL;
+    }
+    if (src.sin_family == AF_INET) {
+        if (!inet_ntop(AF_INET, &src.sin_addr,
+                       g_udp_last_source_host,
+                       sizeof(g_udp_last_source_host))) {
+            g_udp_last_source_host[0] = '\0';
+        }
+        g_udp_last_source_port = (int64_t)ntohs(src.sin_port);
+    } else {
+        g_udp_last_source_host[0] = '\0';
+        g_udp_last_source_port = 0;
+    }
+    /* Build the Bytes blob in the bus payload arena. */
+    size_t blob_size = sizeof(int64_t) + (size_t)n;
+    void *blob = lotus_bus_payload_arena_alloc(blob_size, 8);
+    if (!blob) return NULL;
+    *(int64_t *)blob = (int64_t)n;
+    if (n > 0) {
+        memcpy((char *)blob + sizeof(int64_t), stack_buf, (size_t)n);
+    }
+    return blob;
+}
+
+/* Returns a String in the bus payload arena holding the last
+ * recv'd datagram's source IP. NUL-terminated; safe across the
+ * Hale String ABI. Returns "" if no recv_with_source has been
+ * called on this thread yet. */
+const char *lotus_udp_last_source_host(void) {
+    size_t n = strlen(g_udp_last_source_host);
+    char *out = (char *)lotus_bus_payload_arena_alloc(n + 1, 1);
+    if (!out) return "";
+    memcpy(out, g_udp_last_source_host, n);
+    out[n] = '\0';
+    return out;
+}
+
+int64_t lotus_udp_last_source_port(void) {
+    return g_udp_last_source_port;
+}
+
+/* 2026-05-26 — UDP send/recv timeouts via SO_RCVTIMEO /
+ * SO_SNDTIMEO. These take a struct timeval (not a plain int)
+ * so they can't ride the set_option_int pass-through.
+ * Accepts a Hale Duration (i64 nanoseconds); 0 means "no
+ * timeout" (the default; blocking). */
+static int udp_set_timeout(int fd, int name, int64_t ns) {
+    if (fd < 0) { errno = EINVAL; return -1; }
+    if (ns < 0) { errno = EINVAL; return -1; }
+    struct timeval tv;
+    tv.tv_sec = (time_t)(ns / 1000000000);
+    tv.tv_usec = (suseconds_t)((ns % 1000000000) / 1000);
+    return setsockopt(fd, SOL_SOCKET, name, &tv, sizeof(tv));
+}
+
+int lotus_udp_set_recv_timeout_ns(int fd, int64_t ns) {
+    return udp_set_timeout(fd, SO_RCVTIMEO, ns);
+}
+
+int lotus_udp_set_send_timeout_ns(int fd, int64_t ns) {
+    return udp_set_timeout(fd, SO_SNDTIMEO, ns);
+}
+
 /* Hale-side wrappers that adapt the raw primitives to the
  * String / Bytes ABI. The String variant of sendto takes a
  * NUL-terminated string and computes its length internally;
