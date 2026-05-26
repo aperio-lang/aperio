@@ -178,3 +178,66 @@ jobs:
             --extract-to . \
             --extract-overwrite \
             --partition hash:${{ matrix.partition }}/4
+
+  # 2026-05-26 — TSAN regression coverage for the lockfree
+  # substrate paths. F.32-1γ-v2 + the substrate-race-fixes work
+  # closed five originally-flagged TSAN races
+  # (bus_queue_drain multi-thread flag, arena subregion mutex,
+  # arena_destroy / coop_pool_worker ordering, lazy-init env
+  # helpers via pthread_once) — the lockfree hashmap path
+  # validates clean with an empty suppression list. This job
+  # locks that in: any future regression that re-races on the
+  # lockfree set / get / remove / grow paths fails CI here.
+  #
+  # Separate job because TSAN-instrumented binaries are ~5-15×
+  # slower; running the full workspace under TSAN would gate
+  # PRs on 30+ minute CI. The dedicated suite at
+  # `crates/hale-codegen/tests/form_hashmap_lockfree_tsan.rs`
+  # covers the substrate paths we care about + completes in
+  # under a minute.
+  tsan:
+    name: tsan (form_hashmap_lockfree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-tsan-x86_64-linux-llvm18-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-tsan-x86_64-linux-llvm18-
+
+      - name: Install LLVM 18 + clang
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            llvm-18-dev libpolly-18-dev libzstd-dev \
+            clang-18 libclang-18-dev zlib1g-dev
+
+      - name: cargo build --release -p hale-codegen
+        run: cargo build --release -p hale-codegen
+
+      - name: LOTUS_TSAN=1 cargo test (form_hashmap_lockfree_tsan)
+        # The TSAN tests are #[ignore]'d so the normal suite
+        # skips them; --ignored opts in. LOTUS_TSAN=1 in env
+        # tells `build_executable` to pass -fsanitize=thread to
+        # clang for both the runtime C compile and the binary
+        # link. The C runtime's embedded
+        # __tsan_default_suppressions returns empty as of
+        # 2026-05-26 — any race surfaced here is a new
+        # regression and gates the merge.
+        env:
+          LOTUS_TSAN: "1"
+        run: |
+          cargo test --release -p hale-codegen \
+            --test form_hashmap_lockfree_tsan \
+            -- --ignored --test-threads=1 --nocapture
