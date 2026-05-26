@@ -1100,7 +1100,18 @@ locus accepts coordinatees:
   tracks a slot index per child; on child dissolve, the slot
   returns to a per-arena free-list so peak slot space stays
   O(concurrent children alive), not O(total children ever
-  accepted). Per F.3.
+  accepted). Per F.3. The free-list + `next_slot` counter are
+  protected by a per-arena `pthread_mutex_t subregion_lock`
+  (2026-05-26) — without it, two threads concurrently
+  creating or destroying children of the same parent (common
+  under cross-pool cooperative placement where a worker's
+  handler-scratch sub-region sits under the App arena) would
+  race on the slot tracker: concurrent `realloc` of the
+  freelist buffer, double-pop yielding duplicate slot
+  indices, lost pushes. The lock window is O(1) per
+  create/destroy (a counter increment or a freelist push);
+  steady-state allocations within a sub-region remain
+  lock-free.
 - **Recognition** parents (v1.x-3): the sub-mode commitment
   spelled at the declaration site picks the allocator family.
   `fixed_cell` routes children through
