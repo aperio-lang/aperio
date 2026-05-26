@@ -656,11 +656,10 @@ type __JsonArrayIterSpan {
 
 fn __json_array_first_span(json: String) -> std::json::ArrayIterSpan {
     let total = len(json);
-    let bs = std::bytes::from_string(json);
     // Skip leading whitespace.
     let mut p = 0;
     while p < total {
-        let c = std::bytes::at(bs, p) or 0;
+        let c = std::str::byte_at_unchecked(json, p);
         if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1; }
         else { break; }
     }
@@ -669,7 +668,7 @@ fn __json_array_first_span(json: String) -> std::json::ArrayIterSpan {
             pos: total, cur_start: -1, cur_end: 0, done: true
         };
     }
-    let bracket = std::bytes::at(bs, p) or 0;
+    let bracket = std::str::byte_at_unchecked(json, p);
     if bracket != 91 {
         // Not an array.
         return std::json::ArrayIterSpan {
@@ -694,10 +693,9 @@ fn __json_array_step_span(json: String, start: Int)
     -> std::json::ArrayIterSpan
 {
     let total = len(json);
-    let bs = std::bytes::from_string(json);
     let mut p = start;
     while p < total {
-        let c = std::bytes::at(bs, p) or 0;
+        let c = std::str::byte_at_unchecked(json, p);
         if c == 32 || c == 9 || c == 10 || c == 13 || c == 44 { p = p + 1; }
         else { break; }
     }
@@ -706,7 +704,7 @@ fn __json_array_step_span(json: String, start: Int)
             pos: total, cur_start: -1, cur_end: 0, done: true
         };
     }
-    let c = std::bytes::at(bs, p) or 0;
+    let c = std::str::byte_at_unchecked(json, p);
     if c == 93 {
         // End of array.
         return std::json::ArrayIterSpan {
@@ -717,7 +715,7 @@ fn __json_array_step_span(json: String, start: Int)
     let mut depth = 0;
     let mut in_str = false;
     while p < total {
-        let ch = std::bytes::at(bs, p) or 0;
+        let ch = std::str::byte_at_unchecked(json, p);
         if in_str {
             if ch == 92 { p = p + 2; continue; }
             if ch == 34 { in_str = false; }
@@ -837,6 +835,14 @@ fn __json_iter_find_field_range(it: std::json::ArrayIterSpan, json: String, name
 // (ok=false) on malformed input. NOTE: this DOES NOT unescape;
 // callers needing unescaped content with backslash sequences
 // must use iter_find_string_field (the allocating variant).
+//
+// Uses std::str::byte_at_unchecked directly on `json` rather
+// than allocating a Bytes copy via std::bytes::from_string —
+// the latter would alloc len(json) bytes per call, and on a
+// 5 MB JSON walked 100k times that's TB of allocation demand.
+// The bounds (r.start, r.end_pos) come from the parent scan
+// which guarantees 0 <= start, end_pos <= len(json), so the
+// unchecked access is safe.
 fn __json_iter_find_string_field_range(it: std::json::ArrayIterSpan, json: String, name: String)
     -> std::json::JsonFieldRange
 {
@@ -848,9 +854,8 @@ fn __json_iter_find_string_field_range(it: std::json::ArrayIterSpan, json: Strin
     if n < 2 {
         return r;
     }
-    let bs = std::bytes::from_string(json);
-    let first = std::bytes::at(bs, r.start) or 0;
-    let last = std::bytes::at(bs, r.end_pos - 1) or 0;
+    let first = std::str::byte_at_unchecked(json, r.start);
+    let last = std::str::byte_at_unchecked(json, r.end_pos - 1);
     // 34 = '"'. Both ends must be quotes for the strip.
     if first != 34 || last != 34 {
         return r;
@@ -864,9 +869,10 @@ fn __json_iter_find_string_field_range(it: std::json::ArrayIterSpan, json: Strin
 
 // Internal: same scan logic as __json_find_field_raw_in but
 // returns the (start, end_exclusive) range instead of an owned
-// substring. The two share their scanning code via this helper;
-// the legacy String-returning helpers slice the source at the
-// end.
+// substring. Uses std::str::byte_at_unchecked on `json` directly
+// — does NOT allocate a Bytes copy of the source per call.
+// Bounds are computed at entry (scan_limit, name_len, etc.) so
+// every byte access is provably within [0, len(json)).
 fn __json_find_field_range_in(json: String, name: String, start: Int, end_exclusive: Int)
     -> std::json::JsonFieldRange
 {
@@ -875,53 +881,46 @@ fn __json_find_field_range_in(json: String, name: String, start: Int, end_exclus
     if end_exclusive <= start { return miss; }
     let total = len(json);
     let bound = if end_exclusive < total { end_exclusive } else { total };
-    let bs = std::bytes::from_string(json);
     let name_len = len(name);
     let needle_len = name_len + 2;
     let mut p = start;
     let scan_limit = bound - needle_len;
     if scan_limit < start { return miss; }
     while p <= scan_limit {
-        let c0 = std::bytes::at(bs, p) or 0;
+        let c0 = std::str::byte_at_unchecked(json, p);
         if c0 == 34 {
-            let mut ok_match = true;
-            let name_bs = std::bytes::from_string(name);
-            let mut k = 0;
-            while k < name_len {
-                let want = std::bytes::at(name_bs, k) or 0;
-                let got = std::bytes::at(bs, p + 1 + k) or 0;
-                if want != got { ok_match = false; }
-                k = k + 1;
-            }
-            if ok_match {
-                let close_q = std::bytes::at(bs, p + 1 + name_len) or 0;
+            // Inline the name-byte compare via range_eq, which
+            // also avoids the std::bytes::from_string(name) trip
+            // (a smaller alloc per scan-iter, but still material
+            // over 100k iters × hundreds of `"` hits per iter).
+            if std::str::range_eq(json, p + 1, p + 1 + name_len, name) {
+                let close_q = std::str::byte_at_unchecked(json, p + 1 + name_len);
                 if close_q == 34 {
                     let mut q = p + needle_len;
                     while q < bound {
-                        let ch = std::bytes::at(bs, q) or 0;
+                        let ch = std::str::byte_at_unchecked(json, q);
                         if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
                             q = q + 1;
                         } else { break; }
                     }
                     if q < bound {
-                        let colon = std::bytes::at(bs, q) or 0;
+                        let colon = std::str::byte_at_unchecked(json, q);
                         if colon == 58 {
                             q = q + 1;
                             while q < bound {
-                                let ch = std::bytes::at(bs, q) or 0;
+                                let ch = std::str::byte_at_unchecked(json, q);
                                 if ch == 32 || ch == 9 || ch == 10 || ch == 13 {
                                     q = q + 1;
                                 } else { break; }
                             }
                             // q is at the start of the value. Scan
                             // to its end with depth-tracking + quoted
-                            // string handling, mirroring
-                            // __json_find_field_raw_in's value scan.
+                            // string handling.
                             let val_start = q;
                             let mut depth = 0;
                             let mut in_str = false;
                             while q < bound {
-                                let ch = std::bytes::at(bs, q) or 0;
+                                let ch = std::str::byte_at_unchecked(json, q);
                                 if in_str {
                                     if ch == 92 { q = q + 2; continue; }
                                     if ch == 34 { in_str = false; }

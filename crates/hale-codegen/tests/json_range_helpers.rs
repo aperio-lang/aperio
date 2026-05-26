@@ -180,3 +180,87 @@ fn iter_find_field_range_missing_field_reports_not_ok() {
     assert_eq!(n, 2, "expected 2 missing_price; got: {:?}", stdout);
     assert!(!stdout.contains("found_price"), "no element has the field; got: {:?}", stdout);
 }
+
+#[test]
+fn high_volume_walk_bounded_rss() {
+    // 2026-05-26 regression guard. The original range_* impl had a
+    // hidden `std::bytes::from_string(json)` inside each scan loop
+    // (and inside the iter_find_string_field_range quote check),
+    // which allocated a fresh Bytes copy of the entire source JSON
+    // on every call. For fathom's coinbase L2 workload (~5 MB
+    // snapshot × 100k elements × ~5 stdlib calls per iter) that
+    // pushed peak RSS to 13+ GB on a single snapshot. The fix
+    // routed scan loops through std::str::byte_at_unchecked, which
+    // takes the String pointer directly with no allocation.
+    //
+    // Bound: a 50k-element walk on a 2 MB synthesized array should
+    // peak under 100 MB. (Pre-fix on the same input: GB-range and
+    // climbs linearly with iteration count.)
+    let src = r#"
+        fn build_input() -> String {
+            let mut b = std::str::builder_new();
+            std::str::builder_append(b, "[");
+            let mut i = 0;
+            while i < 50000 {
+                if i > 0 { std::str::builder_append(b, ","); }
+                std::str::builder_append(b, "{\"side\":\"bid\",\"price\":\"100.5\",\"size\":\"1.25\"}");
+                i = i + 1;
+            }
+            std::str::builder_append(b, "]");
+            return std::str::builder_finish(b);
+        }
+
+        fn walk(json: String) -> Int {
+            let mut it = std::json::array_first_span(json);
+            let mut n = 0;
+            while !it.done {
+                let side_r = std::json::iter_find_string_field_range(it, json, "side");
+                if std::str::range_eq(json, side_r.start, side_r.end_pos, "bid") {
+                    n = n + 1;
+                }
+                let size_r = std::json::iter_find_string_field_range(it, json, "size");
+                let _v = std::str::range_parse_decimal(
+                    json, size_r.start, size_r.end_pos
+                ) or 0.0d;
+                it = std::json::array_next_span(it, json);
+            }
+            return n;
+        }
+
+        fn main() {
+            let json = build_input();
+            let _n = walk(json);
+            // Print peak-equivalent RSS at end-of-walk. Test asserts
+            // a bound on this value; the regression manifests as
+            // multi-GB rather than single/double-digit MB.
+            print("final_rss_mb=");
+            println(std::process::rss_bytes() / 1048576);
+        }
+    "#;
+    let (stdout, status) = build_and_run("high_volume", src);
+    assert!(
+        status.success(),
+        "high-volume walk crashed (probable memory leak): {:?}\nstdout: {}",
+        status, stdout,
+    );
+    // Parse out the final RSS line and bound it.
+    let rss_line = stdout
+        .lines()
+        .find(|l| l.starts_with("final_rss_mb="))
+        .expect(&format!("missing final_rss_mb in stdout: {:?}", stdout));
+    let rss: i64 = rss_line
+        .trim_start_matches("final_rss_mb=")
+        .trim()
+        .parse()
+        .expect(&format!("can't parse rss line: {:?}", rss_line));
+    // Pre-fix: GB-range, scales linearly with iter count. Post-fix:
+    // single-digit MB on this size. 100 MB is a generous bound that
+    // leaves headroom for cold-start / allocator-rounding noise.
+    assert!(
+        rss < 100,
+        "50k-iter range walk exceeded 100 MB RSS ({}MB) — likely \
+         a bytes_from_string regression in a scan helper. Pre-fix \
+         this OOM'd on fathom at 13+ GB.",
+        rss
+    );
+}

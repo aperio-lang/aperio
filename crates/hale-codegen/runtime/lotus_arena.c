@@ -5418,6 +5418,36 @@ int64_t lotus_str_len(const char *s) {
     return (int64_t)strlen(s);
 }
 
+/* 2026-05-26 — direct byte-access on a String at offset `i`,
+ * returning the byte value (0..255) or -1 on out-of-range.
+ * Symmetric with lotus_bytes_at but skips the
+ * std::bytes::from_string(s) trip, which allocates a fresh
+ * Bytes copy of the entire String every call. Used by stdlib
+ * scan helpers (JSON walkers, etc.) that peek at single bytes
+ * inside a large source String. The strlen call dominates cost
+ * for large inputs — for tight scan loops use
+ * lotus_str_byte_at_unchecked instead. */
+int64_t lotus_str_byte_at(const char *s, int64_t i) {
+    if (!s || i < 0) return -1;
+    int64_t n = (int64_t)strlen(s);
+    if (i >= n) return -1;
+    return (int64_t)(unsigned char)s[i];
+}
+
+/* Unchecked byte access — no strlen, no bounds check. Caller
+ * MUST guarantee 0 <= i < strlen(s); the typical pattern is
+ * computing the bound once (via len(json) at the scanner's
+ * entry point) and iterating `while p < bound`. Used by the
+ * JSON range-walker scanners where the bound is already known
+ * from len(json) computed at function entry. The point of this
+ * variant is to avoid a per-byte-access strlen — for a 5 MB
+ * source string scanned 100k times, an O(N) strlen per call
+ * compounds to seconds of pure-CPU; the unchecked variant is
+ * a single load. Misuse (i out of range) is UB. */
+int64_t lotus_str_byte_at_unchecked(const char *s, int64_t i) {
+    return (int64_t)(unsigned char)s[i];
+}
+
 /*
  * Substring `s[lo..hi]` with exclusive `hi`. Bounds clamp so
  * out-of-range indices produce a (possibly empty) string rather

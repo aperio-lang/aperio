@@ -4605,6 +4605,25 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             None,
         );
 
+        // 2026-05-26: direct byte-access on a String. The
+        // safe variant strlens internally; the _unchecked
+        // variant is for tight scan loops where the bound is
+        // externally known (caller has called len(s) once).
+        let str_byte_at_ty = i64_t.fn_type(
+            &[ptr_t.into(), i64_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_str_byte_at",
+            str_byte_at_ty,
+            None,
+        );
+        self.module.add_function(
+            "lotus_str_byte_at_unchecked",
+            str_byte_at_ty,
+            None,
+        );
+
         // 2026-05-26: range-bounded variants of the str parsers
         // for the allocation-free JSON-walk path. Each takes
         // (json: ptr, start: i64, end_exclusive: i64) plus the
@@ -17149,6 +17168,56 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         )
     }
 
+    /// 2026-05-26 — `std::str::byte_at_unchecked(s: String, i: Int)
+    /// -> Int`. Direct byte access at offset i, NO bounds check
+    /// — caller must ensure 0 <= i < len(s). Returns the byte
+    /// value 0..255 as Int. Used by stdlib scan helpers (JSON
+    /// walkers) where the bound is externally known and a
+    /// per-access strlen would tank perf. Misuse → UB.
+    fn lower_std_str_byte_at_unchecked(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 2 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::byte_at_unchecked takes 2 args (s, i), got {}",
+                args.len()
+            )));
+        }
+        let (s_val, s_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(s_ty, CodegenTy::String | CodegenTy::StringView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::byte_at_unchecked: s must be String, got {:?}",
+                s_ty
+            )));
+        }
+        let s_val = self.unpack_view_if_needed(s_val, &s_ty)?;
+        let (i_val, i_ty) = self.lower_expr(&args[1], scope)?;
+        if !matches!(i_ty, CodegenTy::Int) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::str::byte_at_unchecked: i must be Int, got {:?}",
+                i_ty
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_str_byte_at_unchecked")
+            .expect("lotus_str_byte_at_unchecked declared");
+        let v = self
+            .builder
+            .build_call(
+                f,
+                &[s_val.into(), i_val.into()],
+                "str.byte_at_unchecked.ret",
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((v, CodegenTy::Int))
+    }
+
     /// 2026-05-26 — `std::str::range_parse_int(json: String, start: Int,
     /// end_exclusive: Int) -> Int fallible(ParseError)`. Range-
     /// bounded variant of parse_int — no need to materialize the
@@ -27682,6 +27751,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_str_range_eq(args, scope)?;
                 Ok(())
             }
+            ["std", "str", "byte_at_unchecked"] => {
+                let _ = self.lower_std_str_byte_at_unchecked(args, scope)?;
+                Ok(())
+            }
             ["std", "str", "can_parse_float"] => {
                 let _ = self.lower_std_str_can_parse_float(args, scope)?;
                 Ok(())
@@ -28307,6 +28380,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "str", "range_eq"] => {
                 self.lower_std_str_range_eq(args, scope)
+            }
+            ["std", "str", "byte_at_unchecked"] => {
+                self.lower_std_str_byte_at_unchecked(args, scope)
             }
             ["std", "str", "can_parse_float"] => {
                 self.lower_std_str_can_parse_float(args, scope)
