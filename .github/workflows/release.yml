@@ -12,13 +12,22 @@ name: release
 # manual run for ad-hoc builds (useful for smoke-testing the
 # workflow itself before tagging).
 #
-# Three matrix entries cover the practical surface:
+# Two matrix entries cover the practical surface:
 #   - Linux x86_64 (ubuntu-latest)
-#   - macOS Intel x86_64 (macos-13)
 #   - macOS Apple Silicon arm64 (macos-14)
 #
-# Linux arm64 is not yet covered — add a fourth matrix entry when
-# a user surfaces the need.
+# Intel Mac (x86_64-apple-darwin / macos-13) was dropped 2026-05-27.
+# Two reasons: (1) the macos-13 runner is being sunset by GitHub —
+# its homebrew bottles for `llvm@18` are degrading, and a missing
+# bottle forces brew to build LLVM from source on the runner
+# (multi-hour hangs that no longer represent a working release
+# path). (2) Apple Silicon has been the dominant Mac platform
+# since 2020; Intel-Mac users can run the arm64 binary via
+# Rosetta 2 with no functional difference for our workload. Add
+# native Intel back if/when a downstream consumer asks.
+#
+# Linux arm64 is also not covered — add when a user surfaces the
+# need.
 
 on:
   push:
@@ -28,7 +37,7 @@ on:
 
 # Re-pushing the same tag (common during a stabilization push)
 # auto-cancels the in-flight run so a fresh one isn't stuck
-# behind it in the scarce macos-13 runner queue.
+# behind it in the scarce macos runner queue.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -47,9 +56,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             llvm-prefix: /usr/lib/llvm-18
-          - os: macos-13
-            target: x86_64-apple-darwin
-            llvm-prefix: /usr/local/opt/llvm@18
           - os: macos-14
             target: aarch64-apple-darwin
             llvm-prefix: /opt/homebrew/opt/llvm@18
