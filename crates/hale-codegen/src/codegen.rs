@@ -4483,6 +4483,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ptr_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function("lotus_crypto_hmac_sha256", hmac_sha256_ty, None);
+        // 2026-05-27: declare i64 @lotus_crypto_crc32(ptr bytes)
+        let crc32_ty = i64_t.fn_type(&[ptr_t.into()], false);
+        self.module
+            .add_function("lotus_crypto_crc32", crc32_ty, None);
         // declare ptr @lotus_text_base64_encode(ptr bytes)
         let b64_encode_ty = ptr_t.fn_type(&[ptr_t.into()], false);
         self.module
@@ -28772,6 +28776,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_crypto_hmac_sha256(args, scope)?;
                 Ok(())
             }
+            ["std", "crypto", "crc32"] => {
+                let _ = self.lower_std_crypto_crc32(args, scope)?;
+                Ok(())
+            }
             ["std", "text", "base64", "encode"] => {
                 let _ = self.lower_std_text_base64_encode(args, scope)?;
                 Ok(())
@@ -29455,6 +29463,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
             ["std", "crypto", "hmac_sha256"] => {
                 self.lower_std_crypto_hmac_sha256(args, scope)
+            }
+            ["std", "crypto", "crc32"] => {
+                self.lower_std_crypto_crc32(args, scope)
             }
             ["std", "text", "base64", "encode"] => {
                 self.lower_std_text_base64_encode(args, scope)
@@ -33976,6 +33987,47 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("returns ptr");
         Ok((ptr, CodegenTy::Bytes))
+    }
+
+    /// 2026-05-27: lower
+    /// `std::crypto::crc32(b: Bytes) -> Int`. IEEE 802.3
+    /// reversed polynomial (`0xEDB88320`), init `0xFFFFFFFF`,
+    /// final XOR `0xFFFFFFFF` — the variant zlib's `crc32()`
+    /// and Python's `binascii.crc32` return. Returns the
+    /// 4-byte checksum as `Int` (caller casts/compares as
+    /// needed). Non-fallible, no arena allocation.
+    fn lower_std_crypto_crc32(
+        &mut self,
+        args: &[Expr],
+        scope: &Scope<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::crc32 takes 1 arg (b), got {}",
+                args.len()
+            )));
+        }
+        let (b_val, b_ty) = self.lower_expr(&args[0], scope)?;
+        if !matches!(b_ty, CodegenTy::Bytes | CodegenTy::BytesView) {
+            return Err(CodegenError::Unsupported(format!(
+                "std::crypto::crc32: b must be Bytes, got {:?}",
+                b_ty
+            )));
+        }
+        let b_val = self.unpack_view_if_needed(b_val, &b_ty)?;
+        let f = self
+            .module
+            .get_function("lotus_crypto_crc32")
+            .expect("lotus_crypto_crc32 declared");
+        let call = self
+            .builder
+            .build_call(f, &[b_val.into()], "crc32.ret")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let iv = call
+            .try_as_basic_value()
+            .left()
+            .expect("returns i64");
+        Ok((iv, CodegenTy::Int))
     }
 
     /// ws-echo `sha1-base64-missing`: lower
