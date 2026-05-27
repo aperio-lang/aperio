@@ -13,6 +13,34 @@
 // `on_connection: fn(std::io::tcp::Stream)` param type
 // resolves at A1 time.
 
+// 2026-05-27 — bus-routed observability event for TCP I/O.
+// Stream + Listener emit one of these per send / recv /
+// accept / close operation when their `log_subject` param
+// is set to a non-empty subject. Empty subject (default) =
+// no publish, zero overhead beyond a single len-check
+// branch.
+//
+// Wiring shape: the user instantiates a Stream / Listener
+// with `log_subject: "io.tcp.kraken"` (or any subject under
+// `io.tcp.**`); a separate subscriber locus they own picks
+// the events up via `subscribe "io.tcp.**"` (or a more
+// specific subject) and routes them — stderr, structured
+// log, metrics, ring buffer, whatever they want. No
+// `Logger` interface or per-Stream sink locus needed; the
+// bus IS the indirection.
+//
+//   phase — one of: connect, send, recv, accept, close, error
+//   detail — extra context (peer address, error string, …)
+//   bytes  — bytes transferred for send/recv events; -1 else
+//   fd     — the underlying socket fd, for correlating
+//            multi-connection traffic onto a single subject
+type __StdIoTcpLogEvent {
+    phase:  String = "";
+    detail: String = "";
+    bytes:  Int    = -1;
+    fd:     Int    = -1;
+}
+
 // m81: Stream locus — owns one connected TCP fd, exposes
 // send/recv via fn members, closes on dissolve. User code
 // receives a Stream as the parameter to a callback (via
@@ -23,18 +51,46 @@
 locus __StdIoTcpStream {
     params {
         conn_fd: Int = -1;
+        // 2026-05-27 — when non-empty, every TCP op publishes
+        // a `LogEvent` to this bus subject. Subject must lie
+        // under the `io.tcp.**` wildcard (the publish decl
+        // below). Default "" disables: the runtime branch is
+        // a single `len(log_subject) > 0` check per op, so
+        // the hot path costs essentially nothing when off.
+        log_subject: String = "";
+    }
+    bus {
+        publish "io.tcp.**" of type __StdIoTcpLogEvent;
     }
     fn send(msg: String) -> Int {
-        return std::io::tcp::__send(self.conn_fd, msg);
+        let n = std::io::tcp::__send(self.conn_fd, msg);
+        if len(self.log_subject) > 0 {
+            self.log_subject <- __StdIoTcpLogEvent {
+                phase: "send", bytes: n, fd: self.conn_fd,
+            };
+        }
+        return n;
     }
     // m89: binary-safe send. Use this for image bodies, raw
     // protocol frames, or anything where embedded NUL bytes
     // would cause `send`'s strlen-based shipping to truncate.
     fn send_bytes(b: Bytes) -> Int {
-        return std::io::tcp::__send_bytes(self.conn_fd, b);
+        let n = std::io::tcp::__send_bytes(self.conn_fd, b);
+        if len(self.log_subject) > 0 {
+            self.log_subject <- __StdIoTcpLogEvent {
+                phase: "send", bytes: n, fd: self.conn_fd,
+            };
+        }
+        return n;
     }
     fn recv(max_bytes: Int) -> String {
-        return std::io::tcp::__recv(self.conn_fd, max_bytes);
+        let s = std::io::tcp::__recv(self.conn_fd, max_bytes);
+        if len(self.log_subject) > 0 {
+            self.log_subject <- __StdIoTcpLogEvent {
+                phase: "recv", bytes: len(s), fd: self.conn_fd,
+            };
+        }
+        return s;
     }
     // Phase 2g: binary-safe recv. Returns up to max_bytes as a
     // length-prefixed Bytes blob — embedded NUL bytes survive,
@@ -43,9 +99,20 @@ locus __StdIoTcpStream {
     // file uploads, custom RPC formats) or any read whose payload
     // may contain zero bytes.
     fn recv_bytes(max_bytes: Int) -> Bytes {
-        return std::io::tcp::__recv_bytes(self.conn_fd, max_bytes);
+        let b = std::io::tcp::__recv_bytes(self.conn_fd, max_bytes);
+        if len(self.log_subject) > 0 {
+            self.log_subject <- __StdIoTcpLogEvent {
+                phase: "recv", bytes: len(b), fd: self.conn_fd,
+            };
+        }
+        return b;
     }
     dissolve() {
+        if len(self.log_subject) > 0 {
+            self.log_subject <- __StdIoTcpLogEvent {
+                phase: "close", fd: self.conn_fd,
+            };
+        }
         std::io::tcp::__close_fd(self.conn_fd);
     }
 }
