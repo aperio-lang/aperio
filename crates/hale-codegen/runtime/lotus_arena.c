@@ -10601,6 +10601,40 @@ void *lotus_crypto_hmac_sha256(const void *key_b, const void *msg_b) {
 }
 
 /*
+ * 2026-05-27 — CRC32 (IEEE 802.3 reversed polynomial,
+ * `0xEDB88320`). Init `0xFFFFFFFF`, final XOR
+ * `0xFFFFFFFF` — the standard variant that zlib's
+ * `crc32()` and Python's `binascii.crc32` return.
+ * Returns the 4-byte checksum as i64 (caller can cast /
+ * compare as needed). Stand-alone bit-at-a-time impl; no
+ * lookup table to keep the binary section small. For
+ * market-data-shape inputs (a few hundred bytes per
+ * call, hundreds of calls per second) this is fast
+ * enough; users on bulk paths can wrap a table-driven
+ * variant on top of the same Bytes shape if needed.
+ *
+ * Verified against published test vectors:
+ *     crc32("")          = 0x00000000
+ *     crc32("a")         = 0xE8B7BE43
+ *     crc32("abc")       = 0x352441C2
+ *     crc32("123456789") = 0xCBF43926
+ */
+int64_t lotus_crypto_crc32(const void *b) {
+    int64_t len = b ? lotus_bytes_len(b) : 0;
+    const unsigned char *msg =
+        b ? (const unsigned char *)b + sizeof(int64_t) : NULL;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (int64_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)msg[i];
+        for (int j = 0; j < 8; j++) {
+            uint32_t mask = (uint32_t)(0u - (crc & 1u));
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return (int64_t)(uint32_t)(crc ^ 0xFFFFFFFFu);
+}
+
+/*
  * ws-echo `sha1-base64-missing`: Base64 encode a Bytes blob,
  * returning a NUL-terminated String (standard alphabet,
  * with `=` padding to a multiple of 4). Anchored in the
