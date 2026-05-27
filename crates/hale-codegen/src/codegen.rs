@@ -834,6 +834,7 @@ const STDLIB_PATH_RENAMES: &[(&[&str], &str)] = &[
     (&["std", "io", "file", "seek"], "__std_io_file_seek"),
     (&["std", "io", "tcp", "Listener"], "__StdIoTcpListener"),
     (&["std", "io", "tcp", "Stream"], "__StdIoTcpStream"),
+    (&["std", "io", "tcp", "LogEvent"], "__StdIoTcpLogEvent"),
     (&["std", "iter", "Lines"], "__StdIterLines"),
     (&["std", "json", "ArrayIter"], "__JsonArrayIter"),
     (&["std", "json", "ArrayIterSpan"], "__JsonArrayIterSpan"),
