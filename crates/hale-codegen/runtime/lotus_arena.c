@@ -3839,17 +3839,52 @@ void lotus_ring_buffer_destroy(void *rb_ptr) {
  * without self-deadlock (and so cooperative handlers don't
  * block pinned producers for their entire run-time).
  *
- * Inline payload size cap: LOTUS_PAYLOAD_MAX bytes per cell.
- * Larger payloads abort at enqueue (v0 limitation).
+ * Two-tier payload storage: small payloads stay inline (zero
+ * malloc on the hot path); large payloads spill to a per-cell
+ * `malloc`. LOTUS_PAYLOAD_INLINE sets the inline threshold —
+ * payloads at or below this size use `payload_inline`,
+ * payloads above it route through `payload_heap`. The drain
+ * paths free the heap buffer after the handler returns.
+ *
+ * Pre-2026-05-27 this was a hard `LOTUS_PAYLOAD_MAX` cap and
+ * over-cap payloads were dropped silently on enqueue —
+ * surfaced by an L2 market-data feed that wanted to ship
+ * 3.3 KB book snapshots over the bus. The two-tier shape
+ * keeps the inline fast path's cost (one memcpy, no malloc)
+ * while letting large payloads through. The UDP reader
+ * thread's recv buffer is sized off `lotus_bus_udp_bufsize`
+ * (env-configurable, default 64 KB) to admit jumbo-frame
+ * datagrams end-to-end.
  */
 
-#define LOTUS_PAYLOAD_MAX 512
+#define LOTUS_PAYLOAD_INLINE 512
+
+/* Maximum wire-format payload size the substrate handles per
+ * message. Reader threads and dispatch sites allocate
+ * buffers of this size; payloads larger than this truncate at
+ * deserialize. Chosen at the UDP datagram max (65507 rounded
+ * up) — bigger payloads would have to fragment, which the bus
+ * doesn't do today (an app-layer framing protocol is the
+ * right shape for >64 KB). Stack buffers of this size are
+ * fine on default 8 MB pthread stacks even at 4-8 levels of
+ * recursive bus dispatch; cooperative-pool workers and
+ * reader threads inherit the default.
+ *
+ * Decoupled from LOTUS_PAYLOAD_INLINE so the in-cell hot path
+ * keeps its tight inline size (zero malloc, one memcpy) while
+ * the wire-side keeps headroom for jumbo / spilled payloads. */
+#define LOTUS_PAYLOAD_MAX 65536
 
 typedef struct lotus_bus_cell {
     void  *handler;                       /* void (*)(void *self, void *payload) */
     void  *self_ptr;                      /* subscriber's locus ptr */
-    size_t payload_size;                  /* bytes used in inline */
-    char   payload_inline[LOTUS_PAYLOAD_MAX];
+    size_t payload_size;                  /* bytes used (inline or heap) */
+    /* When NULL: payload lives in `payload_inline` (fits in
+     * LOTUS_PAYLOAD_INLINE bytes). When non-NULL: payload lives
+     * in a per-cell malloc'd buffer of `payload_size` bytes;
+     * drain paths free it after handler returns. */
+    void  *payload_heap;
+    char   payload_inline[LOTUS_PAYLOAD_INLINE];
 } lotus_bus_cell_t;
 
 typedef struct lotus_bus_queue {
@@ -3923,11 +3958,17 @@ void lotus_bus_queue_enqueue(lotus_bus_queue_t *q,
                              const void *payload_src,
                              size_t payload_size) {
     if (!q) return;
-    if (payload_size > LOTUS_PAYLOAD_MAX) {
-        /* v0 limitation — payloads above 512 bytes need spill-
-         * to-malloc support that isn't here yet. Drop silently;
-         * better-than-corrupting. */
-        return;
+    /* Two-tier payload storage. Small payloads land in the
+     * cell's inline buffer (no malloc on the hot path); large
+     * ones spill to a per-cell malloc that the drain path
+     * frees after the handler returns. */
+    void *heap_buf = NULL;
+    if (payload_size > LOTUS_PAYLOAD_INLINE) {
+        heap_buf = malloc(payload_size);
+        if (!heap_buf) return;        /* drop on OOM */
+        if (payload_src) {
+            memcpy(heap_buf, payload_src, payload_size);
+        }
     }
     int locked = __atomic_load_n(&g_bus_has_pinned, __ATOMIC_ACQUIRE);
     if (locked) pthread_mutex_lock(&q->lock);
@@ -3947,6 +3988,7 @@ void lotus_bus_queue_enqueue(lotus_bus_queue_t *q,
                 realloc(q->cells, new_cap * sizeof(lotus_bus_cell_t));
             if (!new_cells) {
                 if (locked) pthread_mutex_unlock(&q->lock);
+                if (heap_buf) free(heap_buf);
                 return;     /* drop on OOM */
             }
             q->cells = new_cells;
@@ -3957,7 +3999,8 @@ void lotus_bus_queue_enqueue(lotus_bus_queue_t *q,
     slot->handler      = handler;
     slot->self_ptr     = self_ptr;
     slot->payload_size = payload_size;
-    if (payload_size > 0 && payload_src) {
+    slot->payload_heap = heap_buf;
+    if (!heap_buf && payload_size > 0 && payload_src) {
         memcpy(slot->payload_inline, payload_src, payload_size);
     }
     if (locked) pthread_mutex_unlock(&q->lock);
@@ -4020,18 +4063,22 @@ void lotus_bus_queue_drain(lotus_bus_queue_t *q) {
             lotus_bus_cell_t cell_copy = q->cells[q->head++];
             pthread_mutex_unlock(&q->lock);
 
-            void *payload_ptr = (cell_copy.payload_size > 0)
-                ? (void *)cell_copy.payload_inline
-                : NULL;
+            void *payload_ptr = NULL;
+            if (cell_copy.payload_size > 0) {
+                payload_ptr = cell_copy.payload_heap
+                    ? cell_copy.payload_heap
+                    : (void *)cell_copy.payload_inline;
+            }
             ((lotus_handler_fn)cell_copy.handler)(
                 cell_copy.self_ptr, payload_ptr);
+            if (cell_copy.payload_heap) free(cell_copy.payload_heap);
         }
     } else {
         /* Single-threaded cooperative path: no concurrent producer
          * exists. One stack-allocated payload buffer, reused
          * across iterations and stable across recursive drain
          * calls (the recursive call has its own frame). */
-        unsigned char stack_payload[LOTUS_PAYLOAD_MAX]
+        unsigned char stack_payload[LOTUS_PAYLOAD_INLINE]
             __attribute__((aligned(16)));
         for (;;) {
             if (q->head >= q->tail) {
@@ -4043,8 +4090,14 @@ void lotus_bus_queue_drain(lotus_bus_queue_t *q) {
             void *handler_fn = cell->handler;
             void *handler_self = cell->self_ptr;
             size_t psize = cell->payload_size;
+            void *heap_ptr = cell->payload_heap;
             void *payload_ptr = NULL;
-            if (psize > 0) {
+            if (heap_ptr) {
+                /* Heap pointer is stable across handler-driven
+                 * q->cells realloc — hand it through directly,
+                 * free after handler returns. */
+                payload_ptr = heap_ptr;
+            } else if (psize > 0) {
                 /* Last cell-dereference before invoking the
                  * handler. After this memcpy, any handler-side
                  * realloc of q->cells is harmless — we're done
@@ -4053,6 +4106,7 @@ void lotus_bus_queue_drain(lotus_bus_queue_t *q) {
                 payload_ptr = stack_payload;
             }
             ((lotus_handler_fn)handler_fn)(handler_self, payload_ptr);
+            if (heap_ptr) free(heap_ptr);
         }
     }
 }
@@ -4132,8 +4186,15 @@ void lotus_mailbox_post(lotus_mailbox_t *mb,
                         const void *payload_src,
                         size_t payload_size) {
     if (!mb) return;
-    if (payload_size > LOTUS_PAYLOAD_MAX) {
-        return;     /* v0 limit */
+    /* Two-tier payload storage; see queue_enqueue for the
+     * design rationale. */
+    void *heap_buf = NULL;
+    if (payload_size > LOTUS_PAYLOAD_INLINE) {
+        heap_buf = malloc(payload_size);
+        if (!heap_buf) return;
+        if (payload_src) {
+            memcpy(heap_buf, payload_src, payload_size);
+        }
     }
     pthread_mutex_lock(&mb->lock);
     if (mb->tail == mb->cap) {
@@ -4150,6 +4211,7 @@ void lotus_mailbox_post(lotus_mailbox_t *mb,
                 realloc(mb->cells, new_cap * sizeof(lotus_bus_cell_t));
             if (!new_cells) {
                 pthread_mutex_unlock(&mb->lock);
+                if (heap_buf) free(heap_buf);
                 return;
             }
             mb->cells = new_cells;
@@ -4160,7 +4222,8 @@ void lotus_mailbox_post(lotus_mailbox_t *mb,
     slot->handler      = handler;
     slot->self_ptr     = self_ptr;
     slot->payload_size = payload_size;
-    if (payload_size > 0 && payload_src) {
+    slot->payload_heap = heap_buf;
+    if (!heap_buf && payload_size > 0 && payload_src) {
         memcpy(slot->payload_inline, payload_src, payload_size);
     }
     pthread_cond_broadcast(&mb->not_empty);
@@ -4187,18 +4250,26 @@ int lotus_mailbox_drain_one(lotus_mailbox_t *mb) {
     }
     pthread_mutex_unlock(&mb->lock);
 
-    /* Hand `cell_copy.payload_inline` directly to the handler.
-     * `cell_copy` is a stack-local snapshot of the dequeued cell;
-     * its inline buffer is the canonical payload copy for this
-     * dispatch. Skipping the prior `lotus_arena_alloc` + extra
-     * memcpy into the locus's arena drops the per-event overhead
-     * on the pinned-subscriber path. See the matching note in
-     * lotus_bus_queue_drain — same lifetime invariant. */
-    void *payload_ptr = (cell_copy.payload_size > 0)
-        ? (void *)cell_copy.payload_inline
-        : NULL;
+    /* Hand the dequeued cell's payload to the handler.
+     * `cell_copy` is a stack-local snapshot of the dequeued
+     * cell; its inline buffer (or its heap pointer) is the
+     * canonical payload copy for this dispatch. Skipping the
+     * prior `lotus_arena_alloc` + extra memcpy into the
+     * locus's arena drops the per-event overhead on the
+     * pinned-subscriber path. See the matching note in
+     * lotus_bus_queue_drain — same lifetime invariant. The
+     * heap-spill case (payload > LOTUS_PAYLOAD_INLINE) hands
+     * the malloc'd buffer through directly and frees it after
+     * the handler returns. */
+    void *payload_ptr = NULL;
+    if (cell_copy.payload_size > 0) {
+        payload_ptr = cell_copy.payload_heap
+            ? cell_copy.payload_heap
+            : (void *)cell_copy.payload_inline;
+    }
     ((lotus_handler_fn)cell_copy.handler)(
         cell_copy.self_ptr, payload_ptr);
+    if (cell_copy.payload_heap) free(cell_copy.payload_heap);
     return 1;
 }
 
@@ -4279,11 +4350,15 @@ void lotus_mailbox_drain_pending(lotus_mailbox_t *mb) {
             mb->tail = 0;
         }
         pthread_mutex_unlock(&mb->lock);
-        void *payload_ptr = (cell_copy.payload_size > 0)
-            ? (void *)cell_copy.payload_inline
-            : NULL;
+        void *payload_ptr = NULL;
+        if (cell_copy.payload_size > 0) {
+            payload_ptr = cell_copy.payload_heap
+                ? cell_copy.payload_heap
+                : (void *)cell_copy.payload_inline;
+        }
         ((lotus_handler_fn)cell_copy.handler)(
             cell_copy.self_ptr, payload_ptr);
+        if (cell_copy.payload_heap) free(cell_copy.payload_heap);
     }
 }
 
@@ -4399,8 +4474,15 @@ void lotus_coop_pool_post(lotus_coop_pool_t *p,
                           const void *payload_src,
                           size_t payload_size) {
     if (!p) return;
-    if (payload_size > LOTUS_PAYLOAD_MAX) {
-        return;     /* v0 limit */
+    /* Two-tier payload storage; see queue_enqueue for the
+     * design rationale. */
+    void *heap_buf = NULL;
+    if (payload_size > LOTUS_PAYLOAD_INLINE) {
+        heap_buf = malloc(payload_size);
+        if (!heap_buf) return;
+        if (payload_src) {
+            memcpy(heap_buf, payload_src, payload_size);
+        }
     }
     pthread_mutex_lock(&p->lock);
     if (p->tail == p->cap) {
@@ -4417,6 +4499,7 @@ void lotus_coop_pool_post(lotus_coop_pool_t *p,
                 realloc(p->cells, new_cap * sizeof(lotus_bus_cell_t));
             if (!new_cells) {
                 pthread_mutex_unlock(&p->lock);
+                if (heap_buf) free(heap_buf);
                 return;
             }
             p->cells = new_cells;
@@ -4427,7 +4510,8 @@ void lotus_coop_pool_post(lotus_coop_pool_t *p,
     slot->handler      = handler;
     slot->self_ptr     = self_ptr;
     slot->payload_size = payload_size;
-    if (payload_size > 0 && payload_src) {
+    slot->payload_heap = heap_buf;
+    if (!heap_buf && payload_size > 0 && payload_src) {
         memcpy(slot->payload_inline, payload_src, payload_size);
     }
     /* F.32-4-prefetch (2026-05-24): hint the receiver's L1 to
@@ -4474,11 +4558,15 @@ static int lotus_coop_pool_drain_one(lotus_coop_pool_t *p) {
         p->tail = 0;
     }
     pthread_mutex_unlock(&p->lock);
-    void *payload_ptr = (cell_copy.payload_size > 0)
-        ? (void *)cell_copy.payload_inline
-        : NULL;
+    void *payload_ptr = NULL;
+    if (cell_copy.payload_size > 0) {
+        payload_ptr = cell_copy.payload_heap
+            ? cell_copy.payload_heap
+            : (void *)cell_copy.payload_inline;
+    }
     ((lotus_handler_fn)cell_copy.handler)(
         cell_copy.self_ptr, payload_ptr);
+    if (cell_copy.payload_heap) free(cell_copy.payload_heap);
     return 1;
 }
 
@@ -6710,6 +6798,40 @@ LOTUS_SOCKOPT_GETTER(SO_BINDTODEVICE)
 #else
 int lotus_sockopt_SO_BINDTODEVICE(void) { return -1; }
 #endif
+/* IP_MTU_DISCOVER + IP_PMTUDISC_* (2026-05-27) — let apps opt
+ * into kernel-side fragmentation when running on a path whose
+ * MTU isn't end-to-end jumbo. Default (Linux) is
+ * IP_PMTUDISC_WANT (DF=1, fail-with-EMSGSIZE on
+ * oversized-datagram). Setting IP_MTU_DISCOVER to
+ * IP_PMTUDISC_DONT clears DF so the upstream router
+ * fragments — degrades to per-fragment loss multiplier but
+ * unblocks delivery on a sub-MTU path. Linux-only; the
+ * #ifdef guards keep the door open for other platforms. */
+#ifdef IP_MTU_DISCOVER
+LOTUS_SOCKOPT_GETTER(IP_MTU_DISCOVER)
+#else
+int lotus_sockopt_IP_MTU_DISCOVER(void) { return -1; }
+#endif
+#ifdef IP_PMTUDISC_DONT
+LOTUS_SOCKOPT_GETTER(IP_PMTUDISC_DONT)
+#else
+int lotus_sockopt_IP_PMTUDISC_DONT(void) { return -1; }
+#endif
+#ifdef IP_PMTUDISC_WANT
+LOTUS_SOCKOPT_GETTER(IP_PMTUDISC_WANT)
+#else
+int lotus_sockopt_IP_PMTUDISC_WANT(void) { return -1; }
+#endif
+#ifdef IP_PMTUDISC_DO
+LOTUS_SOCKOPT_GETTER(IP_PMTUDISC_DO)
+#else
+int lotus_sockopt_IP_PMTUDISC_DO(void) { return -1; }
+#endif
+#ifdef IP_PMTUDISC_PROBE
+LOTUS_SOCKOPT_GETTER(IP_PMTUDISC_PROBE)
+#else
+int lotus_sockopt_IP_PMTUDISC_PROBE(void) { return -1; }
+#endif
 #undef LOTUS_SOCKOPT_GETTER
 
 /* 2026-05-26 — UDP P4: recv_with_source + set_*_timeout.
@@ -8338,8 +8460,65 @@ static void *lotus_bus_reader_thread_main(void *arg) {
  * datagram per message, opaque bytes that the bus router hands
  * to the registered deserialize_fn. UDP's native datagram
  * boundaries match SEQPACKET's, so no length prefix needed.
- * Sanity cap: the receiver-side stack buffer is LOTUS_PAYLOAD_MAX
- * (512 B); larger datagrams truncate. */
+ * The receiver-side wire buffer is sized at LOTUS_PAYLOAD_MAX
+ * (64 KB), which covers the UDP datagram max. The kernel-side
+ * SO_RCVBUF defaults to the system value (~208 KB on Linux);
+ * tune higher for bursty receivers via LOTUS_BUS_UDP_RCVBUF. */
+
+/* 2026-05-27: dedupe-throttled stderr log for fanout `sendto`
+ * failures. Without this the runtime swallows the error
+ * silently; with it the first occurrence of each errno class
+ * surfaces a one-line diagnostic. The most common cases for
+ * UDP fanout are EMSGSIZE (payload exceeds path MTU + DF
+ * set — see IP_MTU_DISCOVER), ENOBUFS (kernel send buffer
+ * full — bump SO_SNDBUF), and EAGAIN (rare for blocking UDP
+ * sockets; would indicate something pathological).
+ *
+ * Per-errno dedupe so a real fault doesn't flood the log;
+ * tiny static table is fine — there are only a handful of
+ * errno values sendto actually returns. Thread-safety:
+ * mutex around the table; the contention is unmeasurable
+ * because hitting this path means delivery is already
+ * failing. */
+static pthread_mutex_t g_udp_sendto_err_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_udp_sendto_err_seen[8] = {0};
+static int g_udp_sendto_err_count   = 0;
+
+static void lotus_bus_udp_log_sendto_error(const char *subject, int err) {
+    pthread_mutex_lock(&g_udp_sendto_err_lock);
+    for (int i = 0; i < g_udp_sendto_err_count; i++) {
+        if (g_udp_sendto_err_seen[i] == err) {
+            pthread_mutex_unlock(&g_udp_sendto_err_lock);
+            return;
+        }
+    }
+    if (g_udp_sendto_err_count <
+        (int)(sizeof(g_udp_sendto_err_seen)
+              / sizeof(g_udp_sendto_err_seen[0]))) {
+        g_udp_sendto_err_seen[g_udp_sendto_err_count++] = err;
+    }
+    pthread_mutex_unlock(&g_udp_sendto_err_lock);
+    fprintf(stderr,
+            "[bus] udp sendto failed (subject=\"%s\", errno=%d/%s) "
+            "— logged once per errno; check path MTU "
+            "(EMSGSIZE → reduce payload or enable jumbo / "
+            "IP_MTU_DISCOVER=IP_PMTUDISC_DONT) or kernel send "
+            "buffer (ENOBUFS → bump SO_SNDBUF)\n",
+            subject ? subject : "?", err,
+            strerror(err) ? strerror(err) : "?");
+}
+
+/* 2026-05-27: SO_RCVBUF size for UDP reader sockets. Env-
+ * configurable so jumbo / bursty receivers can grow the kernel-
+ * side receive queue without code changes. Returns 0 if unset
+ * or invalid (caller skips setsockopt). */
+static int lotus_bus_udp_rcvbuf_env(void) {
+    const char *s = getenv("LOTUS_BUS_UDP_RCVBUF");
+    if (!s || !*s) return 0;
+    long n = strtol(s, NULL, 10);
+    if (n <= 0 || n > INT_MAX) return 0;
+    return (int)n;
+}
 static int lotus_addr_is_multicast(const struct in_addr *a) {
     uint32_t h = ntohl(a->s_addr);
     return (h >= 0xE0000000u) && (h < 0xF0000000u);
@@ -8418,6 +8597,17 @@ static void *lotus_bus_udp_reader_thread_main(void *arg) {
 #ifdef SO_REUSEPORT
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
+    /* SO_RCVBUF override (2026-05-27). Kernel default (~208 KB
+     * on Linux) is fine for most receivers; bursty / jumbo /
+     * high-fanout cases can lift this via LOTUS_BUS_UDP_RCVBUF
+     * (bytes). Best-effort: kernel caps the value at
+     * net.core.rmem_max — failure is silent because there's no
+     * recovery path. */
+    int rcvbuf = lotus_bus_udp_rcvbuf_env();
+    if (rcvbuf > 0) {
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                         &rcvbuf, sizeof(rcvbuf));
+    }
     struct sockaddr_in bind_addr;
     memset(&bind_addr, 0, sizeof(bind_addr));
     bind_addr.sin_family = AF_INET;
@@ -8831,9 +9021,12 @@ void lotus_bus_remote_fanout(const char *subject,
              * reader thread for recvfrom. */
             if (e->role != LOTUS_TRANSPORT_CONNECT) continue;
             if (e->udp_fd < 0) continue;
-            (void)sendto(e->udp_fd, payload, payload_size, 0,
-                         (struct sockaddr *)&e->udp_dest,
-                         sizeof(e->udp_dest));
+            ssize_t sent = sendto(e->udp_fd, payload, payload_size, 0,
+                                  (struct sockaddr *)&e->udp_dest,
+                                  sizeof(e->udp_dest));
+            if (sent < 0) {
+                lotus_bus_udp_log_sendto_error(e->subject, errno);
+            }
             continue;
         }
         if (!e->transport) continue;

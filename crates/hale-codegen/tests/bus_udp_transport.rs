@@ -180,3 +180,79 @@ fn udp_multicast_delivers_payload_loopback() {
         out
     );
 }
+
+fn large_subscriber_src() -> &'static str {
+    r#"
+        type Big {
+            counts: [Int; 100] = [0; 100];
+            tag:    Int        = 0;
+        }
+        locus Sub {
+            bus {
+                subscribe "big" as on_big of type Big;
+            }
+            fn on_big(b: Big) {
+                println("big_tag=", b.tag);
+                println("big_first=", b.counts[0]);
+                println("big_last=", b.counts[99]);
+            }
+        }
+        fn main() {
+            Sub { };
+            std::time::sleep(800ms);
+        }
+    "#
+}
+
+fn large_publisher_src() -> &'static str {
+    r#"
+        type Big {
+            counts: [Int; 100] = [0; 100];
+            tag:    Int        = 0;
+        }
+        locus Pub {
+            bus {
+                publish "big" of type Big;
+            }
+            birth() {
+                let mut b = Big { tag: 77 };
+                b.counts[0]  = 1234567;
+                b.counts[99] = 7654321;
+                "big" <- b;
+            }
+        }
+        fn main() {
+            Pub { };
+        }
+    "#
+}
+
+#[test]
+fn udp_unicast_delivers_payload_over_inline_threshold() {
+    // [Int; 100] + Int = 808 bytes, well above
+    // LOTUS_PAYLOAD_INLINE (512) so the receiver-side
+    // local_dispatch routes through the heap-spill branch in
+    // queue_enqueue. End-to-end: serialize → sendto → recvfrom
+    // (heap buffer sized at LOTUS_PAYLOAD_MAX) → deserialize →
+    // heap-spilled queue cell → drain → handler.
+    let sub_bin = compile("uc_big_sub", large_subscriber_src());
+    let pub_bin = compile("uc_big_pub", large_publisher_src());
+    let port = 57785;
+    let sub_cfg = unique_path("uc_big_sub", "conf");
+    let pub_cfg = unique_path("uc_big_pub", "conf");
+    std::fs::write(&sub_cfg, format!("big = udp://127.0.0.1:{}:listen\n", port))
+        .expect("write sub cfg");
+    std::fs::write(&pub_cfg, format!("big = udp://127.0.0.1:{}:connect\n", port))
+        .expect("write pub cfg");
+
+    let out = run_pair(&sub_bin, &pub_bin, &sub_cfg, &pub_cfg);
+
+    let _ = std::fs::remove_file(&sub_bin);
+    let _ = std::fs::remove_file(&pub_bin);
+    let _ = std::fs::remove_file(&sub_cfg);
+    let _ = std::fs::remove_file(&pub_cfg);
+
+    assert!(out.contains("big_tag=77"),     "got: {:?}", out);
+    assert!(out.contains("big_first=1234567"), "got: {:?}", out);
+    assert!(out.contains("big_last=7654321"),  "got: {:?}", out);
+}

@@ -231,6 +231,42 @@ the fd. The Linux 3.9+ `SO_REUSEPORT` is set on the
 subscriber socket so multiple processes on the same host can
 receive the same multicast group.
 
+### Payload size, MTU, and jumbo frames
+
+The substrate's bus carries up to ~64 KB per message (the UDP
+datagram max). Inside a process, payloads ≤ 512 B stay in the
+mailbox cell's inline buffer (zero malloc on the hot path);
+larger ones spill to a per-cell `malloc` that the dispatch
+path frees after the handler returns.
+
+Over `udp://`, the practical ceiling is set by the network's
+path MTU, not the substrate. Three scenarios:
+
+- **Loopback (tests, same-host deployment)**: Linux's `lo`
+  interface defaults to MTU 65536. Any bus payload ≤ 64 KB
+  rides as a single datagram. No tuning required.
+- **Controlled fabric with jumbo (LAN, AWS-VPC ENA at 9001
+  MTU, GCP at 8896, colo with end-to-end 9000)**: payloads
+  up to ~8950 B ride as a single datagram. Standard for
+  market-data shops shipping full L2 snapshots.
+- **Standard 1500-MTU path**: payloads >1472 B fail with
+  `EMSGSIZE` (Linux default DF=1 — `IP_PMTUDISC_WANT`). The
+  runtime logs the error once per errno class to stderr. Two
+  options: reduce payload (deltas / top-N projection), or
+  set `IP_MTU_DISCOVER=IP_PMTUDISC_DONT` on the publisher fd
+  to let upstream routers fragment. Fragmentation
+  dramatically worsens loss (one dropped fragment = whole
+  datagram lost; 30 s IP reassembly timer) — use jumbo
+  instead when you can.
+
+### Tuning knobs
+
+| Knob | Effect | When to use |
+|---|---|---|
+| `LOTUS_BUS_UDP_RCVBUF=<bytes>` | `setsockopt(SO_RCVBUF)` on the subscriber socket | Bursty receivers; the default ~208 KB fills under fast-market multicast bursts. Try `4194304` (4 MB) as a starting point. The kernel caps at `net.core.rmem_max` (often 256 KB until raised). |
+| `IP_MTU_DISCOVER` / `IP_PMTUDISC_*` | Constants exposed in `std::io::sockopt::*` so an adapter or curated wrapper can set the DF bit on a publisher socket | Sub-MTU paths where you accept fragmentation as the lesser evil vs. EMSGSIZE failures. |
+| `SO_SNDBUF` | Publisher-side kernel send queue | ENOBUFS from `sendto` means raise this. |
+
 ## When the topic is also bound, the closed-world opt is skipped
 
 The compiler normally rewrites a topic that's used only
