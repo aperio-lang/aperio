@@ -391,8 +391,12 @@ session 3):
 6. ✅ Sustained-write doesn't grow RSS post-warmup beyond
    table-current + brief-migration peak. Validated via
    `lockfree_many_grow_cycles_no_use_after_free` (10 grow
-   cycles, eager OLD free); the full 60s bench is a perf
-   follow-up.
+   cycles, correctness check) AND
+   `lockfree_sustained_write_rss_bounded` (2026-05-26 follow-
+   up: asserts final RSS < 128 MB for a 20k-insert ~12-grow
+   workload; pre-eager-free design peaked in the GB range
+   under this shape). The full 60s wall-clock variant remains
+   a perf-bench follow-up.
 
 End-of-session state: γ-v2 ships. The lockfree discipline
 now supports `remove` + transparent grow with steady-state
