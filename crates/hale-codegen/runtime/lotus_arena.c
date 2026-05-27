@@ -8171,12 +8171,16 @@ int lotus_str_can_parse_decimal_range(const char *s, int64_t start,
  * per peer) is m60.
  */
 
-/* Wave B (bus-transport redesign): an entry is one of two kinds.
+/* Wave B (bus-transport redesign): an entry is one of three kinds.
  * UNIX = substrate-provided AF_UNIX transport; ADAPTER = user-
  * supplied protocol-layer locus (NATS, MQTT, raw-TCP-with-framing,
- * ...) whose `send` method receives outbound payloads. */
+ * ...) whose `send` method receives outbound payloads;
+ * UDP (2026-05-26) = unified IPv4 UDP transport that covers both
+ * unicast and multicast — the destination address determines which
+ * mode (224.0.0.0/4 → multicast, else unicast). */
 #define LOTUS_BUS_REMOTE_KIND_UNIX    0
 #define LOTUS_BUS_REMOTE_KIND_ADAPTER 1
+#define LOTUS_BUS_REMOTE_KIND_UDP     2
 
 typedef struct lotus_bus_remote_entry {
     char              *subject;       /* owned (strdup'd at register) */
@@ -8203,6 +8207,19 @@ typedef struct lotus_bus_remote_entry {
     void             (*adapter_send_fn)(void *self,
                                         const char *subject,
                                         void *bytes);
+    /* --- UDP fields (valid when kind == UDP) ---
+     * 2026-05-26: unified IPv4 UDP transport. `udp_fd` is the
+     * socket used for BOTH sendto (CONNECT role) and recvfrom
+     * (LISTEN role). `udp_dest` is filled at register time for
+     * CONNECT entries; LISTEN entries leave it zeroed (the
+     * reader thread's recvfrom captures the source per-datagram
+     * if a caller needs it). `udp_is_multicast` records whether
+     * the destination falls in 224.0.0.0/4 — drives
+     * IP_ADD_MEMBERSHIP on LISTEN side and IP_DROP_MEMBERSHIP
+     * on destroy. */
+    int                udp_fd;
+    struct sockaddr_in udp_dest;
+    int                udp_is_multicast;
 } lotus_bus_remote_entry_t;
 
 static lotus_bus_remote_entry_t *g_bus_remote_entries = NULL;
@@ -8306,6 +8323,182 @@ static void *lotus_bus_reader_thread_main(void *arg) {
     return NULL;
 }
 
+/* 2026-05-26: UDP bus-transport helpers. The scheme `udp://host:port`
+ * covers both unicast and multicast — the host's address class
+ * picks which: 224.0.0.0/4 → multicast (kernel routes via the
+ * multicast tree on send; subscribers must IP_ADD_MEMBERSHIP at
+ * bind time to receive), anything else → unicast (kernel routes
+ * normally; subscribers just bind).
+ *
+ * The publisher's `sendto` call is identical for both — the kernel
+ * inspects the destination and picks the route. The subscriber-
+ * side bind is identical except multicast also joins the group.
+ *
+ * Wire frame: same as the existing AF_UNIX transport — one
+ * datagram per message, opaque bytes that the bus router hands
+ * to the registered deserialize_fn. UDP's native datagram
+ * boundaries match SEQPACKET's, so no length prefix needed.
+ * Sanity cap: the receiver-side stack buffer is LOTUS_PAYLOAD_MAX
+ * (512 B); larger datagrams truncate. */
+static int lotus_addr_is_multicast(const struct in_addr *a) {
+    uint32_t h = ntohl(a->s_addr);
+    return (h >= 0xE0000000u) && (h < 0xF0000000u);
+}
+
+/* Parse "host:port" into a sockaddr_in. Returns 0 on success, -1
+ * on malformed input (sets errno on the standard parses). Host
+ * must be a dotted-quad IPv4; hostname resolution is the caller's
+ * job (the bus router runs on the boot path and shouldn't block
+ * on DNS — explicit IPs match the spec/runtime.md transport
+ * surface contract). */
+static int lotus_bus_parse_udp_addr(const char *spec,
+                                     struct sockaddr_in *out)
+{
+    if (!spec || !out) { errno = EINVAL; return -1; }
+    const char *colon = strrchr(spec, ':');
+    if (!colon || colon == spec) { errno = EINVAL; return -1; }
+    char host[64];
+    size_t host_len = (size_t)(colon - spec);
+    if (host_len >= sizeof(host)) { errno = EINVAL; return -1; }
+    memcpy(host, spec, host_len);
+    host[host_len] = '\0';
+    char *end = NULL;
+    long port = strtol(colon + 1, &end, 10);
+    if (!end || *end != '\0' || port <= 0 || port > 65535) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->sin_family = AF_INET;
+    out->sin_port   = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &out->sin_addr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* UDP LISTEN reader thread. Binds the socket (joins the multicast
+ * group if applicable), then loops recvfrom + deserialize +
+ * local_dispatch — same shape as the unix:// reader thread. */
+typedef struct lotus_bus_udp_reader_args {
+    char                     *host_port;  /* owned by thread */
+    lotus_bus_remote_entry_t *entry;
+} lotus_bus_udp_reader_args_t;
+
+static void *lotus_bus_udp_reader_thread_main(void *arg) {
+    lotus_bus_udp_reader_args_t *args = (lotus_bus_udp_reader_args_t *)arg;
+    struct sockaddr_in dest;
+    if (lotus_bus_parse_udp_addr(args->host_port, &dest) != 0) {
+        fprintf(stderr,
+                "lotus_bus udp reader: invalid host:port %s\n",
+                args->host_port);
+        free(args->host_port);
+        free(args);
+        return NULL;
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        perror("lotus_bus udp reader: socket");
+        free(args->host_port);
+        free(args);
+        return NULL;
+    }
+    int one = 1;
+    /* SO_REUSEADDR so multiple subscribers on the same multicast
+     * group can bind the same port. Required for multicast;
+     * harmless for unicast. */
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    /* SO_REUSEPORT (Linux 3.9+) — required on modern kernels for
+     * the multi-subscriber-same-host pattern when multiple
+     * processes want to receive the same multicast group. Without
+     * this, kernel-level load-balancing across the bound sockets
+     * may not engage. Best-effort: some kernels lack the option,
+     * we ignore the failure. */
+#ifdef SO_REUSEPORT
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port   = dest.sin_port;
+    if (lotus_addr_is_multicast(&dest.sin_addr)) {
+        /* Multicast: bind INADDR_ANY so the socket receives
+         * datagrams sent to the group from any source. */
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        /* Unicast: bind the configured address so we receive
+         * only datagrams addressed to us (and not to other IPs
+         * on this host). */
+        bind_addr.sin_addr = dest.sin_addr;
+    }
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        perror("lotus_bus udp reader: bind");
+        close(fd);
+        free(args->host_port);
+        free(args);
+        return NULL;
+    }
+    if (lotus_addr_is_multicast(&dest.sin_addr)) {
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr     = dest.sin_addr;
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                       &mreq, sizeof(mreq)) < 0) {
+            perror("lotus_bus udp reader: IP_ADD_MEMBERSHIP");
+            close(fd);
+            free(args->host_port);
+            free(args);
+            return NULL;
+        }
+        args->entry->udp_is_multicast = 1;
+    }
+    /* Publish the fd back to the entry so destroy_all can close
+     * + leave-group on teardown. */
+    args->entry->udp_fd   = fd;
+    args->entry->udp_dest = dest;
+
+    char wire_buf[LOTUS_PAYLOAD_MAX];
+    char struct_buf[LOTUS_PAYLOAD_MAX];
+    while (1) {
+        ssize_t n = recvfrom(fd, wire_buf, sizeof(wire_buf), 0, NULL, NULL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;  /* EBADF / ENOTCONN / shutdown-induced */
+        }
+        if (n == 0) {
+            /* Two cases:
+             *   - Legitimate zero-length datagram. Not meaningful
+             *     for the bus router; the wire frame can never be
+             *     empty (it's the serialized form of the user's
+             *     type, which has at least the header bytes).
+             *   - Socket has been shut down by destroy_all
+             *     (shutdown(SHUT_RDWR)).
+             * Either way, exit the loop. */
+            break;
+        }
+        lotus_deserialize_fn deserialize = NULL;
+        for (size_t i = 0; i < g_bus_count; i++) {
+            lotus_bus_entry_t *e = &g_bus_entries[i];
+            if (!e->subject) continue;
+            if (!lotus_subject_match(e->subject, args->entry->subject)) continue;
+            deserialize = e->deserialize;
+            break;
+        }
+        if (!deserialize) continue;
+        ssize_t struct_size = deserialize(
+            wire_buf, (size_t)n, struct_buf, sizeof(struct_buf));
+        if (struct_size <= 0) continue;
+        lotus_bus_local_dispatch(g_bus_queue_for_remote,
+                                 args->entry->subject,
+                                 struct_buf, (size_t)struct_size);
+    }
+    free(args->host_port);
+    free(args);
+    return NULL;
+}
+
 void lotus_bus_register_remote(const char *subject,
                                const char *url,
                                int role) {
@@ -8314,20 +8507,31 @@ void lotus_bus_register_remote(const char *subject,
                 "lotus_bus_register_remote: null subject or url\n");
         return;
     }
-    /* v1.x recognizes the `unix://` scheme only. User-supplied
-     * adapters (NATS, TCP-with-framing, etc.) await Wave B of
-     * the bus-transport redesign — see [[bus-transport-redesign]]
-     * in the dev memory. */
+    /* Recognized schemes:
+     *   unix://<path>          AF_UNIX SEQPACKET (m58)
+     *   udp://<ipv4>:<port>    IPv4 UDP, unicast or multicast
+     *                          (multicast detected from address
+     *                          class) — added 2026-05-26.
+     * User-supplied protocol-layer transports come in via
+     * lotus_bus_register_remote_adapter (Wave B). */
     static const char unix_scheme[] = "unix://";
-    size_t scheme_len = sizeof(unix_scheme) - 1;
-    if (strncmp(url, unix_scheme, scheme_len) != 0) {
+    static const char udp_scheme[]  = "udp://";
+    size_t unix_len = sizeof(unix_scheme) - 1;
+    size_t udp_len  = sizeof(udp_scheme) - 1;
+    int is_udp = 0;
+    const char *path = NULL;
+    if (strncmp(url, unix_scheme, unix_len) == 0) {
+        path = url + unix_len;
+    } else if (strncmp(url, udp_scheme, udp_len) == 0) {
+        is_udp = 1;
+        path   = url + udp_len;
+    } else {
         fprintf(stderr,
                 "lotus_bus_register_remote: unsupported URL scheme "
-                "(only unix:// in v1.x): %s\n",
+                "(recognize unix:// and udp://): %s\n",
                 url);
         return;
     }
-    const char *path = url + scheme_len;
     if (*path == '\0') {
         fprintf(stderr,
                 "lotus_bus_register_remote: empty path in %s\n", url);
@@ -8355,12 +8559,75 @@ void lotus_bus_register_remote(const char *subject,
     lotus_bus_remote_entry_t *e =
         &g_bus_remote_entries[g_bus_remote_count++];
     e->subject           = subject_copy;
-    e->kind              = LOTUS_BUS_REMOTE_KIND_UNIX;
+    e->kind              = is_udp
+        ? LOTUS_BUS_REMOTE_KIND_UDP
+        : LOTUS_BUS_REMOTE_KIND_UNIX;
     e->transport         = NULL;
     e->role              = role;
     e->has_reader_thread = 0;
     e->adapter_self      = NULL;
     e->adapter_send_fn   = NULL;
+    e->udp_fd            = -1;
+    memset(&e->udp_dest, 0, sizeof(e->udp_dest));
+    e->udp_is_multicast  = 0;
+
+    if (is_udp) {
+        if (role == LOTUS_TRANSPORT_LISTEN) {
+            /* LISTEN: spawn reader thread that owns the bind +
+             * multicast-group-join + recvfrom loop. Same shape
+             * as the unix:// reader thread but UDP semantics. */
+            lotus_bus_udp_reader_args_t *args =
+                (lotus_bus_udp_reader_args_t *)malloc(sizeof(*args));
+            if (!args) return;
+            args->host_port = strdup(path);
+            args->entry     = e;
+            if (!args->host_port) {
+                free(args);
+                return;
+            }
+            if (pthread_create(&e->reader_thread, NULL,
+                               lotus_bus_udp_reader_thread_main, args) != 0)
+            {
+                perror("lotus_bus_register_remote: udp pthread_create");
+                free(args->host_port);
+                free(args);
+                return;
+            }
+            e->has_reader_thread = 1;
+        } else {
+            /* CONNECT: open a UDP socket bound to an ephemeral
+             * local port; resolve the destination addr at
+             * register time. Per-publish dispatch does
+             * sendto(fd, payload, udp_dest). */
+            if (lotus_bus_parse_udp_addr(path, &e->udp_dest) != 0) {
+                fprintf(stderr,
+                        "lotus_bus_register_remote: invalid udp:// "
+                        "host:port %s\n", path);
+                return;
+            }
+            int fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (fd < 0) {
+                perror("lotus_bus_register_remote: udp socket");
+                return;
+            }
+            /* Bind to an ephemeral local port so the kernel picks
+             * a source addr for our sendto's. INADDR_ANY lets the
+             * kernel select the route-appropriate interface. */
+            struct sockaddr_in any;
+            memset(&any, 0, sizeof(any));
+            any.sin_family      = AF_INET;
+            any.sin_addr.s_addr = htonl(INADDR_ANY);
+            any.sin_port        = 0;
+            if (bind(fd, (struct sockaddr *)&any, sizeof(any)) < 0) {
+                perror("lotus_bus_register_remote: udp bind");
+                close(fd);
+                return;
+            }
+            e->udp_fd           = fd;
+            e->udp_is_multicast = lotus_addr_is_multicast(&e->udp_dest.sin_addr);
+        }
+        return;
+    }
 
     if (role == LOTUS_TRANSPORT_LISTEN) {
         /* m59: spawn a reader thread that owns this subject's
@@ -8443,6 +8710,9 @@ void lotus_bus_register_remote_adapter(
     e->has_reader_thread = 0;
     e->adapter_self      = self_data;
     e->adapter_send_fn   = send_fn;
+    e->udp_fd            = -1;
+    memset(&e->udp_dest, 0, sizeof(e->udp_dest));
+    e->udp_is_multicast  = 0;
 }
 
 /* Trim leading + trailing whitespace in-place. Returns a pointer
@@ -8547,6 +8817,23 @@ void lotus_bus_remote_fanout(const char *subject,
                 parena, payload, (int64_t)payload_size);
             if (!bytes_val) continue;
             e->adapter_send_fn(e->adapter_self, e->subject, bytes_val);
+            continue;
+        }
+        if (e->kind == LOTUS_BUS_REMOTE_KIND_UDP) {
+            /* CONNECT-side UDP fanout. sendto routes the
+             * datagram according to the destination's address
+             * class (unicast/multicast). The kernel doesn't
+             * report delivery; sendto returning > 0 only
+             * confirms the datagram entered the local IP stack —
+             * that's the contract publishers expect from a UDP
+             * transport. LISTEN-side UDP entries have udp_fd set
+             * but role != CONNECT; their fd is owned by the
+             * reader thread for recvfrom. */
+            if (e->role != LOTUS_TRANSPORT_CONNECT) continue;
+            if (e->udp_fd < 0) continue;
+            (void)sendto(e->udp_fd, payload, payload_size, 0,
+                         (struct sockaddr *)&e->udp_dest,
+                         sizeof(e->udp_dest));
             continue;
         }
         if (!e->transport) continue;
@@ -10442,6 +10729,32 @@ void lotus_bus_remote_destroy_all(void) {
          * exit. No transport to destroy or reader thread to join
          * here — only the strdup'd subject string to free. */
         if (e->kind == LOTUS_BUS_REMOTE_KIND_ADAPTER) {
+            if (e->subject) free(e->subject);
+            continue;
+        }
+
+        /* 2026-05-26 — UDP entries. Two-step shutdown:
+         *   1. shutdown(SHUT_RDWR) unblocks a recvfrom-blocked
+         *      reader thread (close alone doesn't on Linux —
+         *      the file's refcount is still held by the blocked
+         *      thread, so the recvfrom doesn't see EBADF until
+         *      the next call).
+         *   2. pthread_join after the reader's recvfrom returns
+         *      n == 0 (its exit signal).
+         *   3. close releases the fd.
+         * IP_DROP_MEMBERSHIP is unnecessary pre-close (kernel
+         * drops on close). */
+        if (e->kind == LOTUS_BUS_REMOTE_KIND_UDP) {
+            if (e->udp_fd >= 0) {
+                shutdown(e->udp_fd, SHUT_RDWR);
+            }
+            if (e->has_reader_thread) {
+                pthread_join(e->reader_thread, NULL);
+            }
+            if (e->udp_fd >= 0) {
+                close(e->udp_fd);
+                e->udp_fd = -1;
+            }
             if (e->subject) free(e->subject);
             continue;
         }
