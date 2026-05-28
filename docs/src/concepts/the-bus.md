@@ -254,6 +254,56 @@ Where the literal-subject form (`"events.**"`) accepts any
 matching topic by wire subject, the typed-topic form
 (`subscribe Events as ...`) keeps the strict-type discipline.
 
+## Routing keys + `on_unmatched`
+
+A topic can declare a **routing key** — a field on the payload
+type that selects which subscriber receives each message:
+
+```hale
+type CmdMsg { sym: String; qty: Int; }
+
+topic Cmd {
+    payload: CmdMsg;
+    subject: "cmd";
+    keyed_by sym;
+    on_unmatched: fail;
+}
+
+locus AaplWorker {
+    params { my_sym: String = "AAPL"; }
+    bus { subscribe Cmd as on_cmd where key == self.my_sym; }
+    fn on_cmd(c: CmdMsg) { /* AAPL-only */ }
+}
+```
+
+The `keyed_by sym` clause names the payload field the bus
+inspects at dispatch time. Each subscriber adds a `where key
+== EXPR` predicate; only the subscriber whose predicate
+matches the message's key field receives the call. This is
+the canonical alternative to *N* sibling subscribers each
+filtering inside their handler body.
+
+The `on_unmatched` clause picks what happens when no
+subscriber's `where` predicate matches:
+
+- **`swallow` (default)** — the message is silently dropped.
+  Cheap, but the publisher has no visibility into misses.
+- **`fail`** — the publish-side `<-` expression becomes
+  fallible-required. Callers must address it with `or raise`
+  (re-fail via the closure-violation channel) or `or discard`
+  (suppress this miss specifically). Useful when "no
+  subscriber" is a structural bug worth surfacing.
+- **`fallback`** — the topic must include at least one
+  catch-all subscriber written as `where key == _`. That
+  subscriber receives every message whose key didn't match a
+  more specific predicate.
+
+See `spec/semantics.md § Phase 3: routing keys` for the full
+rule set + the `BusUnmatchedKey` error type. The
+[fallible-bus-adapters](../../spec/design-rationale.md#f33-fallible-user-supplied-bus-adapters-sketch)
+sketch (F.33) extends the same `or` machinery to transport
+failures on user-supplied adapters.
+
 ## The closed-world optimization
 
 If a topic is only used inside one locus type — same locus

@@ -102,14 +102,31 @@ allocation.
 
 ```hale
 fn dispatch(m: ws::WsMessage) {
-    self.metrics.counter("ticks_total", lbl).inc();  // ← name str_clone'd into store arena each call
+    self.metrics.counter("ticks_total", lbl).inc();  // ← compile error: methods on loci may not return locus values
 }
 ```
 
-Even though each call returns a handle and the handle goes
-out of scope, the *literal name* loses its rodata status at the
-function boundary and gets deep-copied into the callee's arena.
-Each call grows the cross-locus store arena.
+This shape is now rejected at typecheck per
+`spec/semantics.md § Locus method dispatch` (the CQRS rule): a
+method on the metrics locus cannot return a Counter locus to
+the caller. The historical allocation cost — the name string
+gets deep-copied into the callee's arena on every call —
+remains a useful illustration of *why* the pattern is bad, but
+the compiler now closes the door before runtime gets a chance.
+
+The three canonical alternatives:
+
+- **Parent-child + index** — `metrics` becomes a parent locus
+  that owns its counters as children. The caller resolves the
+  name to an `Int` index once at boot, then calls
+  `self.metrics.inc(idx)` on the hot path (Int-keyed, no string
+  clone).
+- **Bus topic** — publish an "increment counter X" command;
+  the metrics subscriber dispatches to the right counter.
+- **Delegation** — collapse the per-counter operation onto the
+  parent (`self.metrics.inc_named("ticks")`). Cheap when the
+  caller hits a small fixed set of names; the per-call string
+  shows up in the parent's arena, but the surface is simpler.
 
 ## Patterns that avoid bursts
 
@@ -141,24 +158,32 @@ in the bargain — see
 [Build a wire-format parser](./wire-format-parsers.md) for the
 inverse direction).
 
-### Cache cross-locus handles
+### Resolve string keys to Int indices at boot
 
 If you call into a different locus to look something up by
-string-key on a hot path, pre-resolve at boot:
+string-key on a hot path, pre-resolve the key to an `Int`
+index at boot and pass that index on the hot path:
 
 ```hale
-// At boot, in main():
-let c_ticks = reg.counter("ticks_total", lbl);
-Service { c_ticks: c_ticks, ... };
+locus Service {
+    params {
+        metrics:   MetricsRegistry = MetricsRegistry { };
+        ticks_idx: Int             = 0;
+    }
+    birth() {
+        // register() returns Int — value-typed, satisfies the
+        // CQRS rule from `spec/semantics.md § Locus method
+        // dispatch`. String-clone happens here, exactly once.
+        self.ticks_idx = self.metrics.register("ticks_total");
+    }
 
-// On the hot path:
-fn dispatch(m: ws::WsMessage) {
-    self.c_ticks.inc();   // ← zero per-call alloc
+    fn dispatch(m: ws::WsMessage) {
+        self.metrics.inc(self.ticks_idx);   // ← zero per-call alloc
+    }
 }
 ```
 
-The cached handle is constructed once; the per-call `.inc()` is
-a direct slot write. See
+One boot-time string clone, an Int-keyed hot path. See
 [`agents/memory-patterns.md`][patterns] for the discovery context
 and the full catalog of substrate-closed leak shapes.
 

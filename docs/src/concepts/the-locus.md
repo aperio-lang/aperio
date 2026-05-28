@@ -161,6 +161,20 @@ loaded / probed / evicted; an `Order` that's submitted /
 filled / cancelled), you don't bolt methods onto the `type` —
 you promote it to a `locus`. There is no third primitive.
 
+The gradient runs in one direction: methods on a locus **may
+return types** (data leaving the locus is fine) but **may not
+return locus values**. The compiler rejects
+`fn lookup(id: String) -> Counter` on a registry locus. The
+rule keeps the substrate model honest — a Counter that "leaves"
+the registry would be a stranger in the caller's scope, with
+no lifecycle tower above it. Three canonical alternatives when
+you reach for the rejected shape: declare the would-be-returned
+locus as an `accept`'d child (parent-child + contract),
+publish a typed command on the bus (mediator), or delegate the
+operation onto the parent so the caller never holds the child
+handle. See `spec/semantics.md § Locus method dispatch` for
+the full rule.
+
 ## The one-tower rule
 
 The deepest commitment Hale makes about modeling is this:

@@ -165,6 +165,19 @@ other loci run."
 
 ## What you can't do
 
+- **No nested long-running cooperative children.** A non-main
+  locus with a non-trivial `run()` body can't hold a `params`
+  field whose declared type is a locus with its own non-trivial
+  `run()` — including `std::http::Server` and the other entries
+  on the substrate's known-long-running stdlib list. Nested
+  children share the parent's OS thread, so the child's
+  never-returning accept loop would starve the parent. The
+  compiler rejects this at typecheck and points at the canonical
+  fix: hoist both loci to siblings of a `main locus` and use a
+  `placement { }` block to put them on different pools (the
+  example in [The placement block](#the-placement-block) above
+  is the canonical shape). See `spec/runtime.md § Long-running
+  cooperative children`.
 - **No `greedy` placement class.** A placement that "shares a
   pool thread but never yields between handlers" would be a
   third class; the substrate refuses it. Cooperative already

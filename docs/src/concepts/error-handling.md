@@ -50,6 +50,28 @@ happens (closures are silent on success). If it doesn't, the
 runtime constructs a typed `ClosureViolation` event and routes
 it to the parent's `on_failure`:
 
+Epoch choices: `tick` (every event-loop iteration), `birth`
+(once after construction), `dissolve` (once before
+destruction), `duration(d)` (every `d` of monotonic time),
+`explicit` (only when user code calls `epoch_advance(NAME)`),
+and `inline` (pull-only, fired via `violate NAME;`). For a
+**rate-budget** closure — *"at most N events of this kind per
+minute"* — pair `epoch duration(d)` with a
+`resets_per_epoch(field, ...)` clause: the runtime zeros the
+named field after each window's assertion fires, so the
+counter restarts clean.
+
+```hale
+closure low_corrupt_rate {
+    self.corrupt_per_min ~~ 0 within 10;
+    epoch duration(1m);
+    resets_per_epoch(corrupt_per_min);
+}
+```
+
+See `spec/semantics.md § Per-epoch field reset` for the
+full rule.
+
 ```hale
 locus TradingDesk {
     accept(p: PnLAttribution) { /* ... */ }

@@ -3217,6 +3217,96 @@ composition path; without `BusUnmatchedKey` synth working,
 the multi-source case can't be modeled cleanly.
 
 
+### F.34 Per-epoch field reset (v1.x-WINDOWED)
+
+**Status: shipped (2026-05-28).** Grammar + typecheck +
+codegen + runtime tree-walker all live. See
+`spec/grammar.ebnf § closure_clause`, `spec/semantics.md §
+Per-epoch field reset`, and the
+`crates/hale-codegen/tests/closure_resets_per_epoch.rs`
+integration tests.
+
+**The problem.** Closure assertions can express
+point-in-time invariants (`self.x ~~ self.y within 0`) and,
+post-m46, stream accumulators (`sum(self.delta) ~~ 0 within
+100`). Neither shape expresses a *rate budget*: "at most N
+events of type X per minute." The canonical use is mdgw
+corruption-rate auditing — a parse-error counter that should
+average to zero over rolling 1-minute windows. Today users
+either give up the closure framing (track the counter
+manually, fire violations from inline `violate` calls) or
+re-implement per-window reset by snapshotting the counter at
+window boundaries and computing deltas — both leak the
+windowing math into application code.
+
+**The shape.** A new closure clause
+`resets_per_epoch(field1, field2, ...);` names locus fields
+the runtime zeros AFTER the closure assertion fires at a
+`duration(N)` epoch boundary. Ordering matters: the assertion
+sees the window's accumulated value; the reset prepares the
+next window.
+
+```hale
+closure low_corrupt_rate {
+    self.corrupt_per_min ~~ 0 within 10;
+    epoch duration(1m);
+    resets_per_epoch(corrupt_per_min);
+}
+```
+
+User code increments / decrements the field as the window
+accumulates (`self.corrupt_per_min = self.corrupt_per_min + 1`
+in the parse-error path); the substrate keeps the counter
+honest about which window it belongs to.
+
+**Why a closure clause, not a form or library locus.**
+
+- **Forms shape storage.** `@form(vec/hashmap/ring_buffer)` are
+  all container substrates. A windowed counter is
+  computational / temporal, not a storage shape — adding it as
+  a form would muddy the form taxonomy.
+
+- **Library loci hide the temporal contract.** A
+  `std::metrics::WindowedCounter` lib locus would work, but
+  the closure assertion would degenerate to
+  `self.rate.count() ~~ 0 within N` — the compiler couldn't
+  reason about the temporal contract at the closure layer.
+  F.27's framing has the closure as *the* compiler-visible
+  structural contract; hiding the window math behind a method
+  call breaks that.
+
+- **Closure clauses are the right axis.** `resets_on(events)`
+  already lives on the recovery-event axis (reset on
+  restart/quarantine/dissolve/replace). `resets_per_epoch`
+  mirrors the shape on the epoch-firing axis. Same grammar
+  production family; same load-bearing intent ("close around
+  the counter so the substrate keeps it honest").
+
+**Typecheck restrictions.** The clause is rejected unless
+paired with `epoch duration(N)` — `tick` recurs too fast to
+be a useful rate-budget window, and `birth` / `dissolve` /
+`inline` / `explicit` don't recur. Each named field must be
+declared on the enclosing locus and have numeric type (Int /
+Uint / Float / Decimal); zero is not a meaningful reset value
+for booleans, strings, or structs.
+
+**Considered and rejected.**
+
+- *Auto-detect "rate-budget" closure shape and synthesize the
+  reset.* Pattern-matching `self.X ~~ 0 within Y; epoch
+  duration(Z);` as "obviously a rate budget" was tempting but
+  would couple two orthogonal axes (assertion shape and reset
+  semantics) — closures that legitimately accumulate without
+  resetting (cumulative drift, total event count) would
+  silently get the wrong behavior. The explicit clause keeps
+  the user in control of which fields are window-scoped.
+- *`epoch duration(N) windowed`-style flag.* Single keyword
+  instead of a field list. Couldn't name which fields to
+  reset, so the user would lose control over fields that
+  *aren't* window-scoped but live alongside one that is. The
+  field list is load-bearing.
+
+
 
 The grammar in v0 does **not** specify:
 

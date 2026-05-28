@@ -145,6 +145,20 @@ the key is one of the fields.
 user-declared struct; the indexed-by field must be `Int` or
 `String`.
 
+**Cells are data, not loci.** The cell type may not be a
+locus reference. Storing an entity in a hashmap would mean
+`.get(key)` materializes a stranger in the caller's scope —
+the same antipattern the
+[CQRS rule](./the-locus.md#locus-vs-type) rejects at the
+method layer. For keyed-children patterns: declare the
+would-be cells as `accept`'d children of the parent locus and
+pair with a parallel `@form(hashmap)` of cell type
+`type Index { key: String; child_idx: Int; }` if you need
+name-based lookup; publish a bus topic keyed by name; or
+collapse the per-child op onto the parent
+(`parent.inc_named(name)`). See `spec/forms.md § @form(hashmap)`
+for the full restriction text.
+
 ### `@form(ring_buffer, cap = N)` — fixed-capacity FIFO
 
 ```hale
