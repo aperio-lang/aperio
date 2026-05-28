@@ -166,108 +166,116 @@ dissolves until fn exit. Per-iteration cleanup uses a helper
 free fn whose return is the per-iteration boundary (see
 `handle_one_connection` in `stdlib/io_tcp.hl`).
 
-### Locus role
+### Locus method dispatch — Law of Demeter
 
-Every locus declaration must carry a **load-bearing** role. A locus
-is load-bearing when it carries at least one of:
+Hale enforces the Law of Demeter on locus method calls. A method
+on locus `C` may only invoke methods on values that are
+**friends** of `C`'s current method body. The allowed friends:
 
-1. A non-empty lifecycle body — `birth()`, `run()`, or `dissolve()`
-   with statements beyond a tail-empty block.
-2. A `drain()` or `accept()` declaration.
-3. A `bus subscribe` clause.
-4. A `closure` declaration of any epoch.
-5. A `capacity { ... }` slot (pool / heap / vec / hashmap /
-   ring_buffer / shm_ring).
-6. An `on_failure(child, err)` handler.
-7. A `mode { bulk | harmonic | resolution }` block.
-8. At least one owned param field whose type isn't a borrowed
-   reference (`ptr<T>`) or a value-shape primitive.
+1. `self` — the current C instance.
+2. `self.<field>` (one or more hops of field access on owned
+   members) — C's owned children and value fields.
+3. The method's own parameters.
+4. Locus values constructed locally within the method body
+   via a struct literal (`let b = BytesBuilder { ... }`).
+5. Free-fn / path-call results (`std::str::trim(s)`,
+   `parse_config(args)` — these aren't method calls on locus
+   values to begin with).
 
-A locus that fails *all* of these is **degenerate**: it has no
-lifecycle responsibility, no invariants to enforce, no owned
-state, and no membership in the bus graph. It exists only as a
-method-dispatch wrapper over data that lives elsewhere.
+Method calls on locus-typed values introduced through any other
+path — chained method-call return values, slot-cell results, etc.
+— are rejected at compile time as Law-of-Demeter violations.
 
-#### Why this matters
+The rule is value-introduction-aware, not locus-shape-aware. A
+locus's structure (lifecycle bodies, closures, subscriptions,
+capacity slots, owned state) doesn't matter — what matters is
+who introduced the value into the current scope.
 
-The lotus model treats locus boundaries as load-bearing
-abstractions — flow with invariants. Degenerate loci fight that
-model. They incur full lotus tax (arena create, dissolve cascade,
-field-init storms) for an operation that conceptually lives in
-another locus's tower. The classic surface is the factory shape:
+#### The factory train wreck
+
+The canonical violation is the cross-tower factory pattern:
 
 ```hale
-locus Counter {            // degenerate: just methods on borrowed state
-    store: ptr<Store>;
-    key: String;
-    fn inc() { ... }
-}
-
-locus Registry {
-    fn counter(name: String) -> Counter {
-        return Counter { store: self.store, key: name };
-    }
-}
+self.reg.counter("ticks").inc()
 ```
 
-The call `reg.counter("ticks").inc()` allocates a transient
-`Counter` per call, runs it through the m90 routing
-(program-lifetime payload arena), and leaves it as substrate
-debris. Under sustained call rates this leaks; the design
-sketch in § Method-returning-locus heap allocation (m90) below
-covers the runtime behavior. But the deeper issue is that
-`Counter` shouldn't be a locus at all — the increment operation
-belongs in `Registry`'s tower.
+- `self.reg.counter(...)` is fine: `self.reg` is a friend (field
+  of self), and calling a method on a friend is allowed.
+- The `Counter` that comes back was constructed by `Registry`,
+  not by the caller. The caller doesn't own it. It's a stranger.
+- Calling `.inc()` on that Counter reaches past the friend
+  (`self.reg`) to a stranger. **Rejected.**
 
-#### Enforcement
+The two canonical remedies are well-known from object-oriented
+practice:
 
-The compiler runs a `load_bearing` check in Phase A after
-`declare_locus_struct`. Loci that fail the check are rejected
-with a span-targeted diagnostic. The diagnostic names the two
-canonical alternatives:
+1. **Delegation** — `Registry` exposes the operation directly:
+   ```hale
+   self.reg.inc_counter("ticks");
+   ```
+   The handle abstraction is lost; the call site re-passes the
+   name every time. Acceptable when the caller has only a few
+   counters to touch.
 
-1. **Direct method on the owning locus.** `Registry::inc(name)`
-   in place of `reg.counter(name).inc()`. Loses the typed
-   handle but doesn't allocate.
-2. **Bus topic for the operation.** `Counter::Inc { name }
-   -> Inc` where `Registry` subscribes to `Inc`. Closed-world
-   rewrite (when the preconditions hold) collapses the bus
-   round-trip to a direct dispatch with no allocation.
+2. **Mediator (bus topic)** — decouple through the bus:
+   ```hale
+   topic Inc { name: String };
+   Counter::Inc { name: "ticks" } -> Inc;
+   ```
+   `Registry` subscribes to `Inc`. The closed-world rewrite
+   (when its preconditions hold) collapses the bus round-trip
+   to a direct dispatch — same cost as the delegation form,
+   without losing the handle abstraction at the type level.
 
-#### What's not degenerate
+#### What's not rejected
 
-Loci that own a file descriptor, a socket, a buffer, or any
-resource with a lifecycle (`std::io::file::File`,
-`std::io::tcp::Stream`, `std::http::Server`, `BytesBuilder`) are
-load-bearing — they have non-trivial `dissolve()` bodies that
-clean up the resource. The check passes.
+- **Namespace-lotus pattern** (`__StdLangLang`,
+  `__StdNameConvention`, `__StdLogStdoutSink`, etc.). The caller
+  constructs one themselves and owns it (rule 4). Methods on it
+  are scaffolding calls.
+- **Utility loci** like `BytesBuilder`. Same reason.
+- **Parent-child cascade**. `self.child.method()` is rule 2
+  (child is in self's owned cascade). Multi-hop field access
+  through owned children (`self.engine.profile.summary()`)
+  remains allowed; what's rejected is method-call traversal
+  (`self.engine.fetch_profile().summary()` — the result of
+  `fetch_profile()` is a stranger).
+- **Free-fn calls** that return locus values
+  (`let cfg = parse_config(args); cfg.get("key");`). Free fns
+  are static utilities (rule 5) — their results are introduced
+  cleanly into local scope.
 
-Loci with subscriptions, closures, or accept declarations are
-load-bearing by construction (criteria 2–6 above).
+#### A method that returns a locus value
 
-Loci that exist as parameter-only state containers — no
-methods, only fields read by the surrounding code — are
-load-bearing if any field is owned (criterion 8). The
-"borrowed-handle" failure case is specifically a locus whose
-*only* fields are borrowed references plus value-shape
-primitives plus methods that route through those borrowed
-references.
+By the rule, callers can't invoke methods on the returned value
+within the immediate scope. The return value is usable only as
+a pass-through: bind it to a let (still can't call methods on
+it), pass it as a parameter (the receiver of the parameter can
+call methods on it — params are friends), or feed it back into
+the bus.
 
-#### Opt-out
+The compiler doesn't reject these method declarations directly.
+It rejects every attempted use of their results as
+Law-of-Demeter violations — same effect with a more precise
+diagnostic surface. In practice the leak (see §
+Method-returning-locus heap allocation (m90) below) stops being
+reachable: the m90-routed allocation only fires when a
+construction site has `current_user_fn_ret` set, and the only
+remaining code shape that triggers it is the parameter-passthrough
+case, where the value is consumed by a callee that owns it.
 
-The annotation `@degenerate` on a locus declaration suppresses
-the check. Intended for migration windows only — code that
-applies `@degenerate` is asserting it has read this section and
-accepts the m90 runtime cost. Library-published code with
-`@degenerate` should be considered a transitional shape.
+#### Migration
+
+The annotation `@allow_lod_violation` on a method-call
+expression suppresses the check at that call site. Intended for
+migration windows only — code that applies it asserts the call
+crosses the friendship boundary and accepts the m90 cost.
+Library-published code applying this annotation should be
+considered a transitional shape.
 
 ```hale
-@degenerate
-locus Counter {
-    store: ptr<Store>;
-    key: String;
-    fn inc() { ... }
-}
+@allow_lod_violation
+self.reg.counter("ticks").inc()
 ```
 
 The annotation will be removed in a future major version once
