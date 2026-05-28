@@ -153,7 +153,75 @@ the price.
 | Long-running CPU-bound loops that shouldn't yield | `pinned` |
 | Predictable cadence on a specific CPU core | `pinned(core = N)` |
 | Long-running cooperative sibling that shouldn't serialize against main | `cooperative(pool = own_pool)` |
+| **Many concurrent I/O-bound connections on one thread** | `cooperative(pool = X) where async_io` |
 | Anything else | cooperative on the default pool |
+
+## Green-I/O cooperative pools (`where async_io`)
+
+A cooperative pool's worker thread normally runs each handler to
+completion before draining the next cell. That serializes
+correctly for short-lived handlers but caps concurrent I/O at
+one-blocking-call-per-pool-thread: a `recv_bytes` waiting on a
+socket holds the worker until data arrives, so a second
+connection's handler queues behind it.
+
+A placement entry may declare `where async_io` to opt the pool
+into green-I/O scheduling:
+
+```hale
+placement {
+    listener: cooperative(pool = ws_accept)  where async_io;
+    worker:   cooperative(pool = ws_workers) where async_io;
+}
+```
+
+The pool's worker drain integrates an epoll instance. Inside a
+locus method on this pool, blocking I/O syscalls (`recv_bytes`,
+`accept_one`, `send_bytes`, `recv_str`, `send_str`) park the
+calling coro instead of blocking the OS thread — the worker
+runs other cells and other parked coros' wakeups until epoll
+signals the parked fd is ready, then resumes the original coro.
+
+User code stays synchronous-shaped:
+
+```hale
+locus PerConn {
+    params { fd: Int = -1; }
+    run() {
+        let stream = std::io::tcp::Stream { conn_fd: self.fd };
+        while true {
+            let frame = stream.recv_bytes(4096);   // parks transparently
+            if len(frame) == 0 { break; }
+            handle_frame(frame);
+        }
+    }
+}
+```
+
+Each `recv_bytes` call looks identical to its blocking-pool
+counterpart; the substrate picks the right lowering at the
+syscall boundary. N concurrent connections share one OS thread,
+roughly 70 KiB per connection (64 KiB coro stack + per-conn
+locus arena).
+
+### Restrictions
+
+- All placement entries on the same named cooperative pool must
+  agree on `where async_io`. The drain loop is one-or-the-other.
+- `where async_io` is rejected on `pinned` entries — pinned owns
+  its own thread and has no shared drain loop to park on.
+- `where async_io` is rejected on pool `main` — main runs inline
+  on the binary's primary thread with no dedicated worker.
+
+### Visibility
+
+`std::process::dump_pool_residency()` writes one line per pool
+to stderr with mode (async_io / blocking), parked-coro count,
+and pending cell-queue depth. Call from a heartbeat tick on
+long-running daemons.
+
+See `spec/design-rationale.md § F.35` for the substrate design +
+considered-and-rejected alternatives.
 
 The rule of thumb: pinned is for *I shouldn't share a pool
 thread*. If sharing is fine — even for a relatively-busy

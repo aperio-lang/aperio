@@ -14136,6 +14136,10 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 let _ = self.lower_std_process_dump_arena_residency(args)?;
                 Ok(())
             }
+            ["std", "process", "dump_pool_residency"] => {
+                let _ = self.lower_std_process_dump_pool_residency(args)?;
+                Ok(())
+            }
             ["std", "io", "tcp", "__listen_socket"] => {
                 let _ = self.lower_std_io_tcp_listen_socket(args, scope)?;
                 Ok(())
@@ -14861,6 +14865,9 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             ["std", "process", "rss_bytes"] => self.lower_std_process_rss_bytes(args),
             ["std", "process", "dump_arena_residency"] => {
                 self.lower_std_process_dump_arena_residency(args)
+            }
+            ["std", "process", "dump_pool_residency"] => {
+                self.lower_std_process_dump_pool_residency(args)
             }
             ["std", "io", "tcp", "__listen_socket"] => {
                 self.lower_std_io_tcp_listen_socket(args, scope)

@@ -3307,6 +3307,132 @@ for booleans, strings, or structs.
   field list is load-bearing.
 
 
+### F.35 Green-I/O cooperative pools (`where async_io`)
+
+**Status: shipped (2026-05-28).** Substrate plumbing in
+`crates/hale-codegen/runtime/lotus_arena.c § lotus_coro_t /
+lotus_coop_park_on_fd / lotus_coop_pool_drain_one_async`. User
+surface in `spec/grammar.ebnf § placement_constraint`. Typecheck
++ codegen wired through `crates/hale-types/src/check.rs ::
+check_placement_block` and `crates/hale-codegen/src/codegen.rs ::
+async_io_pools`. Diagnostics via
+`std::process::dump_pool_residency()`.
+
+**The problem.** Hale's cooperative-pool scheduler (F.31) is
+handler-atomic: each bus cell on a pool runs to completion on
+the pool's worker thread before the next cell drains. That's
+correct for short-lived handlers (the design assumes "handlers
+do bounded work between yield points") but pathological for the
+TCP / WebSocket server shape, where a handler is a per-
+connection state machine that blocks on `recv` for the
+connection's lifetime. With M pool threads, you get a hard cap
+of M concurrent connections — every other connection queues
+behind a `recv()` blocked on the kernel.
+
+The workaround pre-F.35 was "pinned per connection" or
+"per-pool single-locus + many pools." Neither scales to the
+Go-shaped "many connections per OS thread" model that the
+substrate's lotus framing is otherwise good at.
+
+**The shape (option β: deployment-seam, no language-keyword
+extension).** A placement entry may declare `where async_io`:
+
+```hale
+placement {
+    listener: cooperative(pool = ws_accept)  where async_io;
+    worker:   cooperative(pool = ws_workers) where async_io;
+}
+```
+
+The pool's worker drain loop integrates an epoll instance.
+Inside a locus method on this pool, blocking I/O syscalls
+(`recv_bytes`, `accept_one`, `send_bytes`, ...) detect the
+async_io context via a TLS pool ptr and route through
+`lotus_coop_park_on_fd` instead of blocking the OS thread. The
+park primitive `swapcontext`s back to the worker's drain
+context; the worker services other cells (and other parked
+coros' wake-ups) until epoll signals the parked fd is ready,
+then `swapcontext`s back into the original coro and the syscall
+retries. From the user's perspective, `recv_bytes(stream)` is
+the same line of source — only the lowering differs.
+
+**Why the deployment-seam shape (not a per-fn `@blocking`
+annotation).** Same axis as `zero_copy` on bus bindings (Form K):
+operational requirements are deployment choices, not author
+choices. The locus body should be portable across deployments;
+the deployment author picks the I/O model based on workload
+shape. The same user code that serves five concurrent
+connections on a default pool serves five thousand on an
+`async_io` pool — with no source edit.
+
+**Stackful vs. stackless coros.** v0.1 uses ucontext + a 64 KiB
+mmap-or-malloc'd stack per in-flight handler invocation
+(`lotus_coro_t`). Memory cost per concurrent connection ≈
+64 KiB + the per-conn locus arena (typically 4-64 KiB) =
+roughly 70 KiB per connection. 10k concurrent connections ≈
+700 MB — comfortable for any modern server. A later iteration
+may replace ucontext with a CPS rewrite (stackless coros á la
+Rust `async fn` / Go's pre-1.4 model) if per-connection memory
+becomes load-bearing; the user-facing surface (`where
+async_io` + transparent `recv_bytes`) stays unchanged.
+
+**Considered and rejected.**
+
+- *Per-fn `@blocking` / `@async` annotation.* Would couple the
+  I/O model to the locus body's source rather than the
+  deployment. A locus shipped against one deployment would need
+  source edits to ship against another. Same rationale as F.31
+  moving placement from per-locus annotations to `main`'s
+  `placement { }` block.
+- *Default-on async_io on every cooperative pool.* Changing the
+  default would silently retroactively alter the meaning of
+  every existing `recv_bytes` call. Programs that were correct
+  with blocking semantics (e.g. a request-loop that assumes
+  reads block until the next message arrives) would shift to
+  cooperative behavior — handlers may interleave in surprising
+  ways. Opt-in via `where async_io` keeps the change localized.
+  Future v0.x may flip the default if the corpus has stabilized
+  on the opt-in path; explicit migration vs. retroactive change.
+- *Stackless coros via CPS rewrite in v0.1.* More invasive
+  codegen (locus methods that may park need state-machine
+  lowering); larger blast radius for the initial ship. ucontext
+  is portable, supported by glibc / musl / BSD libc, and
+  matches the cost shape of historical Go (small stacks per
+  goroutine, no preemption). Stackless coros remain a future
+  iteration if measured per-coro stack memory becomes the
+  binding constraint.
+- *Async I/O via thread pool (libuv-style).* Each blocking
+  syscall would run on a dedicated I/O thread pool, with
+  completion routed back to the cooperative pool via the bus.
+  Works for arbitrary syscalls (read of files, getaddrinfo)
+  but adds cross-thread coordination per call and loses the
+  zero-context-switch property of epoll. Reserve for file I/O
+  (where io_uring is the modern answer anyway) — not the
+  primary network surface.
+- *`pinned-async`: pinned thread with internal poll loop.*
+  Pinned loci own their thread already; an "async-aware pinned"
+  variant would have the locus's `run()` drive its own epoll +
+  state machines. Equivalent power, more boilerplate. The
+  async_io cooperative pool gives the same throughput shape
+  with one pool worker fanning many connections — no per-conn
+  pinned thread, no per-conn run-loop boilerplate.
+
+**Typecheck rules.** All entries on the same named cooperative
+pool must agree on `where async_io` (the drain loop is one-or-
+the-other). `where async_io` is rejected on `pinned` entries
+(pinned owns its thread; no shared drain to park on) and on
+pool `main` (the main pool runs inline on the binary's primary
+thread with no dedicated worker). See `spec/runtime.md § where
+async_io` for the running-context semantics.
+
+**Diagnostics.** `std::process::dump_pool_residency()` writes
+one stderr line per cooperative pool with mode (async_io /
+blocking), parked-coro count, and pending cell-queue depth.
+Embed in a heartbeat tick on long-running daemons for
+occupancy visibility — mirrors the `dump_arena_residency`
+shape.
+
+
 
 The grammar in v0 does **not** specify:
 

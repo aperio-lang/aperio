@@ -1305,6 +1305,20 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             residency_dump_ty,
             None,
         );
+        // F.35 Slice 4: per-pool residency dump (parked-coro count +
+        // pending cell-queue depth per cooperative pool). Surfaced
+        // as `std::process::dump_pool_residency()` for ops embedding
+        // in heartbeat ticks. Same shape as the arena residency
+        // dump above — fd-parameterized so the same primitive can
+        // back stderr ops dumps and per-route diagnostic captures.
+        // declare void @lotus_coop_pool_dump_parked_counts(i32 fd)
+        let pool_dump_ty =
+            void_t.fn_type(&[i32_t.into()], false);
+        self.module.add_function(
+            "lotus_coop_pool_dump_parked_counts",
+            pool_dump_ty,
+            None,
+        );
 
         // m73b: TCP primitives reachable from Hale source via
         // the `std::io::tcp::__*` magic-path calls. lotus_tcp_t

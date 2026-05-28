@@ -30,6 +30,11 @@ pub(crate) trait ProcessStdlib<'ctx> {
         args: &[Expr],
     ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError>;
 
+    fn lower_std_process_dump_pool_residency(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError>;
+
     fn lower_std_process_run_fallible(
         &mut self,
         args: &[Expr],
@@ -239,6 +244,38 @@ impl<'ctx, 'p> ProcessStdlib<'ctx> for Cx<'ctx, 'p> {
         // syntax. Matches the cheap "returns true" pattern used by
         // a few other observability primitives. Actually return
         // unit-like Int(0) to avoid implying a meaningful value.
+        let i64_t = self.context.i64_type();
+        Ok((i64_t.const_int(0, false).into(), CodegenTy::Int))
+    }
+
+    /// F.35 Slice 4: `std::process::dump_pool_residency()` —
+    /// writes one line per cooperative pool to stderr naming
+    /// the pool's name, I/O mode (async_io / blocking), parked-
+    /// coro count, and pending cell-queue depth. Mirrors the
+    /// `dump_arena_residency` shape — call from a heartbeat tick
+    /// on long-running daemons to track per-pool occupancy. The
+    /// dump is cheap (one mutex acquire per pool); the parked-
+    /// list walk reads-without-lock because only the pool's own
+    /// worker mutates that list.
+    fn lower_std_process_dump_pool_residency(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
+        if !args.is_empty() {
+            return Err(CodegenError::Unsupported(format!(
+                "std::process::dump_pool_residency takes 0 arguments, got {}",
+                args.len()
+            )));
+        }
+        let f = self
+            .module
+            .get_function("lotus_coop_pool_dump_parked_counts")
+            .expect("lotus_coop_pool_dump_parked_counts declared");
+        let i32_t = self.context.i32_type();
+        let stderr_fd = i32_t.const_int(2, false);
+        self.builder
+            .build_call(f, &[stderr_fd.into()], "pool_residency.dump")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         let i64_t = self.context.i64_type();
         Ok((i64_t.const_int(0, false).into(), CodegenTy::Int))
     }

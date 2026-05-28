@@ -4934,6 +4934,40 @@ void lotus_coop_pool_start_all(void) {
     }
 }
 
+/* F.35 Slice 4 (2026-05-28): per-pool residency dump. Writes one
+ * line per registered cooperative pool to the supplied fd, naming
+ * the pool, its mode (async_io / blocking), parked coro count,
+ * and pending cell-queue depth. Cheap to call; no signal-safety
+ * guarantees (acquires per-pool mutex). Surfaced to user code as
+ * `std::process::dump_pool_residency()` for embedding in heartbeat
+ * ticks on long-running daemons. */
+void lotus_coop_pool_dump_parked_counts(int fd) {
+    if (fd < 0) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+                     "--- coop pool residency (count=%zu) ---\n",
+                     g_coop_pool_count);
+    if (n > 0) (void)write(fd, buf, (size_t)n);
+    for (size_t i = 0; i < g_coop_pool_count; i++) {
+        lotus_coop_pool_t *p = g_coop_pools[i];
+        if (!p) continue;
+        pthread_mutex_lock(&p->lock);
+        size_t pending = (p->tail >= p->head) ? (p->tail - p->head) : 0;
+        pthread_mutex_unlock(&p->lock);
+        /* parked_head walk is safe without the pool lock because only
+         * the worker thread mutates the list — readers see a possibly-
+         * stale snapshot, which is the right semantic for a residency
+         * dump (it's diagnostic, not a synchronization point). */
+        size_t parked = 0;
+        for (lotus_coro_t *c = p->parked_head; c; c = c->next) parked++;
+        const char *mode = p->async_io_enabled ? "async_io" : "blocking";
+        n = snprintf(buf, sizeof(buf),
+                     "  [%s] mode=%s parked=%zu pending=%zu\n",
+                     p->name, mode, parked, pending);
+        if (n > 0) (void)write(fd, buf, (size_t)n);
+    }
+}
+
 void lotus_coop_pool_shutdown_all(void) {
     /* Two-phase: signal all pools first so they can drain
      * pending cells in parallel, then join. */
