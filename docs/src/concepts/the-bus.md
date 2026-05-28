@@ -226,6 +226,86 @@ live in the adapter body where they belong. NATS-at-most-once
 and MQTT-QoS-2 and a custom broker with transactional ack all
 satisfy the same `__StdBusAdapter` contract.
 
+### Shared-memory zero-copy delivery (`shm_ring`)
+
+For high-frequency same-machine routes where the memcpy cost
+shows up in the latency budget — real-time market data, tick
+streams, anything north of ~100k msg/s on one host — a binding
+can declare `shm_ring` as the transport and assert `zero_copy`
+in a `where` clause:
+
+```hale
+bindings {
+    L2Updates: shm_ring("/l2-updates",
+                        slot_count:  1024,
+                        on_overflow: fail)
+              where intra_machine, zero_copy;
+}
+```
+
+The publisher writes the payload directly into a POSIX
+shared-memory ring buffer slot; the subscriber reads from the
+same memory; no kernel memcpy at the locus boundary. Both
+processes `mmap` the same `/dev/shm` object and coordinate via
+the ring's slot indices.
+
+The `where` clause is two things at once:
+
+- **A user assertion** that the route satisfies the named
+  constraints. The dev team is declaring "this should be intra-
+  machine + zero-copy."
+- **A typecheck contract** the substrate validates: the
+  transport must support the constraint, the payload must be
+  shape-compatible, and the scope keywords must be internally
+  consistent.
+
+Constraint vocabulary:
+
+- **Scope** — `intra_process` (same OS process), `intra_machine`
+  (cross-process, same host), `cross_machine` (network in
+  scope). A binding declares at most one; mixing two is
+  rejected as ambiguous.
+- **Behavior** — `zero_copy` (no memcpy at locus boundary). The
+  typechecker rejects `zero_copy` combined with `cross_machine`
+  (network always serializes) and against transports that can't
+  satisfy it (`unix(...)` rejects `zero_copy` — the kernel
+  memcpies through the socket buffer; user-supplied adapters
+  reject `zero_copy` — the `fn send(subject, bytes)` contract
+  requires serialization).
+
+`zero_copy` further requires the topic's **payload type to be
+flat-shapeable**: every leaf is a fixed-layout primitive
+(`Int`, `Float`, `Bool`, `Decimal`, `Time`, `Duration`), a
+fixed-size array of flat-shapeables, or a struct whose fields
+are all flat-shapeable. `String`, `Bytes`, `BytesView`,
+`StringView`, and unbounded arrays carry heap pointers / length
+prefixes that don't translate to a shared-memory slot, so the
+typechecker rejects them on a zero-copy topic. Use a fixed-size
+byte array (`[Byte; 256]` etc.) for bounded text/binary payloads
+on these routes.
+
+The back-pressure policy (`on_overflow:`) is required on every
+`shm_ring` binding — slot exhaustion needs a policy decision
+the substrate can't guess for you. Three policies:
+
+- **`block`** — publisher spins until a slot frees. Right for
+  control-plane topics where latency tolerates backpressure
+  but data must not be lost. v1 has no timeout; deadlocks if
+  the consumer dies.
+- **`drop`** — publisher unconditionally overwrites the next
+  slot. Slow consumers silently miss messages. Right for
+  stale-is-worthless feeds (market data tickers, telemetry).
+- **`fail`** — publisher panics with a clear stderr diagnostic
+  and `_exit(1)` when the ring is full. Process-level
+  visibility into back-pressure events.
+
+Same pattern as F.35's `where async_io` on placement entries —
+operational requirements declared at the deployment seam,
+validated by the typechecker, consumed by codegen to pick the
+lowering strategy. The locus body's `subscribe T as on_msg`
+handler is the same line of source whether the message arrived
+via shared-memory zero-copy or via a unix-socket memcpy.
+
 ## Hierarchical topics + wildcards
 
 Topics can declare a parent and inherit a dotted wire-subject
