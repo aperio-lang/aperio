@@ -29,6 +29,7 @@ use crate::stdlib::decimal::DecimalStdlib;
 use crate::stdlib::env::EnvStdlib;
 use crate::stdlib::math::MathStdlib;
 use crate::stdlib::process::ProcessStdlib;
+use crate::stdlib::rand::RandStdlib;
 use crate::stdlib::time::TimeStdlib;
 
 /// Compile-time tag for a value's type. Mirrors a small subset
@@ -32448,68 +32449,6 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .left()
             .expect("returns ptr");
         Ok((ptr, CodegenTy::Bytes))
-    }
-
-    /// ws-echo `random-seed-missing`: lower
-    /// `std::rand::seed_from_time()` — re-seed the shared xorshift64*
-    /// state from CLOCK_MONOTONIC. Library-internal use only; not
-    /// cryptographically secure. Statement-position only.
-    fn lower_std_rand_seed_from_time(
-        &mut self,
-        args: &[Expr],
-    ) -> Result<(), CodegenError> {
-        if !args.is_empty() {
-            return Err(CodegenError::Unsupported(format!(
-                "std::rand::seed_from_time takes 0 args, got {}",
-                args.len()
-            )));
-        }
-        let f = self
-            .module
-            .get_function("lotus_rand_seed_from_time")
-            .expect("lotus_rand_seed_from_time declared");
-        self.builder
-            .build_call(f, &[], "rand.seed")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        Ok(())
-    }
-
-    /// ws-echo `random-seed-missing`: lower
-    /// `std::rand::next_int(max: Int) -> Int` — uniform-ish int in
-    /// [0, max). max <= 0 returns 0. Auto-seeds from monotonic
-    /// time on first call so callers that forget the explicit
-    /// seed still get distinct values per process run.
-    fn lower_std_rand_next_int(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::rand::next_int takes 1 arg (max), got {}",
-                args.len()
-            )));
-        }
-        let (max_val, max_ty) = self.lower_expr(&args[0], scope)?;
-        if max_ty != CodegenTy::Int {
-            return Err(CodegenError::Unsupported(format!(
-                "std::rand::next_int: max must be Int, got {:?}",
-                max_ty
-            )));
-        }
-        let f = self
-            .module
-            .get_function("lotus_rand_next_int")
-            .expect("lotus_rand_next_int declared");
-        let call = self
-            .builder
-            .build_call(f, &[max_val.into()], "rand.next.ret")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let v = call
-            .try_as_basic_value()
-            .left()
-            .expect("returns i64");
-        Ok((v, CodegenTy::Int))
     }
 
     /// Phase 2e: lower `std::io::fs::list_dir_count(path: String)
