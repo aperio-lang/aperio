@@ -1412,6 +1412,40 @@ Epoch boundaries:
   RIGHT / TOL to evaluate). See "Inline closure violation"
   below.
 
+### Per-epoch field reset (F.34, v1.x-WINDOWED)
+
+A closure paired with `epoch duration(N)` may declare
+`resets_per_epoch(field1, field2, ...);`. The named locus fields
+are zeroed by the runtime **after** the assertion fires at each
+duration boundary. Ordering matters: the assertion sees the
+window's accumulated value; the reset prepares the next window.
+
+```hale
+closure low_corrupt_rate {
+    self.corrupt_per_min ~~ 0 within 10;
+    epoch duration(1m);
+    resets_per_epoch(corrupt_per_min);
+}
+```
+
+Restrictions enforced at typecheck:
+
+- The closure MUST declare `epoch duration(N)`. The clause is
+  rejected on `tick` / `birth` / `dissolve` / `inline` /
+  `explicit` — other epochs either don't recur or recur too
+  fast for a rate-budget framing.
+- Each named field MUST be declared on the enclosing locus and
+  MUST have numeric type (`Int`, `Uint`, `Float`, `Decimal`).
+  Booleans, strings, and structs are rejected — zero is not a
+  meaningful reset value for them.
+
+User code increments / decrements the field as the window
+accumulates. The closure assertion is the structural contract
+(rate bounded by a per-window budget); `resets_per_epoch`
+keeps the substrate honest about which window the counter
+belongs to without forcing the user to maintain a `last_reset_at`
+field or a parallel pre-fire hook.
+
 ## Inline closure violation
 
 (F.27, v1.x-VIOLATE.) Inline closures provide a pull-only

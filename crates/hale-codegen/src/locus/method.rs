@@ -422,7 +422,13 @@ impl<'ctx, 'p> LocusMethodBodies<'ctx> for Cx<'ctx, 'p> {
 
                 // fire_bb: store now -> last_fire, then run
                 // the assertion check (which routes to
-                // on_failure on violation).
+                // on_failure on violation). F.34: after the
+                // assertion runs, zero any fields named in the
+                // closure's `resets_per_epoch(...)` clause so the
+                // next window starts clean. Order matters — the
+                // reset MUST happen AFTER the assertion so the
+                // current window's accumulated value is what's
+                // judged.
                 self.builder.position_at_end(fire_bb);
                 self.builder
                     .build_store(last_slot, now)
@@ -435,6 +441,73 @@ impl<'ctx, 'p> LocusMethodBodies<'ctx> for Cx<'ctx, 'p> {
                     parent_handler_arg,
                     c_epoch.clone(),
                 )?;
+                if let Some(reset_fields) =
+                    info.resets_per_epoch_per_closure.get(cname).cloned()
+                {
+                    for fname in &reset_fields {
+                        let (field_idx, field_ty) = info
+                            .fields
+                            .get(fname)
+                            .map(|(i, t)| (*i, t.clone()))
+                            .ok_or_else(|| {
+                                CodegenError::Unsupported(format!(
+                                    "resets_per_epoch: field `{}` not \
+                                     found on locus `{}` (typecheck \
+                                     should have rejected this)",
+                                    fname, l.name.name
+                                ))
+                            })?;
+                        let field_ptr = self
+                            .builder
+                            .build_struct_gep(
+                                info.struct_ty,
+                                self_ptr,
+                                field_idx,
+                                &format!(
+                                    "{}.{}.reset.ptr",
+                                    l.name.name, fname
+                                ),
+                            )
+                            .map_err(|e| {
+                                CodegenError::LlvmEmit(e.to_string())
+                            })?;
+                        match field_ty {
+                            CodegenTy::Int => {
+                                let zero = self
+                                    .context
+                                    .i64_type()
+                                    .const_zero();
+                                self.builder
+                                    .build_store(field_ptr, zero)
+                                    .map_err(|e| {
+                                        CodegenError::LlvmEmit(e.to_string())
+                                    })?;
+                            }
+                            CodegenTy::Float => {
+                                let zero = self
+                                    .context
+                                    .f64_type()
+                                    .const_zero();
+                                self.builder
+                                    .build_store(field_ptr, zero)
+                                    .map_err(|e| {
+                                        CodegenError::LlvmEmit(e.to_string())
+                                    })?;
+                            }
+                            _ => {
+                                return Err(CodegenError::Unsupported(
+                                    format!(
+                                        "resets_per_epoch: field `{}` on \
+                                         locus `{}` has non-numeric type \
+                                         (typecheck should have rejected \
+                                         this)",
+                                        fname, l.name.name
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
                 self.builder
                     .build_unconditional_branch(skip_bb)
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;

@@ -949,6 +949,12 @@ pub enum ClosureClause {
     Epoch(EpochSpec),
     PersistsThrough(Vec<Ident>),
     ResetsOn(Vec<Ident>),
+    /// v1.x-WINDOWED (F.34): after the assertion fires at a
+    /// `duration(N)` epoch boundary, the runtime zeros the
+    /// listed locus fields. Lets a closure express a per-window
+    /// rate budget without the user re-implementing the reset
+    /// dance. Only meaningful when paired with `epoch duration(...)`.
+    ResetsPerEpoch(Vec<Ident>),
     /// v1.x-VIOLATE (F.27): names locus fields whose values are
     /// snapshotted into the synthesized `ClosureViolation`
     /// payload at fire time. Only meaningful when paired with

@@ -2179,6 +2179,7 @@ impl Parser {
             TokenKind::Epoch
             | TokenKind::PersistsThrough
             | TokenKind::ResetsOn
+            | TokenKind::ResetsPerEpoch
             | TokenKind::RBrace => true,
             TokenKind::Ident(s) if s == "captures" => true,
             _ => false,
@@ -2246,6 +2247,25 @@ impl Parser {
                 let names = self.parse_paren_recovery_event_list()?;
                 self.expect(TokenKind::Semi, ";")?;
                 Ok(ClosureClause::ResetsOn(names))
+            }
+            // v1.x-WINDOWED (F.34): `resets_per_epoch(f1, f2, ...);`
+            // names locus fields to zero AFTER assertion eval at a
+            // `duration(N)` boundary. Typecheck verifies the
+            // closure has `epoch duration(...)` and each field is
+            // a numeric field on the enclosing locus.
+            TokenKind::ResetsPerEpoch => {
+                self.bump();
+                self.expect(TokenKind::LParen, "(")?;
+                let mut names = Vec::new();
+                if !self.at(&TokenKind::RParen) {
+                    names.push(self.expect_ident("field name")?);
+                    while self.eat(&TokenKind::Comma) {
+                        names.push(self.expect_ident("field name")?);
+                    }
+                }
+                self.expect(TokenKind::RParen, ")")?;
+                self.expect(TokenKind::Semi, ";")?;
+                Ok(ClosureClause::ResetsPerEpoch(names))
             }
             // v1.x-VIOLATE (F.27): `captures: f1, f2, ... ;`
             // Contextual — only recognized inside a closure body

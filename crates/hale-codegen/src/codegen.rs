@@ -2432,6 +2432,13 @@ pub(crate) struct LocusInfo<'ctx> {
     /// `quarantine`, `dissolve`. (`replace` from the spec example
     /// awaits perspective hot-load.)
     pub(crate) persists_through_per_closure: BTreeMap<String, Vec<String>>,
+    /// F.34 (v1.x-WINDOWED): per-closure list of locus field names
+    /// to zero AFTER the assertion fires at a `duration(N)` epoch
+    /// boundary. Only populated for closures that pair `epoch
+    /// duration(...)` with `resets_per_epoch(field1, field2, ...)`.
+    /// Typecheck verifies the epoch shape and that each field is
+    /// numeric and declared on this locus.
+    pub(crate) resets_per_epoch_per_closure: BTreeMap<String, Vec<String>>,
     /// Synthetic `<Locus>.__birth_closures(self_ptr,
     /// parent_self_or_null, on_failure_fn_or_null)` fn that
     /// evaluates every birth-epoch closure right after birth()

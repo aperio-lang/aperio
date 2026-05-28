@@ -132,12 +132,14 @@ pub enum TokenKind {
     // bodies only (see parse_closure_assertion). This frees the
     // math-shaped identifier pool (`fn approx(...)`, `let within
     // = ...`) outside that context. `closure`, `epoch`,
-    // `persists_through`, and `resets_on` stay reserved because
-    // they are unambiguously block-introducers / clause-leaders.
+    // `persists_through`, `resets_on`, and `resets_per_epoch`
+    // stay reserved because they are unambiguously block-
+    // introducers / clause-leaders.
     Closure,
     Epoch,
     PersistsThrough,
     ResetsOn,
+    ResetsPerEpoch,
 
     // Keywords — recovery primitives
     Restart,
@@ -501,6 +503,7 @@ impl<'a> Lexer<'a> {
             "epoch" => TokenKind::Epoch,
             "persists_through" => TokenKind::PersistsThrough,
             "resets_on" => TokenKind::ResetsOn,
+            "resets_per_epoch" => TokenKind::ResetsPerEpoch,
 
             // Recovery
             "restart" => TokenKind::Restart,

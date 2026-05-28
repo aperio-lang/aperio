@@ -524,6 +524,11 @@ impl<'ctx, 'p> LocusDeclare<'ctx> for Cx<'ctx, 'p> {
         > = BTreeMap::new();
         let mut persists_through_per_closure: BTreeMap<String, Vec<String>> =
             BTreeMap::new();
+        // v1.x-WINDOWED (F.34): per-closure list of field names to
+        // zero at each `duration(N)` epoch fire. The runtime hook
+        // in __duration_closures consumes this map.
+        let mut resets_per_epoch_per_closure: BTreeMap<String, Vec<String>> =
+            BTreeMap::new();
         for member in &l.members {
             let LocusMember::Closure(c) = member else {
                 continue;
@@ -619,6 +624,18 @@ impl<'ctx, 'p> LocusDeclare<'ctx> for Cx<'ctx, 'p> {
             if !persists.is_empty() {
                 persists_through_per_closure
                     .insert(c.name.name.clone(), persists);
+            }
+            let mut resets_pe: Vec<String> = Vec::new();
+            for clause in &c.clauses {
+                if let ClosureClause::ResetsPerEpoch(fields) = clause {
+                    for f in fields {
+                        resets_pe.push(f.name.clone());
+                    }
+                }
+            }
+            if !resets_pe.is_empty() {
+                resets_per_epoch_per_closure
+                    .insert(c.name.name.clone(), resets_pe);
             }
         }
 
@@ -982,6 +999,7 @@ impl<'ctx, 'p> LocusDeclare<'ctx> for Cx<'ctx, 'p> {
                 closures: Vec::new(),
                 accumulators_per_closure,
                 persists_through_per_closure,
+                resets_per_epoch_per_closure,
                 birth_closures_fn: None,
                 dissolve_closures_fn: None,
                 tick_closures_fn: None,
@@ -1400,11 +1418,13 @@ impl<'ctx, 'p> LocusDeclare<'ctx> for Cx<'ctx, 'p> {
                             }
                             ClosureClause::PersistsThrough(_)
                             | ClosureClause::ResetsOn(_)
+                            | ClosureClause::ResetsPerEpoch(_)
                             | ClosureClause::Captures(_) => {
                                 // Recovery-event hooks +
-                                // v1.x-VIOLATE captures clause;
-                                // no effect on the v0 assertion-
-                                // bearing single-shot path.
+                                // v1.x-VIOLATE captures clause +
+                                // v1.x-WINDOWED per-epoch reset
+                                // (handled in the duration-fn body,
+                                // not the epoch dispatch table).
                             }
                         }
                     }

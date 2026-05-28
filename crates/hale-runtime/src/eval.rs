@@ -3681,6 +3681,21 @@ impl Interpreter {
                     }
                 }
             }
+            // F.34: zero `resets_per_epoch(...)` fields AFTER
+            // assertion eval so the current window's accumulated
+            // value is what's judged.
+            for clause in &closure.clauses {
+                let ClosureClause::ResetsPerEpoch(field_names) = clause
+                else {
+                    continue;
+                };
+                let mut state = handle.state.borrow_mut();
+                for fname in field_names {
+                    if let Some(slot) = state.get_mut(&fname.name) {
+                        *slot = zero_value_of_same_type(slot);
+                    }
+                }
+            }
         }
         Ok(())
     }

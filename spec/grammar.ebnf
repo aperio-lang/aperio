@@ -440,8 +440,19 @@ closure_assertion = expression , ( "~~" | "approx" ) , expression ,
 closure_clause    = "epoch" , epoch_spec , ";"
                   | "persists_through" , "(" , identifier_list , ")" , ";"
                   | "resets_on" , "(" , identifier_list , ")" , ";"
+                  | "resets_per_epoch" , "(" , identifier_list , ")" , ";"
                   | "captures" , ":" , identifier_list , ";"
                   ;
+
+(* `resets_per_epoch` (F.34, v1.x-WINDOWED, 2026-05-28) names
+   locus fields the runtime zeros AFTER the assertion fires at a
+   `duration(N)` epoch boundary. Lets a closure express a per-
+   window rate budget (e.g. `corrupt_per_min ~~ 0 within 10`)
+   without the user re-implementing the reset dance. Only valid
+   on `epoch duration(...)` closures; the typechecker rejects
+   pairings with `tick` / `birth` / `dissolve` / `inline` /
+   `explicit`. Each named field must be a numeric (Int / Float)
+   param on the enclosing locus. *)
 
 (* `inline` (v1.x-VIOLATE) is a *contextual* keyword:
    recognized only as an `epoch_spec` variant; ordinary

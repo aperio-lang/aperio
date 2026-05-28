@@ -2810,6 +2810,84 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // F.34 (v1.x-WINDOWED): `resets_per_epoch(...)` is
+                // only meaningful on `epoch duration(N)` closures
+                // (the field-zeroing hook fires at duration-boundary,
+                // and the other epochs either don't recur — birth /
+                // dissolve / inline — or recur too fast to be a
+                // useful rate-budget window — tick).
+                let is_duration = cd.clauses.iter().any(|c| {
+                    matches!(
+                        c,
+                        ClosureClause::Epoch(EpochSpec::Duration(_))
+                    )
+                });
+                let resets_pe_fields: Vec<&Ident> = cd
+                    .clauses
+                    .iter()
+                    .flat_map(|c| match c {
+                        ClosureClause::ResetsPerEpoch(names) => {
+                            names.iter().collect()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                if !resets_pe_fields.is_empty() && !is_duration {
+                    self.diags.push(Diag::ty(
+                        cd.span,
+                        format!(
+                            "closure `{}`: `resets_per_epoch(...)` is \
+                             meaningful only on `epoch duration(N)` \
+                             closures. Other epochs either don't recur \
+                             (birth / dissolve / inline) or recur too \
+                             fast to be a useful rate-budget window \
+                             (tick).",
+                            cd.name.name,
+                        ),
+                    ));
+                }
+                if let Some(locus) = self.current_locus {
+                    for f in &resets_pe_fields {
+                        let Some(p) = locus
+                            .params
+                            .iter()
+                            .find(|p| p.name == f.name)
+                        else {
+                            self.diags.push(Diag::ty(
+                                f.span,
+                                format!(
+                                    "closure `{}`: `resets_per_epoch(...)` \
+                                     references field `{}`, which is not \
+                                     declared on locus `{}`",
+                                    cd.name.name, f.name, locus.name,
+                                ),
+                            ));
+                            continue;
+                        };
+                        let is_numeric = matches!(
+                            &p.ty,
+                            Ty::Prim(PrimType::Int)
+                                | Ty::Prim(PrimType::Uint)
+                                | Ty::Prim(PrimType::Float)
+                                | Ty::Prim(PrimType::Decimal)
+                        );
+                        if !is_numeric {
+                            self.diags.push(Diag::ty(
+                                f.span,
+                                format!(
+                                    "closure `{}`: `resets_per_epoch(...)` \
+                                     field `{}` has non-numeric type `{}`. \
+                                     The reset hook zeros the field, which \
+                                     only makes sense for Int / Uint / \
+                                     Float / Decimal counters.",
+                                    cd.name.name,
+                                    f.name,
+                                    p.ty.display(),
+                                ),
+                            ));
+                        }
+                    }
+                }
                 // Original assertion checks for assertion-bearing
                 // closures.
                 if let Some(assertion) = &cd.assertion {
