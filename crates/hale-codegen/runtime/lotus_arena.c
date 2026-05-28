@@ -65,6 +65,13 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <poll.h>
+/* F.35 Slice 1 (2026-05-28): per-pool epoll for async_io cooperative
+ * pools + ucontext-backed coroutine save/restore so blocking syscalls
+ * inside locus methods can park-and-resume instead of blocking the
+ * pool's OS thread. Dormant in this slice — the `async_io_enabled`
+ * flag stays 0 until Slice 2 wires placement constraint to set it. */
+#include <sys/epoll.h>
+#include <ucontext.h>
 
 /* F.32-1γ-v2 session 2 (2026-05-26): TSAN suppressions.
  *
@@ -4395,6 +4402,30 @@ void lotus_mailbox_drain_pending(lotus_mailbox_t *mb) {
  * only ever fire on that pool's thread.
  */
 
+/* F.35 Slice 1: ucontext-backed coroutine state for one in-flight
+ * handler invocation on an async_io pool. Each pool worker maintains
+ * a per-invocation `lotus_coro_t` so the handler can `park_on_fd`
+ * (swapcontext back to drain), let the pool service other work, and
+ * later resume from where it parked. Linked into the pool's
+ * `parked_head` list while waiting on epoll; freed when the handler
+ * returns naturally. */
+typedef struct lotus_coro {
+    ucontext_t        ctx;          /* saved registers + SP for resume */
+    void             *stack;        /* mmap'd or malloc'd stack base */
+    size_t            stack_size;   /* alloc'd size of `stack` */
+    int               parked_fd;    /* fd this coro is parked on (-1 when running) */
+    int               done;         /* 1 once the handler has returned */
+    /* Handler invocation parameters captured at coro creation. The
+     * thunk reads them after swapcontext and tail-calls the handler. */
+    void             *handler;
+    void             *self_ptr;
+    void             *payload_ptr;
+    /* Intrusive list pointers — used for the pool's `parked_head`
+     * chain (when this coro is waiting on epoll) and the pool's
+     * free-list of reusable coro slots (later). */
+    struct lotus_coro *next;
+} lotus_coro_t;
+
 typedef struct lotus_coop_pool {
     /* Name as registered (null-terminated, <= 63 chars). Stored
      * inline so lookup doesn't chase an extra pointer. Pool
@@ -4412,7 +4443,33 @@ typedef struct lotus_coop_pool {
     /* Worker pthread; set once start_all has run. */
     pthread_t         worker;
     int               worker_started;
+    /* F.35 Slice 1: async_io state. Dormant when `async_io_enabled`
+     * is 0 — pool runs the classic blocking-syscall worker loop.
+     * When non-zero, `epoll_fd` is open and the worker uses the
+     * coro-dispatching variant of `drain_one` so handlers can park
+     * via `lotus_coop_park_on_fd`.
+     *
+     * `drain_ctx` is the worker thread's own context — the swap
+     * target when a coro parks or returns. `current_coro` tracks
+     * which coro is on-CPU at any moment so `park_on_fd` (called
+     * from within a handler) knows whose context to save.
+     *
+     * `parked_head` is the linked list of coros parked on this
+     * pool's epoll. epoll_wait wakeups walk it to find which coro
+     * to resume. */
+    int               async_io_enabled;
+    int               epoll_fd;
+    ucontext_t        drain_ctx;
+    lotus_coro_t     *current_coro;
+    lotus_coro_t     *parked_head;
 } lotus_coop_pool_t;
+
+/* F.35 Slice 1: per-coro stack size. 64 KiB is the same default the
+ * pthread library uses for "small" stacks; covers handler bodies
+ * with reasonable depth without inflating per-coro memory cost.
+ * Tunable via the F.35 follow-on `@stack_size(N)` annotation if a
+ * workload ever needs a different default per locus. */
+#define LOTUS_CORO_STACK_BYTES (64 * 1024)
 
 #define LOTUS_COOP_POOL_INITIAL_CAP 64
 #define LOTUS_COOP_POOL_MAX 16
@@ -4456,6 +4513,13 @@ lotus_coop_pool_t *lotus_coop_pool_register(const char *name) {
     p->worker_started = 0;
     pthread_mutex_init(&p->lock, NULL);
     pthread_cond_init(&p->not_empty, NULL);
+    /* F.35 Slice 1: async_io defaults off. Slice 2's codegen flips
+     * this via `lotus_coop_pool_enable_async_io` for pools whose
+     * placement entries declare `where async_io`. */
+    p->async_io_enabled = 0;
+    p->epoll_fd         = -1;
+    p->current_coro     = NULL;
+    p->parked_head      = NULL;
     /* Truncated copy — the bound is LOTUS_COOP_POOL_MAX-name's-
      * worth and pool names are conventionally short. Anything
      * longer than 63 bytes is the caller's fault and gets
@@ -4570,11 +4634,281 @@ static int lotus_coop_pool_drain_one(lotus_coop_pool_t *p) {
     return 1;
 }
 
+/* F.35 Slice 1: thread-locals tracking which pool / coro is on-CPU
+ * on this worker thread. `park_on_fd` (called from inside a handler)
+ * consults `g_current_coro_tls` to find itself, and the pool ptr is
+ * cached on the coro at alloc time so park can reach the pool's
+ * epoll fd + drain context. */
+static __thread lotus_coro_t      *g_current_coro_tls = NULL;
+static __thread lotus_coop_pool_t *g_current_pool_tls = NULL;
+
+/* Enable async_io mode for a pool: opens an epoll fd. Idempotent;
+ * safe to call before or after the worker thread starts (the worker
+ * checks `async_io_enabled` on each loop iteration). Called from
+ * Slice 2's codegen for pools whose placement entries declare
+ * `where async_io`. Returns 0 on success, -1 on epoll_create
+ * failure (caller decides whether to fall back to blocking mode). */
+int lotus_coop_pool_enable_async_io(lotus_coop_pool_t *p) {
+    if (!p) return -1;
+    if (p->async_io_enabled) return 0;
+    int fd = epoll_create1(EPOLL_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    p->epoll_fd = fd;
+    /* Publish epoll_fd + enable flag together via release fence so
+     * the worker thread (which checks the flag without holding the
+     * pool lock) sees a consistent pair. */
+    __atomic_store_n(&p->async_io_enabled, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* F.35 Slice 1: thunk invoked by makecontext. Reads handler+args
+ * from the current coro (stashed before swapcontext), invokes the
+ * handler on the coro's dedicated stack, then marks the coro done
+ * and swaps back to the pool's drain context. */
+static void lotus_coro_thunk(void) {
+    lotus_coro_t *c = g_current_coro_tls;
+    if (!c || !c->handler) {
+        /* Defensive — shouldn't happen, but if it does, jump back
+         * to the drain context so we don't run off the end of the
+         * stack. */
+        if (g_current_pool_tls) {
+            setcontext(&g_current_pool_tls->drain_ctx);
+        }
+        return;
+    }
+    ((lotus_handler_fn)c->handler)(c->self_ptr, c->payload_ptr);
+    c->done = 1;
+    /* uc_link would handle this implicitly, but being explicit is
+     * cheaper to reason about — and lets the worker recognize that
+     * the coro is freeable rather than re-parked. */
+    setcontext(&g_current_pool_tls->drain_ctx);
+}
+
+/* F.35 Slice 1: allocate a coro for one handler invocation. Each
+ * invocation gets its own stack (mmap'd with guard pages would be
+ * ideal; v1 uses malloc for portability, falls back to no guard).
+ * Returns NULL on OOM. */
+static lotus_coro_t *lotus_coro_alloc(lotus_coop_pool_t *p,
+                                       void *handler,
+                                       void *self_ptr,
+                                       void *payload_ptr) {
+    lotus_coro_t *c = (lotus_coro_t *)malloc(sizeof(lotus_coro_t));
+    if (!c) return NULL;
+    c->stack = malloc(LOTUS_CORO_STACK_BYTES);
+    if (!c->stack) { free(c); return NULL; }
+    c->stack_size  = LOTUS_CORO_STACK_BYTES;
+    c->parked_fd   = -1;
+    c->done        = 0;
+    c->handler     = handler;
+    c->self_ptr    = self_ptr;
+    c->payload_ptr = payload_ptr;
+    c->next        = NULL;
+    if (getcontext(&c->ctx) != 0) {
+        free(c->stack);
+        free(c);
+        return NULL;
+    }
+    c->ctx.uc_stack.ss_sp   = c->stack;
+    c->ctx.uc_stack.ss_size = c->stack_size;
+    c->ctx.uc_link          = &p->drain_ctx;
+    makecontext(&c->ctx, lotus_coro_thunk, 0);
+    return c;
+}
+
+static void lotus_coro_free(lotus_coro_t *c) {
+    if (!c) return;
+    if (c->stack) free(c->stack);
+    free(c);
+}
+
+/* F.35 Slice 1: park the current coro on `fd`. Called from inside a
+ * handler running on a coro stack (typically from inside a blocking-
+ * I/O primitive that detected EAGAIN). Registers `fd` with the pool's
+ * epoll, links the coro onto the pool's parked list, then swaps back
+ * to the pool's drain context. Returns 0 when the coro resumes
+ * (epoll said `fd` is ready); -1 on epoll error or pool shutdown.
+ *
+ * `events` is a bitmask of EPOLLIN / EPOLLOUT — what the caller
+ * wants to wait for. EPOLLET / EPOLLONESHOT are not exposed; the
+ * runtime uses level-triggered + manual deregistration so a coro
+ * that wakes can re-park without an extra epoll_ctl cycle. */
+int lotus_coop_park_on_fd(int fd, uint32_t events) {
+    lotus_coop_pool_t *p = g_current_pool_tls;
+    lotus_coro_t      *c = g_current_coro_tls;
+    if (!p || !c) {
+        /* Called from a non-async_io context — caller should have
+         * checked. Defensive return-error so a stray call doesn't
+         * silently corrupt state. */
+        return -1;
+    }
+    if (!p->async_io_enabled || p->epoll_fd < 0) {
+        return -1;
+    }
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events   = events;
+    ev.data.ptr = c;
+    if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        return -1;
+    }
+    c->parked_fd = fd;
+    /* Link onto parked head — single-threaded access (only the
+     * worker touches this list), no lock needed. */
+    c->next = p->parked_head;
+    p->parked_head = c;
+    /* Swap to drain. Returns here when the worker swaps back in
+     * after epoll_wait wakeup. The fd has already been removed
+     * from epoll by the resume path before swap-back. */
+    swapcontext(&c->ctx, &p->drain_ctx);
+    /* Resumed. The resume path cleared parked_fd to -1 and
+     * detached us from parked_head. */
+    return 0;
+}
+
+/* F.35 Slice 1: async-aware drain. Runs in the pool worker thread.
+ * Each iteration:
+ *   1. epoll_wait if there are parked coros (with timeout 0 if the
+ *      cell queue is non-empty so cells get priority; -1 / blocking
+ *      if cells are empty and parked is non-empty).
+ *   2. For each ready fd, find the parked coro, deregister the fd,
+ *      detach from parked list, swapcontext into it. (Coro runs
+ *      until it parks again or returns.)
+ *   3. Drain one cell from the bus queue on a fresh coro stack.
+ *
+ * Returns 0 on shutdown-with-empty-queue-and-no-parked; 1 after a
+ * cell or wakeup advanced state (caller loops). */
+static int lotus_coop_pool_drain_one_async(lotus_coop_pool_t *p) {
+    /* (1) Service parked-fd wakeups first. epoll_wait timeout
+     * choice: 0 (non-blocking) when a cell is pending so we hand
+     * cells to the dispatcher promptly; -1 (block) only when no
+     * cells AND parked exist; skip entirely when neither holds. */
+    if (p->parked_head) {
+        pthread_mutex_lock(&p->lock);
+        int cell_pending = (p->head < p->tail);
+        int shutdown_set = p->shutdown;
+        pthread_mutex_unlock(&p->lock);
+        if (shutdown_set && !cell_pending) {
+            /* Wake parked coros so they can observe shutdown and
+             * unwind. Not implemented in Slice 1 — for now, just
+             * return and let shutdown_all join the worker; the
+             * parked coros leak their stacks until process exit. */
+            return 0;
+        }
+        int timeout_ms = cell_pending ? 0 : -1;
+        struct epoll_event events[16];
+        int n = epoll_wait(p->epoll_fd, events, 16, timeout_ms);
+        if (n < 0) {
+            if (errno != EINTR) {
+                /* epoll error — bail to caller; worker exits. */
+                return 0;
+            }
+            n = 0;
+        }
+        for (int i = 0; i < n; i++) {
+            lotus_coro_t *c = (lotus_coro_t *)events[i].data.ptr;
+            if (!c) continue;
+            /* Deregister fd; level-triggered semantics mean we MUST
+             * detach now to avoid re-firing on the next epoll_wait. */
+            (void)epoll_ctl(p->epoll_fd, EPOLL_CTL_DEL, c->parked_fd, NULL);
+            /* Detach from parked list. */
+            lotus_coro_t **pp = &p->parked_head;
+            while (*pp && *pp != c) pp = &(*pp)->next;
+            if (*pp == c) *pp = c->next;
+            c->next      = NULL;
+            c->parked_fd = -1;
+            /* Resume the coro. Returns here when it parks again or
+             * the handler returns. */
+            g_current_coro_tls = c;
+            swapcontext(&p->drain_ctx, &c->ctx);
+            g_current_coro_tls = NULL;
+            if (c->done) {
+                lotus_coro_free(c);
+            }
+        }
+        if (n > 0) return 1;
+        if (cell_pending == 0) return 1;
+    }
+    /* (2) Drain one cell on a fresh coro stack. */
+    pthread_mutex_lock(&p->lock);
+    while (p->head >= p->tail && !p->shutdown) {
+        /* If parked coros exist, we cannot block on the condvar
+         * forever — epoll might be the wake signal. Drop the lock
+         * and loop back to step (1). */
+        if (p->parked_head) {
+            pthread_mutex_unlock(&p->lock);
+            return 1;
+        }
+        pthread_cond_wait(&p->not_empty, &p->lock);
+    }
+    if (p->head >= p->tail) {
+        p->head = 0;
+        p->tail = 0;
+        pthread_mutex_unlock(&p->lock);
+        return 0;
+    }
+    lotus_bus_cell_t cell_copy = p->cells[p->head++];
+    if (p->head >= p->tail) {
+        p->head = 0;
+        p->tail = 0;
+    }
+    pthread_mutex_unlock(&p->lock);
+    void *payload_ptr = NULL;
+    if (cell_copy.payload_size > 0) {
+        payload_ptr = cell_copy.payload_heap
+            ? cell_copy.payload_heap
+            : (void *)cell_copy.payload_inline;
+    }
+    /* Heap payload outlives the cell on the dispatch path; we copy
+     * the pointer into the coro so the thunk can read it. The free
+     * happens after the coro returns (parked or not). For Slice 1
+     * we conservatively leak heap payloads on coro-park because
+     * the coro retains the pointer until it resumes-and-completes.
+     * Tighten in Slice 3 when blocking I/O is wired up and the
+     * leak shape becomes observable. */
+    lotus_coro_t *c =
+        lotus_coro_alloc(p, cell_copy.handler, cell_copy.self_ptr, payload_ptr);
+    if (!c) {
+        /* OOM on coro alloc — fall back to direct invocation. The
+         * handler runs on the worker's stack; if it parks via
+         * `park_on_fd`, the call returns -1 (no current coro). */
+        ((lotus_handler_fn)cell_copy.handler)(
+            cell_copy.self_ptr, payload_ptr);
+        if (cell_copy.payload_heap) free(cell_copy.payload_heap);
+        return 1;
+    }
+    g_current_coro_tls = c;
+    swapcontext(&p->drain_ctx, &c->ctx);
+    g_current_coro_tls = NULL;
+    if (c->done) {
+        if (cell_copy.payload_heap) free(cell_copy.payload_heap);
+        lotus_coro_free(c);
+    }
+    /* If c is not done (it parked), the cell's payload_heap is
+     * retained by the coro and freed when it resumes-and-completes
+     * (Slice 3 wiring). */
+    return 1;
+}
+
 static void *lotus_coop_pool_worker(void *arg) {
     lotus_coop_pool_t *p = (lotus_coop_pool_t *)arg;
-    while (lotus_coop_pool_drain_one(p)) {
-        /* drain_one ran a handler; loop. */
+    g_current_pool_tls = p;
+    /* F.35 Slice 1: async_io vs classic-blocking branch. The flag
+     * is acquire-loaded once per outer loop iteration so a late
+     * enable (called between worker start and first drain) takes
+     * effect on the next pass. */
+    while (1) {
+        int async = __atomic_load_n(&p->async_io_enabled, __ATOMIC_ACQUIRE);
+        int progressed;
+        if (async) {
+            progressed = lotus_coop_pool_drain_one_async(p);
+        } else {
+            progressed = lotus_coop_pool_drain_one(p);
+        }
+        if (!progressed) break;
     }
+    g_current_pool_tls = NULL;
     return NULL;
 }
 
@@ -4620,7 +4954,10 @@ void lotus_coop_pool_shutdown_all(void) {
 }
 
 /* Tear down the pool registry. Called at program exit AFTER
- * shutdown_all. Frees cell buffers + the pool structs. */
+ * shutdown_all. Frees cell buffers + the pool structs. F.35 Slice 1:
+ * also close the epoll fd and free any still-parked coros (their
+ * stacks would otherwise leak — process exit reclaims either way,
+ * but explicit free keeps valgrind / leak detectors quiet). */
 void lotus_coop_pool_destroy_all(void) {
     for (size_t i = 0; i < g_coop_pool_count; i++) {
         lotus_coop_pool_t *p = g_coop_pools[i];
@@ -4628,6 +4965,17 @@ void lotus_coop_pool_destroy_all(void) {
         pthread_cond_destroy(&p->not_empty);
         pthread_mutex_destroy(&p->lock);
         if (p->cells) free(p->cells);
+        if (p->epoll_fd >= 0) {
+            close(p->epoll_fd);
+            p->epoll_fd = -1;
+        }
+        lotus_coro_t *c = p->parked_head;
+        while (c) {
+            lotus_coro_t *next = c->next;
+            lotus_coro_free(c);
+            c = next;
+        }
+        p->parked_head = NULL;
         free(p);
         g_coop_pools[i] = NULL;
     }
