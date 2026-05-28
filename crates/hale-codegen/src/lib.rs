@@ -32,6 +32,7 @@
 pub(crate) mod bus;
 pub(crate) mod channels;
 pub mod codegen;
+pub(crate) mod form;
 pub(crate) mod locus;
 pub mod mangle;
 pub(crate) mod shared;
