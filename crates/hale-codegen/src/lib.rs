@@ -34,6 +34,7 @@ pub(crate) mod channels;
 pub mod codegen;
 pub(crate) mod locus;
 pub mod mangle;
+pub(crate) mod shared;
 pub(crate) mod stdlib;
 pub(crate) mod types;
 
