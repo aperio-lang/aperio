@@ -22,6 +22,7 @@
 //! against built-ins.
 
 pub mod check;
+pub mod purity;
 pub mod resolve;
 pub mod symbol;
 pub mod sync_inference;
