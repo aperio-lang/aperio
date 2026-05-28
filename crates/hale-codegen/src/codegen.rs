@@ -4383,7 +4383,17 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
 
         // Build a name → locus-type-name map for main's params so
         // we can resolve placement entries' field references back
-        // to the locus type that gets pinned.
+        // to the locus type that gets pinned. Qualified paths
+        // (e.g. `std::http::Server`) are resolved to their
+        // mangled-name form via the same lookup the struct-literal
+        // codegen uses — without this resolution, downstream
+        // `coop_pool_locus_types` insertion silently drops fields
+        // typed against stdlib loci, the `__coop_pool_run_<L>`
+        // wrapper never gets synthesized, and the run() emission
+        // falls back to the defensive synchronous-call path that
+        // blocks the parent on a long-running accept loop
+        // (2026-05-28: surfaced as the refstore-shaped main.run()
+        // starvation in fathom's FRICTION.md).
         let mut params_locus_types: BTreeMap<String, String> = BTreeMap::new();
         for m in &l.members {
             if let LocusMember::Params(pb) = m {
@@ -4391,11 +4401,22 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     if let Some(TypeExpr::Named { path, generic_args, .. }) =
                         &p.ty
                     {
-                        if path.segments.len() == 1 && generic_args.is_empty() {
-                            params_locus_types.insert(
-                                p.name.name.clone(),
-                                path.segments[0].name.clone(),
-                            );
+                        if !generic_args.is_empty() {
+                            continue;
+                        }
+                        let resolved = if path.segments.len() == 1 {
+                            Some(path.segments[0].name.clone())
+                        } else {
+                            let segs: Vec<&str> = path
+                                .segments
+                                .iter()
+                                .map(|s| s.name.as_str())
+                                .collect();
+                            self.mangled_for_path(&segs)
+                        };
+                        if let Some(name) = resolved {
+                            params_locus_types
+                                .insert(p.name.name.clone(), name);
                         }
                     }
                 }
