@@ -2135,6 +2135,97 @@ impl<'a> Checker<'a> {
                     ));
                 }
             }
+            // F.35: per-entry constraint validity.
+            for c in &entry.constraints {
+                match c.kind {
+                    PlacementConstraint::AsyncIo => {
+                        match &entry.spec {
+                            PlacementSpec::Pinned { .. } => {
+                                self.diags.push(Diag::ty(
+                                    c.span,
+                                    format!(
+                                        "placement entry `{}`: `where async_io` \
+                                         is not valid on a pinned placement. \
+                                         Pinned loci own their own OS thread \
+                                         and have no shared drain loop to \
+                                         park on. Use `cooperative(pool = X) \
+                                         where async_io` instead.",
+                                        entry.field.name
+                                    ),
+                                ));
+                            }
+                            PlacementSpec::Cooperative { pool } => {
+                                let pool_name = pool
+                                    .as_ref()
+                                    .map(|i| i.name.as_str())
+                                    .unwrap_or("main");
+                                if pool_name == "main" {
+                                    self.diags.push(Diag::ty(
+                                        c.span,
+                                        format!(
+                                            "placement entry `{}`: `where \
+                                             async_io` is not valid on pool \
+                                             `main`. The main pool runs \
+                                             inline on the binary's primary \
+                                             thread, with no dedicated \
+                                             worker thread to integrate \
+                                             epoll into. Move the field to \
+                                             a named cooperative pool (e.g. \
+                                             `cooperative(pool = io) where \
+                                             async_io`).",
+                                            entry.field.name
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // F.35 cross-entry rule: every entry on the same named
+        // cooperative pool must agree on whether the pool runs in
+        // async_io mode. Mixing an async_io entry with a non-
+        // async_io entry on the same pool is rejected because the
+        // pool's worker drain loop is one-or-the-other.
+        let mut pool_async_io: BTreeMap<String, bool> = BTreeMap::new();
+        let mut pool_first_span: BTreeMap<String, hale_syntax::Span> =
+            BTreeMap::new();
+        for entry in &pb.entries {
+            let pool_name = match &entry.spec {
+                PlacementSpec::Cooperative { pool: Some(name) } => {
+                    name.name.clone()
+                }
+                _ => continue,
+            };
+            if pool_name == "main" {
+                continue;
+            }
+            let has_async_io = entry.constraints.iter().any(|c| {
+                matches!(c.kind, PlacementConstraint::AsyncIo)
+            });
+            match pool_async_io.get(&pool_name).copied() {
+                None => {
+                    pool_async_io.insert(pool_name.clone(), has_async_io);
+                    pool_first_span.insert(pool_name, entry.span);
+                }
+                Some(prev) if prev == has_async_io => {}
+                Some(_) => {
+                    self.diags.push(Diag::ty(
+                        entry.span,
+                        format!(
+                            "placement entry `{}`: pool `{}` has mixed I/O \
+                             modes across placement entries. Every entry on \
+                             a pool must either declare `where async_io` or \
+                             none must; the pool's worker drain loop is \
+                             one-or-the-other. (The pool first appeared at \
+                             the entry whose I/O mode is the other; pick \
+                             one and apply consistently.)",
+                            entry.field.name, pool_name
+                        ),
+                    ));
+                }
+            }
         }
     }
 

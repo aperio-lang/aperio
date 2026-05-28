@@ -441,6 +441,13 @@ pub struct PlacementEntry {
     /// placements.
     pub field: Ident,
     pub spec: PlacementSpec,
+    /// F.35 (2026-05-28): optional `where <constraint>, ...`
+    /// suffix on a placement entry. Empty when no `where` clause
+    /// was written. Each constraint is a bare identifier matched
+    /// against `PlacementConstraint::from_ident`. Validity rules
+    /// (e.g. `async_io` rejected on pinned, pool consistency
+    /// across entries) live at typecheck.
+    pub constraints: Vec<SpannedPlacementConstraint>,
     pub span: Span,
 }
 
@@ -458,6 +465,49 @@ pub enum PlacementSpec {
     /// `pthread_setaffinity_np` the spawned thread to logical
     /// CPU `n`.
     Pinned { core: Option<i64> },
+}
+
+/// F.35 (2026-05-28): operational-constraint keyword on a
+/// `placement { }` entry. Same surface pattern as
+/// `BindingConstraint` (Form K) — user assertions about how the
+/// deployment route should run, validated by the typechecker,
+/// consumed by codegen to pick a lowering strategy.
+///
+/// Surface: `field: cooperative(pool = X) where async_io;`.
+/// `where` is the reserved keyword token; constraint names are
+/// contextual idents matched against `from_ident`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementConstraint {
+    /// `async_io` — the pool's worker drain loop integrates an
+    /// epoll instance; blocking I/O syscalls inside locus methods
+    /// on this pool park-and-resume instead of blocking the OS
+    /// thread. Rejected on pinned entries (pinned owns its
+    /// thread — no shared drain to park on) and on pool `main`
+    /// (no dedicated worker thread). Requires every entry on the
+    /// same pool to declare it (mixed-mode-on-same-pool is a
+    /// typecheck error).
+    AsyncIo,
+}
+
+impl PlacementConstraint {
+    pub fn from_ident(name: &str) -> Option<Self> {
+        match name {
+            "async_io" => Some(Self::AsyncIo),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AsyncIo => "async_io",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpannedPlacementConstraint {
+    pub kind: PlacementConstraint,
+    pub span: Span,
 }
 
 /// Phase 2: per-topic transport binding inside `main locus`.

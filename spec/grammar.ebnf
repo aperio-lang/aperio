@@ -262,9 +262,19 @@ binding_constraint = "intra_process"
    main inherit their parent's pool — placement entries apply
    only at the top-level main-locus surface. *)
 placement_block   = "placement" , "{" , { placement_entry } , "}" ;
-placement_entry   = IDENTIFIER , ":" , placement_spec , ";" ;
+placement_entry   = IDENTIFIER , ":" , placement_spec ,
+                    [ "where" , placement_constraint ,
+                      { "," , placement_constraint } ] , ";" ;
 placement_spec    = "cooperative" , [ "(" , "pool" , "=" , IDENTIFIER , ")" ]
                   | "pinned" , [ "(" , "core" , "=" , INT_LIT , ")" ] ;
+
+(* F.35 (2026-05-28): operational constraints on a placement
+   entry. v0.1 ships one keyword (`async_io`); the typechecker
+   rejects mixing async_io and non-async_io entries on the same
+   cooperative pool, async_io on pinned entries, and async_io
+   on pool `main`. Constraint names are contextual idents. *)
+placement_constraint = "async_io"
+                     ;
 
 
 (* === 3. Params block =========================================== *)

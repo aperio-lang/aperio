@@ -1247,10 +1247,12 @@ impl Parser {
             let field = self.expect_ident("field name")?;
             self.expect(TokenKind::Colon, ":")?;
             let spec = self.parse_placement_spec()?;
+            let constraints = self.parse_placement_constraints_opt()?;
             let semi = self.expect(TokenKind::Semi, ";")?;
             entries.push(PlacementEntry {
                 field: field.clone(),
                 spec,
+                constraints,
                 span: field.span.merge(semi.span),
             });
         }
@@ -1259,6 +1261,56 @@ impl Parser {
             entries,
             span: kw_tok.span.merge(close.span),
         })
+    }
+
+    /// F.35 (2026-05-28): the optional `where <c>, <c>, ...`
+    /// suffix on a placement entry. Mirrors the binding-constraint
+    /// shape (Form K) — same `where` keyword token, same comma
+    /// separation, same "unknown ident → diagnostic" lookup.
+    fn parse_placement_constraints_opt(
+        &mut self,
+    ) -> Result<Vec<SpannedPlacementConstraint>, Diag> {
+        if !self.eat(&TokenKind::Where) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        out.push(self.parse_placement_constraint()?);
+        while self.eat(&TokenKind::Comma) {
+            out.push(self.parse_placement_constraint()?);
+        }
+        Ok(out)
+    }
+
+    fn parse_placement_constraint(
+        &mut self,
+    ) -> Result<SpannedPlacementConstraint, Diag> {
+        let tok = self.peek_token().clone();
+        let name = match &tok.kind {
+            TokenKind::Ident(s) => s.clone(),
+            other => {
+                return Err(Diag::parse(
+                    tok.span,
+                    format!(
+                        "expected placement constraint name (async_io), got {:?}",
+                        other
+                    ),
+                ));
+            }
+        };
+        self.bump();
+        match PlacementConstraint::from_ident(&name) {
+            Some(kind) => Ok(SpannedPlacementConstraint {
+                kind,
+                span: tok.span,
+            }),
+            None => Err(Diag::parse(
+                tok.span,
+                format!(
+                    "unknown placement constraint `{}` — expected `async_io`",
+                    name
+                ),
+            )),
+        }
     }
 
     /// F.31: parse one placement spec — `cooperative` /

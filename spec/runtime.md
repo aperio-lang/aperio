@@ -360,6 +360,49 @@ is silent (the parent's `run()` simply never executes), so the
 type-side rejection is load-bearing: it converts a class of
 hard-to-diagnose runtime bugs into a clear compile-time signal.
 
+#### `where async_io` — green-I/O cooperative pools (F.35)
+
+The sibling-in-main fix puts each long-running child on its own
+OS thread, which caps concurrent connections at one-per-pool. To
+scale beyond that without spawning a thread per connection, a
+placement entry may declare `where async_io`:
+
+```hale
+main locus App {
+    params {
+        listener: std::websocket::Server = std::websocket::Server { ... };
+        worker:   WsWorker               = WsWorker { ... };
+    }
+    placement {
+        listener: cooperative(pool = ws_accept)  where async_io;
+        worker:   cooperative(pool = ws_workers) where async_io;
+    }
+}
+```
+
+`where async_io` opts the pool into green-I/O scheduling: the
+pool's worker drain loop integrates an epoll instance, and
+blocking I/O syscalls inside locus methods on this pool park-
+and-resume instead of blocking the OS thread. The user code
+inside the locus is unchanged — `recv_bytes(stream)` reads the
+same line of source whether the pool is `async_io` or not; the
+substrate picks the right lowering at the syscall boundary.
+
+Typecheck rules:
+
+- All placement entries on the same named cooperative pool must
+  agree on `where async_io`. The pool's drain loop is one-or-the-
+  other.
+- `where async_io` is rejected on `pinned` entries. Pinned loci
+  own their own OS thread and have no shared drain loop to park
+  on.
+- `where async_io` is rejected on pool `main`. The main pool
+  runs inline on the binary's primary thread, with no dedicated
+  worker to integrate epoll into.
+
+See `spec/design-rationale.md § F.35` (forthcoming) for the
+green-I/O substrate design + perf-axis trade-offs.
+
 (Compare: rich / chunked / recognition projection classes are
 genuinely three-way because N≈10, N≈30, and N≈300 are
 different cost regimes at scale — memory has more genuine

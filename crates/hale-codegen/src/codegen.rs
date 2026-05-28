@@ -394,6 +394,7 @@ pub fn build_executable_with_options(
         pinned_locus_types: BTreeSet::new(),
         params_init_self: None,
         main_cooperative_pools: BTreeMap::new(),
+        async_io_pools: BTreeSet::new(),
         cooperative_pool_for_next_locus_instantiation: None,
         current_cooperative_pool: None,
         coop_pool_locus_types: BTreeSet::new(),
@@ -1411,6 +1412,14 @@ pub(crate) struct Cx<'ctx, 'p> {
     /// the main thread's drain loop handles them via the
     /// global cooperative queue.
     pub(crate) main_cooperative_pools: BTreeMap<String, String>,
+    /// F.35 Slice 2 (2026-05-28): cooperative pool names whose
+    /// placement entries declare `where async_io`. The prelude
+    /// emits one `lotus_coop_pool_enable_async_io(pool_ptr)` per
+    /// entry in this set, right after the pool's
+    /// `lotus_coop_pool_register` call. Typecheck has already
+    /// verified mode-consistency across same-pool entries; this
+    /// set carries the canonical truth for codegen.
+    pub(crate) async_io_pools: BTreeSet<String>,
     /// F.31 Phase 4: set by the parent's params-init loop
     /// before recursing into a child's
     /// `lower_locus_instantiation`. The recursion consumes it
@@ -4091,6 +4100,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 .module
                 .get_function("lotus_coop_pool_register")
                 .expect("lotus_coop_pool_register declared");
+            // F.35 Slice 2: enable_async_io declared in builtins;
+            // emitted per-pool below if the pool name is in
+            // `async_io_pools` (populated by the placement walker
+            // for entries with `where async_io`).
+            let enable_async_fn = self
+                .module
+                .get_function("lotus_coop_pool_enable_async_io")
+                .expect("lotus_coop_pool_enable_async_io declared");
             for name in &distinct_pools {
                 let name_ptr = self
                     .builder
@@ -4100,13 +4117,27 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     )
                     .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
                     .as_pointer_value();
-                self.builder
+                let pool_ptr_val = self
+                    .builder
                     .build_call(
                         register_fn,
                         &[name_ptr.into()],
                         &format!("coop_pool.register.{}", name),
                     )
-                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("coop_pool_register returns ptr")
+                    .into_pointer_value();
+                if self.async_io_pools.contains(name) {
+                    self.builder
+                        .build_call(
+                            enable_async_fn,
+                            &[pool_ptr_val.into()],
+                            &format!("coop_pool.enable_async_io.{}", name),
+                        )
+                        .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                }
             }
             let start_all_fn = self
                 .module
@@ -4471,6 +4502,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         {
                             self.pinned_locus_types
                                 .insert(locus_ty.clone());
+                        }
+                    }
+                    // F.35 Slice 2: track pools whose entries
+                    // declare `where async_io`. Typecheck already
+                    // verified mode-consistency across pool entries
+                    // and rejected the placement-spec contradictions
+                    // (pinned / pool=main); here we just collect the
+                    // pool name for the prelude's enable_async_io
+                    // emit.
+                    let has_async_io = entry.constraints.iter().any(|c| {
+                        matches!(c.kind, PlacementConstraint::AsyncIo)
+                    });
+                    if has_async_io {
+                        if let PlacementSpec::Cooperative { pool: Some(name) } =
+                            &entry.spec
+                        {
+                            if name.name != "main" {
+                                self.async_io_pools
+                                    .insert(name.name.clone());
+                            }
                         }
                     }
                 }

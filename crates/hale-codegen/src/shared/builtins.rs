@@ -1003,6 +1003,18 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             coop_pool_void_ty,
             None,
         );
+        // F.35 Slice 2: opt a pool into async_io mode (per-pool epoll
+        // + ucontext coroutine dispatch). Called from the prelude
+        // right after lotus_coop_pool_register for pools whose
+        // placement entries declare `where async_io`.
+        // declare i32 @lotus_coop_pool_enable_async_io(ptr pool)
+        let coop_pool_enable_async_ty =
+            self.context.i32_type().fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_coop_pool_enable_async_io",
+            coop_pool_enable_async_ty,
+            None,
+        );
         let bus_dispatch_ty = void_t.fn_type(
             &[
                 ptr_t.into(),
