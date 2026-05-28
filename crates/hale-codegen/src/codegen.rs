@@ -27,6 +27,7 @@ use hale_syntax::ast::*;
 use crate::stdlib::decimal::DecimalStdlib;
 use crate::stdlib::env::EnvStdlib;
 use crate::stdlib::process::ProcessStdlib;
+use crate::stdlib::time::TimeStdlib;
 
 /// Compile-time tag for a value's type. Mirrors a small subset
 /// of `hale_types::Ty`; we don't pull the full type system in
@@ -5312,7 +5313,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// queue is empty at pop time. Called at the start of every
     /// `flush_dissolve_frame` so cooperative subscribers process
     /// pending cells BEFORE they themselves dissolve.
-    fn emit_bus_drain(&mut self) -> Result<(), CodegenError> {
+    pub(crate) fn emit_bus_drain(&mut self) -> Result<(), CodegenError> {
         let ptr_t = self.context.ptr_type(AddressSpace::default());
         let queue_global = self
             .module
@@ -7734,7 +7735,7 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
     /// (`{ time_t tv_sec; long tv_nsec }` ≡ `{ i64, i64 }`).
     /// 32-bit / non-Linux ABIs would need a different layout; we
     /// only target 64-bit Linux for now.
-    fn timespec_type(&self) -> inkwell::types::StructType<'ctx> {
+    pub(crate) fn timespec_type(&self) -> inkwell::types::StructType<'ctx> {
         let i64_t = self.context.i64_type();
         self.context.struct_type(&[i64_t.into(), i64_t.into()], false)
     }
@@ -27630,327 +27631,13 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         }
     }
 
-    /// Lower `time::monotonic()` to `clock_gettime(CLOCK_MONOTONIC,
-    /// &ts)` followed by `ts.tv_sec * 1_000_000_000 + ts.tv_nsec`.
-    /// Result is a `Duration` (i64 nanoseconds since an
-    /// unspecified reference).
-    /// `std::time::monotonic_ns() -> Int` (2026-05-21). Same
-    /// clock_gettime(CLOCK_MONOTONIC) shape as `monotonic()` but
-    /// types the result as `Int` (i64 ns) instead of `Duration`.
-    /// Kills the ASCII round-trip pattern downstream consumers
-    /// were doing (`to_string(monotonic())` → strip "ns" →
-    /// `parse_int`) at hot-path rates — three String ops per
-    /// reading dropped to one syscall. The Duration return shape
-    /// stays available for callers who actually want the
-    /// formatted-Duration ergonomics.
-    fn lower_time_monotonic_ns(
-        &mut self,
-        args: &[Expr],
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        let (value, _ty) = self.lower_time_monotonic(args)?;
-        Ok((value, CodegenTy::Int))
-    }
-
-    fn lower_time_monotonic(
-        &mut self,
-        args: &[Expr],
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if !args.is_empty() {
-            return Err(CodegenError::Unsupported(format!(
-                "time::monotonic takes 0 arguments, got {}",
-                args.len()
-            )));
-        }
-        let i32_t = self.context.i32_type();
-        let i64_t = self.context.i64_type();
-        let ts_t = self.timespec_type();
-
-        let ts = self.alloca_in_entry(ts_t.into(), "ts")?;
-        let cgt = self
-            .module
-            .get_function("clock_gettime")
-            .expect("clock_gettime declared");
-        // CLOCK_MONOTONIC = 1 on Linux.
-        let clock_id = i32_t.const_int(1, false);
-        self.builder
-            .build_call(cgt, &[clock_id.into(), ts.into()], "cgt.ret")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        // Ignore the return value best-effort; CLOCK_MONOTONIC
-        // shouldn't fail. tv_sec * 1e9 + tv_nsec.
-        let sec_ptr = self
-            .builder
-            .build_struct_gep(ts_t, ts, 0, "ts.sec.ptr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let nsec_ptr = self
-            .builder
-            .build_struct_gep(ts_t, ts, 1, "ts.nsec.ptr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let sec = self
-            .builder
-            .build_load(i64_t, sec_ptr, "ts.sec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .into_int_value();
-        let nsec = self
-            .builder
-            .build_load(i64_t, nsec_ptr, "ts.nsec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-            .into_int_value();
-        let billion = i64_t.const_int(1_000_000_000, false);
-        let sec_ns = self
-            .builder
-            .build_int_mul(sec, billion, "sec.ns")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let total = self
-            .builder
-            .build_int_add(sec_ns, nsec, "now.ns")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        Ok((total.into(), CodegenTy::Duration))
-    }
-
-    /// C7 (pond follow-up): lower `std::time::now() -> Int` to a
-    /// call into `lotus_time_now_seconds`, which wraps
-    /// `clock_gettime(CLOCK_REALTIME, &ts)` and returns `ts.tv_sec`
-    /// as i64. Wall-clock seconds since the Unix epoch — drives
-    /// `pond/sessions` cookie expiries that must survive a
-    /// process restart. Observation only; `time::monotonic` stays
-    /// the basis for scheduling (NTP slewing / leap seconds can
-    /// warp this value).
-    fn lower_std_time_now(
-        &mut self,
-        args: &[Expr],
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if !args.is_empty() {
-            return Err(CodegenError::Unsupported(format!(
-                "std::time::now takes 0 arguments, got {}",
-                args.len()
-            )));
-        }
-        let now_fn = self
-            .module
-            .get_function("lotus_time_now_seconds")
-            .expect("lotus_time_now_seconds declared");
-        let call = self
-            .builder
-            .build_call(now_fn, &[], "time.now.sec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let sec = call
-            .try_as_basic_value()
-            .left()
-            .expect("lotus_time_now_seconds returns i64")
-            .into_int_value();
-        Ok((sec.into(), CodegenTy::Int))
-    }
-
-    /// `std::time::time_from_unix(n: Int) -> Time` — direct
-    /// construction from epoch seconds. Lowers to a call into
-    /// `lotus_time_from_unix`, which gmtime_r + strftime's the
-    /// epoch into a 24-byte ISO 8601 UTC buffer in the caller arena.
-    /// Mirrors the runtime shape of compile-time Time literals.
-    fn lower_std_time_from_unix(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(BasicValueEnum<'ctx>, CodegenTy), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "std::time::time_from_unix takes 1 arg (n), got {}",
-                args.len()
-            )));
-        }
-        let (n_val, n_ty) = self.lower_expr(&args[0], scope)?;
-        if !matches!(n_ty, CodegenTy::Int) {
-            return Err(CodegenError::Unsupported(format!(
-                "std::time::time_from_unix: n must be Int, got {:?}",
-                n_ty
-            )));
-        }
-        let from_unix_fn = self
-            .module
-            .get_function("lotus_time_from_unix")
-            .expect("lotus_time_from_unix declared");
-        let call = self
-            .builder
-            .build_call(from_unix_fn, &[n_val.into()], "time.from_unix")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let ptr = call
-            .try_as_basic_value()
-            .left()
-            .expect("lotus_time_from_unix returns ptr");
-        Ok((ptr, CodegenTy::Time))
-    }
-
-    /// Lower `time::sleep(duration)` to a monotonic-clock,
-    /// EINTR-retrying `clock_nanosleep` call. The lowered IR is:
-    ///
-    /// ```text
-    ///   sec = ns / 1_000_000_000
-    ///   nsec = ns % 1_000_000_000
-    ///   req.tv_sec  = sec
-    ///   req.tv_nsec = nsec
-    ///   while clock_nanosleep(CLOCK_MONOTONIC, 0, &req, &rem) == EINTR {
-    ///       req = rem;   // resume from the remaining time
-    ///   }
-    /// ```
-    ///
-    /// `CLOCK_MONOTONIC` is hardcoded to 1 (Linux); flags = 0 means
-    /// the request is relative (`TIMER_ABSTIME` would make it a
-    /// deadline). Any non-EINTR error exits the loop best-effort —
-    /// we don't crash the program over a clock failure.
-    fn lower_time_sleep(
-        &mut self,
-        args: &[Expr],
-        scope: &Scope<'ctx>,
-    ) -> Result<(), CodegenError> {
-        if args.len() != 1 {
-            return Err(CodegenError::Unsupported(format!(
-                "time::sleep takes 1 argument, got {}",
-                args.len()
-            )));
-        }
-        let (val, ty) = self.lower_expr(&args[0], scope)?;
-        if ty != CodegenTy::Duration {
-            return Err(CodegenError::Unsupported(format!(
-                "time::sleep expects Duration, got {:?}",
-                ty
-            )));
-        }
-        let i32_t = self.context.i32_type();
-        let i64_t = self.context.i64_type();
-        let ts_t = self.timespec_type();
-        let ns = val.into_int_value();
-        let billion = i64_t.const_int(1_000_000_000, false);
-
-        let sec = self
-            .builder
-            .build_int_signed_div(ns, billion, "ts.sec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let nsec = self
-            .builder
-            .build_int_signed_rem(ns, billion, "ts.nsec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-
-        let req = self.alloca_in_entry(ts_t.into(), "req")?;
-        let rem = self.alloca_in_entry(ts_t.into(), "rem")?;
-
-        let req_sec_ptr = self
-            .builder
-            .build_struct_gep(ts_t, req, 0, "req.sec.ptr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let req_nsec_ptr = self
-            .builder
-            .build_struct_gep(ts_t, req, 1, "req.nsec.ptr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_store(req_sec_ptr, sec)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_store(req_nsec_ptr, nsec)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-
-        let func = self
-            .current_fn
-            .expect("current_fn set while lowering time::sleep");
-        let loop_bb = self.context.append_basic_block(func, "sleep.loop");
-        let retry_bb = self.context.append_basic_block(func, "sleep.retry");
-        let done_bb = self.context.append_basic_block(func, "sleep.done");
-
-        self.builder
-            .build_unconditional_branch(loop_bb)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-
-        // loop_bb: call clock_nanosleep, branch on EINTR vs done
-        self.builder.position_at_end(loop_bb);
-        let cns = self
-            .module
-            .get_function("clock_nanosleep")
-            .expect("clock_nanosleep declared");
-        // CLOCK_MONOTONIC = 1, flags = 0
-        let clock_id = i32_t.const_int(1, false);
-        let flags = i32_t.const_int(0, false);
-        let call_result = self
-            .builder
-            .build_call(
-                cns,
-                &[
-                    clock_id.into(),
-                    flags.into(),
-                    req.into(),
-                    rem.into(),
-                ],
-                "cns.ret",
-            )
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let ret_int = call_result
-            .try_as_basic_value()
-            .left()
-            .expect("clock_nanosleep returns i32")
-            .into_int_value();
-        // EINTR == 4 on Linux. Everything else (including success=0)
-        // exits the loop.
-        let eintr = i32_t.const_int(4, false);
-        let is_eintr = self
-            .builder
-            .build_int_compare(inkwell::IntPredicate::EQ, ret_int, eintr, "is.eintr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_conditional_branch(is_eintr, retry_bb, done_bb)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-
-        // retry_bb: copy rem → req, jump back into the loop
-        self.builder.position_at_end(retry_bb);
-        let rem_sec_ptr = self
-            .builder
-            .build_struct_gep(ts_t, rem, 0, "rem.sec.ptr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let rem_nsec_ptr = self
-            .builder
-            .build_struct_gep(ts_t, rem, 1, "rem.nsec.ptr")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let rem_sec = self
-            .builder
-            .build_load(i64_t, rem_sec_ptr, "rem.sec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        let rem_nsec = self
-            .builder
-            .build_load(i64_t, rem_nsec_ptr, "rem.nsec")
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_store(req_sec_ptr, rem_sec)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_store(req_nsec_ptr, rem_nsec)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-        self.builder
-            .build_unconditional_branch(loop_bb)
-            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-
-        self.builder.position_at_end(done_bb);
-        // Drain the cooperative bus queue after sleep returns so a
-        // long-running `while { time::sleep(...); ... }` loop in a
-        // cooperative subscriber delivers cells posted by other
-        // threads during the sleep (unix-bound reader threads,
-        // pinned publishers, etc.). Without this the cells sit in
-        // g_bus_queue until the body's next natural drain point —
-        // the documented workaround was `sleep; yield;`. The drain
-        // is folded in so the canonical pattern just works.
-        self.emit_bus_drain()?;
-        // 2026-05-23: pinned-mailbox drain mirror. If
-        // this sleep ran on a pinned locus's own thread, drain its
-        // mailbox so cells posted by cooperative publishers
-        // during the sleep window fire mid-program rather than at
-        // dissolve. On a cooperative thread, get_current returns
-        // NULL and drain_pending is a no-op.
-        self.emit_pinned_mailbox_drain_pending()?;
-        Ok(())
-    }
-
     /// the coop→pinned drain friction: emit
     /// `lotus_mailbox_drain_pending(lotus_mailbox_get_current())`.
     /// No-op when called from a thread without a TLS-cached
     /// mailbox (cooperative threads, the main thread). Inserted
     /// at every cooperative yield point so a pinned locus's
     /// long-running run() body sees mid-program bus deliveries.
-    fn emit_pinned_mailbox_drain_pending(&mut self) -> Result<(), CodegenError> {
+    pub(crate) fn emit_pinned_mailbox_drain_pending(&mut self) -> Result<(), CodegenError> {
         let get_current_fn = self
             .module
             .get_function("lotus_mailbox_get_current")
