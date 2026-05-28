@@ -29,8 +29,15 @@
 //! interpreter remains the reference for everything not yet
 //! lowered.
 
+pub(crate) mod bus;
+pub(crate) mod channels;
 pub mod codegen;
+pub(crate) mod form;
+pub(crate) mod locus;
 pub mod mangle;
+pub(crate) mod shared;
+pub(crate) mod stdlib;
+pub(crate) mod types;
 
 pub use codegen::{
     build_executable, build_executable_with_imports,
