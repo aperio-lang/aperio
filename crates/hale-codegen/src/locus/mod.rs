@@ -3,3 +3,4 @@
 
 pub(crate) mod decl;
 pub(crate) mod dissolve;
+pub(crate) mod method;
