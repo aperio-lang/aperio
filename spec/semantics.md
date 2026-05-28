@@ -166,6 +166,113 @@ dissolves until fn exit. Per-iteration cleanup uses a helper
 free fn whose return is the per-iteration boundary (see
 `handle_one_connection` in `stdlib/io_tcp.hl`).
 
+### Locus role
+
+Every locus declaration must carry a **load-bearing** role. A locus
+is load-bearing when it carries at least one of:
+
+1. A non-empty lifecycle body — `birth()`, `run()`, or `dissolve()`
+   with statements beyond a tail-empty block.
+2. A `drain()` or `accept()` declaration.
+3. A `bus subscribe` clause.
+4. A `closure` declaration of any epoch.
+5. A `capacity { ... }` slot (pool / heap / vec / hashmap /
+   ring_buffer / shm_ring).
+6. An `on_failure(child, err)` handler.
+7. A `mode { bulk | harmonic | resolution }` block.
+8. At least one owned param field whose type isn't a borrowed
+   reference (`ptr<T>`) or a value-shape primitive.
+
+A locus that fails *all* of these is **degenerate**: it has no
+lifecycle responsibility, no invariants to enforce, no owned
+state, and no membership in the bus graph. It exists only as a
+method-dispatch wrapper over data that lives elsewhere.
+
+#### Why this matters
+
+The lotus model treats locus boundaries as load-bearing
+abstractions — flow with invariants. Degenerate loci fight that
+model. They incur full lotus tax (arena create, dissolve cascade,
+field-init storms) for an operation that conceptually lives in
+another locus's tower. The classic surface is the factory shape:
+
+```hale
+locus Counter {            // degenerate: just methods on borrowed state
+    store: ptr<Store>;
+    key: String;
+    fn inc() { ... }
+}
+
+locus Registry {
+    fn counter(name: String) -> Counter {
+        return Counter { store: self.store, key: name };
+    }
+}
+```
+
+The call `reg.counter("ticks").inc()` allocates a transient
+`Counter` per call, runs it through the m90 routing
+(program-lifetime payload arena), and leaves it as substrate
+debris. Under sustained call rates this leaks; the design
+sketch in § Method-returning-locus heap allocation (m90) below
+covers the runtime behavior. But the deeper issue is that
+`Counter` shouldn't be a locus at all — the increment operation
+belongs in `Registry`'s tower.
+
+#### Enforcement
+
+The compiler runs a `load_bearing` check in Phase A after
+`declare_locus_struct`. Loci that fail the check are rejected
+with a span-targeted diagnostic. The diagnostic names the two
+canonical alternatives:
+
+1. **Direct method on the owning locus.** `Registry::inc(name)`
+   in place of `reg.counter(name).inc()`. Loses the typed
+   handle but doesn't allocate.
+2. **Bus topic for the operation.** `Counter::Inc { name }
+   -> Inc` where `Registry` subscribes to `Inc`. Closed-world
+   rewrite (when the preconditions hold) collapses the bus
+   round-trip to a direct dispatch with no allocation.
+
+#### What's not degenerate
+
+Loci that own a file descriptor, a socket, a buffer, or any
+resource with a lifecycle (`std::io::file::File`,
+`std::io::tcp::Stream`, `std::http::Server`, `BytesBuilder`) are
+load-bearing — they have non-trivial `dissolve()` bodies that
+clean up the resource. The check passes.
+
+Loci with subscriptions, closures, or accept declarations are
+load-bearing by construction (criteria 2–6 above).
+
+Loci that exist as parameter-only state containers — no
+methods, only fields read by the surrounding code — are
+load-bearing if any field is owned (criterion 8). The
+"borrowed-handle" failure case is specifically a locus whose
+*only* fields are borrowed references plus value-shape
+primitives plus methods that route through those borrowed
+references.
+
+#### Opt-out
+
+The annotation `@degenerate` on a locus declaration suppresses
+the check. Intended for migration windows only — code that
+applies `@degenerate` is asserting it has read this section and
+accepts the m90 runtime cost. Library-published code with
+`@degenerate` should be considered a transitional shape.
+
+```hale
+@degenerate
+locus Counter {
+    store: ptr<Store>;
+    key: String;
+    fn inc() { ... }
+}
+```
+
+The annotation will be removed in a future major version once
+in-tree migrations complete.
+
 ### Method-returning-locus heap allocation (m90)
 
 When a method declares `-> Some` and instantiates a `Some`
