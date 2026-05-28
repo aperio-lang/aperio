@@ -3433,6 +3433,251 @@ occupancy visibility — mirrors the `dump_arena_residency`
 shape.
 
 
+### F.36 Pluggable codecs on bus bindings (sketch)
+
+**Status: design sketch (2026-05-28).** No grammar surface, no
+compiler behavior shipped. Captured here so the design is on
+paper for a future implementation pass. The core machinery
+proposed — compiler-inferred method purity — is also load-
+bearing for several future-considered features (memoization,
+parallel evaluation of pure helpers, sort comparator
+verification), so F.36 is the headline use case but not the
+only beneficiary.
+
+**The problem.** The v1 bus adapter contract
+(`interface __StdBusAdapter { fn send(subject: String, bytes:
+Bytes); }`) is a *byte transport*, not a *codec*. The bytes are
+serialized via the m70 wire format, which is internal and not
+publicly specified for cross-language consumption. So Hale ↔
+Hale works fine over any user-supplied transport (NATS, MQTT,
+custom-broker-over-TCP), but Hale ↔ anything-not-Hale (Python
+subscriber over NATS, JSON broker, existing protobuf service)
+is structurally unreachable. The adapter can't re-encode
+because it receives bytes, not values.
+
+The clean answer is to split *transport* (route bytes between
+processes) from *codec* (translate between in-memory values
+and on-the-wire bytes). Today's `__StdBusAdapter` covers
+transport; F.36 adds a parallel surface for codecs.
+
+**The shape.** A bindings entry may declare an optional
+`codec(L { ... })` clause naming a locus that provides the
+encode/decode pair:
+
+```hale
+type Tick { sym: String; price: Decimal; }
+
+locus TickJsonCodec {
+    fn encode(v: Tick) -> Bytes fallible(EncodeError) {
+        let b = std::bytes::BytesBuilder { };
+        b.append_str("{\"sym\":\"");
+        b.append_str(v.sym);
+        b.append_str("\",\"price\":");
+        b.append_str(std::decimal::to_string(v.price));
+        b.append_str("}");
+        return b.finish();
+    }
+    fn decode(b: Bytes) -> Tick fallible(DecodeError) {
+        let w = std::json::Walker { src: std::str::from_bytes(b) };
+        let sym   = w.find_string_at("sym")    or fail DecodeError { kind: "missing_sym" };
+        let price = w.find_decimal_at("price") or fail DecodeError { kind: "missing_price" };
+        return Tick { sym: sym, price: price };
+    }
+}
+
+main locus App {
+    bindings {
+        TickTopic: nats("nats://localhost:4222")
+                   codec(TickJsonCodec { });
+    }
+}
+```
+
+Codegen routes the bus publish path through `codec.encode`
+instead of the m70 `__serialize_Tick`, and the receive path
+through `codec.decode` instead of `__deserialize_Tick`. The
+adapter's `send(subject, bytes)` contract is unchanged — the
+codec runs *before* `send` on publish, *after* the receive-side
+adapter on dispatch. Two layers, clean separation.
+
+**The compiler obligation: method purity must be inferred and
+asserted.** This is the load-bearing piece — and it's
+*structurally pure compiler work* with no new user-facing
+syntax beyond the `codec(L)` clause itself.
+
+The bus reader thread, the publisher's pool, and any consumer
+pool may invoke a codec's methods concurrently with no
+serialization in scope. Codec methods must therefore be
+**stateless** — no `self.X` writes, no bus publishes, no
+impure stdlib calls (println, file write, sleep), and no calls
+to non-pure methods transitively. The same property other
+languages handle with `Sync` traits, `[Pure]` attributes, or
+trust-the-user comments.
+
+Hale's answer: the compiler computes `is_pure` as a derived
+property of every method during typecheck (alongside the
+existing F.31 single-threaded-method invariant check and the
+F.20 structural-interface satisfaction check), then asserts
+the property at the binding site. The author never writes a
+`pure` annotation. The substrate just enforces purity where it
+matters.
+
+If a codec accidentally has a state-mutating method, the
+diagnostic surfaces at the *binding site* (not at the method
+declaration), pointing at the offending line:
+
+```
+error: codec `TickJsonCodec.encode` is not safe to dispatch
+       from arbitrary threads
+  --> bindings { TickTopic: nats("...") codec(TickJsonCodec { }); }
+
+note: codec methods must be stateless — they may be invoked
+      from the bus reader thread, the publisher's pool, and
+      consumer pools concurrently.
+
+note: `encode` writes to `self.call_count` at line 47:
+   47 |         self.call_count = self.call_count + 1;
+      |         ^^^^^^^^^^^^^^^^ this mutates the codec instance
+```
+
+The same surgical-diagnostic shape as the v0.8.3 typecheck
+landings (#18.6 CQRS, #76 nested-long-running, the
+`@form(hashmap)` cell-locus rejection): structural rule, error
+points at the antipattern site, fix path is named in the
+diagnostic.
+
+**Why this works without a `pure` keyword.**
+
+Purity is a *derived* property, not a *declared* one. The
+compiler has full information to compute it from the method
+body. The author writes natural Hale; the compiler reads the
+body and marks the method `is_pure: bool` as an internal
+property of the typecheck output.
+
+Other compiler-enforced design rules in Hale already follow
+this pattern: F.31's pool-placement tracking, the CQRS rule
+(#18.6 — methods returning loci), F.27's closure-vs-assertion
+shape verification. None of these expose a per-method
+annotation to the user; the compiler just enforces the
+structural rule where it matters.
+
+Pure-method inference fits the same shape. The codec case is
+the first feature that needs the property at a binding site,
+but the inference machinery is reusable for any future feature
+that benefits — memoization, parallel evaluation across a
+collection of inputs, sort comparator verification for
+sortable collections, hash function verification for
+`@form(hashmap)` cells. Each gets the property for free once
+the analysis exists.
+
+**Why the locus shape (not free fns).**
+
+An earlier design pass considered binding free fns directly:
+
+```hale
+bindings {
+    TickTopic: nats("...") encoder = tick_to_json, decoder = tick_from_json;
+}
+```
+
+Function types as bindings would also work, kill cliffs around
+generic-interface satisfaction (just signature matching), and
+free codecs from instance-lifetime concerns (free fns are
+static addresses). But the locus shape wins on three counts:
+
+1. **Organization.** A codec's encode + decode + private
+   helpers naturally cluster as a unit. Splitting them into
+   free fns pollutes the module namespace and makes
+   accidental encoder/decoder misalignment harder for readers
+   to spot.
+
+2. **Proven safety, not asserted.** With free fns the
+   thread-safety claim is "trust the author" — the function
+   is just a top-level fn that *happens* to be pure. With
+   locus + inferred purity, the compiler *proves* the safety
+   property and surfaces violations as diagnostics.
+
+3. **Extensibility.** Future codec variants
+   (`TickProtobufCodec`, `TickMsgpackCodec`) get their own
+   namespaces; helpers stay scoped; the source organization
+   stays clean as the codec library grows.
+
+The cost: the structural-interface satisfaction check at the
+binding site has to bind T (the topic's payload type) against
+the codec's method signatures. That's a small extension to
+the F.20 structural-interface machinery — manageable, and the
+purity inference is the larger lift anyway.
+
+**Implementation surface.**
+
+- **Grammar / AST**: one new clause on `binding_entry` —
+  `codec(L { ... })`. ~30 lines.
+- **Purity inference pass** (`hale-types`): dataflow walker
+  over locus method bodies. Walks `Stmt::Assign` looking for
+  self-rooted LHS, walks call sites looking for non-pure
+  callees (transitively), consults the stdlib effect table.
+  Sets `info.is_pure: bool` per method. ~250 lines.
+- **Stdlib effect table** (~50 lines): names which stdlib fns
+  are pure (`std::str::trim`, `std::decimal::to_string`,
+  allocation primitives, arithmetic) vs not (`println`,
+  `time::sleep`, `std::io::fs::write_file`, bus publishes,
+  closure violations).
+- **Binding-site assertion** (~50 lines): when `codec(L)` is
+  bound, verify L's encode/decode methods exist with the
+  right signatures (T = topic's payload type) AND are pure.
+  Diagnostic shape mirrors the CQRS rule's surgical-pointer
+  output.
+- **Codec dispatch codegen** (~100 lines): bus serialize /
+  deserialize paths route through the codec method call
+  instead of m70 `__serialize_T` / `__deserialize_T`. Same
+  return-slot ABI the m70 path uses today (compiler knows
+  T's size at the binding site, pre-allocates the
+  destination, the codec's `decode` writes into it — no
+  double allocation).
+- **Stdlib types** (~30 lines): `EncodeError` /
+  `DecodeError` so codecs can declare fallible returns.
+
+**Total: ~460 lines, 3-4 days.**
+
+**Considered and rejected.**
+
+- *Per-payload-type encoder/decoder methods (`interface
+  Encodable { fn to_bytes() }`).* Each payload type can have
+  at most one encoder under this shape — locks `Tick` into a
+  single encoding. The codec-as-locus shape lets the same
+  topic carry different codecs in different bindings (JSON
+  over NATS, protobuf over the unix socket for the analytics
+  worker).
+- *Binding free fns (`encoder = X, decoder = Y`).* Strictly
+  cheaper to ship — no purity inference needed — but loses
+  organization and the proven-safety property. Free fns can
+  still substitute for codec loci in a future v0.2 (since the
+  purity infrastructure is the same) but the locus shape is
+  the v0.1 surface.
+- *Annotating codec methods with a `pure` modifier.* Pure is
+  a derived property of the method body; the compiler has full
+  information to compute it. Adding a `pure` keyword would
+  give the author the option of *asserting* purity (which the
+  compiler would still have to verify) without removing any
+  compiler work — pure ceremony. Hale's enforced design rules
+  consistently avoid this pattern (cf. F.31, #18.6, #76).
+- *Generic codec interface (`Codec<T>`) parameterized at the
+  type level.* Would lift F.20's structural-interface check
+  to handle interface generics, which is a bigger lift than
+  needed for the codec case. The codec-binding-site check can
+  do per-binding T resolution without lifting the whole
+  interface system.
+
+**Sequencing.** The purity-inference pass is the load-bearing
+piece. Build it standalone first (with the F.31 single-
+threaded-method check as the test harness — purity is a
+stronger version of the same "method body shape" question).
+Then layer the binding-site assertion + the codec(L) grammar
++ the codegen path on top. Each step independently testable;
+the purity pass benefits multiple downstream features so it's
+worth investing in cleanly.
+
+
 
 The grammar in v0 does **not** specify:
 
