@@ -349,6 +349,17 @@ inheritance rule (children share their parent's pool by
 construction). Nested long-running children are an antipattern
 under F.31: hoist to main-locus siblings.
 
+**Typecheck enforcement (2026-05-28).** The compiler rejects
+the antipattern at typecheck. A non-main locus with a non-trivial
+`run()` body holding a `params` field of a locus type whose own
+`run()` is also non-trivial — including `std::http::Server` and
+the other entries on the known-long-running stdlib allowlist —
+gets a hard error pointing at the canonical sibling-in-main +
+placement fix. The runtime starvation that motivated this rule
+is silent (the parent's `run()` simply never executes), so the
+type-side rejection is load-bearing: it converts a class of
+hard-to-diagnose runtime bugs into a clear compile-time signal.
+
 (Compare: rich / chunked / recognition projection classes are
 genuinely three-way because N≈10, N≈30, and N≈300 are
 different cost regimes at scale — memory has more genuine

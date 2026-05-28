@@ -185,7 +185,145 @@ pub fn check_bundle(bundle: &Bundle<'_>, top: &TopScope) -> Vec<Diag> {
     // not a direct method call. See spec/types.md
     // § "Single-threaded-method invariant (F.31)".
     check_placement_single_thread(bundle, top, &mut diags);
+    // F.31-followup (2026-05-28): the nested-long-running-child
+    // antipattern. A non-main locus whose `run()` body has work
+    // to do, holding a params field of a locus type whose own
+    // `run()` doesn't return (or is on the known-long-running
+    // stdlib list), gets a hard error pointing at the canonical
+    // sibling-in-main + placement fix. See `spec/runtime.md §
+    // Long-running cooperative children`.
+    check_nested_long_running_child(bundle, &mut diags);
     diags
+}
+
+/// Known stdlib loci whose `run()` body is structurally non-
+/// terminating (accept loops, daemon loops). Used by the
+/// nested-long-running-child check; the typechecker can't see
+/// stdlib bodies, so the list is maintained explicitly.
+const KNOWN_LONG_RUNNING_STDLIB_LOCI: &[&[&str]] = &[
+    &["std", "http", "Server"],
+];
+
+fn is_known_long_running_stdlib(path_segments: &[&str]) -> bool {
+    KNOWN_LONG_RUNNING_STDLIB_LOCI
+        .iter()
+        .any(|known| *known == path_segments)
+}
+
+fn locus_has_nontrivial_run(l: &LocusDecl) -> bool {
+    l.members.iter().any(|m| match m {
+        LocusMember::Lifecycle(LifecycleDecl {
+            kind: LifecycleKind::Run,
+            body,
+            ..
+        }) => !body.stmts.is_empty(),
+        _ => false,
+    })
+}
+
+fn check_nested_long_running_child(
+    bundle: &Bundle<'_>,
+    diags: &mut Vec<Diag>,
+) {
+    // Build a name → LocusDecl index across the bundle so we can
+    // resolve params-field locus types to their target body.
+    let mut local_loci: BTreeMap<&str, &LocusDecl> = BTreeMap::new();
+    for program in bundle.programs.values() {
+        for item in &program.items {
+            if let TopDecl::Locus(l) = item {
+                local_loci.insert(l.name.name.as_str(), l);
+            }
+        }
+    }
+
+    for program in bundle.programs.values() {
+        for item in &program.items {
+            let TopDecl::Locus(parent) = item else {
+                continue;
+            };
+            if parent.is_main {
+                continue;
+            }
+            if !locus_has_nontrivial_run(parent) {
+                continue;
+            }
+            // Walk params fields. Each ParamDecl whose declared
+            // type is a locus reference goes through the locus-
+            // type-with-run check.
+            for member in &parent.members {
+                let LocusMember::Params(pb) = member else {
+                    continue;
+                };
+                for pd in &pb.params {
+                    let Some(ty) = &pd.ty else {
+                        continue;
+                    };
+                    let TypeExpr::Named { path, .. } = ty else {
+                        continue;
+                    };
+                    let segs: Vec<&str> = path
+                        .segments
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    // Single-segment names: look up locally.
+                    // Multi-segment: check against the known-
+                    // long-running stdlib allowlist.
+                    let target_is_long_running = if segs.len() == 1 {
+                        local_loci
+                            .get(segs[0])
+                            .filter(|l| !l.is_main)
+                            .map(|l| locus_has_nontrivial_run(l))
+                            .unwrap_or(false)
+                    } else {
+                        is_known_long_running_stdlib(&segs)
+                    };
+                    if !target_is_long_running {
+                        continue;
+                    }
+                    let target_display = segs.join("::");
+                    diags.push(Diag::ty(
+                        pd.span,
+                        format!(
+                            "locus `{}` declares params field `{}: {}` \
+                             with a non-trivial `run()` body of its own. \
+                             Nested cooperative children share the parent's \
+                             OS thread; the child's `run()` runs to \
+                             completion before the parent's `run()` begins, \
+                             so a long-running child (`{}`'s accept loop \
+                             never returns) starves the parent.\n\n\
+                             Canonical fix: hoist both loci to siblings of \
+                             a `main locus` and use a `placement {{ }}` \
+                             block to put them on different pools.\n\n\
+                             ```\n\
+                             main locus App {{\n\
+                                 params {{\n\
+                                     parent: {} = {} {{ ... }};\n\
+                                     {}: {} = {} {{ ... }};\n\
+                                 }}\n\
+                                 placement {{\n\
+                                     {}: cooperative(pool = io);\n\
+                                 }}\n\
+                             }}\n\
+                             ```\n\n\
+                             See spec/runtime.md § Long-running cooperative \
+                             children: placement closes Item D.",
+                            parent.name.name,
+                            pd.name.name,
+                            target_display,
+                            target_display,
+                            parent.name.name,
+                            parent.name.name,
+                            pd.name.name,
+                            target_display,
+                            target_display,
+                            pd.name.name,
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// F.31 Phase 5: pool identity. Each main-locus params field
