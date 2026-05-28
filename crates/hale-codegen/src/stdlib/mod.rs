@@ -11,5 +11,6 @@
 
 pub(crate) mod decimal;
 pub(crate) mod env;
+pub(crate) mod math;
 pub(crate) mod process;
 pub(crate) mod time;
