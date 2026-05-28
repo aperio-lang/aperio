@@ -6,6 +6,103 @@ behavior.
 
 ---
 
+## v0.8.3 — CQRS at the locus boundary + F.34 windowed closures
+
+A small release focused on closing structural-design rules at
+typecheck. Three compile-time rejections previously only
+discoverable as silent runtime behavior become hard errors; one
+new closure-clause closes the rate-budget gap; one substrate
+diagnostic closes the silent-drop debug gap.
+
+### Language surface
+
+- **CQRS at the locus boundary (#18.6 / #81).** Methods on loci
+  may not return locus values. The compiler rejects
+  `fn lookup(id: String) -> Counter` on a registry locus at
+  typecheck. The rule keeps the substrate model honest — a
+  returned locus would be a stranger in the caller's scope, with
+  no lifecycle tower above it. Three canonical alternatives:
+  parent-child + contract (`accept`'d children, pair with an
+  index slot for name-based lookup), bus topic (publish typed
+  commands keyed by name), or delegation (collapse the per-child
+  operation onto the parent). See `spec/semantics.md § Locus
+  method dispatch`.
+
+- **`resets_per_epoch(...)` closure clause (F.34, #75).**
+  Closes the `low_corrupt_rate`-shaped friction (per-window rate
+  budgets). A closure paired with `epoch duration(N)` may now
+  declare `resets_per_epoch(field1, field2, ...);` — the
+  runtime zeros the named fields AFTER the assertion fires at
+  each duration boundary. Ordering matters: the assertion sees
+  the window's accumulated value, the reset prepares the next
+  window. Typecheck rejects pairing with non-duration epochs and
+  non-numeric fields. See `spec/semantics.md § Per-epoch field
+  reset` + `spec/design-rationale.md § F.34`.
+
+  ```hale
+  closure low_corrupt_rate {
+      self.corrupt_per_min ~~ 0 within 10;
+      epoch duration(1m);
+      resets_per_epoch(corrupt_per_min);
+  }
+  ```
+
+- **Nested long-running cooperative children rejected at typecheck
+  (#76 / F.31-followup).** A non-main locus with a non-trivial
+  `run()` body holding a `params` field of a locus type whose own
+  `run()` is also non-trivial — including `std::http::Server` and
+  the other entries on the known-long-running stdlib allowlist —
+  is now a compile error pointing at the sibling-in-main +
+  placement fix. The runtime starvation that motivated this rule
+  was silent (parent's `run()` simply never executed), so the
+  type-side rejection converts a class of hard-to-diagnose
+  runtime bugs into a clear compile-time signal. See
+  `spec/runtime.md § Long-running cooperative children`.
+
+### Diagnostics
+
+- **`@form(hashmap)` cell-locus rejection improved (#77).** The
+  pre-existing rule (cells may not be locus references) now
+  produces a diagnostic that names the three canonical
+  alternatives (parent-child + index, bus topic, delegation) and
+  cross-references `spec/semantics.md § Locus method dispatch`.
+  Same framing as #18.6 at the form-synthesis layer.
+
+- **`LOTUS_BUS_LOG_DESERIALIZE_DROP=1`.** Surfaces silent drops
+  in the udp:// reader thread when no deserializer is registered
+  for the inbound subject, or the deserializer returns ≤ 0 (size
+  mismatch, bounded-read failure). Off by default; the silent-skip
+  on cross-routed multicast noise stays correct in steady state.
+  Three udp:// bring-up handoffs this week traced back to silent
+  drops on `deserialize → local-dispatch`; the lack of any signal
+  was load-bearing on debug cycles. Same env-gated pattern as the
+  existing `LOTUS_BUS_LOG_UNMATCHED`.
+
+### Internals
+
+- **Codegen refactor (#22).** `crates/hale-codegen` reorganized:
+  per-domain submodules (`locus/`, `bus/`, `shared/`, `stdlib/`),
+  `codegen.rs` reduced by 56.2%. No surface-level changes.
+
+### Documentation
+
+- **`docs/src/concepts/the-locus.md`** — CQRS rule paragraph.
+- **`docs/src/concepts/the-bus.md`** — routing keys +
+  `on_unmatched` policies (covering machinery shipped in v0.8.2).
+- **`docs/src/concepts/capacity-storage.md`** — hashmap cell-
+  locus rule with alternatives.
+- **`docs/src/concepts/error-handling.md`** — `resets_per_epoch`
+  coverage in the closures intro.
+- **`docs/src/how-tos/threading.md`** — nested-long-running
+  rejection in "What you can't do".
+- **`docs/src/how-tos/keeping-memory-bounded.md`** — factory /
+  cached-handle sections rewritten around the boot-time Int-
+  index resolution pattern (the previous example used the
+  now-rejected `reg.counter().inc()` shape).
+- **`spec/design-rationale.md`** — new F.34 entry.
+
+---
+
 ## v0.8.1 — F.32 cache-aware substrate + #24 narrowing
 
 Cumulative changes since v0.8.0. No source-level breaking
