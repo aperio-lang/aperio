@@ -5,13 +5,24 @@
 // the current window and reports slope / intercept / the
 // extrapolated value at any future time.
 //
-// Composition: LeadingEdge owns an 8-cap ring inline (Hale
-// v0 has no generic Ring<N>; we inline the storage). On
-// slope() / intercept() / extrapolate() the body births an
-// ephemeral Segment, replays the ring's contents through it,
-// and reads the regression. The Segment dissolves at method
-// return — lotus-first composition, fresh substrate cell per
-// query.
+// Composition: LeadingEdge owns a Segment as a long-lived child
+// (param field), not a per-call factory return. Each query
+// resets the segment, replays the ring into it, then reads
+// slope / intercept directly off self.seg. The pattern is the
+// canonical Hale shape for "B's data feeds A":
+//
+//   - LeadingEdge (parent) owns Segment (child) as a param
+//     field with default `Segment { }`.
+//   - `update()` is the command — mutates the ring and
+//     recomputes self.seg via the internal `fit()` helper.
+//   - `slope() / intercept() / extrapolate()` are queries —
+//     call `fit()` to refresh the regression and read
+//     `self.seg.slope()` / `self.seg.intercept()` directly.
+//
+// Method calls go vertically (`self.seg.<method>`); no method
+// returns a locus value (which would violate Hale's CQRS rule
+// and create the m90 leak surface). See spec/semantics.md §
+// Locus method dispatch.
 //
 // Real-world use: triangulator's leading-edge geometry on a
 // market-data feed. Push every tick; ask `extrapolate(t_now
@@ -25,11 +36,6 @@
 //   - intercept() -> Float
 //   - extrapolate(t: Float) -> Float
 //   - clear()
-//
-// Two child loci in one file: Segment (the regression
-// accumulator from 51-geom-segment) and LeadingEdge (this
-// file's contribution). The Segment definition is duplicated
-// here because there's no cross-file module system yet.
 
 locus Segment {
     params {
@@ -39,6 +45,14 @@ locus Segment {
         sum_y: Float = 0.0;
         sum_xx: Float = 0.0;
         sum_xy: Float = 0.0;
+    }
+    fn clear() {
+        self.n = 0;
+        self.nf = 0.0;
+        self.sum_x = 0.0;
+        self.sum_y = 0.0;
+        self.sum_xx = 0.0;
+        self.sum_xy = 0.0;
     }
     fn push(t: Float, v: Float) {
         self.n = self.n + 1;
@@ -68,6 +82,7 @@ locus LeadingEdge {
         values: [Float; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         head: Int = 0;
         n: Int = 0;
+        seg: Segment = Segment { };
     }
 
     fn push(t: Float, v: Float) {
@@ -97,11 +112,10 @@ locus LeadingEdge {
         return 8;
     }
 
-    // Internal: replay current window into a fresh Segment.
-    // Returns the populated Segment by way of slope() /
-    // intercept() / extrapolate() — they're the only callers.
-    fn fit() -> Segment {
-        let s = Segment { };
+    // Internal: reset self.seg and replay the current window
+    // into it. No return — mutates self.seg in place.
+    fn fit() {
+        self.seg.clear();
         let mut i = 0;
         let cap = self.len();
         while i < cap {
@@ -109,34 +123,33 @@ locus LeadingEdge {
             if self.n >= 8 {
                 phys = (self.head + i) % 8;
             }
-            s.push(self.times[phys], self.values[phys]);
+            self.seg.push(self.times[phys], self.values[phys]);
             i = i + 1;
         }
-        return s;
     }
 
     fn slope() -> Float {
-        let s = self.fit();
-        if s.count() < 2 {
+        self.fit();
+        if self.seg.count() < 2 {
             return 0.0;
         }
-        return s.slope();
+        return self.seg.slope();
     }
 
     fn intercept() -> Float {
-        let s = self.fit();
-        if s.count() < 2 {
+        self.fit();
+        if self.seg.count() < 2 {
             return 0.0;
         }
-        return s.intercept();
+        return self.seg.intercept();
     }
 
     fn extrapolate(t: Float) -> Float {
-        let s = self.fit();
-        if s.count() < 2 {
+        self.fit();
+        if self.seg.count() < 2 {
             return 0.0;
         }
-        return s.slope() * t + s.intercept();
+        return self.seg.slope() * t + self.seg.intercept();
     }
 
     fn clear() {
@@ -144,6 +157,7 @@ locus LeadingEdge {
         self.values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         self.head = 0;
         self.n = 0;
+        self.seg.clear();
     }
 }
 

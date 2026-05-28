@@ -1790,6 +1790,14 @@ impl<'a> Checker<'a> {
             self.check_form_shape(decl, form);
         }
 
+        // #18.6 — Hale enforces CQRS at the locus boundary:
+        // methods on loci may not return locus values. Reject
+        // such declarations with a span-targeted diagnostic
+        // naming the canonical alternatives (accept-as-child +
+        // contract reads, bus topics, delegation). See
+        // spec/semantics.md § Locus method dispatch.
+        self.check_no_locus_return(decl);
+
         // Validate that bus-subscribe handlers are declared on
         // the locus body (as fn members).
         let fn_members: BTreeMap<String, &FnDecl> = decl
@@ -1990,6 +1998,101 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// #18.6 — Hale enforces CQRS at the locus boundary:
+    /// methods on loci may not return locus values. The pattern
+    /// `fn factory(...) -> SomeLocus` is rejected at the
+    /// declaration site.
+    ///
+    /// The lotus model treats loci as managed entities — they
+    /// live as accepted children of a parent, expose data
+    /// through `contract`, communicate cross-tower through the
+    /// bus. Returning an entity from a method puts the entity
+    /// into a stranger position at every call site (LoD), mixes
+    /// command/query semantics (CQRS), and depends on a
+    /// concretion rather than an abstraction (Dependency
+    /// Inversion). Mechanically, every call leaks via the m90
+    /// payload-arena routing.
+    ///
+    /// The five lenses (SOLID, LoD, CQRS, mechanical sympathy,
+    /// the lotus model itself) converge on the same rule: a
+    /// method must return data, not an entity. The compiler
+    /// enforces it.
+    ///
+    /// Three canonical remedies in the diagnostic:
+    ///   1. Parent-child: `accept(c: T)` + contract reads
+    ///   2. Bus topic: publish events; receiver subscribes
+    ///   3. Delegation: expose the operation directly on the
+    ///      owning locus
+    ///
+    /// Free fns can still return loci (entity creation —
+    /// `std::io::file::open(path) -> File fallible(IoError)`).
+    /// Lifecycle methods / modes / failure handlers don't have
+    /// return types in the value-bearing sense, so they're
+    /// unaffected.
+    ///
+    /// Spec home: `spec/semantics.md § Locus method dispatch`.
+    fn check_no_locus_return(&mut self, decl: &'a LocusDecl) {
+        for member in &decl.members {
+            let LocusMember::Fn(f) = member else { continue };
+            // Walk the declared return type (if any) and the
+            // fallible-payload type (if any). Both can carry a
+            // locus.
+            if let Some(ret) = &f.ret {
+                self.report_locus_return(decl, f, ret, "return type");
+            }
+            if let Some(payload) = &f.fallible {
+                // `fallible(L)` carries the error payload type.
+                // A locus payload is the same antipattern as a
+                // locus return — the caller would have to call
+                // methods on the recovered locus, violating the
+                // friendship boundary the same way.
+                self.report_locus_return(
+                    decl, f, payload, "fallible payload type",
+                );
+            }
+        }
+    }
+
+    fn report_locus_return(
+        &mut self,
+        decl: &'a LocusDecl,
+        f: &'a FnDecl,
+        ty_expr: &'a TypeExpr,
+        slot_label: &str,
+    ) {
+        let resolved = resolve_type_expr(ty_expr, self.known);
+        let Ty::Named(name) = &resolved else { return };
+        if !matches!(self.top.lookup(name), Some(TopSymbol::Locus(_))) {
+            return;
+        }
+        self.diags.push(Diag::ty(
+            ty_expr.span(),
+            format!(
+                "method `{locus}.{method}` declares {slot} `{ret}` — \
+                 methods on loci may not return locus values.\n\n\
+                 The lotus model treats loci as managed entities (parent-\
+                 child accept, contract exposure, bus topics). Returning \
+                 an entity from a method puts it in a stranger position \
+                 at every call site (violating LoD), mixes \
+                 command/query semantics (CQRS), and depends on a \
+                 concretion rather than an abstraction. Mechanically, \
+                 every call leaks via the m90 payload-arena routing.\n\n\
+                 Rewrite as one of:\n\
+                 1. Parent-child: declare `accept(c: {ret})` on the \
+                    parent and read via `contract {{ expose ... }}`.\n\
+                 2. Bus topic: publish events; receiver subscribes.\n\
+                 3. Delegation: expose the operation directly on `{locus}`.\n\n\
+                 Free fns can still return loci (entity creation \
+                 patterns like `std::io::file::open`). See \
+                 spec/semantics.md § Locus method dispatch.",
+                locus = decl.name.name,
+                method = f.name.name,
+                slot = slot_label,
+                ret = name,
+            ),
+        ));
     }
 
     /// v1.x-FORM-1: verify a `@form(<name>)` annotation's

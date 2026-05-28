@@ -43,6 +43,14 @@ locus Segment {
         sum_xx: Float = 0.0;
         sum_xy: Float = 0.0;
     }
+    fn clear() {
+        self.n = 0;
+        self.nf = 0.0;
+        self.sum_x = 0.0;
+        self.sum_y = 0.0;
+        self.sum_xx = 0.0;
+        self.sum_xy = 0.0;
+    }
     fn push(t: Float, v: Float) {
         self.n = self.n + 1;
         self.nf = self.nf + 1.0;
@@ -71,6 +79,7 @@ locus LeadingEdge {
         values: [Float; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         head: Int = 0;
         n: Int = 0;
+        seg: Segment = Segment { };
     }
 
     fn push(t: Float, v: Float) {
@@ -100,8 +109,13 @@ locus LeadingEdge {
         return 8;
     }
 
-    fn fit() -> Segment {
-        let s = Segment { };
+    // Internal: reset self.seg and replay the current window
+    // into it. No return — mutates self.seg in place. See
+    // spec/semantics.md § Locus method dispatch for why a
+    // factory `fn fit() -> Segment` shape was rejected in favor
+    // of this owned-child pattern.
+    fn fit() {
+        self.seg.clear();
         let mut i = 0;
         let cap = self.len();
         while i < cap {
@@ -109,18 +123,17 @@ locus LeadingEdge {
             if self.n >= 8 {
                 phys = (self.head + i) % 8;
             }
-            s.push(self.times[phys], self.values[phys]);
+            self.seg.push(self.times[phys], self.values[phys]);
             i = i + 1;
         }
-        return s;
     }
 
     fn extrapolate(t: Float) -> Float {
-        let s = self.fit();
-        if s.count() < 2 {
+        self.fit();
+        if self.seg.count() < 2 {
             return 0.0;
         }
-        return s.slope() * t + s.intercept();
+        return self.seg.slope() * t + self.seg.intercept();
     }
 }
 

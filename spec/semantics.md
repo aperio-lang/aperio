@@ -166,120 +166,179 @@ dissolves until fn exit. Per-iteration cleanup uses a helper
 free fn whose return is the per-iteration boundary (see
 `handle_one_connection` in `stdlib/io_tcp.hl`).
 
-### Locus method dispatch — Law of Demeter
+### Locus method dispatch
 
-Hale enforces the Law of Demeter on locus method calls. A method
-on locus `C` may only invoke methods on values that are
-**friends** of `C`'s current method body. The allowed friends:
+**Methods on loci may not return locus values.** This is the
+load-bearing rule for locus method dispatch in Hale. The
+compiler rejects any `fn` member of a locus whose declared
+return type (or fallible-payload type) names a user-declared
+locus.
 
-1. `self` — the current C instance.
-2. `self.<field>` (one or more hops of field access on owned
-   members) — C's owned children and value fields.
-3. The method's own parameters.
-4. Locus values constructed locally within the method body
-   via a struct literal (`let b = BytesBuilder { ... }`).
-5. Free-fn / path-call results (`std::str::trim(s)`,
-   `parse_config(args)` — these aren't method calls on locus
-   values to begin with).
+#### Why this rule
 
-Method calls on locus-typed values introduced through any other
-path — chained method-call return values, slot-cell results, etc.
-— are rejected at compile time as Law-of-Demeter violations.
+Five design principles converge on the same constraint, which
+is why the rule is shaped this narrowly:
 
-The rule is value-introduction-aware, not locus-shape-aware. A
-locus's structure (lifecycle bodies, closures, subscriptions,
-capacity slots, owned state) doesn't matter — what matters is
-who introduced the value into the current scope.
+- **CQRS** — queries return data; entities (loci) are managed
+  structurally, not returned. A method returning a locus mixes
+  command and query semantics in one call.
+- **Law of Demeter** — a method that returns an entity puts
+  that entity into a stranger position at every call site. The
+  only ways to use it are LoD violations (call methods on a
+  stranger) or pass-through (forward to another callee). Both
+  shapes signal the method shouldn't have existed.
+- **Dependency Inversion** — depending on a returned entity is
+  depending on a concretion. The bus and `contract`-exposed
+  fields are the abstraction surfaces for cross-locus
+  coordination.
+- **Single Responsibility** — a locus whose only purpose is to
+  be the return value of a factory method has no responsibility
+  of its own; it's a method-dispatch wrapper around state that
+  lives elsewhere.
+- **Mechanical sympathy** — every "method returns locus"
+  call site triggers per-call allocation through the m90
+  payload-arena routing (program-lifetime, never freed). The
+  pattern leaks by construction. Removing the shape removes
+  the allocation.
+
+These aren't five rules layered on top of each other — they're
+five lenses pointing at one structural error. The compiler
+enforces it once.
 
 #### The factory train wreck
 
-The canonical violation is the cross-tower factory pattern:
+The motivating violation is the cross-tower factory pattern:
 
 ```hale
-self.reg.counter("ticks").inc()
+locus Counter {
+    store: Store;   // borrowed reference back to caller's state
+    key: String;
+    fn inc() { self.store.touch(self.key); }
+}
+
+locus Registry {
+    fn counter(name: String) -> Counter {       // ← rejected
+        return Counter { store: self.store, key: name };
+    }
+}
+
+// caller:
+self.reg.counter("ticks").inc();   // would leak per call
 ```
 
-- `self.reg.counter(...)` is fine: `self.reg` is a friend (field
-  of self), and calling a method on a friend is allowed.
-- The `Counter` that comes back was constructed by `Registry`,
-  not by the caller. The caller doesn't own it. It's a stranger.
-- Calling `.inc()` on that Counter reaches past the friend
-  (`self.reg`) to a stranger. **Rejected.**
+The `counter()` method declaration is the rejection site. The
+diagnostic names three canonical alternatives:
 
-The two canonical remedies are well-known from object-oriented
-practice:
+1. **Parent-child + contract reads.** `Counter` becomes an
+   accepted child of `Registry`; `Registry` reads counter
+   state through the contract:
 
-1. **Delegation** — `Registry` exposes the operation directly:
    ```hale
-   self.reg.inc_counter("ticks");
-   ```
-   The handle abstraction is lost; the call site re-passes the
-   name every time. Acceptable when the caller has only a few
-   counters to touch.
+   locus Counter {
+       params { name: String; value: Int = 0; }
+       contract { expose value: Int; }
+       fn inc() { self.value = self.value + 1; }
+   }
 
-2. **Mediator (bus topic)** — decouple through the bus:
+   locus Registry {
+       accept(c: Counter) { /* default registration */ }
+       fn inc(name: String) {
+           // iterate self.children, find the matching counter,
+           // call c.inc(). Vertical method dispatch on owned
+           // child — friend access, no LoD violation.
+       }
+   }
+   ```
+
+2. **Bus topic (mediator).** Counters publish events; Registry
+   subscribes:
+
    ```hale
    topic Inc { name: String };
    Counter::Inc { name: "ticks" } -> Inc;
    ```
-   `Registry` subscribes to `Inc`. The closed-world rewrite
-   (when its preconditions hold) collapses the bus round-trip
-   to a direct dispatch — same cost as the delegation form,
-   without losing the handle abstraction at the type level.
+
+   Closed-world rewrite (when its preconditions hold) collapses
+   the bus round-trip to a direct dispatch — same cost as
+   delegation, without the typed-handle loss.
+
+3. **Delegation.** `Registry` exposes the operation directly:
+
+   ```hale
+   self.reg.inc("ticks");
+   ```
+
+   Loses the typed handle but doesn't allocate. Acceptable when
+   the caller has only a few counters to touch.
+
+#### Owned-child + contract is the canonical "B's data feeds A" shape
+
+When locus A needs to read and update derived state computed
+from its own input, the canonical pattern is **B as an
+owned-child field of A**, with the update going through a
+vertical command (`self.b.compute(...)`) and reads going through
+a vertical contract exposure or method call on the child:
+
+```hale
+locus Segment {
+    params { /* accumulator state */ }
+    fn clear() { /* reset */ }
+    fn push(t: Float, v: Float) { /* update */ }
+    fn slope() -> Float { /* compute */ }
+    fn intercept() -> Float { /* compute */ }
+}
+
+locus LeadingEdge {
+    params {
+        // ring buffer fields
+        seg: Segment = Segment { };   // owned-child field
+    }
+    fn fit() {                         // command, returns nothing
+        self.seg.clear();
+        // replay ring contents into self.seg
+    }
+    fn slope() -> Float {              // query, returns data
+        self.fit();
+        return self.seg.slope();       // vertical method on owned child
+    }
+}
+```
+
+The `54-geom-leading-edge` example fixture demonstrates this
+shape end-to-end. The earlier "factory return" form
+(`fn fit() -> Segment`) was the pattern this rule rejects.
 
 #### What's not rejected
 
-- **Namespace-lotus pattern** (`__StdLangLang`,
-  `__StdNameConvention`, `__StdLogStdoutSink`, etc.). The caller
-  constructs one themselves and owns it (rule 4). Methods on it
-  are scaffolding calls.
-- **Utility loci** like `BytesBuilder`. Same reason.
-- **Parent-child cascade**. `self.child.method()` is rule 2
-  (child is in self's owned cascade). Multi-hop field access
-  through owned children (`self.engine.profile.summary()`)
-  remains allowed; what's rejected is method-call traversal
-  (`self.engine.fetch_profile().summary()` — the result of
-  `fetch_profile()` is a stranger).
-- **Free-fn calls** that return locus values
-  (`let cfg = parse_config(args); cfg.get("key");`). Free fns
-  are static utilities (rule 5) — their results are introduced
-  cleanly into local scope.
+The rule fires only on `fn` members of a locus. It does not
+catch:
 
-#### A method that returns a locus value
-
-By the rule, callers can't invoke methods on the returned value
-within the immediate scope. The return value is usable only as
-a pass-through: bind it to a let (still can't call methods on
-it), pass it as a parameter (the receiver of the parameter can
-call methods on it — params are friends), or feed it back into
-the bus.
-
-The compiler doesn't reject these method declarations directly.
-It rejects every attempted use of their results as
-Law-of-Demeter violations — same effect with a more precise
-diagnostic surface. In practice the leak (see §
-Method-returning-locus heap allocation (m90) below) stops being
-reachable: the m90-routed allocation only fires when a
-construction site has `current_user_fn_ret` set, and the only
-remaining code shape that triggers it is the parameter-passthrough
-case, where the value is consumed by a callee that owns it.
+- **Free fns returning loci** — entity creation patterns like
+  `std::io::file::open(path: String) -> File fallible(IoError)`
+  are constructors, not factory methods on existing loci.
+- **Methods returning primitives, records, or fallible-of-those.**
+  `BytesBuilder.finish() -> Bytes` is fine; `LeadingEdge.slope()
+  -> Float` is fine.
+- **Methods returning nothing.** Commands stay commands.
+- **Namespace-lotus pattern.** `__StdLangLang.parse(src) -> Int`
+  is fine — the locus's methods return data, not loci.
+- **Lifecycle / mode / failure handler bodies.** These don't
+  have value-bearing return types.
 
 #### Migration
 
-The annotation `@allow_lod_violation` on a method-call
-expression suppresses the check at that call site. Intended for
-migration windows only — code that applies it asserts the call
-crosses the friendship boundary and accepts the m90 cost.
-Library-published code applying this annotation should be
-considered a transitional shape.
+There is no opt-out annotation. The rule is the language's
+structural axiom for locus methods — programs that violate it
+are mis-designed, and the diagnostic names the canonical
+alternatives. Migrating from the factory shape to one of the
+three alternatives is a refactor, not a switch flip.
 
-```hale
-@allow_lod_violation
-self.reg.counter("ticks").inc()
-```
-
-The annotation will be removed in a future major version once
-in-tree migrations complete.
+The runtime m90 routing (see § Method-returning-locus heap
+allocation below) survives only to cover the few remaining
+shapes where a locus value transits through the m90 path
+indirectly (e.g., interface returns from free fns). With
+factory methods stopped at the declaration site, the dominant
+trigger of the m90 leak goes away by construction.
 
 ### Method-returning-locus heap allocation (m90)
 
