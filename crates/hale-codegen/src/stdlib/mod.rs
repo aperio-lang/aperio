@@ -15,6 +15,7 @@ pub(crate) mod env;
 pub(crate) mod io_file;
 pub(crate) mod io_fs;
 pub(crate) mod io_stdin;
+pub(crate) mod io_tls;
 pub(crate) mod math;
 pub(crate) mod process;
 pub(crate) mod rand;
