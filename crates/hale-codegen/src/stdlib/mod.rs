@@ -12,6 +12,7 @@
 pub(crate) mod crypto;
 pub(crate) mod decimal;
 pub(crate) mod env;
+pub(crate) mod io_stdin;
 pub(crate) mod math;
 pub(crate) mod process;
 pub(crate) mod rand;
