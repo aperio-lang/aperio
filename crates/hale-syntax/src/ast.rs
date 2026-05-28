@@ -538,6 +538,26 @@ pub struct BindingEntry {
     /// zero_copy;`. `where` is a contextual keyword (recognized
     /// in binding-entry position only).
     pub constraints: Vec<SpannedBindingConstraint>,
+    /// F.36 Slice 2 (2026-05-28): optional `codec(L { ... })`
+    /// clause that wires a pluggable codec for this binding. The
+    /// named locus must structurally provide `encode(v: T) ->
+    /// Bytes fallible(EncodeError)` and `decode(b: Bytes) -> T
+    /// fallible(DecodeError)`, where T is the topic's payload
+    /// type. Both methods must be pure (Slice 1's purity
+    /// inference asserts at this binding site). When `None`, the
+    /// binding uses the m70 default serializer.
+    pub codec: Option<CodecSpec>,
+    pub span: Span,
+}
+
+/// F.36 Slice 2: pluggable codec instance attached to a binding
+/// entry. The `locus` names the codec type; `inits` are the
+/// instantiation overrides (same shape as adapter loci or any
+/// other struct literal).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodecSpec {
+    pub locus: Ident,
+    pub inits: Vec<StructInit>,
     pub span: Span,
 }
 

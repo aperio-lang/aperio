@@ -1218,12 +1218,16 @@ impl Parser {
             let topic = self.expect_ident("topic name")?;
             self.expect(TokenKind::Colon, ":")?;
             let transport = self.parse_transport_spec()?;
+            // F.36 Slice 2: optional codec(L { ... }) clause
+            // between the transport and the `where` constraints.
+            let codec = self.parse_codec_spec_opt()?;
             let constraints = self.parse_binding_constraints_opt()?;
             let semi = self.expect(TokenKind::Semi, ";")?;
             entries.push(BindingEntry {
                 topic: topic.clone(),
                 transport,
                 constraints,
+                codec,
                 span: topic.span.merge(semi.span),
             });
         }
@@ -1232,6 +1236,39 @@ impl Parser {
             entries,
             span: kw_tok.span.merge(close.span),
         })
+    }
+
+    /// F.36 Slice 2: `codec(LocusName { init1: val1, ... })` —
+    /// pluggable codec instance on the binding. `codec` is a
+    /// contextual ident keyword recognized only in binding-entry
+    /// position. Mirrors the adapter-transport struct-init shape
+    /// for parsing.
+    fn parse_codec_spec_opt(&mut self) -> Result<Option<CodecSpec>, Diag> {
+        let codec_kw = match self.peek() {
+            TokenKind::Ident(s) if s == "codec" => self.peek_token().clone(),
+            _ => return Ok(None),
+        };
+        self.bump(); // consume `codec`
+        self.expect(TokenKind::LParen, "(")?;
+        let locus = self.expect_ident("codec locus name")?;
+        self.expect(TokenKind::LBrace, "{")?;
+        let mut inits = Vec::new();
+        if !self.at(&TokenKind::RBrace) {
+            inits.push(self.parse_struct_init()?);
+            while self.eat(&TokenKind::Comma) {
+                if self.at(&TokenKind::RBrace) {
+                    break;
+                }
+                inits.push(self.parse_struct_init()?);
+            }
+        }
+        self.expect(TokenKind::RBrace, "}")?;
+        let close_paren = self.expect(TokenKind::RParen, ")")?;
+        Ok(Some(CodecSpec {
+            locus,
+            inits,
+            span: codec_kw.span.merge(close_paren.span),
+        }))
     }
 
     /// F.31 (2026-05-23): parse a `placement { field: SPEC; }`

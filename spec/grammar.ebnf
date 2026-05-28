@@ -209,7 +209,21 @@ birth_check_decl  = "birth_check" , "{" , expression , "}" , "->" ,
    locus name. *)
 bindings_block    = "bindings" , "{" , { binding_entry } , "}" ;
 binding_entry     = IDENTIFIER , ":" , transport_spec ,
+                    [ codec_spec ] ,
                     [ binding_where ] , ";" ;
+
+(* F.36 Slice 2 (2026-05-28): optional codec(L { ... }) clause
+   on a binding entry. Pluggable encode/decode for cross-binary
+   bus routes that don't speak the internal m70 wire format.
+   The named locus must structurally provide:
+       fn encode(v: T) -> Bytes fallible(...)
+       fn decode(b: Bytes) -> T fallible(...)
+   where T = topic's payload type. Both methods must be pure
+   (compiler-inferred — no user-facing `pure` keyword). See
+   `spec/design-rationale.md § F.36`. *)
+codec_spec        = "codec" , "(" , IDENTIFIER , "{" ,
+                    [ struct_init , { "," , struct_init } ] ,
+                    "}" , ")" ;
 transport_spec    = unix_transport | shm_ring_transport | adapter_transport ;
 unix_transport    = "unix" , "(" , STRING_LIT , { "," , unix_kwarg } , ")" ;
 unix_kwarg        = "role" , ":" , transport_role ;

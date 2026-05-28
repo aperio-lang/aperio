@@ -1069,6 +1069,281 @@ fn check_satisfies_bus_adapter(
 ///
 /// Diagnostics are pushed to `diags`; the function returns
 /// nothing (zero-or-more errors per binding).
+/// F.36 Slice 2 (2026-05-28): codec(L) binding-clause typecheck.
+/// When a binding entry carries a `codec(L { ... })` clause,
+/// verify that:
+///   1. L is a declared locus.
+///   2. L has `fn encode(v: T) -> Bytes fallible(...)` where
+///      T = the topic's payload type.
+///   3. L has `fn decode(b: Bytes) -> T fallible(...)` where
+///      T = the topic's payload type.
+///   4. Both encode and decode are pure per F.36 Slice 1's
+///      purity inference — codecs may be dispatched from the
+///      bus reader thread / publisher's pool / consumer pools
+///      concurrently, and have no coordination in scope to
+///      serialize mutations to `self`.
+fn check_binding_codec(
+    entry: &BindingEntry,
+    top: &TopScope,
+    purity_map: &crate::purity::PurityMap,
+    diags: &mut Vec<Diag>,
+) {
+    let codec = match &entry.codec {
+        Some(c) => c,
+        None => return,
+    };
+    // (1) Resolve the topic to its payload Ty.
+    let topic_payload: Ty = match top.lookup(&entry.topic.name) {
+        Some(TopSymbol::Topic(t)) => t.payload.clone(),
+        _ => {
+            // Already diagnosed by the parent "topic existence"
+            // check; we can't verify the codec without a
+            // payload type, so bail out silently.
+            return;
+        }
+    };
+    // (2) Resolve the codec locus.
+    let locus_info = match top.lookup(&codec.locus.name) {
+        Some(TopSymbol::Locus(l)) => l.clone(),
+        Some(_) => {
+            diags.push(Diag::ty(
+                codec.locus.span,
+                format!(
+                    "codec binding for topic `{}`: `{}` is not a locus \
+                     — `codec(L {{ ... }})` must name a locus that \
+                     provides `encode` and `decode` methods",
+                    entry.topic.name, codec.locus.name
+                ),
+            ));
+            return;
+        }
+        None => {
+            diags.push(Diag::ty(
+                codec.locus.span,
+                format!(
+                    "codec binding for topic `{}`: unknown locus `{}`",
+                    entry.topic.name, codec.locus.name
+                ),
+            ));
+            return;
+        }
+    };
+    // (3) Verify encode + decode methods exist with the right
+    // signatures.
+    let encode = locus_info.methods.iter().find(|m| m.name == "encode");
+    let decode = locus_info.methods.iter().find(|m| m.name == "decode");
+    let bytes_ty = Ty::Prim(hale_syntax::ast::PrimType::Bytes);
+
+    match encode {
+        None => {
+            diags.push(Diag::ty(
+                codec.locus.span,
+                format!(
+                    "codec `{}` for topic `{}` is missing required method \
+                     `encode(v: {}) -> Bytes fallible(...)`",
+                    codec.locus.name,
+                    entry.topic.name,
+                    topic_payload.display(),
+                ),
+            ));
+        }
+        Some(m) => {
+            if m.params.len() != 1
+                || !m.params[0].assignable_from(&topic_payload)
+            {
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}` for topic `{}`: `encode` must take one \
+                         param of the topic's payload type `{}`; got params \
+                         `{:?}`",
+                        codec.locus.name,
+                        entry.topic.name,
+                        topic_payload.display(),
+                        m.params.iter().map(|t| t.display()).collect::<Vec<_>>(),
+                    ),
+                ));
+            }
+            if !m.ret.assignable_from(&bytes_ty) {
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}` for topic `{}`: `encode` must return \
+                         `Bytes`; got `{}`",
+                        codec.locus.name,
+                        entry.topic.name,
+                        m.ret.display(),
+                    ),
+                ));
+            }
+            if m.fallible.is_none() {
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}` for topic `{}`: `encode` must be \
+                         declared `fallible(E)` (encoding can fail; the \
+                         binding-site dispatch needs a typed error \
+                         channel)",
+                        codec.locus.name, entry.topic.name,
+                    ),
+                ));
+            }
+        }
+    }
+
+    match decode {
+        None => {
+            diags.push(Diag::ty(
+                codec.locus.span,
+                format!(
+                    "codec `{}` for topic `{}` is missing required method \
+                     `decode(b: Bytes) -> {} fallible(...)`",
+                    codec.locus.name,
+                    entry.topic.name,
+                    topic_payload.display(),
+                ),
+            ));
+        }
+        Some(m) => {
+            if m.params.len() != 1
+                || !m.params[0].assignable_from(&bytes_ty)
+            {
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}` for topic `{}`: `decode` must take one \
+                         param of type `Bytes`; got params `{:?}`",
+                        codec.locus.name,
+                        entry.topic.name,
+                        m.params.iter().map(|t| t.display()).collect::<Vec<_>>(),
+                    ),
+                ));
+            }
+            if !m.ret.assignable_from(&topic_payload) {
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}` for topic `{}`: `decode` must return \
+                         the topic's payload type `{}`; got `{}`",
+                        codec.locus.name,
+                        entry.topic.name,
+                        topic_payload.display(),
+                        m.ret.display(),
+                    ),
+                ));
+            }
+            if m.fallible.is_none() {
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}` for topic `{}`: `decode` must be \
+                         declared `fallible(E)` (decoding can fail; the \
+                         binding-site dispatch needs a typed error \
+                         channel)",
+                        codec.locus.name, entry.topic.name,
+                    ),
+                ));
+            }
+        }
+    }
+    // (4) Purity assertion. Codec methods may be invoked from
+    // arbitrary threads (bus reader thread, publisher pool,
+    // consumer pools) concurrently with no coordination in scope
+    // to serialize mutations to self. They MUST be pure.
+    for method_name in &["encode", "decode"] {
+        let key = crate::purity::PurityKey::method(
+            codec.locus.name.clone(),
+            (*method_name).to_string(),
+        );
+        match purity_map.get(&key) {
+            Some(crate::purity::Purity::Pure) => {}
+            Some(crate::purity::Purity::Impure(reason)) => {
+                let (line, hint) = render_impurity(reason);
+                diags.push(Diag::ty(
+                    codec.locus.span,
+                    format!(
+                        "codec `{}.{}` is not safe to dispatch from \
+                         arbitrary threads\n\n\
+                         note: codec methods must be stateless — they may \
+                         be invoked from the bus reader thread, the \
+                         publisher's pool, and consumer pools concurrently. \
+                         No coordination is in scope to serialize mutations \
+                         to `self`.\n\n\
+                         note: {}\n\n\
+                         help: {}",
+                        codec.locus.name, method_name, line, hint,
+                    ),
+                ));
+            }
+            None => {
+                // Method should have been in the map if the
+                // locus was indexed; absence means the locus
+                // doesn't actually have the named method (the
+                // signature-mismatch branch above will have
+                // already diagnosed). Quiet here to avoid
+                // duplicate diagnostics.
+            }
+        }
+    }
+}
+
+/// Render an [`Impurity`] as `(note_line, fix_hint)` strings for
+/// embedding in a codec binding-site diagnostic.
+fn render_impurity(
+    reason: &crate::purity::Impurity,
+) -> (String, &'static str) {
+    use crate::purity::Impurity::*;
+    match reason {
+        SelfFieldWrite { field_chain, .. } => (
+            format!("writes to `{}` (mutates the codec instance)", field_chain),
+            "codecs are pure transformations on input data. \
+             Move per-call counters out of the codec — push them \
+             through the bus as observability events, or measure at \
+             the adapter layer where state has lifecycle.",
+        ),
+        BusSend { subject_repr, .. } => (
+            format!(
+                "publishes to a bus topic ({}) — a side effect outside \
+                 the codec's input/output channel",
+                subject_repr
+            ),
+            "codecs translate between values and bytes; they don't \
+             route messages. If you need to fire downstream events, \
+             do it from the locus that owns the relationship, not \
+             from the codec.",
+        ),
+        Violate { closure_name, .. } => (
+            format!(
+                "violates closure `{}` — escalates a structural failure \
+                 through the parent",
+                closure_name
+            ),
+            "codecs report failures via their `fallible(E)` return \
+             channel, not via closure violations. Replace `violate` \
+             with `fail SomeError {{ ... }}` in the codec body.",
+        ),
+        ImpureStdlibCall { fn_name, .. } => (
+            format!(
+                "calls `{}`, which has side effects (printing, \
+                 file/process I/O, sleeping, or recovery)",
+                fn_name
+            ),
+            "codecs must be deterministic, side-effect-free \
+             transformations. Remove the offending call from the \
+             codec body.",
+        ),
+        ImpureCalleeCall { callee_name, .. } => (
+            format!(
+                "calls `{}`, which is itself not pure (transitively)",
+                callee_name
+            ),
+            "either make the called fn pure (no self-writes, no I/O, \
+             no impure callees), or inline the small pure pieces \
+             directly into the codec body.",
+        ),
+    }
+}
+
 fn check_binding_constraints(
     entry: &BindingEntry,
     top: &TopScope,
@@ -1379,6 +1654,15 @@ fn check_main_and_bindings(
     // reference topic-name, so map name → (publishes, subscribes).
     let (topic_publishes, topic_subscribes) = collect_topic_pub_sub(bundle);
 
+    // F.36 Slice 2 (2026-05-28): compute the bundle-wide purity
+    // map so binding-site codec checks can assert the codec's
+    // encode/decode methods are pure. Done once here; threaded
+    // into `check_binding_codec`. v0.1 always computes; future
+    // polish could gate on "any binding has codec" to skip the
+    // walk for the common case.
+    let programs_vec: Vec<&Program> = bundle.programs.values().copied().collect();
+    let purity_map = crate::purity::infer_purity_for_bundle(&programs_vec, top);
+
     for program in bundle.programs.values() {
         for item in &program.items {
             if let TopDecl::Locus(l) = item {
@@ -1515,6 +1799,16 @@ fn check_main_and_bindings(
                             check_binding_constraints(
                                 entry, top, diags,
                             );
+
+                            // F.36 Slice 2 (2026-05-28): pluggable
+                            // codec validity. When the binding
+                            // entry carries a `codec(L { ... })`
+                            // clause, verify L has the encode /
+                            // decode methods with the right
+                            // signatures (against the topic's
+                            // payload type) AND that both methods
+                            // are pure per Slice 1's inference.
+                            check_binding_codec(entry, top, &purity_map, diags);
 
                             // Form K6b (2026-05-20): shm_ring
                             // Hale-side subscribers are wired
