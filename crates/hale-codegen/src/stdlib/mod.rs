@@ -9,6 +9,7 @@
 //! This module exists to keep the codegen monolith navigable; see
 //! `notes/refactor-codegen-model-org.md`.
 
+pub(crate) mod crypto;
 pub(crate) mod decimal;
 pub(crate) mod env;
 pub(crate) mod math;
