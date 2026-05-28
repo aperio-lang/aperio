@@ -40,23 +40,50 @@ runtime install.
 - **`hale-codegen/`** — LLVM codegen via inkwell. Owns the C
   runtime + the bundled stdlib seed. `CodegenTy` is the
   codegen-side type rep (carries layout / repr info that `Ty`
-  doesn't). The crate is being moved to a model-organized
-  layout (see `notes/refactor-codegen-model-org.md`):
+  doesn't). The crate is **model-organized** along the lotus /
+  hypergraph language model (refactor delivery plan:
+  `notes/refactor-codegen-model-org.md`):
   - `src/codegen.rs` holds `Cx<'ctx, 'p>` (the shared-state
     struct), the top-level entry points (`build_executable` /
-    `build_program`), and the cross-cutting orchestration that
-    doesn't naturally fit a single subsystem.
-  - `src/stdlib/<ns>.rs` holds the `lower_std_<ns>_*` path-call
-    lowerings as `pub(crate) trait <Ns>Stdlib<'ctx>` extensions
-    on `Cx`. One file per `std::*` namespace
-    (`bytes`, `crypto`, `decimal`, `env`, `io_fs`, `io_file`,
-    `io_stdin`, `io_tcp`, `io_tls`, `io_udp`, `math`, `process`,
-    `rand`, `sockopt`, `str`, `text`, `time`, `bus`). The trait
-    is imported at the top of `codegen.rs` so call sites keep
-    the `self.lower_std_*(...)` shape.
-  - Future rounds will pull `locus/`, `bus/`, `form/`, `types/`,
-    `channels/`, `shared/` out of `codegen.rs` along the same
-    pattern.
+    `build_program`), `lower_program` Pass-A/B orchestration,
+    and the central `lower_stmt` / `lower_expr` /
+    `lower_stdlib_path_call*` dispatchers.
+  - `src/stdlib/<ns>.rs` — per-`std::*`-namespace path-call
+    lowerings (`bus`, `bytes`, `crypto`, `decimal`, `env`,
+    `io_fs`, `io_file`, `io_stdin`, `io_tcp`, `io_tls`, `io_udp`,
+    `math`, `process`, `rand`, `sockopt`, `str`, `text`, `time`).
+    Each is a `pub(crate) trait <Ns>Stdlib<'ctx>` extension on
+    `Cx`; the trait is imported at the top of `codegen.rs` so
+    call sites keep the `self.lower_std_*(...)` shape.
+  - `src/bus/{wire,dispatch,runtime}.rs` — bus codegen
+    (serialize/deserialize synthesis, publish + key-filter
+    lowering, register/drain/destroy runtime hooks).
+  - `src/locus/{decl,instantiation,method,dissolve,closure,return_path}.rs`
+    — locus codegen (Phase-A struct + method decls,
+    instantiation constructor, Phase-B method-body emit,
+    drain/dissolve cascade, closure-eval emission, m49/m90
+    return-path deep-copy).
+  - `src/form/mod.rs` — `@form(vec)` / `@form(hashmap)` /
+    `@form(ring_buffer)` synthesized-method dispatchers.
+  - `src/types/mod.rs` — type-expression lowering, user type +
+    enum + interface declarations, generic monomorphization,
+    F.30 view coercions.
+  - `src/channels/mod.rs` — `fallible(E)` value-error protocol
+    (or-disposition lowering, sret epilogues, IoError/ParseError
+    shapes) + structural-channel routing
+    (`resolve_failure_route`).
+  - `src/shared/builtins.rs` — libc + lotus extern declarations
+    (`declare_builtins`).
+  - `src/mangle.rs` — name mangling.
+
+  Trait extensions are the dominant pattern for namespace-style
+  call-site shapes; bare inherent `impl<'ctx, 'p> Cx<'ctx, 'p>`
+  blocks in subdirectory files work too (Rust merges them) and
+  are the pattern for cross-cutting helpers that don't benefit
+  from a namespace trait. Cx fields and helper struct fields are
+  mostly `pub(crate)` so cross-module code can read/write
+  directly — encapsulation isn't load-bearing for an internal
+  state container.
 - **`hale-cli/`** — the `hale` binary. Owns the
   parse-with-imports flow for cross-seed imports.
 - **`hale-ts-shim/`** — tree-sitter staticlib bridge backing
