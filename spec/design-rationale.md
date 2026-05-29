@@ -3086,11 +3086,18 @@ v1 commitment.
 
 ### F.33 Fallible user-supplied bus adapters (sketch)
 
-**Status: design sketch.** No grammar surface, no compiler
-behavior shipped. Captured here because the Phase-3 routing-
-keys `on_unmatched: fail` impl (2026-05-25) opened a path that
-this extension fits into cleanly; documenting now so a future
-session can pick it up without re-deriving the shape.
+**Status: design sketch (2026-05-28).** No grammar surface, no
+compiler behavior shipped. Captured here because the Phase-3
+routing-keys `on_unmatched: fail` impl (2026-05-25) opened a
+path that this extension fits into cleanly; documenting now so
+a future session can pick it up without re-deriving the shape.
+F.36 (codecs, shipped 2026-05-28) has since landed the
+companion precedent: codec `encode` / `decode` methods declared
+`fallible(E)` are now invoked by the bus runtime at publish /
+receive sites, with the substrate threading fallibility through
+the synthesized thunk ABI. F.33 reuses the same machinery on
+the adapter `send` path — the implementation surface shrinks
+accordingly once F.36's thunk-synthesis pattern is in tree.
 
 **The observation.** A user-supplied bus adapter (`bindings {
 Topic: MyAdapter { ... }; }` in main locus) today declares an
