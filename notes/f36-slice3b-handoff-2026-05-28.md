@@ -1,5 +1,19 @@
 # F.36 Slice 3b — handoff (2026-05-28)
 
+> **Update (2026-05-28 PM): Slice 3b landed.** Approach diverged
+> from the plan below — instead of synthesizing thunks that
+> bridge to the Slice 3a runtime ABI (`void*(*)(void*, void*)`),
+> the thunks match the existing m70 `lotus_serialize_fn` /
+> `lotus_deserialize_fn` shapes and are substituted at codegen
+> time at the publish-site and subscribe-register-site. The
+> runtime dispatch path is untouched. The Slice 3a register
+> call + remote-entry codec slots remain in place but are
+> vestigial. See `spec/design-rationale.md § F.36` for the
+> shipped surface and
+> `crates/hale-codegen/tests/codec_dispatch_roundtrip.rs` for
+> the XOR round-trip acceptance test. The brief below preserves
+> the pre-implementation plan for historical reference.
+
 Companion brief to `spec/design-rationale.md § F.36`. Captures the
 state at end-of-session 2026-05-28 with concrete pointers for
 picking up Slice 3b in a fresh session.

@@ -3433,16 +3433,30 @@ occupancy visibility — mirrors the `dump_arena_residency`
 shape.
 
 
-### F.36 Pluggable codecs on bus bindings (sketch)
+### F.36 Pluggable codecs on bus bindings
 
-**Status: design sketch (2026-05-28).** No grammar surface, no
-compiler behavior shipped. Captured here so the design is on
-paper for a future implementation pass. The core machinery
-proposed — compiler-inferred method purity — is also load-
-bearing for several future-considered features (memoization,
-parallel evaluation of pure helpers, sort comparator
-verification), so F.36 is the headline use case but not the
-only beneficiary.
+**Status: shipped (2026-05-28).** Grammar + typecheck + codegen
+all live. Bindings carry an optional `codec(L { ... })` clause;
+the binding-site assertion enforces both signature shape
+(`encode(v: T) -> Bytes fallible(E)` /
+`decode(b: Bytes) -> T fallible(E)` where T is the topic
+payload) and method purity. At publish + receive time, codegen
+substitutes per-binding `__codec_encode_thunk_<Topic>` /
+`__codec_decode_thunk_<Topic>` fn ptrs (matching the m70
+`lotus_serialize_fn` / `lotus_deserialize_fn` ABIs) for the
+default m70 serializer ptrs at the call site — no runtime
+dispatch changes; the publisher's `<-` path, local fanout via
+`lotus_bus_dispatch_wire`, and remote fanout all just see a
+different fn ptr. See `spec/grammar.ebnf § binding_entry`,
+`crates/hale-codegen/tests/bindings_codec_clause.rs`,
+`crates/hale-codegen/tests/codec_instantiation.rs`, and
+`crates/hale-codegen/tests/codec_dispatch_roundtrip.rs` for the
+acceptance surface. The companion machinery — compiler-
+inferred method purity (`hale-types::purity`) — is the load-
+bearing piece and is also reusable for several future features
+(memoization, parallel evaluation of pure helpers, sort
+comparator verification); F.36 is the headline use case but
+not the only beneficiary.
 
 **The problem.** The v1 bus adapter contract
 (`interface __StdBusAdapter { fn send(subject: String, bytes:

@@ -226,6 +226,46 @@ live in the adapter body where they belong. NATS-at-most-once
 and MQTT-QoS-2 and a custom broker with transactional ack all
 satisfy the same `__StdBusAdapter` contract.
 
+### Pluggable codecs (cross-language wire formats)
+
+By default the bus routes payloads through Hale's internal m70
+wire format — fine for Hale ↔ Hale, but opaque to any subscriber
+written in a different language. When you need JSON over a unix
+socket, protobuf to a Python consumer, or a custom binary
+framing for an embedded peer, a binding declares a `codec(L)`
+clause naming a locus that owns the encode/decode logic:
+
+```hale
+locus TickJsonCodec {
+    fn encode(v: Tick) -> Bytes fallible(EncodeError) { ... }
+    fn decode(b: Bytes) -> Tick fallible(DecodeError) { ... }
+}
+
+main locus App {
+    bindings {
+        Tick: unix("/tmp/ticks.sock") codec(TickJsonCodec { });
+    }
+}
+```
+
+The codec locus is structurally typed against the topic's
+payload type — `encode` takes `T`, `decode` returns `T`, both
+fallible — and its methods must be **pure**: no `self.` writes,
+no `println` / `time::sleep` / file I/O / bus publishes /
+closure violations. The typechecker walks the method bodies and
+rejects impurity at the binding site with a surgical pointer
+to the offending statement. The reason: codec methods run from
+arbitrary threads (publisher's thread on encode, the reader
+thread / subscriber's pool on decode), so hidden state would
+cross thread boundaries without coordination.
+
+Codecs and adapters compose: a NATS adapter delivers raw bytes,
+the codec on the binding decides what those bytes look like.
+Different bindings on the same topic can carry different codecs
+(JSON over the public socket, protobuf over the analytics
+worker's binding) — the publisher's `<-` site doesn't know or
+care.
+
 ### Shared-memory zero-copy delivery (`shm_ring`)
 
 For high-frequency same-machine routes where the memcpy cost

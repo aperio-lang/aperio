@@ -383,6 +383,7 @@ pub fn build_executable_with_options(
         current_user_fn_fallible: None,
         accumulator_ctx: None,
         serializers: BTreeMap::new(),
+        codec_thunks: BTreeMap::new(),
         generic_fn_templates: BTreeMap::new(),
         generic_locus_templates: BTreeMap::new(),
         defer_next_locus_dissolve: false,
@@ -1271,6 +1272,19 @@ pub(crate) struct Cx<'ctx, 'p> {
     /// deserializer's job is to reconstruct that struct from
     /// whatever bytes the wire delivered.
     pub(crate) serializers: BTreeMap<String, SerializerPair<'ctx>>,
+    /// F.36 Slice 3b: per-subject codec thunk pair. Populated by
+    /// `emit_codec_binding_register` when a binding entry carries
+    /// `codec(L { ... })`. Each thunk matches the m70 serializer
+    /// ABI (`lotus_serialize_fn` / `lotus_deserialize_fn`), so the
+    /// publish path (`lower_send`) and the subscribe-registration
+    /// path (`emit_bus_register`) substitute these thunks for the
+    /// default `__serialize_T` / `__deserialize_T` ptrs without
+    /// touching the runtime dispatch machinery. Internally, each
+    /// thunk loads the codec self_ptr from a per-subject global
+    /// and calls the user's encode/decode method via Hale's
+    /// fallible ABI (i1 path + sret slots), then translates the
+    /// success value into the m70 buffer-fill shape.
+    pub(crate) codec_thunks: BTreeMap<String, CodecThunks<'ctx>>,
     /// m62: generic free fn templates indexed by name.
     /// Populated in lower_program from FnDecls whose
     /// `generics: Vec<GenericParam>` is non-empty. Call sites
@@ -1483,6 +1497,33 @@ pub(crate) struct SerializerPair<'ctx> {
     /// error. Identity body at v0.1 memcpys `sizeof(T)` bytes
     /// (which equals `n` because the wire format is identity).
     pub(crate) deserialize: FunctionValue<'ctx>,
+}
+
+/// F.36 Slice 3b: per-subject codec thunk pair. Each thunk has
+/// the same LLVM signature as the m70 `SerializerPair` it
+/// substitutes for, so the publish path and subscribe-register
+/// path drop them in without any conditional dispatch logic at
+/// the call site.
+///
+/// `encode`: `i64 @__codec_encode_thunk_<Subject>(ptr src, ptr dst, i64 cap)`
+///   — invokes the user codec's `encode(v: T) -> Bytes fallible(E)`
+///   via Hale's fallible ABI; on ok, memcpys the Bytes body into
+///   `dst` and returns the body length; on fail (or buffer
+///   overflow) returns -1.
+///
+/// `decode`: `i64 @__codec_decode_thunk_<Subject>(ptr src, i64 n, ptr dst, i64 cap)`
+///   — constructs a Hale Bytes header in the thunk frame wrapping
+///   the wire bytes, invokes the user codec's `decode(b: Bytes) ->
+///   T fallible(E)`, and on ok memcpys the struct into `dst`
+///   returning `sizeof(T)`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CodecThunks<'ctx> {
+    pub(crate) encode: FunctionValue<'ctx>,
+    pub(crate) decode: FunctionValue<'ctx>,
+    /// Per-subject global `ptr` slot that the thunks `load` to
+    /// recover the codec instance. Populated by
+    /// `emit_codec_binding_register` at main prelude.
+    pub(crate) codec_self_global: PointerValue<'ctx>,
 }
 
 /// m46: substitution context for `sum(...)` lowering inside a
@@ -3935,6 +3976,14 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             }
         }
 
+        // F.36 Slice 3b: synthesize codec thunks + populate
+        // `codec_thunks` BEFORE Pass C, so `lower_send` (called
+        // from within locus body lowering) can substitute thunks
+        // for the m70 serializer at publish sites. The main-
+        // prelude register call + codec_self global store still
+        // run later via `emit_bindings_prelude`.
+        self.synthesize_codec_thunks_for_main_bindings()?;
+
         // Pass C: lower lifecycle method bodies (birth, run, ...).
         for l in &locus_decls {
             self.lower_locus_method_bodies(l)?;
@@ -4886,21 +4935,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         Ok(())
     }
 
-    /// F.36 Slice 3a: instantiate a codec locus into program-
-    /// lifetime memory (m90 routing through payload arena) +
-    /// resolve its `encode` / `decode` method ptrs + emit a
-    /// `lotus_bus_register_codec(subject, self, encode, decode)`
-    /// call. Mirrors `emit_adapter_binding_register` but for a
-    /// stateless locus (no pinned placement — codec methods are
-    /// pure, dispatched from arbitrary threads).
+    /// F.36 Slice 3a + 3b: instantiate a codec locus into program-
+    /// lifetime memory (m90 routing through payload arena) and
+    /// resolve its `encode` / `decode` method ptrs.
     ///
-    /// Slice 3a: the registration completes, the codec instance
-    /// outlives main, and its method ptrs are stored on the
-    /// remote entry. The publish-side `Topic <- value` and the
-    /// receive-side reader thread don't yet consult these ptrs;
-    /// that's Slice 3b — which also lands the synthesized thunks
-    /// that bridge the user-method ABI (Hale calling convention)
-    /// to the runtime's `void* (*)(void*, void*)` shape.
+    /// Slice 3a registered the bare method ptrs on the
+    /// `lotus_bus_remote_entry_t` via `lotus_bus_register_codec`
+    /// (kept here for completeness — those slots are vestigial
+    /// today because Slice 3b takes a compile-time approach
+    /// instead).
+    ///
+    /// Slice 3b synthesizes per-subject `__codec_encode_thunk_*`
+    /// and `__codec_decode_thunk_*` LLVM fns matching m70's
+    /// `lotus_serialize_fn` / `lotus_deserialize_fn` ABIs. The
+    /// thunks load the codec self_ptr from a per-subject global
+    /// (populated here at main prelude) and invoke the user's
+    /// fallible encode/decode method, translating the result into
+    /// the m70 fill-buffer shape. `lower_send` and
+    /// `emit_bus_register` consult `codec_thunks` to substitute
+    /// the thunk ptrs for the default m70 ptrs at codegen time,
+    /// so the runtime dispatch machinery is untouched.
     fn emit_codec_binding_register(
         &mut self,
         subject: &str,
@@ -4991,7 +5045,411 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                 &format!("lotus.codec.register.{}", topic_name),
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // Slice 3b: populate the per-subject codec_self global so
+        // the thunks (synthesized pre-Pass-C in
+        // `synthesize_codec_thunks_for_main_bindings`) can load
+        // the instance from it.
+        let thunks = self
+            .codec_thunks
+            .get(subject)
+            .copied()
+            .ok_or_else(|| CodegenError::Unsupported(format!(
+                "codec binding for `{}`: thunks not synthesized (pre-Pass-C \
+                 pass missed this binding)",
+                topic_name
+            )))?;
+        self.builder
+            .build_store(
+                thunks.codec_self_global,
+                self_val.into_pointer_value(),
+            )
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         Ok(())
+    }
+
+    /// F.36 Slice 3b: pre-Pass-C synthesis sweep. Walks every
+    /// `codec(L { ... })` binding on the main locus, allocates a
+    /// per-subject `codec_self` global, and synthesizes the
+    /// encode/decode thunks against it. Populates `codec_thunks`
+    /// so `lower_send` (in Pass C) and `emit_bus_register` (in
+    /// the locus instantiation path during main prelude) can both
+    /// substitute thunks for the m70 ptrs by subject lookup.
+    ///
+    /// No main-prelude IR is emitted here — that lands later via
+    /// `emit_codec_binding_register`, which finds the codec_self
+    /// global through `codec_thunks` and stores the constructed
+    /// instance into it.
+    pub(crate) fn synthesize_codec_thunks_for_main_bindings(
+        &mut self,
+    ) -> Result<(), CodegenError> {
+        let main_locus = self.program.items.iter().find_map(|item| match item {
+            TopDecl::Locus(l) if l.is_main => Some(l.clone()),
+            _ => None,
+        });
+        let Some(l) = main_locus else { return Ok(()) };
+
+        let mut wire_subjects: BTreeMap<String, String> = BTreeMap::new();
+        Self::collect_topic_wire_subjects(
+            &self.program.items, &mut wire_subjects,
+        );
+
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let saved_block = self.builder.get_insert_block();
+
+        // Collect (topic_name, subject, locus_ident, payload_type)
+        // up front so we don't iterate `l.members` while borrowing
+        // `self` for the synthesis call.
+        let mut to_synth: Vec<(String, String, Ident, String)> = Vec::new();
+        for m in &l.members {
+            if let LocusMember::Bindings(bb) = m {
+                for entry in &bb.entries {
+                    let Some(codec) = &entry.codec else { continue };
+                    let topic_name = entry.topic.name.clone();
+                    let subject = wire_subjects
+                        .get(&topic_name)
+                        .cloned()
+                        .unwrap_or_else(|| topic_name.clone());
+                    let payload_type = self
+                        .lookup_topic_payload_type_name(&topic_name)?;
+                    to_synth.push((
+                        topic_name,
+                        subject,
+                        codec.locus.clone(),
+                        payload_type,
+                    ));
+                }
+            }
+        }
+
+        for (topic_name, subject, locus_ident, payload_type) in to_synth {
+            // Resolve method ptrs against the codec locus's
+            // declared user_methods (filled in pass A2).
+            let info = self.user_loci.get(&locus_ident.name).cloned()
+                .ok_or_else(|| CodegenError::Unsupported(format!(
+                    "codec binding for `{}`: codec locus `{}` not declared",
+                    topic_name, locus_ident.name
+                )))?;
+            let encode_fn = info.user_methods.get("encode").copied()
+                .ok_or_else(|| CodegenError::Unsupported(format!(
+                    "codec binding for `{}`: locus `{}` has no `encode` method",
+                    topic_name, locus_ident.name
+                )))?;
+            let decode_fn = info.user_methods.get("decode").copied()
+                .ok_or_else(|| CodegenError::Unsupported(format!(
+                    "codec binding for `{}`: locus `{}` has no `decode` method",
+                    topic_name, locus_ident.name
+                )))?;
+
+            let codec_self_global = self.module.add_global(
+                ptr_t,
+                None,
+                &format!("lotus.codec.self.{}", topic_name),
+            );
+            codec_self_global.set_initializer(&ptr_t.const_null());
+            codec_self_global.set_linkage(inkwell::module::Linkage::Private);
+
+            let thunks = self.synthesize_codec_thunks(
+                &locus_ident.name,
+                &topic_name,
+                &subject,
+                &payload_type,
+                codec_self_global.as_pointer_value(),
+                encode_fn,
+                decode_fn,
+            )?;
+            self.codec_thunks.insert(subject, thunks);
+        }
+
+        if let Some(bb) = saved_block {
+            self.builder.position_at_end(bb);
+        }
+        Ok(())
+    }
+
+    /// F.36 Slice 3b helper: find a topic's payload type name by
+    /// walking the program's TopDecl::Topic entries. Returns the
+    /// single-segment type name (e.g., "Tick") or an error if the
+    /// topic isn't declared / has a non-trivial payload type.
+    fn lookup_topic_payload_type_name(
+        &self,
+        topic_name: &str,
+    ) -> Result<String, CodegenError> {
+        let topic_decl = self.program.items.iter().find_map(|item| match item {
+            TopDecl::Topic(t) if t.name.name == topic_name => Some(t),
+            _ => None,
+        }).ok_or_else(|| CodegenError::Unsupported(format!(
+            "codec binding for `{}`: topic decl not found",
+            topic_name
+        )))?;
+        match &topic_decl.payload {
+            TypeExpr::Named { path, generic_args, .. }
+                if path.segments.len() == 1 && generic_args.is_empty() =>
+            {
+                Ok(path.segments[0].name.clone())
+            }
+            other => Err(CodegenError::Unsupported(format!(
+                "codec binding for `{}`: only single-segment struct \
+                 payload types supported; got {:?}",
+                topic_name, other
+            ))),
+        }
+    }
+
+    /// F.36 Slice 3b: emit the `__codec_encode_thunk_<Subject>`
+    /// and `__codec_decode_thunk_<Subject>` LLVM fns.
+    ///
+    /// Saves/restores the builder block (caller is mid-main-
+    /// prelude). Each thunk:
+    ///
+    /// 1. Loads codec_self from `codec_self_global`.
+    /// 2. Allocates the Hale fallible sret slots (out_val + out_err
+    ///    as `ptr`-typed slots, since the success/err types of
+    ///    encode/decode lower to `ptr` — Bytes/TypeRef).
+    /// 3. Invokes the user method via `build_call` directly (NOT
+    ///    via `lower_locus_method_fallible_call`, to avoid the
+    ///    `emit_set_caller_arena` call — TLS-inherited caller arena
+    ///    is what we want for per-subscriber arena routing).
+    /// 4. Branches on the i1 path:
+    ///    - encode ok: memcpy Bytes body into `dst`, return len
+    ///    - decode ok: memcpy T struct into `dst`, return sizeof(T)
+    ///    - fail (either): return -1
+    fn synthesize_codec_thunks(
+        &mut self,
+        locus_name: &str,
+        topic_name: &str,
+        subject: &str,
+        payload_type_name: &str,
+        codec_self_global: PointerValue<'ctx>,
+        encode_fn: FunctionValue<'ctx>,
+        decode_fn: FunctionValue<'ctx>,
+    ) -> Result<CodecThunks<'ctx>, CodegenError> {
+        let saved_block = self.builder.get_insert_block();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let neg_one = i64_t.const_int(u64::MAX, true);  // -1 as i64
+
+        let payload_info = self
+            .user_types
+            .get(payload_type_name)
+            .cloned()
+            .ok_or_else(|| CodegenError::Unsupported(format!(
+                "codec binding for `{}`: payload type `{}` not \
+                 registered",
+                topic_name, payload_type_name
+            )))?;
+        let payload_size = payload_info
+            .struct_ty
+            .size_of()
+            .expect("flat payload struct sized");
+
+        // ===== ENCODE THUNK =====
+        // i64 @__codec_encode_thunk_<Topic>(ptr src, ptr dst, i64 cap)
+        let enc_name = format!("__codec_encode_thunk_{}", topic_name);
+        let enc_ty = i64_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        let enc_thunk = self.module.add_function(&enc_name, enc_ty, None);
+        let enc_entry = self.context.append_basic_block(enc_thunk, "entry");
+        let enc_ok = self.context.append_basic_block(enc_thunk, "ok");
+        let enc_copy = self.context.append_basic_block(enc_thunk, "copy");
+        let enc_overflow = self.context.append_basic_block(enc_thunk, "overflow");
+        let enc_fail = self.context.append_basic_block(enc_thunk, "fail");
+        self.builder.position_at_end(enc_entry);
+
+        let enc_src = enc_thunk.get_nth_param(0).unwrap().into_pointer_value();
+        let enc_dst = enc_thunk.get_nth_param(1).unwrap().into_pointer_value();
+        let enc_cap = enc_thunk.get_nth_param(2).unwrap().into_int_value();
+
+        let enc_codec_self = self.builder.build_load(
+            ptr_t, codec_self_global, "codec.self.load"
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?.into_pointer_value();
+
+        // sret slots: encode success type is Bytes → ptr; err is
+        // a user struct → ptr. Both slots are `ptr`-typed allocas.
+        let enc_out_val = self.builder.build_alloca(ptr_t, "encode.out_val.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let enc_out_err = self.builder.build_alloca(ptr_t, "encode.out_err.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let enc_call = self.builder.build_call(
+            encode_fn,
+            &[
+                enc_codec_self.into(),
+                enc_src.into(),
+                enc_out_val.into(),
+                enc_out_err.into(),
+            ],
+            "encode.call",
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let enc_i1 = enc_call.try_as_basic_value().left()
+            .expect("encode returns i1")
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(enc_i1, enc_fail, enc_ok)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // OK: load Bytes ptr, read len prefix, bounds-check vs cap,
+        // memcpy body into dst, return len.
+        self.builder.position_at_end(enc_ok);
+        let bytes_ptr = self.builder.build_load(ptr_t, enc_out_val, "encode.bytes_ptr")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let bytes_len = self.builder.build_load(i64_t, bytes_ptr, "encode.bytes.len")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_int_value();
+        let too_big = self.builder
+            .build_int_compare(inkwell::IntPredicate::SGT, bytes_len, enc_cap, "encode.toobig")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(too_big, enc_overflow, enc_copy)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(enc_copy);
+        // body_ptr = bytes_ptr + sizeof(i64). GEP over i64-typed
+        // pointer with index 1 advances by 8 bytes.
+        let body_ptr = unsafe {
+            self.builder.build_in_bounds_gep(
+                i64_t,
+                bytes_ptr,
+                &[i64_t.const_int(1, false)],
+                "encode.body_ptr",
+            ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.emit_memcpy_call(enc_dst, body_ptr, bytes_len, "encode.memcpy")?;
+        self.builder.build_return(Some(&bytes_len))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(enc_overflow);
+        self.builder.build_return(Some(&neg_one))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(enc_fail);
+        self.builder.build_return(Some(&neg_one))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // ===== DECODE THUNK =====
+        // i64 @__codec_decode_thunk_<Topic>(ptr src, i64 n, ptr dst, i64 cap)
+        let dec_name = format!("__codec_decode_thunk_{}", topic_name);
+        let dec_ty = i64_t.fn_type(
+            &[ptr_t.into(), i64_t.into(), ptr_t.into(), i64_t.into()],
+            false,
+        );
+        let dec_thunk = self.module.add_function(&dec_name, dec_ty, None);
+        let dec_entry = self.context.append_basic_block(dec_thunk, "entry");
+        let dec_ok = self.context.append_basic_block(dec_thunk, "ok");
+        let dec_overflow = self.context.append_basic_block(dec_thunk, "overflow");
+        let dec_copy = self.context.append_basic_block(dec_thunk, "copy");
+        let dec_fail = self.context.append_basic_block(dec_thunk, "fail");
+        self.builder.position_at_end(dec_entry);
+
+        let dec_src = dec_thunk.get_nth_param(0).unwrap().into_pointer_value();
+        let dec_n = dec_thunk.get_nth_param(1).unwrap().into_int_value();
+        let dec_dst = dec_thunk.get_nth_param(2).unwrap().into_pointer_value();
+        let dec_cap = dec_thunk.get_nth_param(3).unwrap().into_int_value();
+
+        let dec_codec_self = self.builder.build_load(
+            ptr_t, codec_self_global, "codec.self.load"
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?.into_pointer_value();
+
+        // Construct a Hale Bytes header wrapping the wire bytes.
+        // Layout: `[int64_t len][len bytes payload]`. We need a
+        // contiguous allocation of `8 + n` bytes that we can pass
+        // as a Bytes* to the user's decode method. Use the
+        // caller_arena (TLS-inherited from the dispatch path) so
+        // the body lives at least as long as the decode call.
+        let alloc_size = self.builder.build_int_add(
+            dec_n, i64_t.const_int(8, false), "decode.bytes.alloc_size"
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let arena_alloc_fn = self.module
+            .get_function("lotus_caller_arena_or_global")
+            .expect("lotus_caller_arena_or_global declared");
+        let arena_v = self.builder.build_call(
+            arena_alloc_fn, &[], "decode.caller_arena"
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value().left().unwrap().into_pointer_value();
+        let arena_alloc_raw_fn = self.module
+            .get_function("lotus_arena_alloc")
+            .expect("lotus_arena_alloc declared");
+        let bytes_align = i64_t.const_int(8, false);
+        let bytes_hdr_ptr = self.builder.build_call(
+            arena_alloc_raw_fn,
+            &[arena_v.into(), alloc_size.into(), bytes_align.into()],
+            "decode.bytes.hdr",
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .try_as_basic_value().left().unwrap().into_pointer_value();
+        // Store len prefix.
+        self.builder.build_store(bytes_hdr_ptr, dec_n)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        // memcpy wire bytes after the prefix.
+        let bytes_body_ptr = unsafe {
+            self.builder.build_in_bounds_gep(
+                i64_t, bytes_hdr_ptr, &[i64_t.const_int(1, false)],
+                "decode.bytes.body",
+            ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+        };
+        self.emit_memcpy_call(bytes_body_ptr, dec_src, dec_n, "decode.wire.memcpy")?;
+
+        // sret slots: decode success type is T (TypeRef) → ptr;
+        // err is a user struct → ptr.
+        let dec_out_val = self.builder.build_alloca(ptr_t, "decode.out_val.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let dec_out_err = self.builder.build_alloca(ptr_t, "decode.out_err.slot")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let dec_call = self.builder.build_call(
+            decode_fn,
+            &[
+                dec_codec_self.into(),
+                bytes_hdr_ptr.into(),
+                dec_out_val.into(),
+                dec_out_err.into(),
+            ],
+            "decode.call",
+        ).map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let dec_i1 = dec_call.try_as_basic_value().left()
+            .expect("decode returns i1")
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(dec_i1, dec_fail, dec_ok)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        // OK: load T ptr, bounds-check sizeof(T) vs cap, memcpy
+        // struct into dst, return sizeof(T).
+        self.builder.position_at_end(dec_ok);
+        let t_ptr = self.builder.build_load(ptr_t, dec_out_val, "decode.t_ptr")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
+        let too_big_d = self.builder
+            .build_int_compare(inkwell::IntPredicate::SGT, payload_size, dec_cap, "decode.toobig")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        self.builder
+            .build_conditional_branch(too_big_d, dec_overflow, dec_copy)
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(dec_copy);
+        self.emit_memcpy_call(dec_dst, t_ptr, payload_size, "decode.struct.memcpy")?;
+        self.builder.build_return(Some(&payload_size))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(dec_overflow);
+        self.builder.build_return(Some(&neg_one))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        self.builder.position_at_end(dec_fail);
+        self.builder.build_return(Some(&neg_one))
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+
+        let _ = (locus_name, subject);  // currently unused (names embedded in topic_name)
+        if let Some(bb) = saved_block {
+            self.builder.position_at_end(bb);
+        }
+        Ok(CodecThunks {
+            encode: enc_thunk,
+            decode: dec_thunk,
+            codec_self_global,
+        })
     }
 
     /// Walk every `topic Foo : Parent { subject: "..."; }` decl

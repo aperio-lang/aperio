@@ -221,19 +221,28 @@ impl<'ctx, 'p> BusRuntime<'ctx> for Cx<'ctx, 'p> {
         let subj_str = self.global_string(subject);
         let handler_ptr = handler_fn.as_global_value().as_pointer_value();
         let mailbox_val = mailbox_or_null.unwrap_or_else(|| ptr_t.const_null());
-        let deserialize_ptr = self
-            .serializers
-            .get(payload_type)
-            .ok_or_else(|| {
-                CodegenError::Unsupported(format!(
-                    "no serializer synthesized for bus payload type `{}` — \
-                     m60 should have created one in pass A3",
-                    payload_type
-                ))
-            })?
-            .deserialize
-            .as_global_value()
-            .as_pointer_value();
+        // F.36 Slice 3b: subscribe-side codec substitution. When
+        // main has a `codec(L { ... })` clause for this subject,
+        // the synthesized decode thunk replaces the default m70
+        // deserializer. Both ptrs match `lotus_deserialize_fn`'s
+        // ABI, so the runtime dispatch path (reader threads +
+        // `lotus_bus_dispatch_wire`) is untouched.
+        let deserialize_ptr = match self.codec_thunks.get(subject) {
+            Some(thunks) => thunks.decode.as_global_value().as_pointer_value(),
+            None => self
+                .serializers
+                .get(payload_type)
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "no serializer synthesized for bus payload type `{}` — \
+                         m60 should have created one in pass A3",
+                        payload_type
+                    ))
+                })?
+                .deserialize
+                .as_global_value()
+                .as_pointer_value(),
+        };
         // Compute the optional coop_pool ptr (F.31 Phase 4) and
         // the Phase 3 key-filter triple (kind, lo, hi) up front,
         // then funnel through lotus_bus_register_keyed which

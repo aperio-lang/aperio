@@ -286,17 +286,36 @@ impl<'ctx, 'p> BusDispatch<'ctx> for Cx<'ctx, 'p> {
         // __serialize_T inline; m70 moves serialization into the
         // C runtime so the wire bytes are only computed when
         // they're about to be sent.
-        let ser_fn = self
-            .serializers
-            .get(&payload_type_name)
-            .ok_or_else(|| {
-                CodegenError::Unsupported(format!(
-                    "no serializer for bus payload `{}` — pass A3 should \
-                     have synthesized one",
-                    payload_type_name
-                ))
-            })?
-            .serialize;
+        // F.36 Slice 3b: when the subject is a compile-time-constant
+        // string AND main has a `codec(L { ... })` clause for that
+        // subject, route the wire-encode through the synthesized
+        // encode thunk (which matches `lotus_serialize_fn`'s ABI).
+        // The thunk invokes the user's `encode(v: T) -> Bytes
+        // fallible(E)` method and translates the result into the
+        // m70 fill-buffer shape, so the runtime dispatch machinery
+        // is untouched.
+        let codec_encode_override: Option<inkwell::values::FunctionValue<'ctx>> =
+            match subject {
+                Expr::Literal(Literal::String(s), _) => self
+                    .codec_thunks
+                    .get(s)
+                    .map(|t| t.encode),
+                _ => None,
+            };
+        let ser_fn = match codec_encode_override {
+            Some(thunk) => thunk,
+            None => self
+                .serializers
+                .get(&payload_type_name)
+                .ok_or_else(|| {
+                    CodegenError::Unsupported(format!(
+                        "no serializer for bus payload `{}` — pass A3 should \
+                         have synthesized one",
+                        payload_type_name
+                    ))
+                })?
+                .serialize,
+        };
 
         let queue_global = self
             .module
