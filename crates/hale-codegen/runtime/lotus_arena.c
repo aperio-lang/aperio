@@ -1316,6 +1316,44 @@ static inline int lotus_runtime_multithreaded(void) {
     return __atomic_load_n(&g_runtime_multithreaded, __ATOMIC_ACQUIRE);
 }
 
+/* Growable accept'd-children tracker (2026-05-29). Replaces the
+ * old fixed `__children[16]` inline struct array, whose
+ * unchecked accept-time append silently corrupted adjacent
+ * struct fields once a parent accepted more than 16 children
+ * (the daemon-server case — thousands of connections). The
+ * parent struct now holds a heap `void**` buffer pointer plus
+ * i64 count/cap fields; this helper grows the buffer on demand.
+ *
+ * Thread-safety: a single locus's methods are atomic under the
+ * cooperative single-threaded-method invariant, so all accepts
+ * to one parent are serialized on that parent's pool — no lock
+ * needed here. (If accept ever becomes reachable from multiple
+ * threads against the same parent, this realloc would need the
+ * same guard `lotus_arena_create_subregion` uses below.)
+ *
+ * OOM posture matches the arena: a failed realloc drops the
+ * child silently rather than aborting — best-effort, the count
+ * simply doesn't advance. */
+void lotus_children_push(void ***buf, int64_t *count, int64_t *cap,
+                         void *child) {
+    if (*count >= *cap) {
+        int64_t newcap = (*cap < 8) ? 8 : (*cap * 2);
+        void **nb = (void **)realloc(*buf, (size_t)newcap * sizeof(void *));
+        if (!nb) return;
+        *buf = nb;
+        *cap = newcap;
+    }
+    (*buf)[*count] = child;
+    *count += 1;
+}
+
+/* Free the children tracker buffer at parent dissolve. NULL-safe
+ * (free(NULL) is a no-op), so parents that declared accept but
+ * never accepted a child cost nothing. */
+void lotus_children_free(void **buf) {
+    free(buf);
+}
+
 /* Carve a sub-region of `parent`. The sub-region holds its own
  * chunk list (independent allocation lifetime is *bounded* by
  * the parent's, but the chunks themselves are separate from the

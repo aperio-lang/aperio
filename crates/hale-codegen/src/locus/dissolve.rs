@@ -902,6 +902,39 @@ impl<'ctx, 'p> LocusDissolve<'ctx> for Cx<'ctx, 'p> {
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
+        // 2026-05-29: free the growable accept'd-children tracker
+        // buffer (heap-allocated by lotus_children_push, separate
+        // from the arena). NULL-safe in the runtime, so a parent
+        // that declared accept + iterates children but never
+        // accepted one pays nothing. Only present on loci that
+        // iterate `self.children` (children_field_idx is None
+        // otherwise, including on the accept'd children themselves).
+        if let Some(arr_idx) = info.children_field_idx {
+            let arr_field_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    arr_idx,
+                    &format!("{}.children.free.ptr", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let buf = self
+                .builder
+                .build_load(ptr_t, arr_field_ptr, "children.buf")
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let free_fn = self
+                .module
+                .get_function("lotus_children_free")
+                .expect("lotus_children_free declared");
+            self.builder
+                .build_call(
+                    free_fn,
+                    &[buf.into()],
+                    &format!("{}.children.free.call", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        }
         // F.22: tear down capacity slots in reverse declaration
         // order, before slot 0 / arena destroy. Each slot loads
         // its allocator pointer from `__slot_<name>` and calls

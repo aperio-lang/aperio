@@ -20,7 +20,6 @@ use crate::codegen::{
     locus_reads_self_children, param_value, AccumulatorKind,
     AccumulatorSlot, CapacitySlotLayout, CodegenError, CodegenTy,
     Cx, DefaultInit, LocusInfo, ParamValue, SlotForm, SyncMode,
-    CHILDREN_CAP,
 };
 
 pub(crate) trait LocusDeclare<'ctx> {
@@ -319,30 +318,38 @@ impl<'ctx, 'p> LocusDeclare<'ctx> for Cx<'ctx, 'p> {
         // self_ptr.
         //
         // When `accept` is declared but no body reads
-        // `self.children`, we elide the array entirely. The
+        // `self.children`, we elide the storage entirely. The
         // append at accept-time then becomes a no-op (the
-        // `children_field_idx` Option below gates it), and
-        // accept-loops scale without the fixed-cap CHILDREN_CAP
-        // cliff (writing past it silently corrupts adjacent
-        // struct memory — bench surfaces this at k≈25 with the
-        // 16-slot cap). For loci that DO iterate, the array is
-        // kept; closing the residual 16-child cap is a separate
-        // milestone (growable children buffer) gated on a
-        // workload that needs it.
+        // `children_field_idx` Option below gates it).
+        //
+        // For loci that DO iterate, the storage is a growable
+        // heap buffer (2026-05-29): a `__children` pointer to a
+        // `void**` buffer plus `__child_count` / `__child_cap`
+        // i64 fields. `lotus_children_push` grows it on demand.
+        // This replaced a fixed `[16]` inline array whose
+        // unchecked accept-time append silently corrupted
+        // adjacent struct memory once a parent accepted more than
+        // 16 children (the bench surfaced it at k≈25) — fatal for
+        // the daemon-server pattern that accepts one child per
+        // connection.
         let uses_children = has_accept && locus_reads_self_children(l);
-        let (children_field_idx, child_count_field_idx) = if uses_children {
-            let i64_t = self.context.i64_type();
-            let arr_ty = ptr_t.array_type(CHILDREN_CAP);
-            let arr_idx = idx;
-            llvm_field_tys.push(arr_ty.into());
-            idx += 1;
-            let cnt_idx = idx;
-            llvm_field_tys.push(i64_t.into());
-            idx += 1;
-            (Some(arr_idx), Some(cnt_idx))
-        } else {
-            (None, None)
-        };
+        let (children_field_idx, child_count_field_idx, child_cap_field_idx) =
+            if uses_children {
+                let i64_t = self.context.i64_type();
+                // __children: ptr to a heap void** buffer.
+                let arr_idx = idx;
+                llvm_field_tys.push(ptr_t.into());
+                idx += 1;
+                let cnt_idx = idx;
+                llvm_field_tys.push(i64_t.into());
+                idx += 1;
+                let cap_idx = idx;
+                llvm_field_tys.push(i64_t.into());
+                idx += 1;
+                (Some(arr_idx), Some(cnt_idx), Some(cap_idx))
+            } else {
+                (None, None, None)
+            };
 
         // m28b stage 2: pinned-class loci that declare bus
         // subscriptions get a synthetic `__mailbox: ptr` field.
@@ -1011,6 +1018,7 @@ impl<'ctx, 'p> LocusDeclare<'ctx> for Cx<'ctx, 'p> {
                 failure_handler: None,
                 children_field_idx,
                 child_count_field_idx,
+                child_cap_field_idx,
                 arena_field_idx,
                 restart_count_field_idx,
                 quarantined_field_idx,

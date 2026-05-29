@@ -20,7 +20,6 @@ use crate::bus::runtime::BusRuntime;
 use crate::codegen::{
     chunk_hint_for_coop_pool, CodegenError, CodegenTy, Cx,
     DefaultInit, ParamValue, Scope, SelfCx, SlotForm, SyncMode,
-    CHILDREN_CAP,
 };
 use crate::locus::dissolve::LocusDissolve;
 use crate::stdlib::time::TimeStdlib;
@@ -1478,10 +1477,35 @@ impl<'ctx, 'p> LocusInstantiate<'ctx> for Cx<'ctx, 'p> {
         // function exit (after the run_bb code that consumes it
         // — see end of fn + the pinned-branch early-return).
 
-        // Zero-init the synthetic child_count field if this locus
-        // declares accept. The children array slots are written
-        // on accept dispatch; only the counter must start at 0.
-        if let Some(cnt_idx) = info.child_count_field_idx {
+        // Zero-init the synthetic children-tracker fields if this
+        // locus iterates `self.children`: __children starts as a
+        // NULL heap pointer, __child_count and __child_cap at 0.
+        // lotus_children_push lazily allocates the buffer on the
+        // first accept. The buffer slots themselves are written on
+        // accept dispatch.
+        if let (Some(arr_idx), Some(cnt_idx), Some(cap_idx)) = (
+            info.children_field_idx,
+            info.child_count_field_idx,
+            info.child_cap_field_idx,
+        ) {
+            let i64_t = self.context.i64_type();
+            let zero = i64_t.const_int(0, false);
+            let null_ptr = self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null();
+            let arr_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    arr_idx,
+                    &format!("{}.children.ptr", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(arr_ptr, null_ptr)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
             let cnt_ptr = self
                 .builder
                 .build_struct_gep(
@@ -1491,9 +1515,20 @@ impl<'ctx, 'p> LocusInstantiate<'ctx> for Cx<'ctx, 'p> {
                     &format!("{}.child_count.ptr", locus_name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-            let zero = self.context.i64_type().const_int(0, false);
             self.builder
                 .build_store(cnt_ptr, zero)
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let cap_ptr = self
+                .builder
+                .build_struct_gep(
+                    info.struct_ty,
+                    self_ptr,
+                    cap_idx,
+                    &format!("{}.child_cap.ptr", locus_name),
+                )
+                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            self.builder
+                .build_store(cap_ptr, zero)
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
         }
 
@@ -1846,26 +1881,18 @@ impl<'ctx, 'p> LocusInstantiate<'ctx> for Cx<'ctx, 'p> {
                             )
                             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     }
-                    // Append child_self → parent.children[child_count++]
-                    if let (Some(arr_idx), Some(cnt_idx)) = (
+                    // Append child_self to the parent's growable
+                    // children buffer:
+                    //   lotus_children_push(&__children,
+                    //       &__child_count, &__child_cap, child)
+                    // The helper grows the heap buffer on demand and
+                    // bumps the count — no fixed cap, no adjacent-
+                    // memory corruption past 16 children (2026-05-29).
+                    if let (Some(arr_idx), Some(cnt_idx), Some(cap_idx)) = (
                         parent_info.children_field_idx,
                         parent_info.child_count_field_idx,
+                        parent_info.child_cap_field_idx,
                     ) {
-                        let i64_t = self.context.i64_type();
-                        let cnt_ptr = self
-                            .builder
-                            .build_struct_gep(
-                                parent_info.struct_ty,
-                                parent_self.self_ptr,
-                                cnt_idx,
-                                "child.count.ptr",
-                            )
-                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                        let cur = self
-                            .builder
-                            .build_load(i64_t, cnt_ptr, "child.count")
-                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                            .into_int_value();
                         let arr_ptr = self
                             .builder
                             .build_struct_gep(
@@ -1875,33 +1902,42 @@ impl<'ctx, 'p> LocusInstantiate<'ctx> for Cx<'ctx, 'p> {
                                 "children.ptr",
                             )
                             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                        let i32_t = self.context.i32_type();
-                        let ptr_t = self
-                            .context
-                            .ptr_type(AddressSpace::default());
-                        let arr_ty = ptr_t.array_type(CHILDREN_CAP);
-                        let slot = unsafe {
-                            self.builder
-                                .build_gep(
-                                    arr_ty,
-                                    arr_ptr,
-                                    &[i32_t.const_int(0, false), cur],
-                                    "child.slot.ptr",
-                                )
-                                .map_err(|e| {
-                                    CodegenError::LlvmEmit(e.to_string())
-                                })?
-                        };
-                        self.builder
-                            .build_store(slot, self_ptr)
-                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-                        let one = i64_t.const_int(1, false);
-                        let next = self
+                        let cnt_ptr = self
                             .builder
-                            .build_int_add(cur, one, "child.count.next")
+                            .build_struct_gep(
+                                parent_info.struct_ty,
+                                parent_self.self_ptr,
+                                cnt_idx,
+                                "child.count.ptr",
+                            )
                             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        let cap_ptr = self
+                            .builder
+                            .build_struct_gep(
+                                parent_info.struct_ty,
+                                parent_self.self_ptr,
+                                cap_idx,
+                                "child.cap.ptr",
+                            )
+                            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                        let push_fn = self
+                            .module
+                            .get_function("lotus_children_push")
+                            .expect("lotus_children_push declared");
                         self.builder
-                            .build_store(cnt_ptr, next)
+                            .build_call(
+                                push_fn,
+                                &[
+                                    arr_ptr.into(),
+                                    cnt_ptr.into(),
+                                    cap_ptr.into(),
+                                    self_ptr.into(),
+                                ],
+                                &format!(
+                                    "{}.accept.push",
+                                    parent_self.locus_name
+                                ),
+                            )
                             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                     }
                 }

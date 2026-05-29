@@ -67,6 +67,19 @@ resolution cheap:
 | **Chunked** (proj_chunked, N≈10–30) | Per-locus arena with **per-coordinatee sub-regions**. Each accept allocates a sub-region; each dissolution frees one wholesale. Bookkeeping slots reclaimed via free-list. | Typed-message-header per coordinatee; moderate churn supported. |
 | **Recognition** (proj_recognition, N≈100–500) | Sub-mode-typed recpool selected at the locus declaration site (`fixed_cell`, `shared_slab`, `spillover`, or `summary_only`). v1 ships `fixed_cell` (bitmap-tracked fixed cells; child's arena lives inline in the cell) and `shared_slab` (one bump arena shared across all children; per-child release is a no-op). See **Recognition sub-modes** below. | Summary-only per coordinatee; many supported; minimal per-coordinatee state. |
 
+The `N≈…` figures are the *expected* coordinatee counts each
+class is tuned for, not hard caps. The `for child in
+self.children` iteration handle list — the codegen-level array
+of accepted child `self_ptr`s, distinct from where coordinatee
+state lives above — is a heap buffer that grows geometrically
+(`lotus_children_push`), so a parent may accept arbitrarily many
+children regardless of class. (Before 2026-05-29 this was a
+fixed 16-slot inline array with no bounds check; accepting a
+17th child while iterating `self.children` corrupted adjacent
+struct memory.) Recognition's `fixed_cell` cap is the one real
+hard limit, and it is an explicit, declared budget enforced as a
+runtime error — not an implementation ceiling.
+
 The compiler picks based on the locus's declared projection
 class. A locus with no explicit `projection` annotation defaults
 to `chunked` if it accepts coordinatees, `rich` if it doesn't.

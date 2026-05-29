@@ -1205,6 +1205,29 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             None,
         );
 
+        // 2026-05-29: growable accept'd-children tracker. Replaces
+        // the fixed __children[16] inline array whose unchecked
+        // append corrupted adjacent struct memory past 16 accepts.
+        // declare void @lotus_children_push(ptr buf, ptr count, ptr cap, ptr child)
+        // (buf/count/cap are addresses of the parent struct's
+        //  __children / __child_count / __child_cap fields)
+        let children_push_ty = void_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.module.add_function(
+            "lotus_children_push",
+            children_push_ty,
+            None,
+        );
+        // declare void @lotus_children_free(ptr buf)
+        let children_free_ty = void_t.fn_type(&[ptr_t.into()], false);
+        self.module.add_function(
+            "lotus_children_free",
+            children_free_ty,
+            None,
+        );
+
         // m70: lazy global payload arena for cross-process String
         // byte storage. The synthesized __deserialize_T body calls
         // this when decoding a length-prefixed String — allocates

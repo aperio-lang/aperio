@@ -2523,16 +2523,23 @@ pub(crate) struct LocusInfo<'ctx> {
     /// matching type fails its closure, the runtime routes the
     /// violation to this fn instead of dprintf+exit.
     pub(crate) failure_handler: Option<(String, FunctionValue<'ctx>)>,
-    /// When this locus declares `accept(child: T)`, every accept
-    /// dispatch appends the child's self_ptr to a built-in
-    /// fixed-cap array embedded in the locus struct so
-    /// `for child in self.children { ... }` can iterate. Indexes
-    /// of the synthetic array + counter fields if the locus
-    /// declares accept. None for accept-less loci.
+    /// When this locus declares `accept(child: T)` AND a method
+    /// body iterates `for child in self.children`, every accept
+    /// dispatch appends the child's self_ptr to a growable
+    /// heap buffer tracked by three synthetic struct fields:
+    /// `__children` (a `ptr` to a `void**` buffer), `__child_count`
+    /// (i64), and `__child_cap` (i64). The buffer grows via
+    /// `lotus_children_push` (2026-05-29 — replaced a fixed
+    /// `[16]` inline array that corrupted adjacent struct memory
+    /// past 16 accepts). All three are None for loci that don't
+    /// iterate their children.
     pub(crate) children_field_idx: Option<u32>,
-    /// Index of the `i64 child_count` field. Always paired with
+    /// Index of the `i64 __child_count` field. Always paired with
     /// `children_field_idx`.
     pub(crate) child_count_field_idx: Option<u32>,
+    /// Index of the `i64 __child_cap` field (the heap buffer's
+    /// allocated capacity). Always paired with `children_field_idx`.
+    pub(crate) child_cap_field_idx: Option<u32>,
     /// Index of the synthetic `__arena: ptr` field carrying this
     /// locus's `lotus_arena_t*`. Always 0 — the arena field is
     /// the first slot in every locus struct so bus dispatch can
@@ -2865,13 +2872,6 @@ pub(crate) enum SlotForm {
     /// never grows.
     RingBuffer,
 }
-
-/// Maximum number of children any locus struct's built-in
-/// `children` array can hold. v0 codegen uses a fixed cap to
-/// avoid resize / heap dance; production-grade loci typically have
-/// O(few-dozen) coordinatees, and 04-modes' AggregatorL only
-/// instantiates 3.
-pub(crate) const CHILDREN_CAP: u32 = 16;
 
 /// One locus param's default-initializer. Either pre-resolved
 /// (the common case — scalar literal) or deferred to the
@@ -11607,10 +11607,8 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
             .map(|(_, ln)| ln.clone())
             .expect("children_field_idx implies accept declared");
 
-        let i32_t = self.context.i32_type();
         let i64_t = self.context.i64_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
-        let arr_ty = ptr_t.array_type(CHILDREN_CAP);
 
         let func = self
             .current_fn
@@ -11669,23 +11667,26 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
         // body: load self.children[i] as a LocusRef local named
         // var_name; lower body; jump to inc.
         self.builder.position_at_end(body_bb);
-        let arr_ptr = self
+        // __children is now a `ptr` field holding a heap `void**`
+        // buffer (2026-05-29) — load the buffer base, then index
+        // `[i]` into it (each slot is a `ptr`).
+        let arr_field_ptr = self
             .builder
             .build_struct_gep(
                 cs.struct_ty,
                 cs.self_ptr,
                 arr_idx,
-                "for.children.ptr",
+                "for.children.field.ptr",
             )
             .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+        let buf = self
+            .builder
+            .build_load(ptr_t, arr_field_ptr, "for.children.buf")
+            .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            .into_pointer_value();
         let slot_ptr = unsafe {
             self.builder
-                .build_gep(
-                    arr_ty,
-                    arr_ptr,
-                    &[i32_t.const_int(0, false), i],
-                    "for.slot.ptr",
-                )
+                .build_gep(ptr_t, buf, &[i], "for.slot.ptr")
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
         };
         let child_ptr = self
