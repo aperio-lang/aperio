@@ -4509,12 +4509,6 @@ typedef struct lotus_coro {
     size_t            stack_size;   /* alloc'd size of `stack` */
     int               parked_fd;    /* fd this coro is parked on (-1 when running) */
     int               done;         /* 1 once the handler has returned */
-    /* 2026-05-30 wakeable park: set by a cancel-wake (pool shutdown,
-     * or — later — a parent draining this child). park_on_fd returns
-     * -1 once this is set (both at entry and after a resume), so the
-     * parking primitive yields its empty/EOF sentinel and the handler
-     * unwinds cooperatively instead of leaking its parked stack. */
-    int               cancel_requested;
     /* Handler invocation parameters captured at coro creation. The
      * thunk reads them after swapcontext and tail-calls the handler. */
     void             *handler;
@@ -4841,7 +4835,6 @@ static lotus_coro_t *lotus_coro_alloc(lotus_coop_pool_t *p,
     c->stack_size  = LOTUS_CORO_STACK_BYTES;
     c->parked_fd   = -1;
     c->done        = 0;
-    c->cancel_requested = 0;
     c->handler     = handler;
     c->self_ptr    = self_ptr;
     c->payload_ptr = payload_ptr;
@@ -4887,14 +4880,6 @@ int lotus_coop_park_on_fd(int fd, uint32_t events) {
     if (!p->async_io_enabled || p->epoll_fd < 0) {
         return -1;
     }
-    /* 2026-05-30 wakeable park: a coro already marked for
-     * cancellation never parks again — every park returns -1 so the
-     * parking primitive keeps yielding its sentinel and the handler
-     * unwinds. Bounds the cancel-and-resume loop: a resumed coro
-     * can't re-link onto parked_head. */
-    if (c->cancel_requested) {
-        return -1;
-    }
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.events   = events;
@@ -4912,25 +4897,8 @@ int lotus_coop_park_on_fd(int fd, uint32_t events) {
      * from epoll by the resume path before swap-back. */
     swapcontext(&c->ctx, &p->drain_ctx);
     /* Resumed. The resume path cleared parked_fd to -1 and
-     * detached us from parked_head. If we were resumed by a
-     * cancel-wake rather than fd-readiness, report -1 so the
-     * parking primitive yields its empty/EOF sentinel and the
-     * handler unwinds. */
-    if (c->cancel_requested) {
-        return -1;
-    }
+     * detached us from parked_head. */
     return 0;
-}
-
-/* 2026-05-30 wakeable park: is the current coro being cancelled? The
- * parking I/O primitives consult this on their give-up path so a
- * graceful cancel-wake (park_on_fd returned -1 because the coro is
- * unwinding, not because of a real I/O error) doesn't emit a
- * misleading perror. Returns 0 outside a coro context (where -1 from
- * park always means a genuine error). */
-static int lotus_coro_cancel_pending(void) {
-    lotus_coro_t *c = g_current_coro_tls;
-    return c ? c->cancel_requested : 0;
 }
 
 /* F.35 Slice 1: async-aware drain. Runs in the pool worker thread.
@@ -4945,26 +4913,6 @@ static int lotus_coro_cancel_pending(void) {
  *
  * Returns 0 on shutdown-with-empty-queue-and-no-parked; 1 after a
  * cell or wakeup advanced state (caller loops). */
-/* 2026-05-30 wakeable park: cancel-and-resume one parked coro. The
- * coro must ALREADY be detached from parked_head and its fd
- * deregistered from epoll by the caller. Marks cancel and swaps in;
- * the coro's park_on_fd returns -1, its parking primitive yields its
- * empty/EOF sentinel, run() unwinds, the handler returns (done=1),
- * and we free the coro. A cancelled coro can't re-park (park returns
- * -1 at entry), so it can't re-link — the call always makes progress
- * toward done. Factored out so the shutdown path and (later) a
- * per-child `terminate`/parent-drain can share it. */
-static void lotus_coro_cancel_and_resume(lotus_coop_pool_t *p,
-                                          lotus_coro_t *c) {
-    c->cancel_requested = 1;
-    g_current_coro_tls = c;
-    swapcontext(&p->drain_ctx, &c->ctx);
-    g_current_coro_tls = NULL;
-    if (c->done) {
-        lotus_coro_free(c);
-    }
-}
-
 static int lotus_coop_pool_drain_one_async(lotus_coop_pool_t *p) {
     /* (1) Service parked-fd wakeups first. epoll_wait timeout
      * choice: 0 (non-blocking) when a cell is pending so we hand
@@ -4977,23 +4925,30 @@ static int lotus_coop_pool_drain_one_async(lotus_coop_pool_t *p) {
         pthread_mutex_unlock(&p->lock);
         if (shutdown_set && !cell_pending) {
             /* 2026-05-30 wakeable park: the pool is shutting down and
-             * has no more cells, but coros are still parked. Wake each
-             * cooperatively — detach, deregister its fd, cancel-and-
-             * resume so it unwinds through its normal cleanup — rather
-             * than leaking the parked stack until process exit (the
-             * old Slice-1 behavior). Cancelled coros can't re-park, so
-             * parked_head drains to empty. */
-            while (p->parked_head) {
-                lotus_coro_t *c = p->parked_head;
-                p->parked_head = c->next;
-                c->next = NULL;
+             * has no more cells, but coros are still parked. We do NOT
+             * resume them to unwind: a forever-loop run() (the stdlib
+             * Listener / http Server `while true { accept }`) does not
+             * cooperatively break on a cancel-wake — accept would
+             * return its sentinel, the loop would re-accept, and we'd
+             * spin (cooperative unwind needs the loop to check
+             * `self.draining`, which the stdlib loops don't — a future
+             * refinement). The process is exiting, so ABANDON them:
+             * free each parked coro's stack (its fd/arena are
+             * reclaimed at process exit / by the parent's dissolve).
+             * The wake eventfd — poked by shutdown_all — is what let
+             * this worker return from epoll_wait to reach here; that
+             * alone unblocks the join. */
+            lotus_coro_t *c = p->parked_head;
+            while (c) {
+                lotus_coro_t *next = c->next;
                 if (c->parked_fd >= 0) {
                     (void)epoll_ctl(p->epoll_fd, EPOLL_CTL_DEL,
                                     c->parked_fd, NULL);
-                    c->parked_fd = -1;
                 }
-                lotus_coro_cancel_and_resume(p, c);
+                lotus_coro_free(c);
+                c = next;
             }
+            p->parked_head = NULL;
             return 0;
         }
         int timeout_ms = cell_pending ? 0 : -1;
@@ -7174,9 +7129,7 @@ int lotus_tcp_accept_one(int listen_fd) {
         }
         /* Silent on a cancel-wake: park returned -1 because the coro
          * is unwinding (pool shutdown / parent drain), not an error. */
-        if (!lotus_coro_cancel_pending()) {
             perror("lotus_tcp_accept_one: accept");
-        }
         return -1;
     }
 }
@@ -7795,9 +7748,7 @@ int lotus_tcp_send_str(int fd, const char *msg) {
         if (w < 0 && async && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             if (lotus_coop_park_on_fd(fd, EPOLLOUT) == 0) continue;
         }
-        if (!lotus_coro_cancel_pending()) {
             perror("lotus_tcp_send_str: write");
-        }
         return -1;
     }
     return 0;
@@ -7843,9 +7794,7 @@ int lotus_tcp_send_bytes(int fd, const void *bytes_ptr) {
         if (w < 0 && async && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             if (lotus_coop_park_on_fd(fd, EPOLLOUT) == 0) continue;
         }
-        if (!lotus_coro_cancel_pending()) {
             perror("lotus_tcp_send_bytes: write");
-        }
         return -1;
     }
     return 0;

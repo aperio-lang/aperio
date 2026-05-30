@@ -141,14 +141,19 @@ the model: runtime is automatic; stdlib is explicit.
   (it lives to parent dissolve). The reclaim runs on the child's
   own pool worker while its arena is valid; `emit_locus_arena_
   destroy` is idempotent (NULLs `__arena`), so a later
-  parent-dissolve of the same locus no-ops. Cooperative
-  cancellation of a coro PARKED at the time of teardown (pool
-  shutdown, later a parent drain) is the **wakeable park**: a
-  per-pool wake `eventfd` in the pool's epoll lets `shutdown_all`
-  unblock a worker sitting in `epoll_wait(-1)`; a `cancel`
-  flag makes `lotus_coop_park_on_fd` return -1 so the parking
-  primitive yields its EOF/empty sentinel and `run()` unwinds
-  normally — never seizing a suspended stack.
+  parent-dissolve of the same locus no-ops. At pool shutdown a
+  coro may still be PARKED (a listener in `accept()`); the
+  **wakeable park** handles it: a per-pool wake `eventfd` in the
+  pool's epoll lets `shutdown_all` unblock a worker sitting in
+  `epoll_wait(-1)` (the condvar broadcast can't), so the worker
+  returns from the drain and the join completes instead of
+  hanging. The parked coros are then *abandoned* — their stacks
+  freed without resuming them — because a forever-loop `run()`
+  (`while true { accept }`) cannot be cooperatively unwound
+  without the loop checking `self.draining` (a future
+  refinement), and the process is exiting anyway. Per-child
+  reclamation proper (terminate / flow run-completion) never
+  needs this: there the coro returns from `run()` on its own.
 - **Recovery primitives.** `restart`, `restart_in_place`,
   `quarantine`, `reorganize`, `bubble`, `dissolve`, `drain` —
   all language keywords; runtime implements the actual

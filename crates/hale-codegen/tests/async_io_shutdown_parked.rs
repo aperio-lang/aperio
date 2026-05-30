@@ -2,21 +2,17 @@
 //!
 //! When the program exits with an async_io coro still PARKED (a
 //! listener in accept() that no client ever hit, a recv blocked on
-//! a quiet socket), shutdown must wake it cooperatively so it
-//! unwinds through its normal run() exit. Two prior failure modes
-//! this guards against:
+//! a quiet socket), shutdown must not hang. The fix: a per-pool wake
+//! eventfd lets shutdown_all unblock a worker sitting in
+//! epoll_wait(-1) (the cell condvar can't), so the worker returns
+//! from the drain and the parked coros are abandoned (stacks freed,
+//! not resumed — a forever-loop run() can't be cooperatively
+//! unwound, and the process is exiting). Prior failure mode this
+//! guards against:
 //!   - HANG: shutdown_all only broadcast the cell condvar, which
 //!     never wakes a worker blocked in epoll_wait(-1) → join hung.
-//!   - CRASH: once woken, the coro resumed AFTER the main locus's
-//!     dissolve freed its arena → use-after-free in the work it did
-//!     on resume (e.g. the Stream it builds per accepted fd).
-//!
-//! The fix: a per-pool wake eventfd (shutdown unblocks epoll_wait),
-//! a cancel flag that makes park_on_fd return -1 so the parking
-//! primitive yields and run() unwinds, and quiescing the pool
-//! BEFORE the main locus dissolves its pooled children. This test
-//! just asserts the program EXITS (cleanly, promptly) — that single
-//! observation catches both the hang and the crash.
+//! This test asserts the program EXITS cleanly and promptly — that
+//! single observation catches the hang.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
