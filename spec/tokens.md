@@ -77,8 +77,8 @@ narrowing the closure-keyword family uses for `approx` / `within`.
 ### Lifecycle keywords
 
 ```
-birth           accept          run             drain
-dissolve        on_failure
+birth           accept          release         run
+drain           dissolve        on_failure
 ```
 
 ### Mode keywords

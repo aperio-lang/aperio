@@ -196,6 +196,38 @@ a still-executing frame. (A child that `terminate`s mid-`run()`
 exits `run()` immediately, like `return`; code after `terminate`
 in the same method does not execute.)
 
+### `release(c)` and flow children
+
+`release(c: Child) { ... }` (2026-05-30) is the death-side
+bookend, symmetric to `accept(c: Child)`. Declaring it on a
+parent has two effects:
+
+1. **It marks `Child` a *flow*.** A flow child is reclaimed when
+   its `run()` *completes* — a plain `return` (or running off the
+   end of `run()`), no explicit `terminate;` required. This is
+   the connection model: `run()` is the connection's flow (a
+   recv/park loop that returns on EOF), and the child's arena is
+   reclaimed the moment that flow ends. A child whose type is NOT
+   declared in any parent's `release` is a *resident*: its `run()`
+   returning means "ready" (it lives on as a subscriber), and it
+   is reclaimed only when the parent dissolves. The same
+   `run()`-returns event thus means "reclaim me" for a flow and
+   "ready" for a resident — disambiguated by the parent's
+   declaration, never guessed.
+2. **It fires on each completion.** When a flow child completes
+   (via run-completion OR `terminate;`), the runtime calls
+   `parent.release(owner, child)` — **after** the child drains,
+   **before** it dissolves — so the parent observes the
+   completion and reads the child's final settled state (the
+   mirror of `accept(c)`, which reads it fresh). `release` is
+   policy only: it does not free. The owner is the accept'ing
+   parent, recorded at accept time; `release` does not fire if a
+   flow-typed locus is instantiated outside an accept context
+   (no owner).
+
+`release` has the same shape as `accept` — one typed child
+param — and the same fn signature `(parent_self, child_self)`.
+
 ### Locus method dispatch
 
 **Methods on loci may not return locus values.** This is the

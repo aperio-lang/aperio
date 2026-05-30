@@ -2442,6 +2442,15 @@ pub(crate) struct LocusInfo<'ctx> {
     /// lowering and child-instantiation sites (which must call
     /// parent.accept before child.birth, per F.7).
     pub(crate) accept_param: Option<(String, String)>,
+    /// For loci that declare `release(child: ChildLocus)` (2026-05-30,
+    /// the death-side bookend), the child param's (binding name, child
+    /// locus name). None otherwise. Its presence marks `ChildLocus` a
+    /// "flow": a child whose run() completing reclaims it (vs. a
+    /// resident, reclaimed only at parent dissolve). The run-wrapper
+    /// for the child type searches the locus set for the parent that
+    /// declares `release` of it, to fire `parent.release(owner, child)`
+    /// on completion.
+    pub(crate) release_param: Option<(String, String)>,
     /// User-defined `fn` members on the locus (called as bus
     /// handlers, mode dispatchers, etc.). Each entry is
     /// (method name → LLVM function value). Methods take
@@ -2649,6 +2658,12 @@ pub(crate) struct LocusInfo<'ctx> {
     /// route violations to the parent without a static call
     /// site (bus drains don't have one).
     pub(crate) parent_self_field_idx: u32,
+    /// 2026-05-30: index of the synthetic `__owner_self: ptr` field —
+    /// the accept'ing parent's self_ptr, stored unconditionally at
+    /// accept dispatch (cf. `parent_self_field_idx`, which is failure-
+    /// routing-gated). Read by a flow child's run-wrapper to fire
+    /// `parent.release(owner, child)`. Null when never accept'd.
+    pub(crate) owner_self_field_idx: u32,
     /// m42: index of the synthetic `__parent_on_failure: ptr`
     /// field. Paired with `parent_self_field_idx`. Holds the
     /// parent's `on_failure` fn ptr (or null). Read by the
@@ -3369,42 +3384,60 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                     &format!("{}.run.via_pool", locus_name),
                 )
                 .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-            // 2026-05-30 per-child terminate: if run() ended with the
-            // `__drain_requested` latch set (via `terminate;`), this
-            // locus asked to end — its run() coro has completed, so
-            // reclaim it NOW (drain → dissolve → arena reclaim)
-            // instead of waiting for the parent to dissolve (which,
-            // for a daemon parent, is never — the leak). The teardown
-            // mirrors the ephemeral if-!defer path in
-            // lower_locus_instantiation; the idempotent arena-destroy
-            // latch makes a later parent-dissolve of the same locus a
-            // no-op. Runs on the pool worker (the coro's own thread)
-            // while the locus's arena is still valid — the parent
-            // isn't dissolving.
+            // 2026-05-30: reclaim this locus when run() completes if
+            // EITHER (a) it's a FLOW — some parent declares
+            // `release(c: ThisType)`, so run-completion reclaims it (a
+            // connection child that returns on EOF), OR (b) run() set
+            // the `__drain_requested` latch via `terminate;`. Reclaim
+            // = drain → [parent.release(owner, self), for a flow] →
+            // dissolve → arena reclaim, on the coro's own worker while
+            // the arena is valid (the parent isn't dissolving). The
+            // idempotent arena-destroy latch makes a later
+            // parent-dissolve of the same locus a no-op.
+            //
+            // A locus is a flow iff some declared locus has a
+            // `release(c: T)` whose child type T is this locus —
+            // then `release_fn` is that parent's release method.
+            let release_fn = self.user_loci.values().find_map(|p| {
+                match &p.release_param {
+                    Some((_, child)) if child == locus_name => {
+                        p.methods.get("release").copied()
+                    }
+                    _ => None,
+                }
+            });
             let i64_t = self.context.i64_type();
-            let dr_ptr = self
-                .builder
-                .build_struct_gep(
-                    info.struct_ty,
-                    self_arg,
-                    info.drain_requested_field_idx,
-                    &format!("{}.terminate.dr.ptr", locus_name),
-                )
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
-            let dr = self
-                .builder
-                .build_load(i64_t, dr_ptr, &format!("{}.terminate.dr", locus_name))
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
-                .into_int_value();
-            let terminating = self
-                .builder
-                .build_int_compare(
-                    inkwell::IntPredicate::NE,
-                    dr,
-                    i64_t.const_int(0, false),
-                    &format!("{}.terminate.set", locus_name),
-                )
-                .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+            let terminating = if release_fn.is_some() {
+                // Flow: run-completion always reclaims.
+                self.context.bool_type().const_int(1, false)
+            } else {
+                let dr_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        self_arg,
+                        info.drain_requested_field_idx,
+                        &format!("{}.terminate.dr.ptr", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let dr = self
+                    .builder
+                    .build_load(
+                        i64_t,
+                        dr_ptr,
+                        &format!("{}.terminate.dr", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_int_value();
+                self.builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        dr,
+                        i64_t.const_int(0, false),
+                        &format!("{}.terminate.set", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+            };
             let reclaim_bb =
                 self.context.append_basic_block(wrapper, "terminate.reclaim");
             let ret_bb =
@@ -3436,6 +3469,51 @@ impl<'ctx, 'p> Cx<'ctx, 'p> {
                         )
                         .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
                 }
+            }
+            // The `release(c)` parent bookend fires HERE — after the
+            // child drains, before it dissolves — so the parent reads
+            // the child's final settled state (mirror of accept(c),
+            // which reads it fresh). owner = __owner_self (the
+            // accept'ing parent); guarded against null for a flow-typed
+            // locus instantiated outside an accept context.
+            if let Some(rfn) = release_fn {
+                let owner_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        info.struct_ty,
+                        self_arg,
+                        info.owner_self_field_idx,
+                        &format!("{}.release.owner.ptr", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let owner = self
+                    .builder
+                    .build_load(ptr_t, owner_ptr, &format!("{}.release.owner", locus_name))
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?
+                    .into_pointer_value();
+                let owner_null = self
+                    .builder
+                    .build_is_null(owner, &format!("{}.release.owner.null", locus_name))
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                let fire_bb =
+                    self.context.append_basic_block(wrapper, "release.fire");
+                let after_rel_bb =
+                    self.context.append_basic_block(wrapper, "release.after");
+                self.builder
+                    .build_conditional_branch(owner_null, after_rel_bb, fire_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(fire_bb);
+                self.builder
+                    .build_call(
+                        rfn,
+                        &[owner.into(), self_arg.into()],
+                        &format!("{}.release.call", locus_name),
+                    )
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder
+                    .build_unconditional_branch(after_rel_bb)
+                    .map_err(|e| CodegenError::LlvmEmit(e.to_string()))?;
+                self.builder.position_at_end(after_rel_bb);
             }
             if let Some(closures_fn) = info.dissolve_closures_fn {
                 let (parent_self, handler_ptr) =

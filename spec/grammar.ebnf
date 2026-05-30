@@ -402,6 +402,8 @@ lifecycle_decl    = lifecycle_keyword , [ "(" , [ param_list ] , ")" ] ,
                     [ "->" , type_expr ] , block ;
 lifecycle_keyword = "birth"
                   | "accept"
+                  | "release"   (* 2026-05-30: death-side bookend of accept;
+                                   one child param. See spec/semantics.md. *)
                   | "run"
                   | "drain"
                   | "dissolve"

@@ -966,6 +966,15 @@ pub struct LifecycleDecl {
 pub enum LifecycleKind {
     Birth,
     Accept,
+    /// 2026-05-30 — death-side bookend, symmetric to `accept`.
+    /// `release(c: Child) { ... }` fires when an accept'd child of
+    /// type `Child` completes (its run() returns), after the child
+    /// drains and before it dissolves, so the parent observes the
+    /// completion and reads the child's final state. Declaring it
+    /// also marks `Child` a "flow": its run() completing reclaims it
+    /// (vs. a "resident" child, which lives until the parent
+    /// dissolves). Same shape as `accept`: one typed child param.
+    Release,
     Run,
     Drain,
     Dissolve,
